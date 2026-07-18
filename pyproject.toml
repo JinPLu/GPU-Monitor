@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-broker"
+version = "0.1.0"
+description = "Local shared-GPU status and lease coordination."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "alembic>=1.14,<2",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "itsdangerous>=2.2,<3",
+  "jinja2>=3.1,<4",
+  "mcp>=1.27,<2",
+  "prometheus-client>=0.21,<1",
+  "pydantic>=2.10,<3",
+  "pyyaml>=6,<7",
+  "sqlalchemy>=2.0,<3",
+  "typer>=0.15,<1",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+gpu-broker = "gpu_broker.cli:app"
+gpu-broker-mcp = "gpu_broker.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gpu_broker = [
+  "web/templates/*.html",
+  "web/static/*.css",
+  "web/static/*.js",
+  "web/static/vendor/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["build", ".venv"]
+
+[tool.ruff.lint]
+select = ["F"]

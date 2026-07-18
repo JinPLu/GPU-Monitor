@@ -1,0 +1,13 @@
+schema_version: 1
+collector:
+  enabled: true
+  interval_seconds: 10
+  stale_after_seconds: 30
+  ssh_connect_timeout_seconds: 8
+projects:
+  - id: default
+    display_name: Default
+    weight: 1
+    quota_gpus: null
+    concurrency_limit: null
+endpoints: []

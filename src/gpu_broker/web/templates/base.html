@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  {% if csrf %}<meta name="csrf-token" content="{{ csrf }}">{% endif %}
+  <title>GPU Broker</title>
+  <link rel="stylesheet" href="/static/vendor/phosphor/style.css?v=2.1.2">
+  <link rel="stylesheet" href="/static/app.css?v=20260719-symbol-polish-1">
+</head>
+<body data-realtime="{{ 'on' if actor else 'off' }}" data-page="{{ page }}">
+  <div class="environment-backdrop" aria-hidden="true">
+    <img src="/static/assets/server-room-background.jpg" alt="">
+  </div>
+  <div class="app-shell{% if not actor %} signed-out{% endif %}">
+    {% if actor %}
+    <aside class="sidebar" id="app-sidebar" aria-label="GPU Broker 工作区导航">
+      <a class="brand" href="/" aria-label="GPU Broker 资源总览">
+        <span class="brand-mark" aria-hidden="true"><i class="ph ph-graphics-card"></i></span><span>GPU Broker</span>
+      </a>
+      <nav class="sidebar-nav" aria-label="主要导航">
+        <p class="nav-label">工作区</p>
+        <a href="/" {% if page == 'overview' %}aria-current="page"{% endif %}><i class="ph ph-squares-four" aria-hidden="true"></i>资源总览</a>
+        <a href="/ui/gpus" {% if page in ['gpus', 'gpu-detail'] %}aria-current="page"{% endif %}><i class="ph ph-grid-four" aria-hidden="true"></i>GPU 状态</a>
+        <a href="/ui/requests" {% if page in ['requests', 'leases'] %}aria-current="page"{% endif %}><i class="ph ph-arrows-left-right" aria-hidden="true"></i>认领与队列</a>
+        <a href="/ui/reservations" {% if page == 'reservations' %}aria-current="page"{% endif %}><i class="ph ph-calendar-dots" aria-hidden="true"></i>使用安排</a>
+        <p class="nav-label">管理</p>
+        <a href="/ui/projects" {% if page == 'projects' %}aria-current="page"{% endif %}><i class="ph ph-users" aria-hidden="true"></i>项目与身份</a>
+        <a href="/ui/maintenance" {% if page == 'maintenance' %}aria-current="page"{% endif %}><i class="ph ph-wrench" aria-hidden="true"></i>维护窗口</a>
+        <a href="/ui/alerts" {% if page == 'alerts' %}aria-current="page"{% endif %}><i class="ph ph-warning" aria-hidden="true"></i>告警</a>
+        <a href="/ui/audit" {% if page == 'audit' %}aria-current="page"{% endif %}><i class="ph ph-clock-counter-clockwise" aria-hidden="true"></i>审计与历史</a>
+        <a href="/ui/doctor" {% if page == 'doctor' %}aria-current="page"{% endif %}><i class="ph ph-gear" aria-hidden="true"></i>设置与 Doctor</a>
+      </nav>
+      <div class="sidebar-footer">
+        <span id="realtime-state" class="live-state"><i aria-hidden="true"></i><span>数据连接中</span></span>
+        <p>仅本机控制面 · 不执行远端任务</p>
+      </div>
+    </aside>
+    {% endif %}
+    <div class="workspace">
+      {% if actor %}
+      <header class="topbar">
+        <button class="sidebar-toggle icon-button" type="button" data-toggle-sidebar aria-expanded="true" aria-controls="app-sidebar" aria-label="显示或隐藏导航"><i class="ph ph-list" aria-hidden="true"></i></button>
+        <div class="topbar-title"><span>共享 GPU 工作区</span><small><i class="ph ph-shield-check" aria-hidden="true"></i> 本机只读监控 · 协调状态</small></div>
+        <form class="actor-switcher" method="post" action="/ui/actor">
+          <label><span>当前操作者</span><input name="actor_id" value="{{ actor.id }}" pattern="[A-Za-z][A-Za-z0-9_.-]{1,127}" required aria-label="当前人类或 Agent 名称"></label>
+          <button class="quiet" type="submit">切换</button>
+        </form>
+      </header>
+      {% endif %}
+      <main id="main-content" tabindex="-1">
+        {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

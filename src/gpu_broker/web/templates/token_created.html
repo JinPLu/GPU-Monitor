@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">一次性凭证</p>
+    <h1>已创建 {{ payload.actor.display_name }}</h1>
+  </div>
+</section>
+
+<section class="secret-panel" aria-labelledby="token-title">
+  <h2 id="token-title">立即复制并安全保存此 token</h2>
+  <p>它只会在此响应中显示一次。请将其交给对应的人类或 Agent 的秘密管理工具；不要复制到项目配置、审计记录或聊天记录。</p>
+  <label>API token
+    <input id="issued-token" type="text" value="{{ payload.token }}" readonly autocomplete="off">
+  </label>
+  <div class="inline-actions">
+    <button type="button" id="copy-issued-token">复制 token</button>
+    <a class="button-link quiet-link" href="/ui/projects">我已安全保存</a>
+  </div>
+  <p id="copy-status" class="muted" role="status"></p>
+</section>
+
+<script>
+(() => {
+  const input = document.getElementById("issued-token");
+  const button = document.getElementById("copy-issued-token");
+  const status = document.getElementById("copy-status");
+  if (!input || !button || !navigator.clipboard) return;
+  button.addEventListener("click", async () => {
+    await navigator.clipboard.writeText(input.value);
+    status.textContent = "已复制。请确认它已保存到受权限保护的秘密管理工具。";
+  });
+})();
+</script>
+{% endblock %}

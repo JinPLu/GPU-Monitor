@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="login-panel" aria-labelledby="login-title">
+  <p class="eyebrow">本机、协作式 GPU 资源控制面</p>
+  <h1 id="login-title">登录 gpu-broker</h1>
+  <p>输入只保存在本地秘密管理中的 API token。服务器只保存 token hash；租约不代表训练或服务启动授权。</p>
+  <form method="post" action="/ui/login" class="stack">
+    <label>API token
+      <input id="api-token" name="token" type="password" autocomplete="current-password" required autofocus>
+    </label>
+    <button id="paste-desktop-token" class="quiet" type="button" hidden>从系统剪贴板粘贴 token</button>
+    <p id="desktop-paste-status" class="muted" role="status" hidden></p>
+    <button type="submit">登录</button>
+  </form>
+</section>
+<script>
+  (() => {
+    const input = document.getElementById("api-token");
+    const button = document.getElementById("paste-desktop-token");
+    const status = document.getElementById("desktop-paste-status");
+    const bridge = window.webkit?.messageHandlers?.gpuBrokerClipboard;
+    if (!input || !button || !status || !bridge) return;
+
+    button.hidden = false;
+    const setStatus = (message) => {
+      status.textContent = message;
+      status.hidden = false;
+    };
+    window.gpuBrokerSetToken = (token) => {
+      input.value = token;
+      input.focus();
+      setStatus("已填入 token；请点击“登录”。");
+    };
+    window.gpuBrokerClipboardError = (message) => setStatus(message);
+    button.addEventListener("click", () => {
+      setStatus("正在从系统剪贴板读取…");
+      bridge.postMessage({ action: "paste-token" });
+    });
+  })();
+</script>
+{% endblock %}

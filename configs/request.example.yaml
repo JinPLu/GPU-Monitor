@@ -1,0 +1,11 @@
+project_id: default
+task_ref: example-task
+purpose: Example GPU workload; lease does not authorize a launch
+gpu_count: 1
+nodes: 1
+gpus_per_node: 1
+same_host: true
+placement: pack
+min_free_vram_mib: 16000
+expected_duration_seconds: 1800
+duration_seconds: 3600
