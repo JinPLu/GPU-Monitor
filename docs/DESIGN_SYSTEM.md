@@ -6,7 +6,7 @@
 - Primary user: the person who needs to see which GPU capacity is safe to use, who owns it, and what needs attention before making a claim.
 - Single job of the overview: make resource availability legible at a glance, then make the next safe action obvious.
 - Platform: macOS desktop only. The target implementation is native SwiftUI/AppKit, not a browser page and not a WKWebView skin.
-- Reference: Apple Home for macOS — the provided reference image and the [Apple Home user guide](https://support.apple.com/zh-cn/guide/home/welcome/mac) show a spatially grouped control surface with category chips, rooms/sections, cameras, scenes, and accessory tiles.
+- Reference: Apple Home for macOS — the [Apple Home user guide](https://support.apple.com/zh-cn/guide/home/welcome/mac) shows a spatially grouped control surface with category chips, rooms/sections, cameras, scenes, and accessory tiles.
 
 ## Design decision
 
