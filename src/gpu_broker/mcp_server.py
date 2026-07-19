@@ -23,7 +23,7 @@ MCP_INSTRUCTIONS = (
     "authorized workload, call gpu_bind_observed_workload(agent_name, lease_id, optional run_id) so "
     "the Broker records only already-observed processes; it never launches, stops, or changes remote "
     "work. Release with gpu_release(agent_name, lease_id) when work stops or startup fails. "
-    "Reservations and server registration are admin actions requiring separate explicit authorization. "
+    "Reservations and server registration/deletion are admin actions requiring separate explicit authorization. "
     "If MCP or the service is unavailable, report that state and do not fall back to SSH, SQLite, "
     "inventory, remote probes, or nvidia-smi."
 )
@@ -324,6 +324,16 @@ def gpu_add_server(
             "project_ids": [],
             "enabled": True,
         },
+        idempotency_key=secrets.token_hex(16),
+    )
+
+
+@mcp.tool()
+def gpu_delete_server(agent_name: str, server_id: str) -> dict[str, Any]:
+    """Delete an SSH server from monitoring; this never stops a remote workload."""
+
+    return _client(agent_name).delete(
+        f"/api/v1/endpoints/{server_id}",
         idempotency_key=secrets.token_hex(16),
     )
 

@@ -101,3 +101,6 @@ class BrokerClient:
         idempotency_key: str,
     ) -> dict[str, Any]:
         return self.request("POST", path, json_body=body, idempotency_key=idempotency_key)
+
+    def delete(self, path: str, *, idempotency_key: str) -> dict[str, Any]:
+        return self.request("DELETE", path, idempotency_key=idempotency_key)

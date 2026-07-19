@@ -8,7 +8,7 @@ import yaml
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from gpu_broker import mcp_server
+from gpu_broker import API_CAPABILITIES, mcp_server
 from gpu_broker.api import create_app
 from gpu_broker.cli import app as cli_app
 from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
@@ -75,11 +75,7 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     snapshot = client.get("/api/v1/snapshot", headers={"X-GPU-Broker-Actor": "test-agent"})
     assert snapshot.status_code == 200
     assert snapshot.json()["data"]["gpus"][0]["state"] == "HELD"
-    assert client.get("/health/live").json()["capabilities"] == [
-        "workload_profiles",
-        "instant_claims",
-        "coordination_board",
-    ]
+    assert client.get("/health/live").json()["capabilities"] == list(API_CAPABILITIES)
     compact = client.get(
         "/api/v1/gpus?compact=true",
         headers={"X-GPU-Broker-Actor": "test-agent"},
@@ -287,6 +283,35 @@ def test_endpoint_project_grant_route_is_not_exposed(tmp_path: Path, inventory) 
     assert response.status_code == 404
 
 
+def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'endpoint-delete.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    client = TestClient(app)
+
+    missing_key = client.delete(
+        "/api/v1/endpoints/endpoint-b",
+        headers={"X-GPU-Broker-Actor": "endpoint-admin"},
+    )
+    assert missing_key.status_code == 422
+
+    headers = {"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "delete-endpoint-b"}
+    deleted = client.delete("/api/v1/endpoints/endpoint-b", headers=headers)
+    retried = client.delete("/api/v1/endpoints/endpoint-b", headers=headers)
+
+    assert deleted.status_code == 200
+    assert retried.json() == deleted.json()
+    assert deleted.json()["endpoint_id"] == "endpoint-b"
+    listed = client.get("/api/v1/endpoints", headers={"X-GPU-Broker-Actor": "endpoint-admin"})
+    assert [endpoint["id"] for endpoint in listed.json()["data"]] == ["endpoint-a"]
+
+
 def test_project_creation_route_and_gui_are_not_exposed(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
@@ -370,6 +395,17 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
     )
     assert added_server.status_code == 200
     assert "click-server" in added_server.text
+    removed_server = client.post(
+        "/ui/action/delete-endpoint",
+        data={
+            "endpoint_id": "click-server",
+            "csrf": _csrf(added_server.text),
+            "confirmed": "yes",
+        },
+        follow_redirects=True,
+    )
+    assert removed_server.status_code == 200
+    assert "click-server" not in {endpoint["id"] for endpoint in service.list_endpoints(service.local_actor("human"))["data"]}
 
     switched = client.post("/ui/actor", data={"actor_id": "click-agent"}, follow_redirects=True)
     assert switched.status_code == 200
@@ -407,6 +443,7 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_release",
         "gpu_schedule",
         "gpu_add_server",
+        "gpu_delete_server",
     }.issubset(names)
     assert "gpu_grant_server_project" not in names
     for name in ("gpu_claim", "gpu_schedule"):

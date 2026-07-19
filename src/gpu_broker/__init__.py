@@ -9,4 +9,5 @@ API_CAPABILITIES = (
     "workload_profiles",
     "instant_claims",
     "coordination_board",
+    "server_deletion",
 )

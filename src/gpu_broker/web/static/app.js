@@ -1,6 +1,7 @@
 (() => {
   const liveState = document.getElementById("realtime-state");
   const dashboardNode = document.getElementById("dashboard-data");
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const dialogOpeners = new WeakMap();
 
   const setLiveState = (kind, text) => {
@@ -417,12 +418,22 @@
     const status = endpoint.monitor?.status || "PENDING";
     return `
       <section class="server-block" data-server-id="${escapeHTML(endpoint.id)}" data-expanded="${expanded}">
-        <button class="server-summary" type="button" data-toggle-server="${escapeHTML(endpoint.id)}" aria-expanded="${expanded}">
+        <div class="server-summary">
           <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong><code>${escapeHTML(sshCommand)}</code></strong><small>${escapeHTML(endpoint.id)} · ${escapeHTML(monitorLabels[status] || status)}</small></span></span>
           <span class="server-counts" aria-label="GPU 状态：共 ${gpus.length}，空闲 ${available}，占用 ${busy}，认领 ${claimed}，异常 ${abnormal}"><span title="总数"><strong>${gpus.length}</strong></span><span class="count-available" title="空闲"><strong>${available}</strong></span><span title="占用"><strong>${busy}</strong></span><span title="认领"><strong>${claimed}</strong></span><span class="${abnormal ? "count-alert" : ""}" title="异常"><strong>${abnormal}</strong></span></span>
           <span class="server-aggregate">${clusterMeter("CPU 负载", cpuLoadPct, "cpu")}${clusterMeter("内存", memoryUsedPct, "memory")}${clusterMeter("显存", memoryPct, "memory")}${clusterMeter("GPU 利用率", util, "utilization")}</span>
-          <span class="server-expand"><span>${expanded ? "收起 GPU" : "展开 GPU"}</span><i class="ph ph-caret-down" aria-hidden="true"></i></span>
-        </button>
+          <span class="server-actions">
+            <button class="server-expand" type="button" data-toggle-server="${escapeHTML(endpoint.id)}" aria-expanded="${expanded}" title="${expanded ? "收起 GPU" : "展开 GPU"}">
+              <span>${expanded ? "收起 GPU" : "展开 GPU"}</span><i class="ph ph-caret-down" aria-hidden="true"></i>
+            </button>
+            <form class="server-delete-form" method="post" action="/ui/action/delete-endpoint" data-delete-server-form data-server-label="${escapeHTML(endpoint.id)}">
+              <input type="hidden" name="endpoint_id" value="${escapeHTML(endpoint.id)}">
+              <input type="hidden" name="csrf" value="${escapeHTML(csrfToken)}">
+              <input type="hidden" name="confirmed" value="yes">
+              <button class="icon-button server-delete" type="submit" title="删除服务器" aria-label="删除服务器 ${escapeHTML(endpoint.id)}"><i class="ph ph-trash" aria-hidden="true"></i></button>
+            </form>
+          </span>
+        </div>
         <div class="gpu-tiles">${expanded ? (gpus.length ? gpus.map(gpuRow).join("") : '<p class="empty-inline">尚未发现 GPU；该服务器不会参与分配。</p>') : ""}</div>
       </section>`;
   };
@@ -515,6 +526,14 @@
       dialogOpeners.set(document.getElementById("gpu-detail"), detail);
       openGpuDetail(detail.dataset.showGpu);
     }
+  });
+
+  serverGroups.addEventListener("submit", (event) => {
+    const form = event.target.closest("[data-delete-server-form]");
+    if (!form) return;
+    const label = form.dataset.serverLabel || "该服务器";
+    const confirmed = window.confirm(`删除服务器 ${label}？这会移除本机监控登记和该服务器的当前 GPU/遥测记录，不会停止远端任务。`);
+    if (!confirmed) event.preventDefault();
   });
 
   document.getElementById("toggle-all-servers").addEventListener("click", (event) => {

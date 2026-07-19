@@ -163,6 +163,26 @@ def endpoint_list(
     _print(_call(lambda: _client(url, actor).get("/api/v1/endpoints")), as_json)
 
 
+@endpoint_app.command("delete")
+def endpoint_delete(
+    endpoint_id: str,
+    as_json: Annotated[bool, typer.Option("--json")]=False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None,
+) -> None:
+    """Delete a server from monitoring; this never stops a remote workload."""
+
+    _print(
+        _call(
+            lambda: _client(url, actor).delete(
+                f"/api/v1/endpoints/{endpoint_id}",
+                idempotency_key=secrets.token_hex(16),
+            )
+        ),
+        as_json,
+    )
+
+
 @gpu_app.command("list")
 def gpu_list(
     state: Annotated[str | None, typer.Option()] = None,

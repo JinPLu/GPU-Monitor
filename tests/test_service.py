@@ -9,7 +9,17 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from gpu_broker.database import Database
-from gpu_broker.models import AuditEvent, Lease, LeaseResource, TelemetryCurrent, TelemetrySnapshot
+from gpu_broker.models import (
+    Alert,
+    AuditEvent,
+    Endpoint,
+    GPUDevice,
+    Lease,
+    LeaseResource,
+    ProviderState,
+    TelemetryCurrent,
+    TelemetrySnapshot,
+)
 from gpu_broker.schemas import (
     ActorCreate,
     EndpointEnabled,
@@ -235,6 +245,81 @@ def test_endpoint_identity_is_enforced(service, admin) -> None:
             idempotency_key="endpoint-move",
         )
     assert error.value.code == "endpoint_identity_immutable"
+
+
+def test_endpoint_delete_removes_unleased_monitoring_state(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+    service.record_provider_failure("endpoint-a", "timeout")
+
+    deleted = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-delete")
+    retried = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-delete")
+
+    assert retried == deleted
+    assert deleted["endpoint_id"] == "endpoint-a"
+    assert deleted["deleted_gpu_count"] == 2
+    assert [endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]] == ["endpoint-b"]
+    assert all(gpu["endpoint_id"] != "endpoint-a" for gpu in service.list_gpus(admin)["data"])
+    assert any(event["action"] == "endpoint.deleted" for event in service.list_events(admin)["data"])
+
+    def deleted_rows(session):  # type: ignore[no-untyped-def]
+        return (
+            session.get(Endpoint, "endpoint-a"),
+            session.scalars(select(GPUDevice).where(GPUDevice.endpoint_id == "endpoint-a")).all(),
+            session.scalars(select(ProviderState).where(ProviderState.endpoint_id == "endpoint-a")).all(),
+            session.scalars(
+                select(Alert).where(
+                    Alert.resource_type == "endpoint",
+                    Alert.resource_id == "endpoint-a",
+                )
+            ).all(),
+        )
+
+    endpoint, gpus, provider_states, alerts = service._read(deleted_rows)
+    assert endpoint is None
+    assert gpus == []
+    assert provider_states == []
+    assert alerts == []
+
+
+def test_endpoint_delete_refuses_active_and_historical_leases(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(admin, request_data("delete-blocked"), idempotency_key="delete-blocked")
+    assert claimed["lease"] is not None
+
+    with pytest.raises(BrokerError) as active_error:
+        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-active")
+    assert active_error.value.code == "endpoint_has_active_leases"
+
+    service.release_lease(
+        admin,
+        claimed["lease"]["id"],
+        reason="finished",
+        idempotency_key="delete-blocked-release",
+    )
+    with pytest.raises(BrokerError) as history_error:
+        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-history")
+    assert history_error.value.code == "endpoint_has_lease_history"
+
+
+def test_endpoint_delete_refuses_enabled_workload_profile_references(service, admin) -> None:
+    service.upsert_workload_profile(
+        admin,
+        WorkloadProfileUpsert.model_validate(
+            {
+                "id": "endpoint-bound-profile",
+                "project_id": "project-a",
+                "display_name": "Endpoint bound profile",
+                "purpose": "keep endpoint reference valid",
+                "duration_seconds": 3600,
+                "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-b"]},
+            }
+        ),
+        idempotency_key="endpoint-bound-profile",
+    )
+
+    with pytest.raises(BrokerError) as error:
+        service.delete_endpoint(admin, "endpoint-b", idempotency_key="delete-profile-ref")
+    assert error.value.code == "endpoint_referenced_by_profiles"
 
 
 def test_claim_auto_creates_project_and_ignores_legacy_endpoint_scope(service, admin) -> None:

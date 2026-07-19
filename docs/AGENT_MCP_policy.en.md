@@ -11,5 +11,5 @@ Install this block only in clients that can call the local `gpu-broker` MCP. The
 - Do not choose `profile_id`, `project_id`, `gpu_count`, server placement, or exact `gpu_ids` from a repository, directory, task title, free capacity, inventory, or defaults. Any non-empty `project_id` is accepted directly and needs no pre-registration.
 - Let the Broker place routine claims unless the user explicitly names a server or exact GPUs. A queued response or `lease: null` is not permission to run; use only GPUs in a returned held or active lease.
 - GPU Broker coordinates ownership only. It never authorizes, launches, stops, changes, or preempts remote work.
-- Reservations and server registration are admin actions requiring separate explicit authorization.
+- Reservations and server registration/deletion are admin actions requiring separate explicit authorization.
 - If MCP or the service is unavailable, report that state and stop; do not fall back to out-of-band GPU inspection.

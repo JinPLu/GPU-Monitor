@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, TypeVar
 
 from sqlalchemy import delete, func, or_, select, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from gpu_broker import SCHEMA_VERSION
@@ -3506,6 +3506,20 @@ class BrokerService:
 
         return self._write(operation)
 
+    @staticmethod
+    def _constraints_reference_endpoint(
+        constraints_json: str,
+        *,
+        endpoint_id: str,
+        gpu_ids: set[str],
+    ) -> bool:
+        constraints = json_load(constraints_json)
+        if not isinstance(constraints, dict):
+            return False
+        endpoint_ids = constraints.get("endpoint_ids") or []
+        allowed_gpu_ids = constraints.get("gpu_ids") or []
+        return endpoint_id in endpoint_ids or bool(gpu_ids.intersection(allowed_gpu_ids))
+
     def upsert_endpoint(
         self, actor: ActorContext, endpoint_data: EndpointUpsert, *, idempotency_key: str
     ) -> dict[str, Any]:
@@ -3587,6 +3601,176 @@ class BrokerService:
                 session,
                 actor=actor,
                 action="endpoint.upsert",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def delete_endpoint(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Remove an endpoint and current observations without touching remote workloads."""
+
+        self._require_role(actor, ADMIN_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="endpoint.delete", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            now = utcnow()
+            gpu_ids = set(
+                session.scalars(
+                    select(GPUDevice.id).where(GPUDevice.endpoint_id == endpoint.id)
+                ).all()
+            )
+            active_lease_count = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(LeaseResource)
+                    .join(Lease, Lease.id == LeaseResource.lease_id)
+                    .where(
+                        LeaseResource.gpu_id.in_(gpu_ids),
+                        LeaseResource.active.is_(True),
+                        Lease.state.in_(ACTIVE_LEASE_STATES),
+                    )
+                )
+                if gpu_ids
+                else 0
+            )
+            if active_lease_count:
+                raise BrokerError(
+                    "endpoint_has_active_leases",
+                    "endpoint has active leases; release or reconcile them before deleting the server",
+                    status_code=409,
+                    details={"active_lease_count": active_lease_count},
+                )
+            lease_history_count = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(LeaseResource)
+                    .where(LeaseResource.gpu_id.in_(gpu_ids))
+                )
+                if gpu_ids
+                else 0
+            )
+            if lease_history_count:
+                raise BrokerError(
+                    "endpoint_has_lease_history",
+                    "endpoint has lease history; disable it instead to preserve historical lease records",
+                    status_code=409,
+                    details={"lease_resource_count": lease_history_count},
+                )
+            blocking_requests = [
+                request.id
+                for request in session.scalars(
+                    select(AllocationRequest)
+                    .where(AllocationRequest.state.in_({"QUEUED", "PENDING_APPROVAL"}))
+                    .order_by(AllocationRequest.created_at)
+                ).all()
+                if self._constraints_reference_endpoint(
+                    request.constraints_json,
+                    endpoint_id=endpoint.id,
+                    gpu_ids=gpu_ids,
+                )
+            ]
+            if blocking_requests:
+                raise BrokerError(
+                    "endpoint_referenced_by_requests",
+                    "endpoint is referenced by queued requests; cancel or edit those requests before deleting",
+                    status_code=409,
+                    details={"request_ids": blocking_requests[:20]},
+                )
+            blocking_profiles = [
+                profile.id
+                for profile in session.scalars(
+                    select(WorkloadProfile)
+                    .where(WorkloadProfile.enabled.is_(True))
+                    .order_by(WorkloadProfile.id)
+                ).all()
+                if self._constraints_reference_endpoint(
+                    profile.constraints_json,
+                    endpoint_id=endpoint.id,
+                    gpu_ids=gpu_ids,
+                )
+            ]
+            if blocking_profiles:
+                raise BrokerError(
+                    "endpoint_referenced_by_profiles",
+                    "endpoint is referenced by enabled workload profiles; update or disable them before deleting",
+                    status_code=409,
+                    details={"profile_ids": blocking_profiles[:20]},
+                )
+            blocking_reservations = [
+                reservation.id
+                for reservation in session.scalars(
+                    select(Reservation)
+                    .where(Reservation.state == "ACTIVE", Reservation.end_at > now)
+                    .order_by(Reservation.start_at)
+                ).all()
+                if gpu_ids.intersection(json_load(reservation.gpu_ids_json))
+                or self._constraints_reference_endpoint(
+                    reservation.constraints_json,
+                    endpoint_id=endpoint.id,
+                    gpu_ids=gpu_ids,
+                )
+            ]
+            if blocking_reservations:
+                raise BrokerError(
+                    "endpoint_referenced_by_reservations",
+                    "endpoint is referenced by active or future reservations; cancel them before deleting",
+                    status_code=409,
+                    details={"reservation_ids": blocking_reservations[:20]},
+                )
+
+            revision = self._bump_revision(session, now)
+            before = self._endpoint_dict(endpoint)
+            alert_filters = [(Alert.resource_type == "endpoint") & (Alert.resource_id == endpoint.id)]
+            if gpu_ids:
+                alert_filters.append((Alert.resource_type == "gpu") & Alert.resource_id.in_(gpu_ids))
+            session.execute(delete(Alert).where(or_(*alert_filters)))
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="endpoint.deleted",
+                resource_type="endpoint",
+                resource_id=endpoint.id,
+                result="success",
+                before=before,
+                after={"deleted": True, "gpu_ids": sorted(gpu_ids)},
+                summary={"gpu_count": len(gpu_ids)},
+                now=now,
+            )
+            session.delete(endpoint)
+            try:
+                session.flush()
+            except IntegrityError as exc:
+                raise BrokerError(
+                    "endpoint_delete_restricted",
+                    "endpoint is still referenced by protected history; disable it instead",
+                    status_code=409,
+                ) from exc
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "endpoint_id": endpoint_id,
+                "deleted_gpu_count": len(gpu_ids),
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="endpoint.delete",
                 key=idempotency_key,
                 response=result,
                 now=now,

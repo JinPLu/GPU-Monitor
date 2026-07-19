@@ -1,50 +1,50 @@
 <p align="center">
-  <img src="desktop/assets/GPU%20Broker%20Icon.png" width="104" alt="GPU Broker icon">
+  <img src="desktop/assets/GPU%20Broker%20Icon.png" width="96" alt="GPU Broker icon">
 </p>
 
 <h1 align="center">GPU Broker</h1>
 
-<p align="center">本机共享 GPU 协调面：看清资源、认领租约、排队等待，不启动也不停止远端任务。</p>
+<p align="center">给共享 GPU 准备的本机协调台：看清资源、认领租约、排队等待、用完释放。</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.12%2B-2563EB" alt="Python 3.12+">
-  <img src="https://img.shields.io/badge/macOS-13%2B%20desktop-2563EB" alt="macOS 13+ desktop">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-2563EB" alt="MIT License"></a>
+  <a href="docs/AGENT_MCP_zh.md">MCP 安装</a> ·
+  <a href="docs/DESIGN_SYSTEM.md">桌面设计</a> ·
+  <a href="docs/IMPLEMENTATION_STATUS_zh.md">当前状态</a> ·
+  <a href="CONTRIBUTING.md">参与贡献</a> ·
+  <a href="LICENSE">MIT License</a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/desktop-overview.jpg" width="900" alt="GPU Broker macOS resource overview">
+  <img src="https://img.shields.io/badge/Python-3.12%2B-2563EB?logo=python&logoColor=white" alt="Python 3.12+">
+  <img src="https://img.shields.io/badge/Desktop-macOS%20%7C%20Windows-334155" alt="macOS and Windows desktop">
+  <img src="https://img.shields.io/badge/REST%20%2F%20CLI%20%2F%20MCP-loopback-0F766E" alt="REST CLI MCP loopback">
+  <img src="https://img.shields.io/badge/Remote%20control-never-C2410C" alt="Does not control remote workloads">
 </p>
+
+<p align="center">
+  <img src="docs/assets/desktop-overview-sanitized.png" width="900" alt="GPU Broker dashboard with sanitized demo data">
+</p>
+
+<p align="center"><sub>示例图已去敏，不包含真实主机、端口、IP、用户或组织信息。</sub></p>
 
 > [!IMPORTANT]
-> GPU Broker 只协调“谁占用哪块 GPU”。租约不会授权、启动、停止或抢占远端工作负载。
+> GPU Broker 只协调“谁占用哪块 GPU”。租约不会授权、启动、停止或抢占远端任务。
 
----
+## 能帮你做什么
 
-## 能做什么
+GPU Broker 把人类、脚本和 Agent 放到同一个本机资源看板上。大家看到同一份状态，走同一套队列和租约规则，最后用可审计的记录收尾。
 
-- **macOS 原生桌面**：SwiftUI/AppKit 窗口查看服务器容量、平均 GPU 显存、平均 GPU 利用率、CPU 和内存状态。
-- **只读采集**：粘贴 `ssh [-p PORT] USER@HOST` 后逐行预览并登记；采集器只运行固定只读探针。
-- **租约协调**：人类和 Agent 通过同一套队列、租约和审计规则认领 GPU。
-- **CLI / REST / MCP**：脚本、桌面和 Agent 都走本机 REST；MCP 只协调资源归属，不替你启动远端进程。
+- 看清服务器、GPU、显存、利用率、CPU 和内存状态。
+- 认领空闲 GPU；忙时进入队列，由 Broker 统一排队和选址。
+- 添加、停用或删除服务器登记，保持资源池干净。
+- 让 Dashboard、CLI、REST 和 MCP 共享同一个服务层，不复制调度逻辑。
+- 用固定只读 SSH 探针采集状态，不读取私钥、环境变量或任务内容。
 
-## 工作方式
-
-```text
-Desktop / CLI / MCP ──REST──> BrokerService ──> SQLite
-                                  ▲
-                    fixed read-only SSH probes
-```
-
-调度、队列、租约、审计和 fail-closed 规则只在 `BrokerService` 中维护；CLI 和 MCP 不直连 SQLite、SSH 或复制领域逻辑。
-
----
+简单查看和手动认领用 Dashboard；自动化和 Agent 协作走 CLI、REST 或 MCP。
 
 ## 快速开始
 
-需要 Python 3.12+ 和 [uv](https://docs.astral.sh/uv/)。源码构建 macOS 桌面壳还需要 macOS 13+ 与 Xcode Command Line Tools。
-
-### Headless 服务
+准备条件：Python 3.12+ 和 [uv](https://docs.astral.sh/uv/)。
 
 ```bash
 uv sync --extra dev --reinstall-package gpu-broker
@@ -54,79 +54,77 @@ uv run --reinstall-package gpu-broker gpu-broker serve
 
 服务默认只监听 <http://127.0.0.1:8787/>。
 
-### macOS 桌面 app
+### macOS 桌面版
 
 ```bash
 zsh desktop/build-macos-app.sh
 open "dist/GPU Broker.app"
 ```
 
-这是源码构建路径，不是已签名的独立下载包。构建后仓库根目录只保留 `GPU Broker.app` 入口 symlink，实际产物在 `dist/`。
+### Windows 桌面版
 
-### 添加服务器
+在 Windows PowerShell 中运行：
 
-在 Dashboard 的“粘贴 SSH 命令”中一行输入一台服务器；多行会逐行预览，只提交有效且不重复的地址。系统仅解析地址并使用固定只读探针，不读取私钥、环境或远端任务内容。
+```powershell
+.\desktop\build-windows-app.ps1
+.\dist\windows\GPU Broker\GPU Broker.exe
+```
 
-### 日常认领
+桌面版都是源码构建产物，不是已签名安装包。Windows 首次运行会在 `%LOCALAPPDATA%\GPU Broker\` 写入默认 inventory 和 SQLite state；路径和端口可用 `GPU_BROKER_DATA_DIR`、`GPU_BROKER_INVENTORY`、`GPU_BROKER_DATABASE_URL`、`GPU_BROKER_BIND_PORT` 覆盖。
 
-人类在 Dashboard 里直接认领或选择预设任务；Agent 通过 MCP 走同一套租约生命周期。预设任务需要 `profile_id` 和任务名；临时任务需要任意非空项目标识、任务名和 GPU 数量。未指定服务器时由 Broker 统一排队和选址；这些动作只协调归属，不启动远端进程。
+## 直接使用
 
----
+| 你想做的事 | 入口 |
+| --- | --- |
+| 查看资源、添加服务器、认领或删除服务器 | Dashboard |
+| 写脚本、备份、迁移、一次性采集 | CLI |
+| 接入本机工具或内部页面 | REST |
+| 让 Agent 查询、认领、绑定观测、释放租约 | MCP |
 
-## 入口怎么选
+常用命令：
 
-| 入口 | 适合 | 边界 |
-| --- | --- | --- |
-| Desktop | 人类日常查看和认领 | macOS 源码构建，原生 SwiftUI/AppKit |
-| REST | 本机服务与集成 | loopback，默认无登录 |
-| CLI | 脚本、备份、采集、迁移 | 始终通过 REST（初始化/迁移除外） |
-| MCP | Agent 查询和租约生命周期 | 只协调，不启动远端工作负载 |
+```bash
+gpu-broker status
+gpu-broker gpu list
+gpu-broker request queue
+gpu-broker endpoint delete <endpoint_id>
+gpu-broker lease release --help
+```
 
-CLI 入口可用 `gpu-broker --help` 查看；常用命令包括 `status`、`gpu list`、`request queue` 和 `lease release`。
+## 服务器管理
+
+在 Dashboard 里粘贴一行或多行 `ssh [-p PORT] USER@HOST`。GPU Broker 会逐行预览，只登记合法且不重复的地址。
+
+粘贴内容只用于解析地址，不会作为 shell 命令执行。管道、跳板、密钥参数和额外 shell 片段会被拒绝。
+
+误登记或已退役的服务器可以从 Dashboard、REST、CLI 或 MCP 删除。删除只移除本机监控登记和当前观测记录，不会停止远端任务；如果服务器仍被活跃/历史租约、未来预约、排队请求或启用的预设任务引用，系统会拒绝删除，请先释放、取消或改配置。
 
 ## Agent / MCP
 
-保持 GPU Broker 服务运行后，为目标 Agent 注册同一个 `gpu-broker-mcp`。日常 MCP 工作流只有四步：必要时读 `gpu_coordination`，认领，启动后绑定观测，结束后释放。安装和全局规则见：
-
-- [英文全局规则](docs/AGENT_MCP_policy.en.md)
-- [安装与客户端适配](docs/AGENT_MCP_zh.md)
-
-规则只维护在全局；其他项目不需要复制 GPU Broker 工作流。安装器只维护 Codex/Claude 全局 Markdown 中一个带标记的规则块；Cursor 只输出可粘贴内容。它不会后台同步、修改项目文件或自动注册 MCP。
-
-## 安全边界
-
-- 默认 loopback、无登录；不要直接暴露到网络。
-- GPU UUID 与 endpoint `id` 是身份边界；同 IP 不同端口不合并。
-- telemetry 过期、采集异常、非托管进程、维护或冲突一律拒绝分配。
-- inventory 只是静态资产清单，不能证明 GPU 当前可用。
-- 本地 actor 是审计标签，不是认证凭据。
-
----
-
-## 项目结构
+保持服务运行后，为目标 Agent 注册同一个 `gpu-broker-mcp`。日常流程很短：
 
 ```text
-src/gpu_broker/       application package, REST/CLI/MCP/domain logic
-src/gpu_broker/migrations/  packaged Alembic schema
-configs/              secret-free inventory and request examples
-desktop/              native macOS app, assets, and build script
-tests/                service, API/GUI/MCP, collector, migration tests
-docs/                 MCP policy, design system, implementation status, evidence
+看协调看板 -> 认领或排队 -> 任务启动后绑定观测 -> 任务结束后释放
 ```
 
-构建产物、运行状态、本地 CodeGraph 索引、Superdesign 临时输出、QA 截图和 app bundle symlink 不属于源码；详见 `.gitignore`。
+预设任务使用 `profile_id` 和任务名。临时任务只需要项目标识、任务名和 GPU 数量。注册、删除服务器和预约属于管理动作，需要用户单独授权。
 
-## 开源文件边界
+完整安装和全局规则见：
 
-仓库保留运行产品、测试、文档和必要的展示资产。以下内容不应提交：
+- [安装与客户端适配](docs/AGENT_MCP_zh.md)
+- [英文全局规则](docs/AGENT_MCP_policy.en.md)
 
-- `dist/`、`build/`、`state/`、`.venv/`、`.codegraph/`、`.superdesign/`
-- 根目录 `GPU Broker*.app` symlink 或 app bundle
-- 本地数据库、私钥、`.env`、真实 inventory、临时 QA 截图
+## 权限与安全边界
 
-设计来源整理在 [Native macOS Material Design System](docs/DESIGN_SYSTEM.md)，不提交工具生成的中间页面和代码转储。
+- 默认只绑定 loopback；不要直接暴露到网络。
+- GPU Broker 只协调归属，不控制远端运行时。
+- inventory 只是静态资产清单，不能证明 GPU 当前可用。
+- GPU UUID 和 endpoint `id` 是身份边界；同 IP 不同端口不合并。
+- telemetry 过期、采集异常、非托管进程、维护或冲突都会拒绝分配。
+- 本地 actor 是审计标签，不是认证凭据。
+- 自动启停、抢占、dstack/Slurm 和非 loopback 部署不在当前开放边界内。
 
-## 开发验证
+## 开发与验证
 
 ```bash
 uv sync --extra dev --reinstall-package gpu-broker
@@ -134,14 +132,15 @@ uv run --reinstall-package gpu-broker pytest
 uv run --reinstall-package gpu-broker ruff check .
 ```
 
-修改桌面壳或打包路径后，再运行 `zsh desktop/build-macos-app.sh`。
+改桌面壳或打包路径时，在对应平台运行构建脚本：macOS 用 `zsh desktop/build-macos-app.sh`，Windows 用 `.\desktop\build-windows-app.ps1`。
 
-## 进一步阅读
+源码主要在 `src/gpu_broker/`，桌面壳和资源在 `desktop/`，测试在 `tests/`，规则与状态文档在 `docs/`。不要提交 `dist/`、`build/`、`state/`、`.venv/`、`.codegraph/`、真实 inventory、私钥、`.env`、本地数据库或临时 QA 截图。
+
+## 更多资料
 
 - [贡献指南](CONTRIBUTING.md)
 - [安全边界与报告](SECURITY.md)
 - [桌面设计系统](docs/DESIGN_SYSTEM.md)
-- [MCP 全局安装](docs/AGENT_MCP_zh.md)
 - [实施状态与未完成 gate](docs/IMPLEMENTATION_STATUS_zh.md)
 - [历史验证归档](docs/archive/IMPLEMENTATION_EVIDENCE_2026-07-19.md)
 

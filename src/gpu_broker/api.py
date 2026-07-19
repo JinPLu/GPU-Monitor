@@ -587,6 +587,18 @@ def create_app(settings: Settings) -> FastAPI:
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
+    @app.delete("/api/v1/endpoints/{endpoint_id}")
+    def delete_endpoint(
+        endpoint_id: str,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.delete_endpoint(
+            actor,
+            endpoint_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
     @app.post("/ui/endpoints/ssh/preview")
     def preview_ssh_endpoint(
         preview: SSHCommandRequest,
@@ -1152,6 +1164,8 @@ def create_app(settings: Settings) -> FastAPI:
                 "endpoint_id": _form_value(form, "endpoint_id", required=True),
                 "enabled": _form_boolean(form, "enabled"),
             }
+        if action == "delete-endpoint":
+            return {"endpoint_id": _form_value(form, "endpoint_id", required=True)}
         if action == "revoke-token":
             return {"token_id": _form_value(form, "token_id", required=True)}
         if action == "reconcile":
@@ -1187,6 +1201,7 @@ def create_app(settings: Settings) -> FastAPI:
             "workload-profile": "/ui/identities",
             "actor": "/ui/identities",
             "revoke-token": "/ui/identities",
+            "delete-endpoint": "/",
             "reconcile": "/ui/doctor",
             "prune-telemetry": "/ui/doctor",
         }
@@ -1230,6 +1245,12 @@ def create_app(settings: Settings) -> FastAPI:
                     actor,
                     data["endpoint_id"],
                     EndpointEnabled.model_validate({"enabled": data["enabled"]}),
+                    idempotency_key=key,
+                )
+            elif action == "delete-endpoint":
+                result = service.delete_endpoint(
+                    actor,
+                    data["endpoint_id"],
                     idempotency_key=key,
                 )
             elif action == "cancel-request":
