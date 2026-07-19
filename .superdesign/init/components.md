@@ -1,3 +1,13 @@
+# Components
+
+GPU Broker is a server-rendered FastAPI/Jinja UI with vanilla JavaScript. It has no separate shared component directory; the client-side dashboard renderer and its template define the reusable visual primitives.
+
+## Dashboard renderer and interaction primitives
+
+- Source: `src/gpu_broker/web/static/app.js`
+- Description: Client-side renderer for snapshot metrics, server summaries, GPU tiles, status pills, meters, dialogs, filters, and real-time updates.
+
+```javascript
 (() => {
   const liveState = document.getElementById("realtime-state");
   const dashboardNode = document.getElementById("dashboard-data");
@@ -761,3 +771,188 @@
     if (!document.hidden && refreshIntervalMs > 0) refresh();
   });
 })();
+
+```
+
+## Dashboard page component
+
+- Source: `src/gpu_broker/web/templates/dashboard.html`
+- Description: Jinja entry template for the resource overview; the server list is completed by the dashboard renderer.
+
+```html
+{% extends "base.html" %}
+{% block content %}
+<section class="dashboard-heading">
+  <div>
+    <p class="eyebrow">共享服务器池 · 实时状态空间</p>
+    <h1>GPU 资源空间</h1>
+    <p class="muted dashboard-subtitle">先看多个集群的容量与调度状态，需要时再展开到单块 GPU；认领不会启动或停止远端任务。</p>
+  </div>
+  {% if payload.endpoints %}<div class="dashboard-actions" aria-label="常用操作">
+    <button class="quiet-action" type="button" data-open-dialog="server-dialog"><i class="ph ph-plus" aria-hidden="true"></i>添加服务器</button>
+    <button type="button" data-open-dialog="claim-dialog"><i class="ph ph-user-plus" aria-hidden="true"></i>认领 GPU</button>
+    <button class="quiet-action" type="button" data-open-dialog="schedule-dialog"><i class="ph ph-calendar-plus" aria-hidden="true"></i>安排时间</button>
+  </div>{% endif %}
+</section>
+
+{% if not payload.endpoints %}
+<section class="first-run" aria-labelledby="first-run-title">
+  <div class="first-run-mark" aria-hidden="true"><i class="ph ph-terminal-window"></i></div>
+  <p class="eyebrow">欢迎使用 GPU Broker</p>
+  <h2 id="first-run-title">添加第一台 GPU 服务器</h2>
+  <p>粘贴平时使用的 SSH 连接命令，即可开始固定、只读的 GPU 状态监控。</p>
+  <code>ssh -p 22 gpu@gpu-host.example.com</code>
+  <p class="muted">命令只用于提取用户、主机和端口；不会被执行，也不会读取私钥或启动远端任务。</p>
+  <button type="button" data-open-dialog="server-dialog"><i class="ph ph-plus" aria-hidden="true"></i>添加服务器</button>
+</section>
+{% endif %}
+
+<section class="summary-strip{% if not payload.endpoints %} deferred-until-server{% endif %}" aria-label="资源摘要">
+  <button class="summary-item" type="button" data-resource-filter="all" aria-pressed="true"><i class="ph ph-hard-drives" aria-hidden="true"></i><span>服务器</span><strong id="kpi-servers">{{ payload.summary.online_servers }} / {{ payload.summary.total_servers }}</strong><small>在线 / 总数</small></button>
+  <button class="summary-item summary-primary" type="button" data-resource-filter="available" aria-pressed="false"><i class="ph ph-check" aria-hidden="true"></i><span>可用 GPU</span><strong><span id="kpi-available">{{ payload.summary.available_gpus }}</span><i> / </i><span id="kpi-total">{{ payload.summary.total_gpus }}</span></strong><small>空闲 / 总数</small></button>
+  <button class="summary-item" type="button" data-resource-filter="busy" aria-pressed="false"><i class="ph ph-waveform" aria-hidden="true"></i><span>占用</span><strong id="kpi-busy">{{ payload.summary.busy_gpus }}</strong><small>有计算进程</small></button>
+  <button class="summary-item" type="button" data-resource-filter="claimed" aria-pressed="false"><i class="ph ph-user" aria-hidden="true"></i><span>认领</span><strong id="kpi-claimed">{{ payload.summary.claimed_gpus }}</strong><small>协作归属</small></button>
+  <button class="summary-item summary-warning" type="button" data-resource-filter="attention" aria-pressed="false"><i class="ph ph-warning" aria-hidden="true"></i><span>需注意</span><strong id="kpi-abnormal">{{ payload.summary.abnormal_gpus }}</strong><small>异常或待确认</small></button>
+</section>
+
+<div id="dashboard-layout" class="dashboard-layout{% if not payload.endpoints %} deferred-until-server{% endif %}">
+  <section class="resource-panel" aria-labelledby="resource-table-title">
+    <div class="panel-heading">
+      <div>
+        <h2 id="resource-table-title">集群调度</h2>
+        <p class="muted"><span id="data-age">数据年龄 {{ payload.data_age_seconds if payload.data_age_seconds is not none else '—' }} 秒</span> · 默认聚合，展开查看单 GPU</p>
+      </div>
+      <div class="resource-tools">
+        <label class="resource-search"><i class="ph ph-magnifying-glass" aria-hidden="true"></i><span class="sr-only">筛选服务器</span><input id="resource-search" type="search" placeholder="搜索名称、IP 或端口" autocomplete="off"></label>
+        <div class="refresh-controls" aria-label="资源刷新">
+          <button class="quiet-action compact-action refresh-button" id="refresh-dashboard" type="button" title="刷新" aria-label="刷新"><i class="ph ph-arrow-clockwise" aria-hidden="true"></i></button>
+          <label class="refresh-interval"><span class="sr-only">自动刷新频率</span><select id="refresh-interval" aria-label="自动刷新频率"><option value="5000">每 5 秒</option><option value="10000" selected>每 10 秒</option><option value="30000">每 30 秒</option><option value="0">从不自动刷新</option></select></label>
+        </div>
+        <button class="quiet-action compact-action" id="toggle-all-servers" type="button"><i class="ph ph-arrows-out-line-vertical" aria-hidden="true"></i>展开全部</button>
+      </div>
+    </div>
+    <div class="resource-list-head" role="row" aria-label="资源列表表头">
+      <span>SSH 连接<small>直接复制日常登录命令</small></span>
+      <span>GPU 状态<small class="resource-status-legend"><span>总数</span><span>空闲</span><span>占用</span><span>认领</span><span>异常</span></small></span>
+      <span>资源使用<small class="resource-metric-legend"><span>CPU</span><span>内存</span><span>显存</span><span>GPU 利用率</span></small></span>
+      <span>操作</span>
+    </div>
+    <div id="server-groups" class="server-groups" aria-live="polite"></div>
+    <noscript><p class="empty">需要启用 JavaScript 才能显示实时资源表。</p></noscript>
+  </section>
+
+  <aside id="coordination-panel" class="coordination-panel" aria-labelledby="coordination-title">
+    <div class="panel-heading compact-heading">
+      <div><h2 id="coordination-title">协作安排</h2><p class="muted">谁在用、谁在等、接下来给谁</p></div>
+      <button id="toggle-coordination" class="icon-button" type="button" title="收起协作安排" aria-label="收起协作安排" aria-controls="coordination-panel" aria-expanded="true"><i class="ph ph-caret-right" aria-hidden="true"></i></button>
+    </div>
+    <div class="side-tabs" role="tablist" aria-label="协作安排分类">
+      <button id="claims-tab" type="button" role="tab" aria-selected="true" aria-controls="coordination-content" data-side-tab="claims">当前认领 <span id="claims-count">0</span></button>
+      <button id="queue-tab" type="button" role="tab" aria-selected="false" aria-controls="coordination-content" data-side-tab="queue" tabindex="-1">排队 <span id="queue-count">0</span></button>
+      <button id="schedule-tab" type="button" role="tab" aria-selected="false" aria-controls="coordination-content" data-side-tab="schedule" tabindex="-1">安排 <span id="schedule-count">0</span></button>
+    </div>
+    <div id="coordination-content" class="coordination-content" role="tabpanel" aria-labelledby="claims-tab" tabindex="0"></div>
+    <p class="advanced-link"><a href="/ui/requests">管理认领与队列</a> · <a href="/ui/doctor">高级设置</a></p>
+  </aside>
+</div>
+<button id="coordination-reopen" class="coordination-reopen icon-button{% if not payload.endpoints %} deferred-until-server{% endif %}" type="button" title="展开协作安排" aria-label="展开协作安排" aria-controls="coordination-panel" hidden><i class="ph ph-caret-left" aria-hidden="true"></i></button>
+
+<dialog id="server-dialog" class="modal-dialog">
+  <div class="dialog-heading"><div><p class="eyebrow">只读监控</p><h2>添加服务器</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
+  <p class="muted consequence-copy">注册只添加只读监控配置；命令不会被执行，注册成功也不代表 SSH 连通或 GPU 可用。</p>
+  <div class="dialog-tabs" role="tablist" aria-label="添加服务器方式">
+    <button id="ssh-command-tab" type="button" role="tab" aria-selected="true" aria-controls="ssh-command-panel" data-dialog-tab="ssh-command-panel">粘贴 SSH 命令</button>
+    <button id="ssh-manual-tab" type="button" role="tab" aria-selected="false" aria-controls="ssh-manual-panel" data-dialog-tab="ssh-manual-panel" tabindex="-1">手动填写</button>
+  </div>
+  <section id="ssh-command-panel" class="dialog-tab-panel" role="tabpanel" aria-labelledby="ssh-command-tab">
+    <div id="ssh-error" class="inline-message error-message" role="alert" hidden></div>
+    <form id="ssh-preview-form" class="stack">
+      <label>SSH 命令（每行一台服务器）<textarea id="ssh-command" name="command" rows="4" required spellcheck="false" autocomplete="off" placeholder="ssh -p 22 user@gpu-host"></textarea></label>
+      <button id="paste-ssh-command" class="quiet-action" type="button" hidden>从系统剪贴板粘贴</button>
+      <p id="ssh-clipboard-status" class="muted" role="status" hidden></p>
+      <p class="field-help">每行仅解析常见的 <code>ssh</code> 用户、主机和端口参数，不会运行任何命令。</p>
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="dialog-actions"><button class="quiet-action" type="button" data-close-dialog>取消</button><button id="ssh-preview-button" type="submit">检查命令</button></div>
+    </form>
+    <section id="ssh-preview" class="ssh-preview" aria-live="polite" hidden>
+      <div class="preview-heading"><div><p class="eyebrow">注册预览</p><h3 id="ssh-preview-title">确认服务器信息</h3></div><span class="badge">未连接验证</span></div>
+      <div id="ssh-preview-fields" class="ssh-preview-fields"></div>
+      <label id="ssh-endpoint-id-field">服务器名称（可选）<input id="ssh-endpoint-id" name="endpoint_id" placeholder="例如 training-a"></label>
+      <p class="field-help">继续只会登记配置。首次只读采集成功前，该服务器及 GPU 不会被视为可用。</p>
+      <div class="dialog-actions"><button class="quiet-action" type="button" data-edit-ssh-command>返回修改</button><button id="ssh-commit-button" type="button">确认注册</button></div>
+    </section>
+  </section>
+  <section id="ssh-manual-panel" class="dialog-tab-panel" role="tabpanel" aria-labelledby="ssh-manual-tab" hidden>
+    <form method="post" action="/ui/action/endpoint" class="stack form-grid">
+      <label>服务器名称（可留空）<input name="id" placeholder="例如 training-a"></label>
+      <label>主机或 SSH 地址<input name="host" required placeholder="10.0.0.1 或 gpu-host"></label>
+      <label>SSH 端口<input name="port" type="number" min="1" max="65535" value="22" required></label>
+      <label>SSH 用户<input name="ssh_user" value="root" required></label>
+      <label>期望 GPU 数（可留空）<input name="expected_gpu_count" type="number" min="1" placeholder="自动发现"></label>
+      <input type="hidden" name="labels" value="gpu"><input type="hidden" name="enabled" value="true">
+      <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
+      <p class="field-help span-all">手动注册同样不会测试连接，也不会启动、停止或抢占远端任务。</p>
+      <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">添加监控配置</button></div>
+    </form>
+  </section>
+</dialog>
+
+<dialog id="claim-dialog" class="modal-dialog">
+  <div class="dialog-heading"><div><p class="eyebrow">当前认领者：{{ actor.id }}</p><h2>认领 GPU</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
+  <p class="muted">可直接填写任意项目标识和任务；完成后释放租约。空闲时直接可用，不足时自动进入共享队列。</p>
+  {% if payload.claimable_workload_profiles %}
+  <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
+    <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ profile.constraints.gpu_count }} GPU</option>{% endfor %}</select></label>
+    <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
+    <p class="field-help span-all">按配置认领会直接登记为使用中，但不会启动远端任务。</p>
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
+    <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">按配置认领</button></div>
+  </form>
+  {% else %}
+  <p class="field-help">还没有可用的预设任务；临时需求可直接使用下方一次性认领。</p>
+  {% endif %}
+  <details class="stack">
+    <summary>一次性认领（需明确资源）</summary>
+    <form method="post" action="/ui/action/quick-claim" class="stack form-grid quick-claim-form">
+      <label>项目标识<input name="project_id" required placeholder="例如：storyboard"></label>
+      <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
+      <label>服务器<select name="endpoint_id"><option value="">自动选择</option>{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
+      <label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
+      <details class="span-all"><summary>高级：指定精确 GPU</summary><label>GPU（可多选）<select name="gpu_ids" multiple size="6">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label><p class="field-help">选择后以所选 GPU 数量为准。</p></details>
+      <p class="field-help span-all">临时任务会把任务说明写入审计用途；完成后请释放租约。认领成功同样不会启动远端任务。</p>
+      <input type="hidden" name="placement" value="pack"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
+      <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">一次性认领</button></div>
+    </form>
+  </details>
+</dialog>
+
+<dialog id="schedule-dialog" class="modal-dialog">
+  <div class="dialog-heading"><div><p class="eyebrow">未来预约</p><h2>安排使用时间</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
+  <p class="muted consequence-copy">安排只登记未来的协作优先级，不会启动、停止或抢占远端任务。</p>
+  <form method="post" action="/ui/action/reservation" class="stack form-grid">
+    <label>项目标识<input name="project_id" required placeholder="例如：storyboard"></label>
+    <label>时区<select name="timezone"><option value="Asia/Shanghai" selected>Asia/Shanghai</option><option value="UTC">UTC</option></select></label>
+    <label>开始时间<input name="start_at" type="datetime-local" required></label>
+    <label>结束时间<input name="end_at" type="datetime-local" required></label>
+    <label class="span-all">GPU（可多选）<select name="gpu_ids" multiple required size="8">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label>
+    <label class="span-all">任务说明<input name="reason" required placeholder="例如 周一模型评测"></label>
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
+    <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">保存安排</button></div>
+  </form>
+</dialog>
+
+<dialog id="gpu-detail" class="drawer-dialog">
+  <div class="dialog-heading"><div><p class="eyebrow" id="detail-server">GPU 详情</p><h2 id="detail-title">GPU</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
+  <div class="detail-status-row"><span id="detail-state" class="state-pill">—</span><span class="muted" id="detail-observed">—</span></div>
+  <section class="detail-metrics" aria-label="当前 GPU 指标">
+    <div><span>显存</span><strong id="detail-memory">—</strong></div><div><span>利用率</span><strong id="detail-util">—</strong></div><div><span>温度</span><strong id="detail-temp">—</strong></div><div><span>功耗</span><strong id="detail-power">—</strong></div>
+  </section>
+  <div class="chart-heading"><h3>使用趋势</h3><div class="range-switch" aria-label="历史时间范围"><button type="button" data-history-window="3600" aria-pressed="true">1h</button><button type="button" data-history-window="21600" aria-pressed="false">6h</button><button type="button" data-history-window="86400" aria-pressed="false">24h</button></div></div>
+  <div id="gpu-chart" class="gpu-chart"><p class="muted">打开详情后才加载历史曲线。</p></div>
+  <section class="detail-ownership"><h3>归属与进程</h3><div id="detail-ownership" class="muted">—</div></section>
+</dialog>
+
+<script id="dashboard-data" type="application/json">{{ payload | tojson }}</script>
+{% endblock %}
+
+```

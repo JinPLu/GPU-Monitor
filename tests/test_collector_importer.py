@@ -14,7 +14,7 @@ from gpu_broker.collector import (
     parse_host_resources,
     parse_process_csv,
 )
-from gpu_broker.config import InventoryConfig, ProjectConfig
+from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig
 from gpu_broker.importer import import_servers_files, parse_ssh_command
 
 
@@ -129,3 +129,19 @@ def test_inventory_allows_no_initial_endpoints() -> None:
         endpoints=[],
     )
     assert inventory.endpoints == []
+
+
+def test_inventory_allows_no_projects_or_endpoint_project_scope() -> None:
+    inventory = InventoryConfig(
+        schema_version=1,
+        endpoints=[
+            EndpointConfig(
+                id="endpoint-a",
+                host="127.0.0.1",
+                port=2201,
+                ssh_user="gpu",
+            )
+        ],
+    )
+    assert inventory.projects == []
+    assert inventory.endpoints[0].project_ids == []

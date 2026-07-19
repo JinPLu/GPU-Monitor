@@ -37,12 +37,10 @@ from gpu_broker.schemas import (
     AlertAcknowledge,
     EndpointEnabled,
     EndpointObservation,
-    EndpointProjectGrant,
     EndpointUpsert,
     LeaseBind,
     LeaseObservedBind,
     MaintenanceCreate,
-    ProjectUpsert,
     RequestCreate,
     RequestCreateFlat,
     RetentionPrune,
@@ -201,17 +199,9 @@ def create_app(settings: Settings) -> FastAPI:
             )
 
     def ssh_projects(project_ids: list[str] | None) -> list[str]:
-        configured = [project.id for project in inventory.projects]
-        selected = configured if project_ids is None else project_ids
-        unknown = [project_id for project_id in selected if project_id not in configured]
-        if unknown:
-            raise BrokerError(
-                "invalid_endpoint_projects",
-                "服务器引用了未配置的项目",
-                status_code=422,
-                details={"unknown_project_ids": unknown},
-            )
-        return selected
+        # Endpoint project lists are legacy metadata only.  A server is visible
+        # to every claim, so SSH registration does not need a project registry.
+        return project_ids or []
 
     def ssh_preview_token(command: str | list[str], project_ids: list[str]) -> str:
         binding = json.dumps(
@@ -547,16 +537,6 @@ def create_app(settings: Settings) -> FastAPI:
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
-    @app.post("/api/v1/projects")
-    def upsert_project(
-        project_data: ProjectUpsert,
-        actor: ApiActor,
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    ) -> dict[str, Any]:
-        return service.upsert_project(
-            actor, project_data, idempotency_key=_idempotency_key(idempotency_key)
-        )
-
     @app.post("/api/v1/workload-profiles")
     def upsert_workload_profile(
         profile_data: WorkloadProfileUpsert,
@@ -590,20 +570,6 @@ def create_app(settings: Settings) -> FastAPI:
         return service.upsert_endpoint(
             actor,
             endpoint_data,
-            idempotency_key=_idempotency_key(idempotency_key),
-        )
-
-    @app.post("/api/v1/endpoints/{endpoint_id}/projects")
-    def grant_endpoint_project_access(
-        endpoint_id: str,
-        grant: EndpointProjectGrant,
-        actor: ApiActor,
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    ) -> dict[str, Any]:
-        return service.grant_endpoint_project_access(
-            actor,
-            endpoint_id,
-            grant.project_id,
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
@@ -917,7 +883,6 @@ def create_app(settings: Settings) -> FastAPI:
         snapshot = service.snapshot(actor)["data"]
         workload_profiles = service.list_workload_profiles(actor)["data"]
         return {
-            "projects": service.list_projects(actor)["data"],
             "endpoints": snapshot["endpoints"],
             "gpus": snapshot["gpus"],
             "workload_profiles": workload_profiles,
@@ -947,7 +912,7 @@ def create_app(settings: Settings) -> FastAPI:
             return {"leases": service.list_leases(actor)["data"]}
         if page == "reservations":
             return {**ui_reference_data(actor), "reservations": service.list_reservations(actor)["data"]}
-        if page == "projects":
+        if page == "identities":
             return {
                 **ui_reference_data(actor),
                 "actors": service.list_actors(actor)["data"] if actor.is_admin else [],
@@ -1133,15 +1098,6 @@ def create_app(settings: Settings) -> FastAPI:
                 "alert_id": _form_value(form, "alert_id", required=True),
                 "note": _form_value(form, "note"),
             }
-        if action == "project":
-            return {
-                "id": _form_value(form, "id", required=True),
-                "display_name": _form_value(form, "display_name", required=True),
-                "weight": _form_int(form, "weight", required=True, minimum=1),
-                "quota_gpus": _form_int(form, "quota_gpus", minimum=1),
-                "concurrency_limit": _form_int(form, "concurrency_limit", minimum=1),
-                "enabled": _form_boolean(form, "enabled"),
-            }
         if action == "workload-profile":
             duration_hours = _form_int(form, "duration_hours", required=True, minimum=1, maximum=720)
             gpu_count = _form_int(form, "gpu_count", required=True, minimum=1)
@@ -1164,7 +1120,6 @@ def create_app(settings: Settings) -> FastAPI:
                 "id": _form_value(form, "id", required=True),
                 "display_name": _form_value(form, "display_name", required=True),
                 "role": _form_value(form, "role", required=True),
-                "project_ids": _form_list(form, "project_ids"),
                 "token_label": _form_value(form, "token_label", required=True),
             }
         if action == "endpoint":
@@ -1187,8 +1142,9 @@ def create_app(settings: Settings) -> FastAPI:
                 "storage_group": _form_value(form, "storage_group"),
                 "expected_gpu_count": _form_int(form, "expected_gpu_count", minimum=1),
                 "expected_gpu_total_vram_mib": _form_int(form, "expected_gpu_total_vram_mib", minimum=1),
-                "project_ids": _form_list(form, "project_ids")
-                or [project.id for project in inventory.projects],
+                # Kept in the REST schema for old clients, but endpoint project
+                # labels no longer affect placement and the GUI never asks for them.
+                "project_ids": [],
                 "enabled": _form_boolean(form, "enabled"),
             }
         if action == "endpoint-enabled":
@@ -1228,10 +1184,9 @@ def create_app(settings: Settings) -> FastAPI:
             "cancel-reservation": "/ui/reservations",
             "maintenance": "/ui/maintenance",
             "ack-alert": "/ui/alerts",
-            "project": "/ui/projects",
-            "workload-profile": "/ui/projects",
-            "actor": "/ui/projects",
-            "revoke-token": "/ui/projects",
+            "workload-profile": "/ui/identities",
+            "actor": "/ui/identities",
+            "revoke-token": "/ui/identities",
             "reconcile": "/ui/doctor",
             "prune-telemetry": "/ui/doctor",
         }
@@ -1311,8 +1266,6 @@ def create_app(settings: Settings) -> FastAPI:
                     AlertAcknowledge.model_validate({"note": data.get("note")}),
                     idempotency_key=key,
                 )
-            elif action == "project":
-                result = service.upsert_project(actor, ProjectUpsert.model_validate(data), idempotency_key=key)
             elif action == "workload-profile":
                 result = service.upsert_workload_profile(
                     actor,

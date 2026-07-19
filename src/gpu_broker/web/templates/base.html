@@ -7,7 +7,7 @@
   {% if csrf %}<meta name="csrf-token" content="{{ csrf }}">{% endif %}
   <title>GPU Broker</title>
   <link rel="stylesheet" href="/static/vendor/phosphor/style.css?v=2.1.2">
-  <link rel="stylesheet" href="/static/app.css?v=20260719-desktop-home-2">
+  <link rel="stylesheet" href="/static/app.css?v=20260720-home-clarity">
 </head>
 <body data-realtime="{{ 'on' if actor else 'off' }}" data-page="{{ page }}">
   <div class="environment-backdrop" aria-hidden="true">
@@ -26,7 +26,7 @@
         <a href="/ui/requests" {% if page in ['requests', 'leases'] %}aria-current="page"{% endif %}><i class="ph ph-arrows-left-right" aria-hidden="true"></i>认领与队列</a>
         <a href="/ui/reservations" {% if page == 'reservations' %}aria-current="page"{% endif %}><i class="ph ph-calendar-dots" aria-hidden="true"></i>使用安排</a>
         <p class="nav-label">管理</p>
-        <a href="/ui/projects" {% if page == 'projects' %}aria-current="page"{% endif %}><i class="ph ph-users" aria-hidden="true"></i>项目与身份</a>
+        <a href="/ui/identities" {% if page == 'identities' %}aria-current="page"{% endif %}><i class="ph ph-users" aria-hidden="true"></i>身份与预设</a>
         <a href="/ui/maintenance" {% if page == 'maintenance' %}aria-current="page"{% endif %}><i class="ph ph-wrench" aria-hidden="true"></i>维护窗口</a>
         <a href="/ui/alerts" {% if page == 'alerts' %}aria-current="page"{% endif %}><i class="ph ph-warning" aria-hidden="true"></i>告警</a>
         <a href="/ui/audit" {% if page == 'audit' %}aria-current="page"{% endif %}><i class="ph ph-clock-counter-clockwise" aria-hidden="true"></i>审计与历史</a>

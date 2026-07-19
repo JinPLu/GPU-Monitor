@@ -26,3 +26,4 @@ def test_client_retries_a_transient_gateway_error(monkeypatch) -> None:  # type:
         "data": {},
     }
     assert len(calls) == 2
+    assert all(call[1]["trust_env"] is False for call in calls)

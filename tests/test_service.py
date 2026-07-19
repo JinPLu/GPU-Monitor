@@ -15,7 +15,6 @@ from gpu_broker.schemas import (
     EndpointEnabled,
     EndpointUpsert,
     LeaseObservedBind,
-    ProjectUpsert,
     ReservationCreate,
     RequestCreate,
     WorkloadProfileClaim,
@@ -202,21 +201,8 @@ def test_fair_queue_interleaves_projects_after_fresh_telemetry(service, admin) -
     assert set(allocations[:2]) == {"project-a", "project-b"}
 
 
-def test_quota_and_endpoint_identity_are_enforced(service, admin) -> None:
+def test_endpoint_identity_is_enforced(service, admin) -> None:
     service.ingest_observation(observation(count=4))
-    service.upsert_project(
-        admin,
-        ProjectUpsert(
-            id="project-a",
-            display_name="Project A",
-            weight=1,
-            quota_gpus=1,
-            concurrency_limit=None,
-        ),
-        idempotency_key="quota",
-    )
-    blocked = service.create_request(admin, request_data("too-many", count=2), idempotency_key="too-many")
-    assert blocked["lease"] is None
     created = service.upsert_endpoint(
         admin,
         EndpointUpsert(
@@ -251,45 +237,19 @@ def test_quota_and_endpoint_identity_are_enforced(service, admin) -> None:
     assert error.value.code == "endpoint_identity_immutable"
 
 
-def test_granting_existing_server_to_project_preserves_scope_and_unblocks_claim(service, admin) -> None:
+def test_claim_auto_creates_project_and_ignores_legacy_endpoint_scope(service, admin) -> None:
     service.ingest_observation(observation(count=1))
-    service.upsert_project(
+    claimed = service.create_request(
         admin,
-        ProjectUpsert(
-            id="project-c",
-            display_name="Project C",
-            weight=1,
-            quota_gpus=None,
-            concurrency_limit=None,
-        ),
-        idempotency_key="project-c",
-    )
-    queued = service.create_request(
-        admin,
-        request_data("cross-project-claim", project_id="project-c"),
-        idempotency_key="cross-project-claim",
+        request_data("cross-project-claim", project_id="storyboard"),
+        idempotency_key="storyboard-claim",
         activate_if_allocated=True,
     )
-    assert queued["lease"] is None
-    assert "project_endpoint_scope" in (queued["request"]["blocked_reason"] or "")
-
-    granted = service.grant_endpoint_project_access(
-        admin,
-        "endpoint-a",
-        "project-c",
-        idempotency_key="grant-project-c",
-    )
-    again = service.grant_endpoint_project_access(
-        admin,
-        "endpoint-a",
-        "project-c",
-        idempotency_key="grant-project-c",
-    )
-    assert granted == again
-    assert granted["project_ids"] == ["project-a", "project-b", "project-c"]
-    assert len(granted["allocated_lease_ids"]) == 1
-    request = next(item for item in service.list_requests(admin)["data"] if item["id"] == queued["request"]["id"])
-    assert request["state"] == "ACTIVE"
+    assert claimed["lease"] is not None
+    assert claimed["request"]["state"] == "ACTIVE"
+    assert claimed["lease"]["project_id"] == "storyboard"
+    projects = {project["id"] for project in service.list_projects(admin)["data"]}
+    assert "storyboard" in projects
 
 
 def test_coordination_board_and_observed_binding_are_agent_self_service(service, admin) -> None:
@@ -506,7 +466,7 @@ def test_expired_lease_with_process_becomes_orphan_and_stays_blocked(service, ad
     assert blocked["lease"] is None
 
 
-def test_project_scope_and_token_hash_never_returned(service, admin) -> None:
+def test_allocator_can_claim_an_unregistered_project_and_token_hash_never_returned(service, admin) -> None:
     created = service.create_actor(
         admin,
         ActorCreate(
@@ -520,13 +480,13 @@ def test_project_scope_and_token_hash_never_returned(service, admin) -> None:
     )
     assert created["token"]
     agent = service.authenticate(created["token"])
-    with pytest.raises(BrokerError) as error:
-        service.create_request(
-            agent,
-            request_data("wrong-project", project_id="project-b"),
-            idempotency_key="scope",
-        )
-    assert error.value.code == "project_forbidden"
+    claimed = service.create_request(
+        agent,
+        request_data("unregistered-project", project_id="storyboard"),
+        idempotency_key="unregistered-project",
+    )
+    assert claimed["request"]["project_id"] == "storyboard"
+    assert any(item["id"] == claimed["request"]["id"] for item in service.list_requests(agent)["data"])
     actors = service.list_actors(admin)["data"]
     assert "token_hash" not in str(actors)
 

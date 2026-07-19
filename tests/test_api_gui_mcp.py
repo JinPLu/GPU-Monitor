@@ -8,9 +8,10 @@ import yaml
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
+from gpu_broker import mcp_server
 from gpu_broker.api import create_app
 from gpu_broker.cli import app as cli_app
-from gpu_broker.config import InventoryConfig, ProjectConfig, Settings
+from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
 from gpu_broker.mcp_server import mcp
 from gpu_broker.schemas import EndpointUpsert
 from tests.helpers import observation, process_for_gpu
@@ -56,6 +57,8 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert "uPlot.iife.min.js" not in home.text
     assert "API token" not in home.text
     assert '/ui/action/quick-claim' in home.text
+    assert '/ui/identities' in home.text
+    assert '/ui/projects' not in home.text
     assert 'name="purpose"' not in home.text
     headers = {"X-GPU-Broker-Actor": "test-agent", "Idempotency-Key": "api-key"}
     payload = {
@@ -75,7 +78,6 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert client.get("/health/live").json()["capabilities"] == [
         "workload_profiles",
         "instant_claims",
-        "project_endpoint_grants",
         "coordination_board",
     ]
     compact = client.get(
@@ -171,7 +173,7 @@ def test_api_claim_auto_activates_without_a_duration_estimate(tmp_path: Path, in
     claimed = client.post(
         "/api/v1/claims",
         json={
-            "project_id": "project-a",
+            "project_id": "s",
             "task_ref": "api-claim",
             "purpose": "api-claim",
             "constraints": {"gpu_count": 1},
@@ -181,7 +183,47 @@ def test_api_claim_auto_activates_without_a_duration_estimate(tmp_path: Path, in
     assert claimed.status_code == 200
     assert claimed.json()["request"]["state"] == "ACTIVE"
     assert claimed.json()["lease"]["state"] == "ACTIVE"
+    assert claimed.json()["lease"]["project_id"] == "s"
     assert claimed.json()["request"]["duration_seconds"] == 8 * 60 * 60
+
+
+def test_api_claim_bootstraps_an_empty_project_registry(tmp_path: Path) -> None:
+    inventory = InventoryConfig(
+        schema_version=1,
+        endpoints=[
+            EndpointConfig(
+                id="endpoint-a",
+                host="127.0.0.1",
+                port=2201,
+                ssh_user="gpu",
+            )
+        ],
+    )
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'empty-projects.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    app.state.service.ingest_observation(observation(count=1))
+    client = TestClient(app)
+
+    claimed = client.post(
+        "/api/v1/claims",
+        json={
+            "project_id": "x",
+            "task_ref": "unregistered-project",
+            "purpose": "unregistered-project",
+            "constraints": {"gpu_count": 1},
+        },
+        headers={"X-GPU-Broker-Actor": "claim-agent", "Idempotency-Key": "claim-empty-projects"},
+    )
+
+    assert claimed.status_code == 200
+    assert claimed.json()["lease"]["project_id"] == "x"
 
 
 def test_coordination_api_and_observed_binding(tmp_path: Path, inventory) -> None:
@@ -226,7 +268,7 @@ def test_coordination_api_and_observed_binding(tmp_path: Path, inventory) -> Non
     assert board.json()["data"]["leases"][0]["activity"] == "running"
 
 
-def test_endpoint_project_grant_is_additive(tmp_path: Path, inventory) -> None:
+def test_endpoint_project_grant_route_is_not_exposed(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -237,14 +279,36 @@ def test_endpoint_project_grant_is_additive(tmp_path: Path, inventory) -> None:
         )
     )
     client = TestClient(app)
-    headers = {"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "grant-project-b"}
     response = client.post(
         "/api/v1/endpoints/endpoint-a/projects",
-        json={"project_id": "project-b"},
-        headers=headers,
+        json={"project_id": "storyboard"},
+        headers={"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "unused"},
     )
-    assert response.status_code == 200
-    assert response.json()["project_ids"] == ["project-a", "project-b"]
+    assert response.status_code == 404
+
+
+def test_project_creation_route_and_gui_are_not_exposed(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'no-project-admin.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/projects",
+        json={"id": "storyboard", "display_name": "Storyboard"},
+        headers={"X-GPU-Broker-Actor": "project-admin", "Idempotency-Key": "unused"},
+    )
+    assert response.status_code == 405
+    assert client.get("/ui/projects").status_code == 404
+    identities = client.get("/ui/identities")
+    assert identities.status_code == 200
+    assert "/ui/action/project" not in identities.text
 
 
 def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) -> None:
@@ -311,7 +375,7 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
     assert switched.status_code == 200
     assert 'value="click-agent"' in switched.text
 
-    for page in ["/", "/ui/gpus", "/ui/requests", "/ui/leases", "/ui/reservations", "/ui/projects", "/ui/maintenance", "/ui/alerts", "/ui/audit", "/ui/doctor"]:
+    for page in ["/", "/ui/gpus", "/ui/requests", "/ui/leases", "/ui/reservations", "/ui/identities", "/ui/maintenance", "/ui/alerts", "/ui/audit", "/ui/doctor"]:
         response = client.get(page)
         assert response.status_code == 200, page
     gpu_id = service.list_gpus(service.local_actor("click-agent"))["data"][0]["id"]
@@ -343,9 +407,9 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_release",
         "gpu_schedule",
         "gpu_add_server",
-        "gpu_grant_server_project",
     }.issubset(names)
-    for name in ("gpu_claim", "gpu_schedule", "gpu_add_server"):
+    assert "gpu_grant_server_project" not in names
+    for name in ("gpu_claim", "gpu_schedule"):
         assert "project_id" in by_name[name].inputSchema["required"]
     assert {"agent_name", "project_id", "task", "gpu_count"}.issubset(
         by_name["gpu_claim"].inputSchema["required"]
@@ -358,7 +422,29 @@ def test_mcp_exposes_required_tools() -> None:
     assert "reason" not in by_name["gpu_release"].inputSchema["required"]
 
 
-def test_ssh_preview_commit_is_bound_non_mutating_and_uses_defaults(tmp_path: Path, inventory) -> None:
+def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = []
+
+    class FakeClient:
+        def get(self, path, *, params=None):  # type: ignore[no-untyped-def]
+            calls.append(("GET", path, params))
+            return {"schema_version": "v1", "data": {}}
+
+        def post(self, path, body=None, *, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append(("POST", path, body, idempotency_key))
+            return {"schema_version": "v1", "request": {}, "lease": None}
+
+    monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
+
+    assert mcp_server.gpu_coordination() == {"schema_version": "v1", "data": {}}
+    assert calls == [("GET", "/api/v1/coordination", None)]
+
+    calls.clear()
+    assert mcp_server.gpu_claim("agent", "project", "task", 1)["request"] == {}
+    assert [call[:2] for call in calls] == [("POST", "/api/v1/claims")]
+
+
+def test_ssh_preview_commit_is_bound_non_mutating_and_has_no_project_scope_by_default(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -393,7 +479,7 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_uses_defaults(tmp_path: Pa
         "storage_group": None,
         "expected_gpu_count": None,
         "expected_gpu_total_vram_mib": None,
-        "project_ids": ["project-a", "project-b"],
+        "project_ids": [],
         "enabled": True,
     }
     assert len(data["preview_token"]) == 64

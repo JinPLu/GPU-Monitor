@@ -50,9 +50,9 @@
       </div>
     </div>
     <div class="resource-list-head" role="row" aria-label="资源列表表头">
-      <span>服务器</span>
-      <span>GPU 状态<small>总数 · 空闲 · 占用 · 认领 · 异常</small></span>
-      <span>资源使用<small>CPU · 内存 · 显存 · GPU 利用率</small></span>
+      <span>SSH 连接<small>直接复制日常登录命令</small></span>
+      <span>GPU 状态<small class="resource-status-legend"><span>总数</span><span>空闲</span><span>占用</span><span>认领</span><span>异常</span></small></span>
+      <span>资源使用<small class="resource-metric-legend"><span>CPU</span><span>内存</span><span>显存</span><span>GPU 利用率</span></small></span>
       <span>操作</span>
     </div>
     <div id="server-groups" class="server-groups" aria-live="polite"></div>
@@ -117,22 +117,22 @@
 
 <dialog id="claim-dialog" class="modal-dialog">
   <div class="dialog-heading"><div><p class="eyebrow">当前认领者：{{ actor.id }}</p><h2>认领 GPU</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
-  <p class="muted">日常工作直接选项目配置和任务；资源范围和用途由项目预先批准。完成后释放租约；空闲时直接可用，不足时自动进入共享队列。</p>
+  <p class="muted">可直接填写任意项目标识和任务；完成后释放租约。空闲时直接可用，不足时自动进入共享队列。</p>
   {% if payload.claimable_workload_profiles %}
   <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
-    <label>项目配置<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ profile.constraints.gpu_count }} GPU</option>{% endfor %}</select></label>
+    <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ profile.constraints.gpu_count }} GPU</option>{% endfor %}</select></label>
     <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
     <p class="field-help span-all">按配置认领会直接登记为使用中，但不会启动远端任务。</p>
     <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
     <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">按配置认领</button></div>
   </form>
   {% else %}
-  <p class="field-help">还没有可用的项目配置；管理员可在“项目”页创建。临时需求请使用下方一次性认领。</p>
+  <p class="field-help">还没有可用的预设任务；临时需求可直接使用下方一次性认领。</p>
   {% endif %}
   <details class="stack">
     <summary>一次性认领（需明确资源）</summary>
     <form method="post" action="/ui/action/quick-claim" class="stack form-grid quick-claim-form">
-      <label>项目<select name="project_id" required>{% for project in payload.projects %}<option value="{{ project.id }}">{{ project.display_name }}</option>{% endfor %}</select></label>
+      <label>项目标识<input name="project_id" required placeholder="例如：storyboard"></label>
       <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
       <label>服务器<select name="endpoint_id"><option value="">自动选择</option>{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
       <label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
@@ -148,7 +148,7 @@
   <div class="dialog-heading"><div><p class="eyebrow">未来预约</p><h2>安排使用时间</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
   <p class="muted consequence-copy">安排只登记未来的协作优先级，不会启动、停止或抢占远端任务。</p>
   <form method="post" action="/ui/action/reservation" class="stack form-grid">
-    <label>项目<select name="project_id" required>{% for project in payload.projects %}<option value="{{ project.id }}">{{ project.display_name }}</option>{% endfor %}</select></label>
+    <label>项目标识<input name="project_id" required placeholder="例如：storyboard"></label>
     <label>时区<select name="timezone"><option value="Asia/Shanghai" selected>Asia/Shanghai</option><option value="UTC">UTC</option></select></label>
     <label>开始时间<input name="start_at" type="datetime-local" required></label>
     <label>结束时间<input name="end_at" type="datetime-local" required></label>

@@ -1,15 +1,15 @@
 # GPU Broker — Global Agent Adapter
 
-Install this short block in a client's global rules when the local `gpu-broker` MCP is available. The MCP server's `instructions` are the runtime contract; this block keeps client routing and safety behavior consistent without adding project-local GPU instructions.
+Install this block only in clients that can call the local `gpu-broker` MCP. The MCP server's `instructions` are the runtime contract; this adapter keeps routing simple.
 
-- Use `gpu-broker` MCP only when the user asks to inspect or coordinate GPU resources. Do not read SQLite, inventory, SSH endpoints, or remote GPU probes to infer broker state.
-- There is no dedicated scheduling agent. Any agent may read `gpu_coordination` to see shared server capacity, lease owners, tasks, observed process attribution, queue pressure, and factual utilization signals; the Broker itself owns fair queue ordering and routine placement.
-- When a user or approved task contract names an enabled `profile_id`, call `gpu_claim_profile`; the profile fixes its project, GPU count, optional endpoint subset, and maximum lease window. Do not select a profile from a repository, directory, task title, free capacity, or defaults.
-- Otherwise, an explicitly authorized project task needs only `project_id`, task, and `gpu_count` for `gpu_claim`; the broker records the task as its purpose and selects placement when no server is named. Add a server or exact `gpu_ids` only when the task explicitly asks for that placement. Do not infer the project or GPU count from a repository, directory, task title, free capacity, or defaults. Release the lease when the workload ends; its centrally chosen maximum lease window is not a task-time estimate.
-- Call `gpu_claim` or `gpu_claim_profile` atomically. A queued response or `lease: null` is not permission to run; use only GPUs in a returned held or active lease.
-- A routine `gpu_claim` / `gpu_claim_profile` becomes active automatically when allocated. Call `gpu_release` after the workload stops (or failed startup) with the same `agent_name` and `lease_id`; its default reason is `workload_completed`. Cancel only an explicitly abandoned request. Renew only with explicit, bounded authorization.
-- After an authorized workload starts on the caller's returned lease, call `gpu_bind_observed_workload` with the same `agent_name` and lease ID. A stable run ID is optional; without one the Broker derives it from the lease. It records only the Broker's fresh observed process identities, does not launch or stop anything, and lets every agent see the work as managed rather than unmanaged.
-- If a claim is blocked only by `project_endpoint_scope`, report the named project/server boundary. Call `gpu_grant_server_project` only when the user explicitly authorizes granting that project access to that existing server; it is additive and immediately rechecks queued claims. Do not infer either value from capacity or a task title.
-- Reservations, server registration, and changing a server's project access are separate administrative operations and require separate explicit authorization.
-- GPU Broker coordinates ownership only; it does not authorize, start, stop, or preempt remote work. If MCP or the service is unavailable, report that state and do not fall back to SSH, inventory, SQLite, or `nvidia-smi`.
-- The loopback actor label is an audit identity, not authentication or proof of project authorization.
+- Use `gpu-broker` only for user-authorized GPU inspection or coordination. Do not infer broker state from SQLite, inventory, SSH endpoints, remote probes, or `nvidia-smi`.
+- Daily workflow:
+  1. Read `gpu_coordination` only when shared state is needed.
+  2. If the user names a `profile_id`, call `gpu_claim_profile`.
+  3. Otherwise call `gpu_claim` only when `project_id`, task, and `gpu_count` are explicitly authorized.
+  4. After an authorized workload starts, call `gpu_bind_observed_workload`; when it stops or fails startup, call `gpu_release`.
+- Do not choose `profile_id`, `project_id`, `gpu_count`, server placement, or exact `gpu_ids` from a repository, directory, task title, free capacity, inventory, or defaults. Any non-empty `project_id` is accepted directly and needs no pre-registration.
+- Let the Broker place routine claims unless the user explicitly names a server or exact GPUs. A queued response or `lease: null` is not permission to run; use only GPUs in a returned held or active lease.
+- GPU Broker coordinates ownership only. It never authorizes, launches, stops, changes, or preempts remote work.
+- Reservations and server registration are admin actions requiring separate explicit authorization.
+- If MCP or the service is unavailable, report that state and stop; do not fall back to out-of-band GPU inspection.

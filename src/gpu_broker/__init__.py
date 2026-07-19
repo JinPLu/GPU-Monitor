@@ -8,6 +8,5 @@ SCHEMA_VERSION = "v1"
 API_CAPABILITIES = (
     "workload_profiles",
     "instant_claims",
-    "project_endpoint_grants",
     "coordination_board",
 )

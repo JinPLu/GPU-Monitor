@@ -56,6 +56,11 @@ class BrokerClient:
                     json=json_body,
                     params=params,
                     timeout=self.timeout_seconds,
+                    # GPU Broker is a local control plane.  MCP processes are
+                    # often launched with a minimal environment that omits
+                    # NO_PROXY, so httpx would otherwise send loopback calls
+                    # through an ambient HTTP proxy and surface its empty 502.
+                    trust_env=False,
                 )
             except httpx.HTTPError as exc:
                 last_transport_error = exc

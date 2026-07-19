@@ -93,9 +93,18 @@ def test_cursor_print_is_paste_ready(
 
 def test_global_adapter_and_runtime_instructions_share_safety_invariants() -> None:
     adapter = POLICY.read_text(encoding="utf-8")
-    for phrase in ("gpu_claim", "lease", "gpu_count", "gpu_release", "nvidia-smi"):
+    for phrase in (
+        "gpu_claim",
+        "lease",
+        "gpu_count",
+        "gpu_release",
+        "nvidia-smi",
+        "pre-registration",
+    ):
         assert phrase in adapter
         assert phrase in mcp.instructions
+    assert "gpu_grant_server_project" not in adapter
+    assert "gpu_grant_server_project" not in mcp.instructions
 
 
 def test_install_refuses_symlink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

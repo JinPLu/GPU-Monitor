@@ -26,7 +26,6 @@ from gpu_broker.models import (
     ApiToken,
     AuditEvent,
     Endpoint,
-    EndpointProject,
     EndpointTelemetryCurrent,
     GPUDevice,
     IdempotencyRecord,
@@ -52,7 +51,6 @@ from gpu_broker.schemas import (
     LeaseBind,
     LeaseObservedBind,
     MaintenanceCreate,
-    ProjectUpsert,
     RetentionPrune,
     RequestCreate,
     ReservationCreate,
@@ -210,13 +208,6 @@ class BrokerService:
                 endpoint.expected_gpu_total_vram_mib = configured_endpoint.expected_gpu_total_vram_mib
                 endpoint.updated_at = now
             session.flush()
-            session.execute(
-                EndpointProject.__table__.delete().where(
-                    EndpointProject.endpoint_id == configured_endpoint.id
-                )
-            )
-            for project_id in configured_endpoint.project_ids:
-                session.add(EndpointProject(endpoint_id=configured_endpoint.id, project_id=project_id))
 
     def _ensure_bootstrap_admin(self, session: Session, raw_token: str, now: datetime) -> bool:
         if len(raw_token) < 24:
@@ -265,9 +256,6 @@ class BrokerService:
                 select(Endpoint).where(Endpoint.enabled.is_(True)).order_by(Endpoint.id)
             ).all()
             for endpoint in endpoints:
-                project_ids = session.scalars(
-                    select(EndpointProject.project_id).where(EndpointProject.endpoint_id == endpoint.id)
-                ).all()
                 values.append(
                     EndpointConfig(
                         id=endpoint.id,
@@ -279,7 +267,7 @@ class BrokerService:
                         storage_group=endpoint.storage_group,
                         expected_gpu_count=endpoint.expected_gpu_count,
                         expected_gpu_total_vram_mib=endpoint.expected_gpu_total_vram_mib,
-                        project_ids=project_ids,
+                        project_ids=[],
                     )
                 )
             return values
@@ -424,15 +412,6 @@ class BrokerService:
             raise BrokerError(
                 "forbidden_role",
                 f"role {actor.role} is not allowed for this operation",
-                status_code=403,
-            )
-
-    @staticmethod
-    def _require_project_access(actor: ActorContext, project_id: str) -> None:
-        if not actor.is_admin and project_id not in actor.project_ids:
-            raise BrokerError(
-                "project_forbidden",
-                f"actor {actor.id} is not authorized for project {project_id}",
                 status_code=403,
             )
 
@@ -895,14 +874,10 @@ class BrokerService:
                 ).all()
                 if provider_state.endpoint_id is not None
             }
-            endpoint_access = defaultdict(set)
-            for entry in session.scalars(select(EndpointProject)).all():
-                endpoint_access[entry.endpoint_id].add(entry.project_id)
             visible_endpoints = [
                 endpoint
                 for endpoint in endpoints
-                if (actor.is_admin or bool(endpoint_access[endpoint.id].intersection(actor.project_ids)))
-                and (endpoint_id is None or endpoint.id == endpoint_id)
+                if endpoint_id is None or endpoint.id == endpoint_id
             ]
             visible_ids = {endpoint.id for endpoint in visible_endpoints}
             host_telemetry_by_endpoint = (
@@ -976,11 +951,7 @@ class BrokerService:
                 .where(Lease.state.in_(ACTIVE_LEASE_STATES))
                 .order_by(Lease.issued_at.desc())
             ).all()
-            visible_leases = [
-                lease
-                for lease in all_leases
-                if actor.is_admin or lease.project_id in actor.project_ids
-            ]
+            visible_leases = all_leases
             lease_by_id = {lease.id: lease for lease in all_leases}
             lease_ids = set(lease_by_id)
             resources_by_lease: dict[str, list[LeaseResource]] = defaultdict(list)
@@ -1021,11 +992,6 @@ class BrokerService:
                 )
                 for lease in all_leases
             }
-            if not actor.is_admin:
-                for lease in all_leases:
-                    if lease.project_id not in actor.project_ids:
-                        lease_payloads[lease.id]["task_ref"] = None
-                        lease_payloads[lease.id]["purpose"] = None
             binding_keys = {
                 lease_id: {
                     process_key
@@ -1056,11 +1022,7 @@ class BrokerService:
                 .where(Reservation.state == "ACTIVE", Reservation.end_at > now)
                 .order_by(Reservation.start_at)
             ).all()
-            visible_reservations = [
-                item
-                for item in all_reservations
-                if actor.is_admin or item.project_id in actor.project_ids
-            ]
+            visible_reservations = all_reservations
             current_reservation_by_gpu: dict[str, Reservation] = {}
             for reservation in all_reservations:
                 if (_as_utc(reservation.start_at) or now) <= now:
@@ -1072,12 +1034,6 @@ class BrokerService:
                 .where(AllocationRequest.state == "QUEUED")
                 .order_by(AllocationRequest.created_at)
             ).all()
-            queued_requests = [
-                item
-                for item in queued_requests
-                if actor.is_admin or item.project_id in actor.project_ids
-            ]
-
             endpoint_payloads: list[dict[str, Any]] = []
 
             def endpoint_snapshot(endpoint: Endpoint) -> dict[str, Any]:
@@ -1095,7 +1051,6 @@ class BrokerService:
                     monitor_status = "ONLINE"
                 return {
                     **self._endpoint_dict(endpoint),
-                    "project_ids": sorted(endpoint_access[endpoint.id]),
                     "host_telemetry": self._host_telemetry_dict(
                         host_telemetry_by_endpoint.get(endpoint.id)
                     ),
@@ -1398,7 +1353,6 @@ class BrokerService:
             server_cards.append(
                 {
                     "server_id": endpoint["id"],
-                    "project_ids": endpoint["project_ids"],
                     "monitor_status": endpoint["monitor"]["status"],
                     "host_telemetry": endpoint["host_telemetry"],
                     "capacity": {
@@ -1528,17 +1482,6 @@ class BrokerService:
             gpu = session.get(GPUDevice, gpu_id)
             if gpu is None:
                 raise BrokerError("gpu_not_found", "GPU is not visible or does not exist", status_code=404)
-            if not actor.is_admin:
-                visible = session.scalar(
-                    select(EndpointProject).where(
-                        EndpointProject.endpoint_id == gpu.endpoint_id,
-                        EndpointProject.project_id.in_(actor.project_ids),
-                    )
-                )
-                if visible is None:
-                    raise BrokerError(
-                        "gpu_not_found", "GPU is not visible or does not exist", status_code=404
-                    )
             now = utcnow()
             cutoff = now - timedelta(seconds=window_seconds)
             samples: list[TelemetryCurrent | TelemetrySnapshot] = list(
@@ -2039,18 +1982,31 @@ class BrokerService:
             return f"project concurrency limit {project.concurrency_limit} is reached"
         return None
 
-    def _endpoint_is_available_to_project(
-        self, session: Session, endpoint_id: str, project_id: str
-    ) -> bool:
-        return (
-            session.scalar(
-                select(EndpointProject).where(
-                    EndpointProject.endpoint_id == endpoint_id,
-                    EndpointProject.project_id == project_id,
-                )
-            )
-            is not None
+    @staticmethod
+    def _ensure_claim_project(session: Session, project_id: str, now: datetime) -> Project:
+        """Persist a neutral project tag only because request rows reference it.
+
+        A project id is supplied by the claimant; it is not an enrollment or
+        endpoint-access check.  Configured projects can still carry optional
+        fairness or quota policy, while first use gets the neutral defaults.
+        """
+
+        project = session.get(Project, project_id)
+        if project is not None:
+            return project
+        project = Project(
+            id=project_id,
+            display_name=project_id,
+            weight=1,
+            quota_gpus=None,
+            concurrency_limit=None,
+            enabled=True,
+            created_at=now,
+            updated_at=now,
         )
+        session.add(project)
+        session.flush()
+        return project
 
     def _reservation_blocks_gpu(
         self,
@@ -2074,7 +2030,6 @@ class BrokerService:
         session: Session,
         *,
         request: AllocationRequest,
-        project: Project,
         now: datetime,
     ) -> tuple[list[GPUDevice], dict[str, int]]:
         constraints = ResourceConstraints.model_validate(json_load(request.constraints_json))
@@ -2086,9 +2041,6 @@ class BrokerService:
             endpoint = session.get(Endpoint, gpu.endpoint_id)
             if endpoint is None:
                 excluded["missing_endpoint"] += 1
-                continue
-            if not self._endpoint_is_available_to_project(session, endpoint.id, project.id):
-                excluded["project_endpoint_scope"] += 1
                 continue
             if constraints.endpoint_ids and endpoint.id not in constraints.endpoint_ids:
                 excluded["endpoint_allowlist"] += 1
@@ -2284,7 +2236,7 @@ class BrokerService:
                 request.updated_at = now
                 continue
             candidates, excluded = self._eligible_gpus(
-                session, request=request, project=project, now=now
+                session, request=request, now=now
             )
             resources = self._select_resources(candidates, constraints)
             if resources is None:
@@ -2374,9 +2326,7 @@ class BrokerService:
             if existing is not None:
                 return existing
         now = utcnow()
-        project = session.get(Project, request_data.project_id)
-        if project is None:
-            raise BrokerError("project_not_found", "project does not exist", status_code=404)
+        project = self._ensure_claim_project(session, request_data.project_id, now)
         if not project.enabled:
             raise BrokerError("project_disabled", "project is disabled", status_code=409)
         revision = self._bump_revision(session, now)
@@ -2466,7 +2416,6 @@ class BrokerService:
         activate_if_allocated: bool = False,
     ) -> dict[str, Any]:
         self._require_role(actor, MUTATING_ROLES)
-        self._require_project_access(actor, request_data.project_id)
 
         def operation(session: Session) -> dict[str, Any]:
             return self._create_request_in_session(
@@ -3061,7 +3010,6 @@ class BrokerService:
         self,
         session: Session,
         *,
-        project_id: str,
         constraints: ResourceConstraints,
         start_at: datetime,
         end_at: datetime,
@@ -3072,8 +3020,6 @@ class BrokerService:
         for gpu in session.scalars(select(GPUDevice).order_by(GPUDevice.endpoint_id, GPUDevice.gpu_index)).all():
             endpoint = session.get(Endpoint, gpu.endpoint_id)
             if endpoint is None or not endpoint.enabled or not gpu.enabled:
-                continue
-            if not self._endpoint_is_available_to_project(session, endpoint.id, project_id):
                 continue
             if constraints.endpoint_ids and endpoint.id not in constraints.endpoint_ids:
                 continue
@@ -3103,7 +3049,6 @@ class BrokerService:
         idempotency_key: str,
     ) -> dict[str, Any]:
         self._require_role(actor, OPERATOR_ROLES)
-        self._require_project_access(actor, reservation_data.project_id)
 
         def operation(session: Session) -> dict[str, Any]:
             existing = self._idempotent(
@@ -3111,10 +3056,8 @@ class BrokerService:
             )
             if existing is not None:
                 return existing
-            project = session.get(Project, reservation_data.project_id)
-            if project is None:
-                raise BrokerError("project_not_found", "project does not exist", status_code=404)
             now = utcnow()
+            project = self._ensure_claim_project(session, reservation_data.project_id, now)
             start_at = ensure_utc(reservation_data.start_at)
             end_at = ensure_utc(reservation_data.end_at)
             gpu_ids = list(reservation_data.gpu_ids)
@@ -3122,7 +3065,6 @@ class BrokerService:
                 assert reservation_data.constraints is not None
                 selected = self._reservation_candidate_gpus(
                     session,
-                    project_id=project.id,
                     constraints=reservation_data.constraints,
                     start_at=start_at,
                     end_at=end_at,
@@ -3138,12 +3080,6 @@ class BrokerService:
                 gpu = session.get(GPUDevice, gpu_id)
                 if gpu is None:
                     raise BrokerError("gpu_not_found", f"GPU {gpu_id} does not exist", status_code=404)
-                if not self._endpoint_is_available_to_project(session, gpu.endpoint_id, project.id):
-                    raise BrokerError(
-                        "reservation_gpu_forbidden",
-                        f"GPU {gpu_id} is not available to project {project.id}",
-                        status_code=403,
-                    )
                 if self._reservation_blocks_gpu(session, gpu_id, start=start_at, end=end_at):
                     raise BrokerError(
                         "reservation_conflict",
@@ -3224,7 +3160,6 @@ class BrokerService:
             reservation = session.get(Reservation, reservation_id)
             if reservation is None:
                 raise BrokerError("reservation_not_found", "reservation does not exist", status_code=404)
-            self._require_project_access(actor, reservation.project_id)
             if reservation.state != "ACTIVE":
                 raise BrokerError("reservation_not_cancellable", "reservation is not active", status_code=409)
             now = utcnow()
@@ -3427,71 +3362,10 @@ class BrokerService:
 
         return self._write(operation)
 
-    def upsert_project(
-        self, actor: ActorContext, project_data: ProjectUpsert, *, idempotency_key: str
-    ) -> dict[str, Any]:
-        self._require_role(actor, ADMIN_ROLES)
-
-        def operation(session: Session) -> dict[str, Any]:
-            existing = self._idempotent(session, actor=actor, action="project.upsert", key=idempotency_key)
-            if existing is not None:
-                return existing
-            now = utcnow()
-            revision = self._bump_revision(session, now)
-            project = session.get(Project, project_data.id)
-            before = self._project_dict(project) if project else None
-            if project is None:
-                project = Project(
-                    id=project_data.id,
-                    display_name=project_data.display_name,
-                    weight=project_data.weight,
-                    quota_gpus=project_data.quota_gpus,
-                    concurrency_limit=project_data.concurrency_limit,
-                    enabled=project_data.enabled,
-                    created_at=now,
-                    updated_at=now,
-                )
-                session.add(project)
-            else:
-                project.display_name = project_data.display_name
-                project.weight = project_data.weight
-                project.quota_gpus = project_data.quota_gpus
-                project.concurrency_limit = project_data.concurrency_limit
-                project.enabled = project_data.enabled
-                project.updated_at = now
-            event = self._audit(
-                session,
-                actor_id=actor.id,
-                action="project.upserted",
-                resource_type="project",
-                resource_id=project.id,
-                result="success",
-                before=before,
-                after=self._project_dict(project),
-                now=now,
-            )
-            result = {
-                "event_id": event.id,
-                "snapshot_revision": revision,
-                "project": self._project_dict(project),
-            }
-            self._remember_idempotency(
-                session,
-                actor=actor,
-                action="project.upsert",
-                key=idempotency_key,
-                response=result,
-                now=now,
-            )
-            return result
-
-        return self._write(operation)
-
     def _validate_workload_profile_endpoints(
         self,
         session: Session,
         *,
-        project_id: str,
         constraints: ResourceConstraints,
     ) -> None:
         missing = [
@@ -3502,17 +3376,6 @@ class BrokerService:
                 "endpoint_not_found",
                 f"workload profile references unknown endpoints: {missing}",
                 status_code=404,
-            )
-        unavailable = [
-            endpoint_id
-            for endpoint_id in constraints.endpoint_ids
-            if not self._endpoint_is_available_to_project(session, endpoint_id, project_id)
-        ]
-        if unavailable:
-            raise BrokerError(
-                "profile_endpoint_forbidden",
-                f"workload profile endpoints are outside project scope: {unavailable}",
-                status_code=422,
             )
 
     def upsert_workload_profile(
@@ -3532,15 +3395,12 @@ class BrokerService:
             )
             if existing is not None:
                 return existing
-            project = session.get(Project, profile_data.project_id)
-            if project is None:
-                raise BrokerError("project_not_found", "project does not exist", status_code=404)
+            now = utcnow()
+            self._ensure_claim_project(session, profile_data.project_id, now)
             self._validate_workload_profile_endpoints(
                 session,
-                project_id=profile_data.project_id,
                 constraints=profile_data.constraints,
             )
-            now = utcnow()
             revision = self._bump_revision(session, now)
             profile = session.get(WorkloadProfile, profile_data.id)
             before = self._workload_profile_dict(profile) if profile else None
@@ -3624,7 +3484,6 @@ class BrokerService:
                 raise BrokerError(
                     "workload_profile_disabled", "workload profile is disabled", status_code=409
                 )
-            self._require_project_access(actor, profile.project_id)
             request_data = RequestCreate.model_validate(
                 {
                     "project_id": profile.project_id,
@@ -3660,17 +3519,6 @@ class BrokerService:
             )
             if existing is not None:
                 return existing
-            unknown_projects = [
-                project_id
-                for project_id in endpoint_data.project_ids
-                if session.get(Project, project_id) is None
-            ]
-            if unknown_projects:
-                raise BrokerError(
-                    "project_not_found",
-                    f"endpoint references unknown projects: {unknown_projects}",
-                    status_code=404,
-                )
             now = utcnow()
             revision = self._bump_revision(session, now)
             endpoint = session.get(Endpoint, endpoint_data.id)
@@ -3719,11 +3567,6 @@ class BrokerService:
                 endpoint.enabled = endpoint_data.enabled
                 endpoint.updated_at = now
             session.flush()
-            session.execute(
-                EndpointProject.__table__.delete().where(EndpointProject.endpoint_id == endpoint.id)
-            )
-            for project_id in endpoint_data.project_ids:
-                session.add(EndpointProject(endpoint_id=endpoint.id, project_id=project_id))
             event = self._audit(
                 session,
                 actor_id=actor.id,
@@ -3733,7 +3576,6 @@ class BrokerService:
                 result="success",
                 before=before,
                 after=self._endpoint_dict(endpoint),
-                summary={"project_ids": endpoint_data.project_ids},
                 now=now,
             )
             result = {
@@ -3745,73 +3587,6 @@ class BrokerService:
                 session,
                 actor=actor,
                 action="endpoint.upsert",
-                key=idempotency_key,
-                response=result,
-                now=now,
-            )
-            return result
-
-        return self._write(operation)
-
-    def grant_endpoint_project_access(
-        self,
-        actor: ActorContext,
-        endpoint_id: str,
-        project_id: str,
-        *,
-        idempotency_key: str,
-    ) -> dict[str, Any]:
-        """Add project access to an existing endpoint without replacing its other grants."""
-
-        self._require_role(actor, ADMIN_ROLES)
-
-        def operation(session: Session) -> dict[str, Any]:
-            existing = self._idempotent(
-                session, actor=actor, action="endpoint.project_access.grant", key=idempotency_key
-            )
-            if existing is not None:
-                return existing
-            endpoint = session.get(Endpoint, endpoint_id)
-            if endpoint is None:
-                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
-            if session.get(Project, project_id) is None:
-                raise BrokerError("project_not_found", "project does not exist", status_code=404)
-            now = utcnow()
-            revision = self._bump_revision(session, now)
-            before_project_ids = sorted(
-                session.scalars(
-                    select(EndpointProject.project_id).where(EndpointProject.endpoint_id == endpoint.id)
-                ).all()
-            )
-            granted = self._endpoint_is_available_to_project(session, endpoint.id, project_id)
-            if not granted:
-                session.add(EndpointProject(endpoint_id=endpoint.id, project_id=project_id))
-                session.flush()
-            project_ids = sorted({*before_project_ids, project_id})
-            event = self._audit(
-                session,
-                actor_id=actor.id,
-                action="endpoint.project_access_granted",
-                resource_type="endpoint",
-                resource_id=endpoint.id,
-                result="success",
-                before={"project_ids": before_project_ids},
-                after={"project_ids": project_ids},
-                summary={"project_id": project_id, "already_granted": granted},
-                now=now,
-            )
-            allocated_lease_ids = self._allocate_queued(session, now, revision)
-            result = {
-                "event_id": event.id,
-                "snapshot_revision": revision,
-                "endpoint": self._endpoint_dict(endpoint),
-                "project_ids": project_ids,
-                "allocated_lease_ids": allocated_lease_ids,
-            }
-            self._remember_idempotency(
-                session,
-                actor=actor,
-                action="endpoint.project_access.grant",
                 key=idempotency_key,
                 response=result,
                 now=now,
@@ -4020,11 +3795,7 @@ class BrokerService:
             requests = session.scalars(
                 select(AllocationRequest).order_by(AllocationRequest.created_at.desc())
             ).all()
-            visible = [
-                self._request_dict(request)
-                for request in requests
-                if actor.is_admin or request.project_id in actor.project_ids
-            ]
+            visible = [self._request_dict(request) for request in requests]
             return self.envelope(session, visible)
 
         return self._read(operation)
@@ -4032,11 +3803,7 @@ class BrokerService:
     def list_leases(self, actor: ActorContext) -> dict[str, Any]:
         def operation(session: Session) -> dict[str, Any]:
             leases = session.scalars(select(Lease).order_by(Lease.issued_at.desc())).all()
-            visible = [
-                self._lease_dict(session, lease)
-                for lease in leases
-                if actor.is_admin or lease.project_id in actor.project_ids
-            ]
+            visible = [self._lease_dict(session, lease) for lease in leases]
             return self.envelope(session, visible)
 
         return self._read(operation)
@@ -4044,17 +3811,12 @@ class BrokerService:
     def list_processes(self, actor: ActorContext) -> dict[str, Any]:
         def operation(session: Session) -> dict[str, Any]:
             now = utcnow()
-            endpoint_access = defaultdict(set)
-            for entry in session.scalars(select(EndpointProject)).all():
-                endpoint_access[entry.endpoint_id].add(entry.project_id)
             values = []
             for process in session.scalars(
                 select(ProcessObservation)
                 .where(ProcessObservation.active.is_(True))
                 .order_by(ProcessObservation.last_seen_at.desc())
             ).all():
-                if not actor.is_admin and not endpoint_access[process.endpoint_id].intersection(actor.project_ids):
-                    continue
                 values.append(
                     {
                         "id": process.id,
@@ -4085,7 +3847,6 @@ class BrokerService:
                 for reservation in session.scalars(
                     select(Reservation).order_by(Reservation.start_at, Reservation.id)
                 ).all()
-                if actor.is_admin or reservation.project_id in actor.project_ids
             ]
             return self.envelope(session, values)
 
@@ -4105,29 +3866,12 @@ class BrokerService:
 
     def list_alerts(self, actor: ActorContext) -> dict[str, Any]:
         def operation(session: Session) -> dict[str, Any]:
-            lease_projects = {
-                lease.id: lease.project_id for lease in session.scalars(select(Lease)).all()
-            }
-            visible: list[dict[str, Any]] = []
-            for alert in session.scalars(
-                select(Alert).order_by(Alert.active.desc(), Alert.last_seen_at.desc())
-            ).all():
-                if actor.is_admin:
-                    visible.append(self._alert_dict(alert))
-                elif alert.resource_type == "lease" and lease_projects.get(alert.resource_id) in actor.project_ids:
-                    visible.append(self._alert_dict(alert))
-                elif alert.resource_type in {"endpoint", "gpu"}:
-                    # Resource alerts are shared only when the endpoint is project-visible.
-                    if alert.resource_type == "endpoint":
-                        endpoint = session.get(Endpoint, alert.resource_id)
-                    else:
-                        gpu = session.get(GPUDevice, alert.resource_id)
-                        endpoint = session.get(Endpoint, gpu.endpoint_id) if gpu else None
-                    if endpoint and any(
-                        self._endpoint_is_available_to_project(session, endpoint.id, project_id)
-                        for project_id in actor.project_ids
-                    ):
-                        visible.append(self._alert_dict(alert))
+            visible = [
+                self._alert_dict(alert)
+                for alert in session.scalars(
+                    select(Alert).order_by(Alert.active.desc(), Alert.last_seen_at.desc())
+                ).all()
+            ]
             return self.envelope(session, visible)
 
         return self._read(operation)
@@ -4183,7 +3927,6 @@ class BrokerService:
             values = [
                 self._project_dict(project)
                 for project in session.scalars(select(Project).order_by(Project.id)).all()
-                if actor.is_admin or project.id in actor.project_ids
             ]
             return self.envelope(session, values)
 
@@ -4192,9 +3935,6 @@ class BrokerService:
     def list_workload_profiles(
         self, actor: ActorContext, *, project_id: str | None = None
     ) -> dict[str, Any]:
-        if project_id is not None:
-            self._require_project_access(actor, project_id)
-
         def operation(session: Session) -> dict[str, Any]:
             profiles = session.scalars(
                 select(WorkloadProfile).order_by(WorkloadProfile.project_id, WorkloadProfile.id)
@@ -4203,7 +3943,6 @@ class BrokerService:
                 self._workload_profile_dict(profile)
                 for profile in profiles
                 if (project_id is None or profile.project_id == project_id)
-                and (actor.is_admin or profile.project_id in actor.project_ids)
             ]
             return self.envelope(session, values)
 
@@ -4248,16 +3987,7 @@ class BrokerService:
         def operation(session: Session) -> dict[str, Any]:
             endpoints = []
             for endpoint in session.scalars(select(Endpoint).order_by(Endpoint.id)).all():
-                endpoints.append(
-                    {
-                        **self._endpoint_dict(endpoint),
-                        "project_ids": session.scalars(
-                            select(EndpointProject.project_id).where(
-                                EndpointProject.endpoint_id == endpoint.id
-                            )
-                        ).all(),
-                    }
-                )
+                endpoints.append(self._endpoint_dict(endpoint))
             return self.envelope(
                 session,
                 {

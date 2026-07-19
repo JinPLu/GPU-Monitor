@@ -8,52 +8,36 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from gpu_broker.client import BrokerClient, BrokerClientError
+from gpu_broker.client import BrokerClient
+
+
+MCP_INSTRUCTIONS = (
+    "Use gpu-broker only for user-authorized GPU inspection or coordination. "
+    "Daily path: read gpu_coordination when state is needed; if a profile_id is named, call "
+    "gpu_claim_profile; otherwise call gpu_claim only when project_id, task, and gpu_count are "
+    "explicitly authorized. Do not infer profile_id, project_id, gpu_count, server_id, or gpu_ids "
+    "from a repo, directory, task title, free capacity, inventory, or defaults. Any non-empty "
+    "project_id is accepted directly and needs no pre-registration. Let the Broker place routine "
+    "claims unless the user explicitly names a server or exact GPUs. A queued response or lease=null "
+    "is not permission to run; use only GPUs in a returned held or active lease. After starting an "
+    "authorized workload, call gpu_bind_observed_workload(agent_name, lease_id, optional run_id) so "
+    "the Broker records only already-observed processes; it never launches, stops, or changes remote "
+    "work. Release with gpu_release(agent_name, lease_id) when work stops or startup fails. "
+    "Reservations and server registration are admin actions requiring separate explicit authorization. "
+    "If MCP or the service is unavailable, report that state and do not fall back to SSH, SQLite, "
+    "inventory, remote probes, or nvidia-smi."
+)
 
 
 mcp = FastMCP(
     "gpu-broker",
     json_response=True,
-    instructions=(
-        "Use this MCP only when the user asks to inspect or coordinate GPU resources. When a user or "
-        "approved task contract names an enabled workload profile, call gpu_claim_profile; do not select "
-        "a profile from a repository, directory, task title, free capacity, or defaults. Otherwise, an "
-        "explicitly authorized project task needs project_id, task, and gpu_count for gpu_claim; its task "
-        "is recorded as the purpose. Add a server or exact gpu_ids only when the task explicitly requests "
-        "that placement. Do not infer project_id or gpu_count from a repository, directory, task title, "
-        "free capacity, or defaults. "
-        "For cross-agent coordination, use gpu_coordination: it is the broker's shared, read-only board of "
-        "server capacity, current lease owners, task visibility, observed process attribution, and queue pressure. "
-        "Do not appoint or emulate a separate scheduler; omit server_id unless the task explicitly requires one and "
-        "let the broker place routine claims. "
-        "Call gpu_claim or gpu_claim_profile atomically: lease=null or a queued response is not permission to "
-        "run. Use only GPUs in a returned held or active lease. For an existing lease, activate it before work "
-        "when available and call gpu_release after the workload stops or failed startup with the same agent_name "
-        "and lease_id where accepted; its default reason is workload_completed. Cancel only explicitly abandoned requests and renew only with "
-        "explicit bounded authorization. If a claim is blocked only by project_endpoint_scope, do not infer a "
-        "server or change access: use gpu_grant_server_project only with explicit authorization for the named "
-        "project and existing server. After an authorized workload has started on the caller's returned lease, call "
-        "gpu_bind_observed_workload with the same agent_name and lease_id (a stable run_id is optional) to record only "
-        "the already-observed processes; this does not launch or stop anything and prevents false unmanaged-process "
-        "conflicts. Reservations, server registration, and changing a server's project access require separate "
-        "authorization. This MCP coordinates ownership only; it never authorizes, starts, stops, or preempts "
-        "remote work. The loopback actor label is audit metadata, not authentication. If MCP or the service is "
-        "unavailable, report that state and do not fall back to SSH, inventory, SQLite, or nvidia-smi."
-    ),
+    instructions=MCP_INSTRUCTIONS,
 )
 
 
 def _client(actor_name: str | None = None) -> BrokerClient:
     return BrokerClient.from_env(actor=actor_name)
-
-
-def _require_capability(client: BrokerClient, capability: str) -> None:
-    health = client.get("/health/live")
-    capabilities = health.get("capabilities")
-    if not isinstance(capabilities, list) or capability not in capabilities:
-        raise BrokerClientError(
-            f"local GPU Broker service lacks '{capability}'; reinstall/update it and restart the loopback service"
-        )
 
 
 def _require_request_fields(request: dict[str, Any]) -> None:
@@ -88,9 +72,7 @@ def gpu_coordination() -> dict[str, Any]:
     such as an idle lease or unbound compute process. It is read-only.
     """
 
-    client = _client()
-    _require_capability(client, "coordination_board")
-    return client.get("/api/v1/coordination")
+    return _client().get("/api/v1/coordination")
 
 
 @mcp.tool()
@@ -125,9 +107,7 @@ def gpu_list_profiles(project_id: str | None = None) -> dict[str, Any]:
     """List project-visible workload profiles approved for routine GPU claims."""
 
     params = {"project_id": project_id} if project_id else None
-    client = _client()
-    _require_capability(client, "workload_profiles")
-    return client.get("/api/v1/workload-profiles", params=params)
+    return _client().get("/api/v1/workload-profiles", params=params)
 
 
 @mcp.tool()
@@ -217,9 +197,7 @@ def gpu_bind_observed_workload(
     without it, the broker uses a stable identifier derived from the lease.
     """
 
-    client = _client(agent_name)
-    _require_capability(client, "coordination_board")
-    return client.post(
+    return _client(agent_name).post(
         f"/api/v1/leases/{lease_id}/bind-observed-workload",
         {"run_id": run_id} if run_id else {},
         idempotency_key=secrets.token_hex(16),
@@ -255,8 +233,6 @@ def gpu_claim(
     task = task.strip()
     if gpu_count < 1 or not task:
         raise ValueError("task must not be empty and gpu_count must be positive")
-    client = _client(agent_name)
-    _require_capability(client, "instant_claims")
     exact_gpu_ids = gpu_ids or []
     constraints = {
         "gpu_count": len(exact_gpu_ids) or gpu_count,
@@ -264,7 +240,7 @@ def gpu_claim(
         "endpoint_ids": [server_id] if server_id else [],
         "gpu_ids": exact_gpu_ids,
     }
-    return client.post(
+    return _client(agent_name).post(
         "/api/v1/claims",
         {
             "project_id": project_id,
@@ -282,9 +258,7 @@ def gpu_claim_profile(agent_name: str, profile_id: str, task: str) -> dict[str, 
 
     if not profile_id.strip() or not task.strip():
         raise ValueError("profile_id and task must not be empty")
-    client = _client(agent_name)
-    _require_capability(client, "workload_profiles")
-    return client.post(
+    return _client(agent_name).post(
         f"/api/v1/workload-profiles/{profile_id}/claim",
         {"task_ref": task},
         idempotency_key=secrets.token_hex(16),
@@ -330,7 +304,6 @@ def gpu_schedule(
 @mcp.tool()
 def gpu_add_server(
     agent_name: str,
-    project_id: str,
     host: str,
     port: int = 22,
     ssh_user: str = "root",
@@ -348,26 +321,9 @@ def gpu_add_server(
             "host": host,
             "port": port,
             "ssh_user": ssh_user,
-            "project_ids": [project_id],
+            "project_ids": [],
             "enabled": True,
         },
-        idempotency_key=secrets.token_hex(16),
-    )
-
-
-@mcp.tool()
-def gpu_grant_server_project(agent_name: str, project_id: str, server_id: str) -> dict[str, Any]:
-    """Grant an explicitly authorized project access to an existing monitored server.
-
-    This is additive: it never removes the server's current project grants. Any
-    now-eligible queued request is allocated immediately by the scheduler.
-    """
-
-    client = _client(agent_name)
-    _require_capability(client, "project_endpoint_grants")
-    return client.post(
-        f"/api/v1/endpoints/{server_id}/projects",
-        {"project_id": project_id},
         idempotency_key=secrets.token_hex(16),
     )
 

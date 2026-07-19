@@ -52,7 +52,9 @@ class EndpointConfig(BaseModel):
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
     expected_gpu_total_vram_mib: int | None = Field(default=None, ge=1)
-    project_ids: list[str] = Field(default_factory=list, min_length=1)
+    # Kept as a tolerated legacy inventory field.  Endpoint access is global;
+    # a claim's project_id is not pre-registered or scoped to a server.
+    project_ids: list[str] = Field(default_factory=list)
 
     @field_validator("labels", "project_ids")
     @classmethod
@@ -69,7 +71,9 @@ class InventoryConfig(BaseModel):
 
     schema_version: Literal[1]
     collector: CollectorConfig = Field(default_factory=CollectorConfig)
-    projects: list[ProjectConfig] = Field(min_length=1)
+    # Project policies are optional.  The broker creates a neutral record when
+    # a claim first uses an otherwise unknown project_id.
+    projects: list[ProjectConfig] = Field(default_factory=list)
     endpoints: list[EndpointConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -83,14 +87,6 @@ class InventoryConfig(BaseModel):
         endpoint_addresses = [(endpoint.host, endpoint.port) for endpoint in self.endpoints]
         if len(endpoint_addresses) != len(set(endpoint_addresses)):
             raise ValueError("host:port endpoint identities must be unique")
-        unknown = {
-            project_id
-            for endpoint in self.endpoints
-            for project_id in endpoint.project_ids
-            if project_id not in project_ids
-        }
-        if unknown:
-            raise ValueError(f"endpoint references unknown project ids: {sorted(unknown)}")
         return self
 
 

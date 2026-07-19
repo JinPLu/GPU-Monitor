@@ -66,7 +66,7 @@ class ResourceConstraints(StrictModel):
 
 
 class RequestCreate(StrictModel):
-    project_id: str = Field(min_length=2, max_length=64)
+    project_id: str = Field(min_length=1, max_length=64)
     task_ref: str = Field(min_length=1, max_length=255)
     purpose: str = Field(min_length=1, max_length=1000)
     duration_seconds: int = Field(default=DEFAULT_LEASE_WINDOW_SECONDS, ge=60, le=60 * 60 * 24 * 30)
@@ -89,7 +89,7 @@ class RequestCreate(StrictModel):
 class RequestCreateFlat(StrictModel):
     """CLI-friendly request form that is converted to the canonical nested schema."""
 
-    project_id: str = Field(min_length=2, max_length=64)
+    project_id: str = Field(min_length=1, max_length=64)
     task_ref: str = Field(min_length=1, max_length=255)
     purpose: str = Field(min_length=1, max_length=1000)
     gpu_count: int = Field(ge=1)
@@ -137,7 +137,7 @@ class LeaseObservedBind(StrictModel):
 
 
 class ReservationCreate(StrictModel):
-    project_id: str = Field(min_length=2, max_length=64)
+    project_id: str = Field(min_length=1, max_length=64)
     gpu_ids: list[str] = Field(default_factory=list)
     start_at: datetime
     end_at: datetime
@@ -173,20 +173,11 @@ class MaintenanceCreate(StrictModel):
         return self
 
 
-class ProjectUpsert(StrictModel):
-    id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
-    display_name: str = Field(min_length=1, max_length=120)
-    weight: int = Field(default=1, ge=1, le=1000)
-    quota_gpus: int | None = Field(default=None, ge=1)
-    concurrency_limit: int | None = Field(default=None, ge=1)
-    enabled: bool = True
-
-
 class WorkloadProfileUpsert(StrictModel):
     """Admin-defined resource contract used by routine project workloads."""
 
     id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
-    project_id: str = Field(min_length=2, max_length=64)
+    project_id: str = Field(min_length=1, max_length=64)
     display_name: str = Field(min_length=1, max_length=120)
     purpose: str = Field(min_length=1, max_length=1000)
     duration_seconds: int = Field(ge=60, le=60 * 60 * 24 * 30)
@@ -214,7 +205,9 @@ class EndpointUpsert(StrictModel):
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
     expected_gpu_total_vram_mib: int | None = Field(default=None, ge=1)
-    project_ids: list[str] = Field(min_length=1)
+    # Accepted for backward-compatible inventory imports only; endpoint scope
+    # does not participate in allocation.
+    project_ids: list[str] = Field(default_factory=list)
     enabled: bool = True
 
     @field_validator("labels", "project_ids")
@@ -225,12 +218,6 @@ class EndpointUpsert(StrictModel):
         if any(not value for value in values):
             raise ValueError("endpoint list values must not be empty")
         return values
-
-
-class EndpointProjectGrant(StrictModel):
-    """Add one project to an existing endpoint without replacing its current scope."""
-
-    project_id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
 
 
 class EndpointEnabled(StrictModel):

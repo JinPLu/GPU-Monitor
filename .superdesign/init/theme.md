@@ -1,3 +1,17 @@
+# Theme
+
+## Implementation profile
+
+- Framework: FastAPI + Jinja templates + vanilla JavaScript, embedded by a native AppKit/WKWebView host.
+- Component library: custom CSS; Phosphor icon webfont from `src/gpu_broker/web/static/vendor/phosphor/`.
+- Styling approach: one scoped vanilla-CSS stylesheet.
+- Background asset: `src/gpu_broker/web/static/assets/server-room-background.jpg`.
+
+## Complete global stylesheet
+
+Source: `src/gpu_broker/web/static/app.css`
+
+```css
 :root {
   color-scheme: light dark;
   --canvas: #eef0f4;
@@ -950,3 +964,13 @@ input, textarea, select { border-color: #c8d7d2; background: rgba(253, 254, 253,
   .server-name strong code { font-size: 12px; }
   .server-expand span { display: none; }
 }
+
+```
+
+## Existing design language inferred from the stylesheet
+
+- Full-page server-room photo backdrop with a translucent application panel.
+- Navy / slate hierarchy, teal-green operational accents, and warm warning states.
+- System UI font stack, approximately 12–32px hierarchy.
+- Large 16–24px rounded cards; soft inner borders; compact operational tables.
+- Phosphor outline icons are the sole icon family and should stay consistent until the native shell takes over.

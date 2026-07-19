@@ -1,3 +1,80 @@
+# Layouts
+
+## Authenticated application shell
+
+- Source: `src/gpu_broker/web/templates/base.html`
+- Description: The visual shell: ambient backdrop, sidebar navigation, compact top bar, workspace, and global static assets.
+
+```html
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  {% if csrf %}<meta name="csrf-token" content="{{ csrf }}">{% endif %}
+  <title>GPU Broker</title>
+  <link rel="stylesheet" href="/static/vendor/phosphor/style.css?v=2.1.2">
+  <link rel="stylesheet" href="/static/app.css?v=20260720-home-clarity">
+</head>
+<body data-realtime="{{ 'on' if actor else 'off' }}" data-page="{{ page }}">
+  <div class="environment-backdrop" aria-hidden="true">
+    <img src="/static/assets/server-room-background.jpg" alt="">
+  </div>
+  <div class="app-shell{% if not actor %} signed-out{% endif %}">
+    {% if actor %}
+    <aside class="sidebar" id="app-sidebar" aria-label="GPU Broker 工作区导航">
+      <a class="brand" href="/" aria-label="GPU Broker 资源总览">
+        <span class="brand-mark" aria-hidden="true"><i class="ph ph-graphics-card"></i></span><span>GPU Broker</span>
+      </a>
+      <nav class="sidebar-nav" aria-label="主要导航">
+        <p class="nav-label">工作区</p>
+        <a href="/" {% if page == 'overview' %}aria-current="page"{% endif %}><i class="ph ph-squares-four" aria-hidden="true"></i>资源总览</a>
+        <a href="/ui/gpus" {% if page in ['gpus', 'gpu-detail'] %}aria-current="page"{% endif %}><i class="ph ph-grid-four" aria-hidden="true"></i>GPU 状态</a>
+        <a href="/ui/requests" {% if page in ['requests', 'leases'] %}aria-current="page"{% endif %}><i class="ph ph-arrows-left-right" aria-hidden="true"></i>认领与队列</a>
+        <a href="/ui/reservations" {% if page == 'reservations' %}aria-current="page"{% endif %}><i class="ph ph-calendar-dots" aria-hidden="true"></i>使用安排</a>
+        <p class="nav-label">管理</p>
+        <a href="/ui/identities" {% if page == 'identities' %}aria-current="page"{% endif %}><i class="ph ph-users" aria-hidden="true"></i>身份与预设</a>
+        <a href="/ui/maintenance" {% if page == 'maintenance' %}aria-current="page"{% endif %}><i class="ph ph-wrench" aria-hidden="true"></i>维护窗口</a>
+        <a href="/ui/alerts" {% if page == 'alerts' %}aria-current="page"{% endif %}><i class="ph ph-warning" aria-hidden="true"></i>告警</a>
+        <a href="/ui/audit" {% if page == 'audit' %}aria-current="page"{% endif %}><i class="ph ph-clock-counter-clockwise" aria-hidden="true"></i>审计与历史</a>
+        <a href="/ui/doctor" {% if page == 'doctor' %}aria-current="page"{% endif %}><i class="ph ph-gear" aria-hidden="true"></i>设置与 Doctor</a>
+      </nav>
+      <div class="sidebar-footer">
+        <span id="realtime-state" class="live-state"><i aria-hidden="true"></i><span>数据连接中</span></span>
+        <p>仅本机控制面 · 不执行远端任务</p>
+      </div>
+    </aside>
+    {% endif %}
+    <div class="workspace">
+      {% if actor %}
+      <header class="topbar">
+        <button class="sidebar-toggle icon-button" type="button" data-toggle-sidebar aria-expanded="true" aria-controls="app-sidebar" aria-label="显示或隐藏导航"><i class="ph ph-list" aria-hidden="true"></i></button>
+        <div class="topbar-title"><span>共享 GPU 工作区</span><small><i class="ph ph-shield-check" aria-hidden="true"></i> 本机只读监控 · 协调状态</small></div>
+        <form class="actor-switcher" method="post" action="/ui/actor">
+          <label><span>当前操作者</span><input name="actor_id" value="{{ actor.id }}" pattern="[A-Za-z][A-Za-z0-9_.-]{1,127}" required aria-label="当前人类或 Agent 名称"></label>
+          <button class="quiet" type="submit">切换</button>
+        </form>
+      </header>
+      {% endif %}
+      <main id="main-content" tabindex="-1">
+        {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+  </div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
+
+```
+
+## All non-dashboard pages
+
+- Source: `src/gpu_broker/web/templates/page.html`
+- Description: The generic management-page layout, cards, forms, dialogs, and data table patterns used across GPU, requests, schedules, alerts, and settings.
+
+```html
 {% extends "base.html" %}
 {% block content %}
 <section class="page-heading">
@@ -338,3 +415,463 @@
 <section class="data-panel"><h2>扩展接口</h2><p>人类通过本界面完成日常操作；自动化与新增能力通过同一套 <a href="/docs">OpenAPI</a>、CLI 和 MCP 接口接入，不需要复制调度逻辑。</p></section>
 {% endif %}
 {% endblock %}
+
+```
+
+## Authentication and token pages
+
+- Source: `src/gpu_broker/web/templates/login.html + token_created.html`
+- Description: Unauthenticated and secret-issuance shells that extend the global layout.
+
+```html
+{% extends "base.html" %}
+{% block content %}
+<section class="login-panel" aria-labelledby="login-title">
+  <p class="eyebrow">本机、协作式 GPU 资源控制面</p>
+  <h1 id="login-title">登录 gpu-broker</h1>
+  <p>输入只保存在本地秘密管理中的 API token。服务器只保存 token hash；租约不代表训练或服务启动授权。</p>
+  <form method="post" action="/ui/login" class="stack">
+    <label>API token
+      <input id="api-token" name="token" type="password" autocomplete="current-password" required autofocus>
+    </label>
+    <button id="paste-desktop-token" class="quiet" type="button" hidden>从系统剪贴板粘贴 token</button>
+    <p id="desktop-paste-status" class="muted" role="status" hidden></p>
+    <button type="submit">登录</button>
+  </form>
+</section>
+<script>
+  (() => {
+    const input = document.getElementById("api-token");
+    const button = document.getElementById("paste-desktop-token");
+    const status = document.getElementById("desktop-paste-status");
+    const bridge = window.webkit?.messageHandlers?.gpuBrokerClipboard;
+    if (!input || !button || !status || !bridge) return;
+
+    button.hidden = false;
+    const setStatus = (message) => {
+      status.textContent = message;
+      status.hidden = false;
+    };
+    window.gpuBrokerSetToken = (token) => {
+      input.value = token;
+      input.focus();
+      setStatus("已填入 token；请点击“登录”。");
+    };
+    window.gpuBrokerClipboardError = (message) => setStatus(message);
+    button.addEventListener("click", () => {
+      setStatus("正在从系统剪贴板读取…");
+      bridge.postMessage({ action: "paste-token" });
+    });
+  })();
+</script>
+{% endblock %}
+{% extends "base.html" %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">一次性凭证</p>
+    <h1>已创建 {{ payload.actor.display_name }}</h1>
+  </div>
+</section>
+
+<section class="secret-panel" aria-labelledby="token-title">
+  <h2 id="token-title">立即复制并安全保存此 token</h2>
+  <p>它只会在此响应中显示一次。请将其交给对应的人类或 Agent 的秘密管理工具；不要复制到项目配置、审计记录或聊天记录。</p>
+  <label>API token
+    <input id="issued-token" type="text" value="{{ payload.token }}" readonly autocomplete="off">
+  </label>
+  <div class="inline-actions">
+    <button type="button" id="copy-issued-token">复制 token</button>
+    <a class="button-link quiet-link" href="/ui/identities">我已安全保存</a>
+  </div>
+  <p id="copy-status" class="muted" role="status"></p>
+</section>
+
+<script>
+(() => {
+  const input = document.getElementById("issued-token");
+  const button = document.getElementById("copy-issued-token");
+  const status = document.getElementById("copy-status");
+  if (!input || !button || !navigator.clipboard) return;
+  button.addEventListener("click", async () => {
+    await navigator.clipboard.writeText(input.value);
+    status.textContent = "已复制。请确认它已保存到受权限保护的秘密管理工具。";
+  });
+})();
+</script>
+{% endblock %}
+
+```
+
+## Current macOS desktop shell
+
+- Source: `desktop/GPU Broker.swift`
+- Description: AppKit window that starts the loopback service and hosts the entire interface in WKWebView. This is the dependency that must be replaced before the web UI can be deleted.
+
+```swift
+import AppKit
+import Darwin
+import Foundation
+import WebKit
+
+private enum DesktopError: LocalizedError {
+    case projectRootMissing
+    case uvMissing
+    case serverExecutableMissing
+    case commandFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .projectRootMissing:
+            return "找不到 gpu-broker 项目目录。请将 GPU Broker.app 保留在项目的 dist/ 目录，或设置 GPU_BROKER_ROOT。"
+        case .uvMissing:
+            return "找不到 uv。请先安装 uv，或设置 GPU_BROKER_UV 指向它的绝对路径。"
+        case .serverExecutableMissing:
+            return "初始化完成，但找不到项目虚拟环境中的 gpu-broker 可执行文件。"
+        case .commandFailed(let details):
+            return details
+        }
+    }
+}
+
+final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler {
+    private let port = 8787
+    private var window: NSWindow?
+    private var webView: WKWebView?
+    private var serverProcess: Process?
+    private var isStarting = false
+
+    private lazy var projectRoot: URL? = {
+        if let configured = ProcessInfo.processInfo.environment["GPU_BROKER_ROOT"], !configured.isEmpty {
+            return URL(fileURLWithPath: configured, isDirectory: true)
+        }
+        let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent()
+        return findProjectRoot(startingAt: bundleParent)
+    }()
+
+    private var baseURL: URL {
+        URL(string: "http://127.0.0.1:\(port)/")!
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.regular)
+        configureMainMenu()
+        let contentRect = NSRect(x: 0, y: 0, width: 1440, height: 820)
+        let createdWindow = NSWindow(
+            contentRect: contentRect,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        createdWindow.title = "GPU Broker"
+        createdWindow.titleVisibility = .hidden
+        createdWindow.titlebarAppearsTransparent = true
+        createdWindow.toolbarStyle = .unifiedCompact
+        createdWindow.titlebarSeparatorStyle = .none
+        createdWindow.backgroundColor = .windowBackgroundColor
+        createdWindow.minSize = NSSize(width: 1024, height: 640)
+        createdWindow.center()
+        createdWindow.delegate = self
+
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController.add(self, name: "gpuBrokerClipboard")
+        let view = WKWebView(frame: contentRect, configuration: configuration)
+        view.autoresizingMask = [.width, .height]
+        createdWindow.contentView = view
+        window = createdWindow
+        webView = view
+        createdWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        connectOrStartServer()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let process = serverProcess, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard
+            message.name == "gpuBrokerClipboard",
+            message.webView === webView,
+            message.webView?.url?.host == "127.0.0.1",
+            message.webView?.url?.port == port,
+            let body = message.body as? [String: Any],
+            let action = body["action"] as? String,
+            ["paste-ssh-command", "paste-token"].contains(action)
+        else {
+            return
+        }
+
+        guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
+            deliverClipboardError("系统剪贴板中没有可粘贴的文本。")
+            return
+        }
+        let callback = action == "paste-ssh-command" ? "gpuBrokerSetSSHCommand" : "gpuBrokerSetToken"
+        deliverClipboardText(text, to: callback)
+    }
+
+    private func configureMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "退出 GPU Broker", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    private func deliverClipboardText(_ text: String, to callback: String) {
+        guard let argument = jsonArgument(text) else {
+            deliverClipboardError("无法读取系统剪贴板文本。")
+            return
+        }
+        webView?.evaluateJavaScript("window.\(callback)?.(\(argument));")
+    }
+
+    private func deliverClipboardError(_ message: String) {
+        guard let argument = jsonArgument(message) else { return }
+        webView?.evaluateJavaScript("window.gpuBrokerClipboardError?.(\(argument));")
+    }
+
+    private func jsonArgument(_ value: String) -> String? {
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: [value]),
+            let array = String(data: data, encoding: .utf8),
+            array.count >= 2
+        else {
+            return nil
+        }
+        return String(array.dropFirst().dropLast())
+    }
+
+    private func findProjectRoot(startingAt url: URL) -> URL? {
+        var candidate = url.standardizedFileURL
+        let fileManager = FileManager.default
+        while candidate.path != "/" {
+            let projectFile = candidate.appendingPathComponent("pyproject.toml")
+            let inventory = candidate.appendingPathComponent("configs/inventory.yaml")
+            if fileManager.fileExists(atPath: projectFile.path) && fileManager.fileExists(atPath: inventory.path) {
+                return candidate
+            }
+            candidate.deleteLastPathComponent()
+        }
+        return nil
+    }
+
+    private func uvExecutable() -> URL? {
+        let environment = ProcessInfo.processInfo.environment
+        let home = environment["HOME"] ?? NSHomeDirectory()
+        let candidates = [
+            environment["GPU_BROKER_UV"],
+            "\(home)/.local/bin/uv",
+            "/opt/homebrew/bin/uv",
+            "/usr/local/bin/uv"
+        ].compactMap { $0 }
+        return candidates
+            .map { URL(fileURLWithPath: $0) }
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+    }
+
+    private func processEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        if let root = projectRoot {
+            environment["GPU_BROKER_PROJECT_ROOT"] = root.path
+        }
+        return environment
+    }
+
+    private func connectOrStartServer(attempt: Int = 0) {
+        healthCheck { [weak self] ready in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if ready {
+                    self.webView?.load(URLRequest(url: self.baseURL))
+                    return
+                }
+                if self.serverProcess == nil && !self.isStarting {
+                    self.initializeAndStartServer()
+                    return
+                }
+                if attempt < 80 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        self.connectOrStartServer(attempt: attempt + 1)
+                    }
+                } else {
+                    self.showFatalError("本机 GPU Broker 服务未能在规定时间内启动。请检查项目依赖和 state 目录。")
+                }
+            }
+        }
+    }
+
+    private func healthCheck(completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .utility).async { [port] in
+            let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+            guard descriptor >= 0 else {
+                completion(false)
+                return
+            }
+            defer { Darwin.close(descriptor) }
+
+            var timeout = timeval(tv_sec: 0, tv_usec: 800_000)
+            withUnsafePointer(to: &timeout) { pointer in
+                _ = Darwin.setsockopt(
+                    descriptor,
+                    SOL_SOCKET,
+                    SO_RCVTIMEO,
+                    pointer,
+                    socklen_t(MemoryLayout<timeval>.size)
+                )
+            }
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = in_port_t(port).bigEndian
+            guard inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1 else {
+                completion(false)
+                return
+            }
+            let connected = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard connected == 0 else {
+                completion(false)
+                return
+            }
+
+            let request = "GET /health/live HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
+            let sent = request.utf8CString.withUnsafeBytes { bytes in
+                Darwin.send(descriptor, bytes.baseAddress, bytes.count - 1, 0)
+            }
+            guard sent > 0 else {
+                completion(false)
+                return
+            }
+            var buffer = [UInt8](repeating: 0, count: 256)
+            let received = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.recv(descriptor, bytes.baseAddress, bytes.count, 0)
+            }
+            guard received > 0 else {
+                completion(false)
+                return
+            }
+            let header = String(decoding: buffer.prefix(received), as: UTF8.self)
+            completion(header.hasPrefix("HTTP/1.1 200") || header.hasPrefix("HTTP/1.0 200"))
+        }
+    }
+
+    private func initializeAndStartServer() {
+        guard let root = projectRoot else {
+            showFatalError(DesktopError.projectRootMissing.localizedDescription)
+            return
+        }
+        guard let uv = uvExecutable() else {
+            showFatalError(DesktopError.uvMissing.localizedDescription)
+            return
+        }
+        isStarting = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try self.runCommand(
+                    executable: uv,
+                    arguments: [
+                        "run", "--no-editable", "--reinstall-package", "gpu-broker",
+                        "gpu-broker", "init", "--db", "state/gpu-broker.sqlite3",
+                        "--inventory", "configs/inventory.yaml"
+                    ],
+                    root: root
+                )
+                let serverExecutable = root.appendingPathComponent(".venv/bin/gpu-broker")
+                guard FileManager.default.isExecutableFile(atPath: serverExecutable.path) else {
+                    throw DesktopError.serverExecutableMissing
+                }
+                DispatchQueue.main.async {
+                    do {
+                        try self.startServer(executable: serverExecutable, root: root)
+                        self.isStarting = false
+                        self.connectOrStartServer()
+                    } catch {
+                        self.isStarting = false
+                        self.showFatalError(error.localizedDescription)
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.isStarting = false
+                    self.showFatalError(error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func runCommand(executable: URL, arguments: [String], root: URL) throws -> String {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.currentDirectoryURL = root
+        process.environment = processEnvironment()
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let details = String(data: data, encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0 else {
+            throw DesktopError.commandFailed("初始化本机状态失败：\(details)")
+        }
+        return details
+    }
+
+    private func startServer(executable: URL, root: URL) throws {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [
+            "serve", "--db", "state/gpu-broker.sqlite3",
+            "--inventory", "configs/inventory.yaml", "--host", "127.0.0.1", "--port", "\(port)"
+        ]
+        process.currentDirectoryURL = root
+        process.environment = processEnvironment()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        serverProcess = process
+    }
+
+    private func showFatalError(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "无法启动 GPU Broker"
+        alert.informativeText = message
+        alert.addButton(withTitle: "退出")
+        alert.runModal()
+        NSApp.terminate(nil)
+    }
+}
+
+let application = NSApplication.shared
+application.setActivationPolicy(.regular)
+let delegate = DesktopAppDelegate()
+application.delegate = delegate
+application.run()
+
+```
