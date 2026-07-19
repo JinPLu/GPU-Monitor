@@ -80,7 +80,7 @@
     <article class="card">
       <div class="card-title"><strong>{{ lease.actor_id }}</strong><span class="badge">{{ lease.state }}</span></div>
       <p>GPU：{% for gpu_id in lease.gpu_ids %}<code>{{ gpu_id }}</code>{% if not loop.last %}、{% endif %}{% endfor %}</p>
-      <p class="muted">项目 {{ lease.project_id }} · 到期 {{ lease.expires_at }}</p>
+      <p class="muted">项目 {{ lease.project_id }} · 安全截止 {{ lease.expires_at }}</p>
     </article>
   {% else %}<p class="empty">当前没有人或 Agent 认领 GPU。</p>{% endfor %}
   </div>
@@ -126,20 +126,31 @@
 <section id="new-request" class="actions" aria-labelledby="request-title">
   <h2 id="request-title">认领 GPU</h2>
   <p>认领者：<strong>{{ actor.id }}</strong></p>
-  <p class="muted">空闲资源会立即归到这个名称下；暂时不可用时会进入共享队列。</p>
-  <form method="post" action="/ui/action/request" class="stack form-grid">
-    <label>任务名称<input name="task_ref" required placeholder="例如：wan-video-eval"></label>
-    <label>项目<select name="project_id" required>{% for project in payload.projects %}<option value="{{ project.id }}">{{ project.display_name }}</option>{% endfor %}</select></label>
-    <label class="span-all">用途<input name="purpose" required placeholder="一句话说明这批 GPU 做什么"></label>
-    <label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
-    <label>使用时长<select name="duration_hours"><option value="1">1 小时</option><option value="2">2 小时</option><option value="4" selected>4 小时</option><option value="8">8 小时</option><option value="24">24 小时</option></select></label>
-    <label>指定服务器（可留空）<select name="endpoint_id"><option value="">自动选择</option>{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
-    <label class="span-all">或直接指定 GPU（可留空；按 ⌘ 多选）<select name="gpu_ids" multiple size="6">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label>
-    <input type="hidden" name="placement" value="pack">
-    <input type="hidden" name="csrf" value="{{ csrf }}">
-    <input type="hidden" name="confirmed" value="yes">
-    <button type="submit">立即认领 / 排队</button>
+  <p class="muted">日常工作直接选项目配置和任务；资源范围和用途由项目预先批准。完成后释放租约，空闲资源会立即归到这个名称下，不足时自动进入共享队列。</p>
+  {% if payload.claimable_workload_profiles %}
+  <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
+    <label>项目配置<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ profile.constraints.gpu_count }} GPU</option>{% endfor %}</select></label>
+    <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
+    <p class="field-help span-all">按配置认领会直接登记为使用中，但不会启动远端任务。</p>
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
+    <button type="submit">按配置认领</button>
   </form>
+  {% else %}
+  <p class="field-help">还没有可用的项目配置；管理员可在“项目”页创建。临时需求请使用下方一次性认领。</p>
+  {% endif %}
+  <details>
+    <summary>一次性认领（需明确资源）</summary>
+    <form method="post" action="/ui/action/quick-claim" class="stack form-grid quick-claim-form">
+      <label>项目<select name="project_id" required>{% for project in payload.projects %}<option value="{{ project.id }}">{{ project.display_name }}</option>{% endfor %}</select></label>
+      <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
+      <label>服务器<select name="endpoint_id"><option value="">自动选择</option>{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
+      <label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
+      <details class="span-all"><summary>高级：指定精确 GPU</summary><label>GPU（可多选）<select name="gpu_ids" multiple size="6">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label><p class="field-help">选择后以所选 GPU 数量为准。</p></details>
+      <p class="field-help span-all">临时任务会把任务说明写入审计用途；完成后请释放租约。认领成功同样不会启动远端任务。</p>
+      <input type="hidden" name="placement" value="pack"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
+      <button type="submit">一次性认领</button>
+    </form>
+  </details>
 </section>
 {% endif %}
 
@@ -150,7 +161,8 @@
     <article class="card request-card state-{{ item.state|lower }}">
       <div class="card-title"><div><strong>{{ item.task_ref }}</strong><p class="muted">{{ item.project_id }} · {{ item.actor_id }}</p></div><span class="badge">{{ item.state }}</span></div>
       <p>{{ item.purpose }}</p>
-      <p>资源：{{ item.constraints.gpu_count }} GPU · 时长 {{ (item.duration_seconds / 3600)|round(1) }} 小时</p>
+      <p>资源：{{ item.constraints.gpu_count }} GPU</p>
+      {% if item.profile_id %}<p class="muted">项目配置：<code>{{ item.profile_id }}</code></p>{% endif %}
       {% if item.blocked_reason %}<p class="warning-text">队列说明：{{ item.blocked_reason }}</p>{% endif %}
       {% if item.state == 'QUEUED' and actor.role in ['allocator', 'operator', 'admin'] %}
       <form method="post" action="/ui/action/cancel-request" class="inline-form">
@@ -172,7 +184,7 @@
     <article class="card lease-card state-{{ lease.state|lower }}">
       <div class="card-title"><div><strong>{{ lease.actor_id }}</strong><p class="muted">{{ lease.project_id }}</p></div><span class="badge">{{ lease.state }}</span></div>
       <p>GPU：{% for gpu_id in lease.gpu_ids %}<code>{{ gpu_id }}</code>{% if not loop.last %}、{% endif %}{% endfor %}</p>
-      <p>到期：{{ lease.expires_at }}</p>
+      <p>安全截止：{{ lease.expires_at }}</p>
       <div class="inline-actions">
         <form method="post" action="/ui/action/renew-lease" class="inline-form">
           <input type="hidden" name="lease_id" value="{{ lease.id }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes"><button type="submit">延长</button>
@@ -195,7 +207,7 @@
     <article class="card lease-card state-{{ lease.state|lower }}">
       <div class="card-title"><div><strong>{{ lease.project_id }}</strong><p class="muted"><code>{{ lease.id }}</code></p></div><span class="badge">{{ lease.state }}</span></div>
       <p>GPU：{% for gpu_id in lease.gpu_ids %}<code>{{ gpu_id }}</code>{% if not loop.last %}、{% endif %}{% endfor %}</p>
-      <p>到期：{{ lease.expires_at or '—' }}{% if lease.workloads %} · 已绑定 {{ lease.workloads|length }} 个工作负载{% endif %}</p>
+      <p>安全截止：{{ lease.expires_at or '—' }}{% if lease.workloads %} · 已绑定 {{ lease.workloads|length }} 个工作负载{% endif %}</p>
       {% if actor.role in ['allocator', 'operator', 'admin'] and lease.state == 'HELD' %}
       <form method="post" action="/ui/action/activate-lease" class="inline-form">
         <input type="hidden" name="lease_id" value="{{ lease.id }}"><input type="hidden" name="csrf" value="{{ csrf }}">
@@ -264,6 +276,10 @@
 {% for project in payload.projects %}<article class="card"><div class="card-title"><strong>{{ project.display_name }}</strong><span class="badge">{{ '启用' if project.enabled else '禁用' }}</span></div><p><code>{{ project.id }}</code> · 权重 {{ project.weight }} · 配额 {{ project.quota_gpus or '未限制' }} GPU</p></article>{% else %}<p class="empty">尚无可见项目。</p>{% endfor %}
 </div></section>
 
+<section class="list-section"><h2>项目工作负载配置</h2><p class="muted">这是项目批准的资源合同。日常 Agent 只需传配置 ID 和任务，不能自行改 GPU 数、用途或服务器范围。</p><div class="stacked-cards">
+{% for profile in payload.workload_profiles %}<article class="card"><div class="card-title"><strong>{{ profile.display_name }}</strong><span class="badge">{{ '启用' if profile.enabled else '禁用' }}</span></div><p><code>{{ profile.id }}</code> · {{ profile.project_id }}</p><p>{{ profile.constraints.gpu_count }} GPU · 服务器：{{ profile.constraints.endpoint_ids|join('、') }}</p><p class="muted">用途：{{ profile.purpose }}</p></article>{% else %}<p class="empty">尚无项目配置。管理员可在下方创建第一条。</p>{% endfor %}
+</div></section>
+
 {% if actor.is_admin %}
 <section class="actions" aria-labelledby="project-admin-title">
   <h2 id="project-admin-title">项目与身份管理</h2>
@@ -274,6 +290,18 @@
       <label>公平权重<input name="weight" type="number" min="1" value="1" required></label><label>GPU 配额（可留空）<input name="quota_gpus" type="number" min="1"></label>
       <label>并发限制（可留空）<input name="concurrency_limit" type="number" min="1"></label><label>状态<select name="enabled"><option value="true">启用</option><option value="false">禁用</option></select></label>
       <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认项目策略变更会影响后续调度。</label><button type="submit">保存项目</button>
+    </form>
+  </details>
+  <details>
+    <summary>创建或更新项目工作负载配置</summary>
+    <form method="post" action="/ui/action/workload-profile" class="stack form-grid">
+      <label>配置 ID<input name="id" required placeholder="wrbench-eval-2gpu"></label><label>显示名称<input name="display_name" required placeholder="WRBench 双卡评测"></label>
+      <label>项目<select name="project_id" required>{% for project in payload.projects %}<option value="{{ project.id }}">{{ project.display_name }}（{{ project.id }}）</option>{% endfor %}</select></label><label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
+      <label>最大租约窗口<select name="duration_hours"><option value="1">1 小时</option><option value="2" selected>2 小时</option><option value="4">4 小时</option><option value="8">8 小时</option><option value="24">24 小时</option></select></label><label>状态<select name="enabled"><option value="true">启用</option><option value="false">禁用</option></select></label>
+      <label class="span-all">允许服务器（可多选，留空则使用项目已授权的全部服务器）<select name="endpoint_ids" multiple size="6">{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
+      <label class="span-all">固定用途<textarea name="purpose" rows="2" required placeholder="例如：WRBench 图像/视频生成基准评测"></textarea></label>
+      <p class="field-help span-all">同一配置 ID 只能保留在原项目中。服务器必须已授权给所选项目；完成即释放租约。最大租约窗口是调度与未来预约共同遵守的硬边界，不是每次申请的预计时长。精确 GPU 固定选择仍应走一次性申请。</p>
+      <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认这是可由 Agent 按配置重复认领的项目资源合同。</label><button type="submit">保存项目配置</button>
     </form>
   </details>
   <details>

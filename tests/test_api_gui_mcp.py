@@ -13,7 +13,7 @@ from gpu_broker.cli import app as cli_app
 from gpu_broker.config import InventoryConfig, ProjectConfig, Settings
 from gpu_broker.mcp_server import mcp
 from gpu_broker.schemas import EndpointUpsert
-from tests.helpers import observation
+from tests.helpers import observation, process_for_gpu
 
 
 def _csrf(html: str) -> str:
@@ -55,21 +55,29 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert "/static/vendor/phosphor/style.css?v=2.1.2" in home.text
     assert "uPlot.iife.min.js" not in home.text
     assert "API token" not in home.text
+    assert '/ui/action/quick-claim' in home.text
+    assert 'name="purpose"' not in home.text
     headers = {"X-GPU-Broker-Actor": "test-agent", "Idempotency-Key": "api-key"}
     payload = {
         "project_id": "project-a",
         "task_ref": "api-request",
         "purpose": "API test",
-        "duration_seconds": 3600,
         "constraints": {"gpu_count": 1},
     }
     first = client.post("/api/v1/requests", json=payload, headers=headers)
     second = client.post("/api/v1/requests", json=payload, headers=headers)
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json()
+    assert first.json()["request"]["duration_seconds"] == 8 * 60 * 60
     snapshot = client.get("/api/v1/snapshot", headers={"X-GPU-Broker-Actor": "test-agent"})
     assert snapshot.status_code == 200
     assert snapshot.json()["data"]["gpus"][0]["state"] == "HELD"
+    assert client.get("/health/live").json()["capabilities"] == [
+        "workload_profiles",
+        "instant_claims",
+        "project_endpoint_grants",
+        "coordination_board",
+    ]
     compact = client.get(
         "/api/v1/gpus?compact=true",
         headers={"X-GPU-Broker-Actor": "test-agent"},
@@ -86,6 +94,157 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     requests = client.get("/ui/requests")
     assert requests.status_code == 200
     assert "认领 GPU" in requests.text
+
+
+def test_workload_profile_rest_and_gui_claim(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'profiles.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    service.ingest_observation(observation(count=1))
+    client = TestClient(app)
+    headers = {"X-GPU-Broker-Actor": "profile-agent", "Idempotency-Key": "profile-upsert"}
+    profile = {
+        "id": "api-eval-1gpu",
+        "project_id": "project-a",
+        "display_name": "API evaluation",
+        "purpose": "approved API evaluation",
+        "duration_seconds": 3600,
+        "constraints": {
+            "gpu_count": 1,
+            "placement": "pack",
+            "endpoint_ids": ["endpoint-a"],
+        },
+        "enabled": True,
+    }
+    created = client.post("/api/v1/workload-profiles", json=profile, headers=headers)
+    assert created.status_code == 200
+    assert created.json()["workload_profile"]["id"] == "api-eval-1gpu"
+
+    listed = client.get(
+        "/api/v1/workload-profiles?project_id=project-a",
+        headers={"X-GPU-Broker-Actor": "profile-agent"},
+    )
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["data"]] == ["api-eval-1gpu"]
+
+    page = client.get("/ui/requests")
+    assert page.status_code == 200
+    assert '/ui/action/profile-claim' in page.text
+    assert 'value="api-eval-1gpu"' in page.text
+    claimed = client.post(
+        "/ui/action/profile-claim",
+        data={
+            "profile_id": "api-eval-1gpu",
+            "task_ref": "profile-gui-task",
+            "csrf": _csrf(page.text),
+            "confirmed": "yes",
+        },
+        follow_redirects=True,
+    )
+    assert claimed.status_code == 200
+    assert "GPU 已认领并登记为使用中" in claimed.text
+    request = service.list_requests(service.local_actor("human"))["data"][0]
+    assert request["profile_id"] == "api-eval-1gpu"
+    assert request["purpose"] == "approved API evaluation"
+    assert request["state"] == "ACTIVE"
+
+
+def test_api_claim_auto_activates_without_a_duration_estimate(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'claim.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    app.state.service.ingest_observation(observation(count=1))
+    client = TestClient(app)
+    claimed = client.post(
+        "/api/v1/claims",
+        json={
+            "project_id": "project-a",
+            "task_ref": "api-claim",
+            "purpose": "api-claim",
+            "constraints": {"gpu_count": 1},
+        },
+        headers={"X-GPU-Broker-Actor": "claim-agent", "Idempotency-Key": "api-claim"},
+    )
+    assert claimed.status_code == 200
+    assert claimed.json()["request"]["state"] == "ACTIVE"
+    assert claimed.json()["lease"]["state"] == "ACTIVE"
+    assert claimed.json()["request"]["duration_seconds"] == 8 * 60 * 60
+
+
+def test_coordination_api_and_observed_binding(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'coordination.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    service.ingest_observation(observation(count=1))
+    client = TestClient(app)
+    claim_headers = {"X-GPU-Broker-Actor": "coordination-agent", "Idempotency-Key": "coordination-claim"}
+    claimed = client.post(
+        "/api/v1/claims",
+        json={
+            "project_id": "project-a",
+            "task_ref": "coordination-api-run",
+            "purpose": "coordination-api-run",
+            "constraints": {"gpu_count": 1},
+        },
+        headers=claim_headers,
+    )
+    assert claimed.status_code == 200
+    lease_id = claimed.json()["lease"]["id"]
+    gpu = service.list_gpus(service.local_actor("coordination-agent"))["data"][0]
+    service.ingest_observation(observation(count=1, processes=[process_for_gpu(gpu["gpu_uuid"])]))
+
+    bound = client.post(
+        f"/api/v1/leases/{lease_id}/bind-observed-workload",
+        json={},
+        headers={"X-GPU-Broker-Actor": "coordination-agent", "Idempotency-Key": "coordination-bind"},
+    )
+    assert bound.status_code == 200
+    assert bound.json()["lease"]["workloads"][0]["run_id"] == f"lease:{lease_id}"
+    board = client.get("/api/v1/coordination", headers={"X-GPU-Broker-Actor": "coordination-agent"})
+    assert board.status_code == 200
+    assert board.json()["data"]["servers"][0]["capacity"]["managed_running_gpus"] == 1
+    assert board.json()["data"]["leases"][0]["activity"] == "running"
+
+
+def test_endpoint_project_grant_is_additive(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'endpoint-project.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    client = TestClient(app)
+    headers = {"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "grant-project-b"}
+    response = client.post(
+        "/api/v1/endpoints/endpoint-a/projects",
+        json={"project_id": "project-b"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["project_ids"] == ["project-a", "project-b"]
 
 
 def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) -> None:
@@ -105,16 +264,15 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
     request_page = client.get("/ui/requests")
     assert request_page.status_code == 200
     assert 'name="task_ref"' in request_page.text
+    assert 'name="purpose"' not in request_page.text
+    assert '/ui/action/quick-claim' in request_page.text
     assert "JSON payload" not in request_page.text
     submitted = client.post(
-        "/ui/action/request",
+        "/ui/action/quick-claim",
         data={
             "project_id": "project-a",
             "task_ref": "click-first-request",
-            "purpose": "browser form test",
             "gpu_count": "1",
-            "duration_hours": "1",
-            "min_free_vram_gib": "",
             "placement": "pack",
             "endpoint_id": "",
             "csrf": _csrf(request_page.text),
@@ -123,18 +281,13 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
         follow_redirects=True,
     )
     assert submitted.status_code == 200
-    assert "资源请求已获分配" in submitted.text
+    assert "GPU 已认领并登记为使用中" in submitted.text
 
     lease = service.list_leases(service.local_actor("human"))["data"][0]
-    lease_page = client.get("/ui/leases")
-    assert "激活租约" in lease_page.text
-    activated = client.post(
-        "/ui/action/activate-lease",
-        data={"lease_id": lease["id"], "csrf": _csrf(lease_page.text), "confirmed": "yes"},
-        follow_redirects=True,
-    )
-    assert activated.status_code == 200
-    assert "操作完成" in activated.text
+    assert lease["state"] == "ACTIVE"
+    request = service.list_requests(service.local_actor("human"))["data"][0]
+    assert request["state"] == "ACTIVE"
+    assert request["purpose"] == "click-first-request"
 
     home_page = client.get("/")
     added_server = client.post(
@@ -171,8 +324,10 @@ def test_mcp_exposes_required_tools() -> None:
     names = set(by_name)
     assert {
         "gpu_status",
+        "gpu_coordination",
         "gpu_list",
         "gpu_who",
+        "gpu_list_profiles",
         "gpu_request",
         "gpu_request_status",
         "gpu_cancel_request",
@@ -180,17 +335,27 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_renew_lease",
         "gpu_release_lease",
         "gpu_bind_workload",
+        "gpu_bind_observed_workload",
         "gpu_list_reservations",
         "gpu_history",
         "gpu_claim",
+        "gpu_claim_profile",
         "gpu_release",
         "gpu_schedule",
         "gpu_add_server",
+        "gpu_grant_server_project",
     }.issubset(names)
     for name in ("gpu_claim", "gpu_schedule", "gpu_add_server"):
         assert "project_id" in by_name[name].inputSchema["required"]
-    assert {"purpose", "gpu_count", "hours"}.issubset(by_name["gpu_claim"].inputSchema["required"])
-    assert "reason" in by_name["gpu_release"].inputSchema["required"]
+    assert {"agent_name", "project_id", "task", "gpu_count"}.issubset(
+        by_name["gpu_claim"].inputSchema["required"]
+    )
+    assert "purpose" not in by_name["gpu_claim"].inputSchema["required"]
+    assert "hours" not in by_name["gpu_claim"].inputSchema["properties"]
+    assert {"agent_name", "profile_id", "task"}.issubset(
+        by_name["gpu_claim_profile"].inputSchema["required"]
+    )
+    assert "reason" not in by_name["gpu_release"].inputSchema["required"]
 
 
 def test_ssh_preview_commit_is_bound_non_mutating_and_uses_defaults(tmp_path: Path, inventory) -> None:

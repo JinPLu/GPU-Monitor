@@ -41,6 +41,7 @@ from gpu_broker.models import (
     TelemetryCurrent,
     TelemetrySnapshot,
     WorkloadBinding,
+    WorkloadProfile,
 )
 from gpu_broker.schemas import (
     ActorCreate,
@@ -49,12 +50,15 @@ from gpu_broker.schemas import (
     EndpointEnabled,
     EndpointUpsert,
     LeaseBind,
+    LeaseObservedBind,
     MaintenanceCreate,
     ProjectUpsert,
     RetentionPrune,
     RequestCreate,
     ReservationCreate,
     ResourceConstraints,
+    WorkloadProfileClaim,
+    WorkloadProfileUpsert,
 )
 from gpu_broker.timeutil import ensure_utc, json_dump, json_load, stable_hash, token_hash, utcnow
 
@@ -63,6 +67,12 @@ ACTIVE_LEASE_STATES = {"HELD", "ACTIVE", "ORPHANED_BUSY", "CONFLICT"}
 TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
 TELEMETRY_HISTORY_INTERVAL_SECONDS = 60
 TELEMETRY_HISTORY_RETENTION_SECONDS = 24 * 60 * 60
+# The collector derives a process start time from `ps etimes`, which has
+# one-second precision and is sampled after the endpoint observation begins.
+# Preserve the already-observed identity across this bounded measurement
+# jitter; otherwise a healthy long-running process can look new on every
+# collection and lose its workload attribution.
+PROCESS_START_TIME_JITTER_SECONDS = 2
 MUTATING_ROLES = {"allocator", "operator", "admin"}
 OPERATOR_ROLES = {"operator", "admin"}
 ADMIN_ROLES = {"admin"}
@@ -533,6 +543,20 @@ class BrokerService:
         }
 
     @staticmethod
+    def _workload_profile_dict(profile: WorkloadProfile) -> dict[str, Any]:
+        return {
+            "id": profile.id,
+            "project_id": profile.project_id,
+            "display_name": profile.display_name,
+            "purpose": profile.purpose,
+            "duration_seconds": profile.duration_seconds,
+            "constraints": json_load(profile.constraints_json),
+            "enabled": profile.enabled,
+            "created_at": _iso(profile.created_at),
+            "updated_at": _iso(profile.updated_at),
+        }
+
+    @staticmethod
     def _actor_dict(actor: Actor, project_ids: Iterable[str]) -> dict[str, Any]:
         return {
             "id": actor.id,
@@ -550,11 +574,11 @@ class BrokerService:
             "id": request.id,
             "actor_id": request.actor_id,
             "project_id": request.project_id,
+            "profile_id": request.profile_id,
             "task_ref": request.task_ref,
             "purpose": request.purpose,
             "constraints": json_load(request.constraints_json),
             "duration_seconds": request.duration_seconds,
-            "expected_duration_seconds": request.expected_duration_seconds,
             "start_after": _iso(request.start_after),
             "deadline": _iso(request.deadline),
             "approval_ref": request.approval_ref,
@@ -789,18 +813,36 @@ class BrokerService:
         assert started is not None
         return f"{process.gpu_id}:{process.pid}:{process.boot_id}:{int(started.timestamp())}"
 
+    @classmethod
+    def _process_dict(cls, process: ProcessObservation) -> dict[str, Any]:
+        return {
+            "pid": process.pid,
+            "boot_id": process.boot_id,
+            "process_started_at": _iso(process.process_started_at),
+            "process_key": cls._process_key(process),
+            "username": process.username,
+            "executable": process.executable,
+            "used_memory_mib": process.used_memory_mib,
+            "observations": process.observations,
+            "first_seen_at": _iso(process.first_seen_at),
+            "last_seen_at": _iso(process.last_seen_at),
+        }
+
     def _processes_match_binding(
         self, session: Session, lease_id: str, processes: Iterable[ProcessObservation]
     ) -> bool:
-        bindings = session.scalars(
-            select(WorkloadBinding).where(WorkloadBinding.lease_id == lease_id)
-        ).all()
-        known = {
-            item
-            for binding in bindings
-            for item in json_load(binding.process_keys_json)
-        }
+        known = self._binding_process_keys(session, lease_id)
         return bool(known) and all(self._process_key(process) in known for process in processes)
+
+    @staticmethod
+    def _binding_process_keys(session: Session, lease_id: str) -> set[str]:
+        return {
+            process_key
+            for binding in session.scalars(
+                select(WorkloadBinding).where(WorkloadBinding.lease_id == lease_id)
+            ).all()
+            for process_key in json_load(binding.process_keys_json)
+        }
 
     def _gpu_dict(self, session: Session, gpu: GPUDevice, now: datetime) -> dict[str, Any]:
         telemetry = self._latest_telemetry(session, gpu.id)
@@ -822,20 +864,7 @@ class BrokerService:
             "first_seen_at": _iso(gpu.first_seen_at),
             "last_seen_at": _iso(gpu.last_seen_at),
             "telemetry": self._telemetry_dict(telemetry),
-            "processes": [
-                {
-                    "pid": process.pid,
-                    "boot_id": process.boot_id,
-                    "process_started_at": _iso(process.process_started_at),
-                    "username": process.username,
-                    "executable": process.executable,
-                    "used_memory_mib": process.used_memory_mib,
-                    "observations": process.observations,
-                    "first_seen_at": _iso(process.first_seen_at),
-                    "last_seen_at": _iso(process.last_seen_at),
-                }
-                for process in processes
-            ],
+            "processes": [self._process_dict(process) for process in processes],
             "lease": self._lease_dict(session, lease) if lease else None,
         }
 
@@ -1066,6 +1095,7 @@ class BrokerService:
                     monitor_status = "ONLINE"
                 return {
                     **self._endpoint_dict(endpoint),
+                    "project_ids": sorted(endpoint_access[endpoint.id]),
                     "host_telemetry": self._host_telemetry_dict(
                         host_telemetry_by_endpoint.get(endpoint.id)
                     ),
@@ -1143,20 +1173,7 @@ class BrokerService:
                     "first_seen_at": _iso(gpu.first_seen_at),
                     "last_seen_at": _iso(gpu.last_seen_at),
                     "telemetry": self._telemetry_dict(telemetry),
-                    "processes": [
-                        {
-                            "pid": process.pid,
-                            "boot_id": process.boot_id,
-                            "process_started_at": _iso(process.process_started_at),
-                            "username": process.username,
-                            "executable": process.executable,
-                            "used_memory_mib": process.used_memory_mib,
-                            "observations": process.observations,
-                            "first_seen_at": _iso(process.first_seen_at),
-                            "last_seen_at": _iso(process.last_seen_at),
-                        }
-                        for process in processes
-                    ],
+                    "processes": [self._process_dict(process) for process in processes],
                     "lease": lease_payloads.get(lease.id) if lease else None,
                 }
                 gpu_payloads.append(payload)
@@ -1237,6 +1254,229 @@ class BrokerService:
             return self.envelope(session, data)
 
         return self._read(operation)
+
+    def coordination(self, actor: ActorContext) -> dict[str, Any]:
+        """Return an agent-readable shared coordination board from one broker snapshot.
+
+        This is intentionally observational: the broker already owns fair queue
+        ordering and placement. Agents use this board to see current consumers,
+        real process attribution, and remaining capacity without appointing a
+        separate scheduler or inspecting servers themselves.
+        """
+
+        snapshot = self.snapshot(actor, compact=False)
+        data = snapshot["data"]
+        gpus: list[dict[str, Any]] = data["gpus"]
+        gpus_by_id = {gpu["id"]: gpu for gpu in gpus}
+        gpus_by_endpoint: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for gpu in gpus:
+            gpus_by_endpoint[gpu["endpoint_id"]].append(gpu)
+
+        def average(values: Iterable[int | float | None]) -> float | None:
+            present = [float(value) for value in values if value is not None]
+            return round(sum(present) / len(present), 1) if present else None
+
+        def gpu_state_counts(values: Iterable[dict[str, Any]]) -> dict[str, int]:
+            counts: dict[str, int] = defaultdict(int)
+            for gpu in values:
+                counts[gpu["state"]] += 1
+            return dict(sorted(counts.items()))
+
+        def lease_activity(values: list[dict[str, Any]]) -> str:
+            states = {gpu["state"] for gpu in values}
+            if states.intersection({"CONFLICT", "ORPHANED_BUSY"}):
+                return "needs_attention"
+            if "BUSY_UNMANAGED" in states:
+                return "unattributed_compute"
+            if "RUNNING_MANAGED" in states:
+                return "running"
+            if values and all(gpu["state"] == "LEASED_IDLE" for gpu in values):
+                return "lease_idle"
+            if values and all(gpu["state"] == "HELD" for gpu in values):
+                return "held"
+            return "starting"
+
+        lease_cards: list[dict[str, Any]] = []
+        consumers_by_endpoint: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        agents: dict[str, dict[str, Any]] = {}
+        signals: list[dict[str, Any]] = []
+        for lease in data["leases"]:
+            lease_gpus = [gpus_by_id[gpu_id] for gpu_id in lease["gpu_ids"] if gpu_id in gpus_by_id]
+            endpoint_ids = sorted({gpu["endpoint_id"] for gpu in lease_gpus})
+            activity = lease_activity(lease_gpus)
+            state_counts = gpu_state_counts(lease_gpus)
+            telemetry = [gpu["telemetry"] for gpu in lease_gpus if gpu["telemetry"] is not None]
+            card = {
+                "lease_id": lease["id"],
+                "agent_name": lease["actor_id"],
+                "project_id": lease["project_id"],
+                "task": lease["task_ref"],
+                "state": lease["state"],
+                "activity": activity,
+                "gpu_count": len(lease_gpus),
+                "servers": endpoint_ids,
+                "gpu_states": state_counts,
+                "observed_gpu_utilization_pct": average(
+                    item["gpu_utilization_pct"] for item in telemetry
+                ),
+                "observed_memory_used_mib": sum(item["memory_used_mib"] for item in telemetry),
+                "observed_process_count": sum(len(gpu["processes"]) for gpu in lease_gpus),
+                "workloads": [
+                    {"run_id": workload["run_id"], "process_key_count": len(workload["process_keys"])}
+                    for workload in lease["workloads"]
+                ],
+                "issued_at": lease["issued_at"],
+                "expires_at": lease["expires_at"],
+            }
+            lease_cards.append(card)
+            for endpoint_id in endpoint_ids:
+                endpoint_gpu_count = sum(gpu["endpoint_id"] == endpoint_id for gpu in lease_gpus)
+                consumers_by_endpoint[endpoint_id].append(
+                    {
+                        "lease_id": card["lease_id"],
+                        "agent_name": card["agent_name"],
+                        "project_id": card["project_id"],
+                        "task": card["task"],
+                        "gpu_count": endpoint_gpu_count,
+                        "activity": card["activity"],
+                    }
+                )
+            agent = agents.setdefault(
+                lease["actor_id"],
+                {
+                    "agent_name": lease["actor_id"],
+                    "active_leases": 0,
+                    "leased_gpus": 0,
+                    "managed_running_gpus": 0,
+                    "idle_leased_gpus": 0,
+                    "projects": set(),
+                    "servers": set(),
+                },
+            )
+            agent["active_leases"] += 1
+            agent["leased_gpus"] += len(lease_gpus)
+            agent["managed_running_gpus"] += state_counts.get("RUNNING_MANAGED", 0)
+            agent["idle_leased_gpus"] += state_counts.get("LEASED_IDLE", 0)
+            agent["projects"].add(lease["project_id"])
+            agent["servers"].update(endpoint_ids)
+            if activity == "lease_idle":
+                signals.append(
+                    {
+                        "kind": "lease_idle",
+                        "severity": "info",
+                        "lease_id": lease["id"],
+                        "agent_name": lease["actor_id"],
+                        "message": "active lease has no observed compute process yet",
+                    }
+                )
+            elif activity == "unattributed_compute":
+                signals.append(
+                    {
+                        "kind": "unattributed_compute",
+                        "severity": "warning",
+                        "lease_id": lease["id"],
+                        "agent_name": lease["actor_id"],
+                        "message": "compute process is observed but not bound to this lease",
+                    }
+                )
+            elif activity == "needs_attention":
+                signals.append(
+                    {
+                        "kind": "lease_conflict",
+                        "severity": "critical",
+                        "lease_id": lease["id"],
+                        "agent_name": lease["actor_id"],
+                        "message": "lease has a process-attribution or expiry conflict",
+                    }
+                )
+
+        server_cards: list[dict[str, Any]] = []
+        for endpoint in data["endpoints"]:
+            endpoint_gpus = gpus_by_endpoint[endpoint["id"]]
+            endpoint_telemetry = [gpu["telemetry"] for gpu in endpoint_gpus if gpu["telemetry"] is not None]
+            state_counts = gpu_state_counts(endpoint_gpus)
+            server_cards.append(
+                {
+                    "server_id": endpoint["id"],
+                    "project_ids": endpoint["project_ids"],
+                    "monitor_status": endpoint["monitor"]["status"],
+                    "host_telemetry": endpoint["host_telemetry"],
+                    "capacity": {
+                        "total_gpus": len(endpoint_gpus),
+                        "available_gpus": state_counts.get("AVAILABLE", 0),
+                        "leased_gpus": sum(1 for gpu in endpoint_gpus if gpu["lease"] is not None),
+                        "managed_running_gpus": state_counts.get("RUNNING_MANAGED", 0),
+                        "idle_leased_gpus": state_counts.get("LEASED_IDLE", 0),
+                        "unattributed_compute_gpus": state_counts.get("BUSY_UNMANAGED", 0),
+                        "gpu_states": state_counts,
+                        "observed_gpu_utilization_pct": average(
+                            item["gpu_utilization_pct"] for item in endpoint_telemetry
+                        ),
+                        "observed_memory_used_mib": sum(
+                            item["memory_used_mib"] for item in endpoint_telemetry
+                        ),
+                    },
+                    "consumers": sorted(
+                        consumers_by_endpoint[endpoint["id"]],
+                        key=lambda item: (item["agent_name"], item["lease_id"]),
+                    ),
+                }
+            )
+
+        for request in data["requests"]:
+            signals.append(
+                {
+                    "kind": "queued_request",
+                    "severity": "info",
+                    "request_id": request["id"],
+                    "project_id": request["project_id"],
+                    "task": request["task_ref"],
+                    "gpu_count": request["constraints"]["gpu_count"],
+                    "message": request["blocked_reason"] or "waiting for scheduler placement",
+                }
+            )
+
+        agent_cards = [
+            {
+                **agent,
+                "projects": sorted(agent["projects"]),
+                "servers": sorted(agent["servers"]),
+            }
+            for agent in agents.values()
+        ]
+        agent_cards.sort(key=lambda item: item["agent_name"])
+        lease_cards.sort(key=lambda item: (item["agent_name"], item["lease_id"]))
+        signals.sort(key=lambda item: (item["severity"], item.get("agent_name", ""), item["kind"]))
+        total_telemetry = [gpu["telemetry"] for gpu in gpus if gpu["telemetry"] is not None]
+        coordination_summary = {
+            **data["summary"],
+            "active_leases": len(lease_cards),
+            "active_agents": len(agent_cards),
+            "queued_requests": len(data["requests"]),
+            "queued_gpus": sum(item["constraints"]["gpu_count"] for item in data["requests"]),
+            "managed_running_gpus": sum(
+                item["gpu_states"].get("RUNNING_MANAGED", 0) for item in lease_cards
+            ),
+            "idle_leased_gpus": sum(item["gpu_states"].get("LEASED_IDLE", 0) for item in lease_cards),
+            "observed_gpu_utilization_pct": average(
+                item["gpu_utilization_pct"] for item in total_telemetry
+            ),
+        }
+        return {
+            **snapshot,
+            "data": {
+                "summary": coordination_summary,
+                "servers": server_cards,
+                "agents": agent_cards,
+                "leases": lease_cards,
+                "queue": data["requests"],
+                "signals": signals,
+                "guidance": (
+                    "This board is read-only. Claims without a requested server are placed by the broker's "
+                    "shared scheduler; agents should not appoint or emulate a separate scheduler."
+                ),
+            },
+        }
 
     def list_endpoints(self, actor: ActorContext) -> dict[str, Any]:
         snapshot = self.snapshot(actor)
@@ -1532,8 +1772,6 @@ class BrokerService:
                     )
                     continue
                 started_at = ensure_utc(process.process_started_at)
-                key = (gpu.id, process.pid, observation.boot_id, started_at)
-                observed_process_keys.add(key)
                 current = session.scalar(
                     select(ProcessObservation).where(
                         ProcessObservation.gpu_id == gpu.id,
@@ -1542,6 +1780,35 @@ class BrokerService:
                         ProcessObservation.process_started_at == started_at,
                     )
                 )
+                if current is None:
+                    # `ps etimes` is intentionally used instead of a full
+                    # process command line, but it makes the calculated
+                    # start timestamp susceptible to a one-second boundary
+                    # race. Reuse only the immediately-active identity for
+                    # the same GPU/PID/boot when the derived times are very
+                    # close; a materially different start time remains a
+                    # new, fail-closed process identity.
+                    candidate = session.scalar(
+                        select(ProcessObservation)
+                        .where(
+                            ProcessObservation.gpu_id == gpu.id,
+                            ProcessObservation.pid == process.pid,
+                            ProcessObservation.boot_id == observation.boot_id,
+                            ProcessObservation.active.is_(True),
+                        )
+                        .order_by(ProcessObservation.last_seen_at.desc())
+                    )
+                    candidate_started_at = _as_utc(candidate.process_started_at) if candidate else None
+                    if (
+                        candidate is not None
+                        and candidate_started_at is not None
+                        and abs((candidate_started_at - started_at).total_seconds())
+                        <= PROCESS_START_TIME_JITTER_SECONDS
+                    ):
+                        current = candidate
+                        started_at = candidate_started_at
+                key = (gpu.id, process.pid, observation.boot_id, started_at)
+                observed_process_keys.add(key)
                 if current is None:
                     session.add(
                         ProcessObservation(
@@ -1811,9 +2078,7 @@ class BrokerService:
         now: datetime,
     ) -> tuple[list[GPUDevice], dict[str, int]]:
         constraints = ResourceConstraints.model_validate(json_load(request.constraints_json))
-        lease_end = now + timedelta(
-            seconds=request.expected_duration_seconds or request.duration_seconds
-        )
+        lease_end = now + timedelta(seconds=request.duration_seconds)
         excluded: dict[str, int] = defaultdict(int)
         values: list[GPUDevice] = []
         all_gpus = session.scalars(select(GPUDevice).order_by(GPUDevice.endpoint_id, GPUDevice.gpu_index)).all()
@@ -2023,9 +2288,15 @@ class BrokerService:
             )
             resources = self._select_resources(candidates, constraints)
             if resources is None:
+                top_exclusions = ", ".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(excluded.items(), key=lambda item: (-item[1], item[0]))[:3]
+                )
                 blocked_reason = (
                     f"insufficient eligible GPUs: need {constraints.gpu_count}, have {len(candidates)}"
                 )
+                if top_exclusions:
+                    blocked_reason += f"; blocked by {top_exclusions}"
                 changed = request.blocked_reason != blocked_reason
                 request.blocked_reason = blocked_reason
                 request.updated_at = now
@@ -2047,11 +2318,11 @@ class BrokerService:
                 request_id=request.id,
                 actor_id=request.actor_id,
                 project_id=request.project_id,
-                state="HELD",
+                state="ACTIVE" if request.auto_activate else "HELD",
                 issued_at=now,
                 expires_at=now + timedelta(seconds=request.duration_seconds),
                 last_heartbeat_at=now,
-                activated_at=None,
+                activated_at=now if request.auto_activate else None,
                 released_at=None,
                 release_reason=None,
                 issued_revision=revision,
@@ -2060,7 +2331,7 @@ class BrokerService:
             session.flush()
             for gpu in resources:
                 session.add(LeaseResource(lease_id=lease.id, gpu_id=gpu.id, active=True, released_at=None))
-            request.state = "LEASED"
+            request.state = "ACTIVE" if request.auto_activate else "LEASED"
             request.blocked_reason = None
             request.updated_at = now
             self._audit(
@@ -2084,74 +2355,128 @@ class BrokerService:
             allocated.append(lease.id)
         return allocated
 
+    def _create_request_in_session(
+        self,
+        session: Session,
+        actor: ActorContext,
+        request_data: RequestCreate,
+        *,
+        idempotency_key: str,
+        idempotency_action: str,
+        activate_if_allocated: bool,
+        profile_id: str | None = None,
+        idempotency_checked: bool = False,
+    ) -> dict[str, Any]:
+        if not idempotency_checked:
+            existing = self._idempotent(
+                session, actor=actor, action=idempotency_action, key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+        now = utcnow()
+        project = session.get(Project, request_data.project_id)
+        if project is None:
+            raise BrokerError("project_not_found", "project does not exist", status_code=404)
+        if not project.enabled:
+            raise BrokerError("project_disabled", "project is disabled", status_code=409)
+        revision = self._bump_revision(session, now)
+        request = AllocationRequest(
+            id=secrets.token_hex(16),
+            actor_id=actor.id,
+            project_id=request_data.project_id,
+            profile_id=profile_id,
+            auto_activate=activate_if_allocated,
+            task_ref=request_data.task_ref,
+            purpose=request_data.purpose,
+            constraints_json=json_dump(request_data.constraints.model_dump(mode="json")),
+            duration_seconds=request_data.duration_seconds,
+            expected_duration_seconds=None,
+            start_after=ensure_utc(request_data.start_after) if request_data.start_after else None,
+            deadline=ensure_utc(request_data.deadline) if request_data.deadline else None,
+            approval_ref=request_data.approval_ref,
+            state="QUEUED",
+            priority_class="normal",
+            blocked_reason=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(request)
+        summary = {"project_id": request.project_id, "task_ref": request.task_ref}
+        if profile_id is not None:
+            summary["profile_id"] = profile_id
+        event = self._audit(
+            session,
+            actor_id=actor.id,
+            action="request.created",
+            resource_type="request",
+            resource_id=request.id,
+            result="success",
+            after=self._request_dict(request),
+            summary=summary,
+            now=now,
+        )
+        session.flush()
+        self._allocate_queued(session, now, revision)
+        lease = session.scalar(select(Lease).where(Lease.request_id == request.id))
+        if lease is not None and activate_if_allocated and lease.state == "HELD":
+            before_lease = self._lease_dict(session, lease)
+            lease.state = "ACTIVE"
+            lease.activated_at = now
+            lease.last_heartbeat_at = now
+            request.state = "ACTIVE"
+            request.updated_at = now
+            activation_summary = {"activation": "immediate_claim"}
+            if profile_id is not None:
+                activation_summary["profile_id"] = profile_id
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="lease.activated",
+                resource_type="lease",
+                resource_id=lease.id,
+                result="success",
+                before=before_lease,
+                after=self._lease_dict(session, lease),
+                summary=activation_summary,
+                now=now,
+            )
+        result = {
+            "event_id": event.id,
+            "snapshot_revision": revision,
+            "request": self._request_dict(request),
+            "lease": self._lease_dict(session, lease) if lease else None,
+            "authority": "GPU lease only; workload launch still requires the applicable project/owner authorization.",
+        }
+        self._remember_idempotency(
+            session,
+            actor=actor,
+            action=idempotency_action,
+            key=idempotency_key,
+            response=result,
+            now=now,
+        )
+        return result
+
     def create_request(
-        self, actor: ActorContext, request_data: RequestCreate, *, idempotency_key: str
+        self,
+        actor: ActorContext,
+        request_data: RequestCreate,
+        *,
+        idempotency_key: str,
+        activate_if_allocated: bool = False,
     ) -> dict[str, Any]:
         self._require_role(actor, MUTATING_ROLES)
         self._require_project_access(actor, request_data.project_id)
 
         def operation(session: Session) -> dict[str, Any]:
-            existing = self._idempotent(
-                session, actor=actor, action="request.create", key=idempotency_key
-            )
-            if existing is not None:
-                return existing
-            now = utcnow()
-            project = session.get(Project, request_data.project_id)
-            if project is None:
-                raise BrokerError("project_not_found", "project does not exist", status_code=404)
-            if not project.enabled:
-                raise BrokerError("project_disabled", "project is disabled", status_code=409)
-            revision = self._bump_revision(session, now)
-            request = AllocationRequest(
-                id=secrets.token_hex(16),
-                actor_id=actor.id,
-                project_id=request_data.project_id,
-                task_ref=request_data.task_ref,
-                purpose=request_data.purpose,
-                constraints_json=json_dump(request_data.constraints.model_dump(mode="json")),
-                duration_seconds=request_data.duration_seconds,
-                expected_duration_seconds=request_data.expected_duration_seconds,
-                start_after=ensure_utc(request_data.start_after) if request_data.start_after else None,
-                deadline=ensure_utc(request_data.deadline) if request_data.deadline else None,
-                approval_ref=request_data.approval_ref,
-                state="QUEUED",
-                priority_class="normal",
-                blocked_reason=None,
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(request)
-            event = self._audit(
+            return self._create_request_in_session(
                 session,
-                actor_id=actor.id,
-                action="request.created",
-                resource_type="request",
-                resource_id=request.id,
-                result="success",
-                after=self._request_dict(request),
-                summary={"project_id": request.project_id, "task_ref": request.task_ref},
-                now=now,
+                actor,
+                request_data,
+                idempotency_key=idempotency_key,
+                idempotency_action="request.create",
+                activate_if_allocated=activate_if_allocated,
             )
-            session.flush()
-            self._allocate_queued(session, now, revision)
-            lease = session.scalar(select(Lease).where(Lease.request_id == request.id))
-            result = {
-                "event_id": event.id,
-                "snapshot_revision": revision,
-                "request": self._request_dict(request),
-                "lease": self._lease_dict(session, lease) if lease else None,
-                "authority": "GPU lease only; workload launch still requires the applicable project/owner authorization.",
-            }
-            self._remember_idempotency(
-                session,
-                actor=actor,
-                action="request.create",
-                key=idempotency_key,
-                response=result,
-                now=now,
-            )
-            return result
 
         return self._write(operation)
 
@@ -2299,7 +2624,25 @@ class BrokerService:
             issued_at = _as_utc(lease.issued_at) or now
             expires_at = _as_utc(lease.expires_at) or now
             duration = max(60, int((expires_at - issued_at).total_seconds()))
-            lease.expires_at = max(expires_at, now) + timedelta(seconds=duration)
+            renewed_expiry = max(expires_at, now) + timedelta(seconds=duration)
+            reserved_gpu_ids = [
+                resource.gpu_id
+                for resource in session.scalars(
+                    select(LeaseResource).where(
+                        LeaseResource.lease_id == lease.id,
+                        LeaseResource.active.is_(True),
+                    )
+                ).all()
+                if self._reservation_blocks_gpu(session, resource.gpu_id, start=now, end=renewed_expiry)
+            ]
+            if reserved_gpu_ids:
+                raise BrokerError(
+                    "lease_renewal_conflicts_with_reservation",
+                    "lease renewal would overlap a future GPU reservation",
+                    status_code=409,
+                    details={"gpu_ids": reserved_gpu_ids},
+                )
+            lease.expires_at = renewed_expiry
             lease.last_heartbeat_at = now
             event = self._audit(
                 session,
@@ -2463,6 +2806,150 @@ class BrokerService:
 
         return self._write(operation)
 
+    def bind_observed_workload(
+        self,
+        actor: ActorContext,
+        lease_id: str,
+        binding: LeaseObservedBind,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Bind fresh collector-observed processes for the caller's active lease.
+
+        This never starts, stops, or selects a remote process. It only records
+        the identities already observed on every GPU held by the specified
+        lease, allowing the regular reconciliation loop to distinguish the
+        caller's workload from an unmanaged process.
+        """
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="lease.bind_observed", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            lease = session.get(Lease, lease_id)
+            if lease is None:
+                raise BrokerError("lease_not_found", "lease does not exist", status_code=404)
+            if not self._can_manage_lease(actor, lease):
+                raise BrokerError("lease_forbidden", "cannot bind another actor's lease", status_code=403)
+            if lease.state not in {"HELD", "ACTIVE", "CONFLICT"}:
+                raise BrokerError(
+                    "lease_not_bindable",
+                    "only held, active, or attribution-conflicted leases can be bound",
+                    status_code=409,
+                )
+            was_conflict = lease.state == "CONFLICT"
+            conflict_before = self._lease_dict(session, lease) if was_conflict else None
+            gpu_ids = session.scalars(
+                select(LeaseResource.gpu_id).where(
+                    LeaseResource.lease_id == lease.id, LeaseResource.active.is_(True)
+                )
+            ).all()
+            if not gpu_ids:
+                raise BrokerError("lease_has_no_resources", "lease has no active GPU resources", status_code=409)
+            now = utcnow()
+            cutoff = now - timedelta(seconds=self.inventory.collector.stale_after_seconds)
+            processes = session.scalars(
+                select(ProcessObservation)
+                .where(
+                    ProcessObservation.gpu_id.in_(gpu_ids),
+                    ProcessObservation.active.is_(True),
+                    ProcessObservation.last_seen_at >= cutoff,
+                )
+                .order_by(ProcessObservation.gpu_id, ProcessObservation.pid)
+            ).all()
+            observed_gpu_ids = {process.gpu_id for process in processes}
+            missing_gpu_ids = sorted(set(gpu_ids).difference(observed_gpu_ids))
+            if missing_gpu_ids:
+                raise BrokerError(
+                    "workload_process_not_observed",
+                    "cannot bind observed workload until every leased GPU has a fresh compute process",
+                    status_code=409,
+                    details={"missing_gpu_ids": missing_gpu_ids},
+                )
+            process_keys = sorted({self._process_key(process) for process in processes})
+            run_id = binding.run_id or f"lease:{lease.id}"
+            revision = self._bump_revision(session, now)
+            existing_binding = session.scalar(
+                select(WorkloadBinding).where(
+                    WorkloadBinding.lease_id == lease.id, WorkloadBinding.run_id == run_id
+                )
+            )
+            if existing_binding is None:
+                session.add(
+                    WorkloadBinding(
+                        lease_id=lease.id,
+                        run_id=run_id,
+                        process_keys_json=json_dump(process_keys),
+                        created_at=now,
+                    )
+                )
+            else:
+                existing_binding.process_keys_json = json_dump(process_keys)
+            if was_conflict:
+                # A lease owner explicitly attesting the current, freshly
+                # observed process identities is the safe recovery action for
+                # an attribution conflict. It changes no remote workload;
+                # the lease remains blocked by any future unknown process.
+                lease.state = "ACTIVE" if lease.activated_at is not None else "HELD"
+                for alert in session.scalars(
+                    select(Alert).where(
+                        Alert.alert_type == "lease_process_conflict",
+                        Alert.resource_type == "lease",
+                        Alert.resource_id == lease.id,
+                        Alert.active.is_(True),
+                    )
+                ).all():
+                    alert.active = False
+                    alert.last_seen_at = now
+                self._audit(
+                    session,
+                    actor_id=actor.id,
+                    action="lease.conflict_resolved",
+                    resource_type="lease",
+                    resource_id=lease.id,
+                    result="success",
+                    before=conflict_before,
+                    after=self._lease_dict(session, lease),
+                    summary={"source": "collector_observed", "run_id": run_id},
+                    now=now,
+                )
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="lease.workload_bound",
+                resource_type="lease",
+                resource_id=lease.id,
+                result="success",
+                after={"run_id": run_id, "process_key_count": len(process_keys)},
+                summary={
+                    "source": "collector_observed",
+                    "gpu_count": len(gpu_ids),
+                    "resolved_conflict": was_conflict,
+                },
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "lease": self._lease_dict(session, lease),
+                "conflict_resolved": was_conflict,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="lease.bind_observed",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
     def _reconcile_leases(self, session: Session, now: datetime, *, actor_id: str) -> None:
         """Fail closed on expiry and unexpected compute processes; never kill/restart anything."""
 
@@ -2515,7 +3002,10 @@ class BrokerService:
                     now=now,
                 )
             elif lease.state in {"HELD", "ACTIVE"} and processes:
-                if not self._processes_match_binding(session, lease.id, processes) and any(
+                known_process_keys = self._binding_process_keys(session, lease.id)
+                if known_process_keys and not all(
+                    self._process_key(process) in known_process_keys for process in processes
+                ) and any(
                     process.observations >= 2 for process in processes
                 ):
                     before = self._lease_dict(session, lease)
@@ -2997,6 +3487,166 @@ class BrokerService:
 
         return self._write(operation)
 
+    def _validate_workload_profile_endpoints(
+        self,
+        session: Session,
+        *,
+        project_id: str,
+        constraints: ResourceConstraints,
+    ) -> None:
+        missing = [
+            endpoint_id for endpoint_id in constraints.endpoint_ids if session.get(Endpoint, endpoint_id) is None
+        ]
+        if missing:
+            raise BrokerError(
+                "endpoint_not_found",
+                f"workload profile references unknown endpoints: {missing}",
+                status_code=404,
+            )
+        unavailable = [
+            endpoint_id
+            for endpoint_id in constraints.endpoint_ids
+            if not self._endpoint_is_available_to_project(session, endpoint_id, project_id)
+        ]
+        if unavailable:
+            raise BrokerError(
+                "profile_endpoint_forbidden",
+                f"workload profile endpoints are outside project scope: {unavailable}",
+                status_code=422,
+            )
+
+    def upsert_workload_profile(
+        self,
+        actor: ActorContext,
+        profile_data: WorkloadProfileUpsert,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Store an admin-approved routine workload contract for one project."""
+
+        self._require_role(actor, ADMIN_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="workload_profile.upsert", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            project = session.get(Project, profile_data.project_id)
+            if project is None:
+                raise BrokerError("project_not_found", "project does not exist", status_code=404)
+            self._validate_workload_profile_endpoints(
+                session,
+                project_id=profile_data.project_id,
+                constraints=profile_data.constraints,
+            )
+            now = utcnow()
+            revision = self._bump_revision(session, now)
+            profile = session.get(WorkloadProfile, profile_data.id)
+            before = self._workload_profile_dict(profile) if profile else None
+            if profile is None:
+                profile = WorkloadProfile(
+                    id=profile_data.id,
+                    project_id=profile_data.project_id,
+                    display_name=profile_data.display_name,
+                    purpose=profile_data.purpose,
+                    duration_seconds=profile_data.duration_seconds,
+                    constraints_json=json_dump(profile_data.constraints.model_dump(mode="json")),
+                    enabled=profile_data.enabled,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(profile)
+            else:
+                if profile.project_id != profile_data.project_id:
+                    raise BrokerError(
+                        "workload_profile_project_immutable",
+                        "existing workload profile cannot move to another project",
+                        status_code=409,
+                    )
+                profile.display_name = profile_data.display_name
+                profile.purpose = profile_data.purpose
+                profile.duration_seconds = profile_data.duration_seconds
+                profile.constraints_json = json_dump(profile_data.constraints.model_dump(mode="json"))
+                profile.enabled = profile_data.enabled
+                profile.updated_at = now
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="workload_profile.upserted",
+                resource_type="workload_profile",
+                resource_id=profile.id,
+                result="success",
+                before=before,
+                after=self._workload_profile_dict(profile),
+                summary={"project_id": profile.project_id},
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "workload_profile": self._workload_profile_dict(profile),
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="workload_profile.upsert",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def claim_workload_profile(
+        self,
+        actor: ActorContext,
+        profile_id: str,
+        claim: WorkloadProfileClaim,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Claim a pre-approved contract without re-supplying its resource fields."""
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="workload_profile.claim", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            profile = session.get(WorkloadProfile, profile_id)
+            if profile is None:
+                raise BrokerError("workload_profile_not_found", "workload profile does not exist", status_code=404)
+            if not profile.enabled:
+                raise BrokerError(
+                    "workload_profile_disabled", "workload profile is disabled", status_code=409
+                )
+            self._require_project_access(actor, profile.project_id)
+            request_data = RequestCreate.model_validate(
+                {
+                    "project_id": profile.project_id,
+                    "task_ref": claim.task_ref,
+                    "purpose": profile.purpose,
+                    "duration_seconds": profile.duration_seconds,
+                    "constraints": json_load(profile.constraints_json),
+                }
+            )
+            return self._create_request_in_session(
+                session,
+                actor,
+                request_data,
+                idempotency_key=idempotency_key,
+                idempotency_action="workload_profile.claim",
+                activate_if_allocated=True,
+                profile_id=profile.id,
+                idempotency_checked=True,
+            )
+
+        return self._write(operation)
+
     def upsert_endpoint(
         self, actor: ActorContext, endpoint_data: EndpointUpsert, *, idempotency_key: str
     ) -> dict[str, Any]:
@@ -3095,6 +3745,73 @@ class BrokerService:
                 session,
                 actor=actor,
                 action="endpoint.upsert",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def grant_endpoint_project_access(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        project_id: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Add project access to an existing endpoint without replacing its other grants."""
+
+        self._require_role(actor, ADMIN_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="endpoint.project_access.grant", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            if session.get(Project, project_id) is None:
+                raise BrokerError("project_not_found", "project does not exist", status_code=404)
+            now = utcnow()
+            revision = self._bump_revision(session, now)
+            before_project_ids = sorted(
+                session.scalars(
+                    select(EndpointProject.project_id).where(EndpointProject.endpoint_id == endpoint.id)
+                ).all()
+            )
+            granted = self._endpoint_is_available_to_project(session, endpoint.id, project_id)
+            if not granted:
+                session.add(EndpointProject(endpoint_id=endpoint.id, project_id=project_id))
+                session.flush()
+            project_ids = sorted({*before_project_ids, project_id})
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="endpoint.project_access_granted",
+                resource_type="endpoint",
+                resource_id=endpoint.id,
+                result="success",
+                before={"project_ids": before_project_ids},
+                after={"project_ids": project_ids},
+                summary={"project_id": project_id, "already_granted": granted},
+                now=now,
+            )
+            allocated_lease_ids = self._allocate_queued(session, now, revision)
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "endpoint": self._endpoint_dict(endpoint),
+                "project_ids": project_ids,
+                "allocated_lease_ids": allocated_lease_ids,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="endpoint.project_access.grant",
                 key=idempotency_key,
                 response=result,
                 now=now,
@@ -3346,6 +4063,7 @@ class BrokerService:
                         "pid": process.pid,
                         "boot_id": process.boot_id,
                         "process_started_at": _iso(process.process_started_at),
+                        "process_key": self._process_key(process),
                         "username": process.username,
                         "executable": process.executable,
                         "used_memory_mib": process.used_memory_mib,
@@ -3437,6 +4155,9 @@ class BrokerService:
                 if not visible and event.resource_type == "request":
                     request = session.get(AllocationRequest, event.resource_id)
                     visible = request is not None and request.project_id in actor.project_ids
+                if not visible and event.resource_type == "workload_profile":
+                    profile = session.get(WorkloadProfile, event.resource_id)
+                    visible = profile is not None and profile.project_id in actor.project_ids
                 if not visible:
                     continue
                 values.append(
@@ -3463,6 +4184,26 @@ class BrokerService:
                 self._project_dict(project)
                 for project in session.scalars(select(Project).order_by(Project.id)).all()
                 if actor.is_admin or project.id in actor.project_ids
+            ]
+            return self.envelope(session, values)
+
+        return self._read(operation)
+
+    def list_workload_profiles(
+        self, actor: ActorContext, *, project_id: str | None = None
+    ) -> dict[str, Any]:
+        if project_id is not None:
+            self._require_project_access(actor, project_id)
+
+        def operation(session: Session) -> dict[str, Any]:
+            profiles = session.scalars(
+                select(WorkloadProfile).order_by(WorkloadProfile.project_id, WorkloadProfile.id)
+            ).all()
+            values = [
+                self._workload_profile_dict(profile)
+                for profile in profiles
+                if (project_id is None or profile.project_id == project_id)
+                and (actor.is_admin or profile.project_id in actor.project_ids)
             ]
             return self.envelope(session, values)
 

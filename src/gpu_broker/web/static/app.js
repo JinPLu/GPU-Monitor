@@ -471,7 +471,7 @@
   const sideItems = () => {
     if (activeSideTab === "claims") {
       return (data.leases || []).map((lease) => `
-        <article class="coordination-item"><header><strong>${escapeHTML(lease.actor_id)}</strong><span class="badge">${escapeHTML(lease.state)}</span></header><p>${escapeHTML(lease.task_ref || lease.purpose || "未填写任务")}</p><p>${lease.gpu_ids.length} 块 GPU · ${escapeHTML(lease.project_id)} · 至 ${formatDate(lease.expires_at, true)}</p></article>`).join("");
+        <article class="coordination-item"><header><strong>${escapeHTML(lease.actor_id)}</strong><span class="badge">${escapeHTML(lease.state)}</span></header><p>${escapeHTML(lease.task_ref || lease.purpose || "未填写任务")}</p><p>${lease.gpu_ids.length} 块 GPU · ${escapeHTML(lease.project_id)} · 安全截止 ${formatDate(lease.expires_at, true)}</p></article>`).join("");
     }
     if (activeSideTab === "queue") {
       return (data.requests || []).map((request) => `
@@ -629,7 +629,7 @@
     const lease = gpu.lease;
     const processes = gpu.processes || [];
     document.getElementById("detail-ownership").innerHTML = lease
-      ? `<strong>${escapeHTML(lease.actor_id)}</strong> · ${escapeHTML(lease.task_ref || lease.purpose || "未填写任务")}<br>${processes.length} 个计算进程 · 到期 ${formatDate(lease.expires_at, true)}`
+      ? `<strong>${escapeHTML(lease.actor_id)}</strong> · ${escapeHTML(lease.task_ref || lease.purpose || "未填写任务")}<br>${processes.length} 个计算进程 · 安全截止 ${formatDate(lease.expires_at, true)}`
       : processes.length
         ? `${processes.length} 个未登记进程 · ${escapeHTML(processes.map((item) => item.executable).join("、"))}`
         : "暂无认领，也没有计算进程";

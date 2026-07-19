@@ -20,6 +20,7 @@ def test_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
         "telemetry_current",
         "leases",
         "lease_resources",
+        "workload_profiles",
         "audit_events",
     }.issubset(
         inspect(database.engine).get_table_names()
@@ -54,6 +55,7 @@ def test_migration_upgrades_existing_schema_to_endpoint_telemetry(tmp_path: Path
 
     command.upgrade(config, "head")
     assert "endpoint_telemetry_current" in inspect(database.engine).get_table_names()
+    assert "workload_profiles" in inspect(database.engine).get_table_names()
 
 
 def test_migration_uses_packaged_scripts_without_project_tree(tmp_path: Path) -> None:

@@ -184,6 +184,25 @@ class Project(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class WorkloadProfile(Base):
+    """A project-approved, bounded resource contract for routine work."""
+
+    __tablename__ = "workload_profiles"
+    __table_args__ = (Index("ix_workload_profiles_project_enabled", "project_id", "enabled"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False
+    )
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(1000), nullable=False)
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    constraints_json: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Actor(Base):
     __tablename__ = "actors"
 
@@ -229,6 +248,13 @@ class AllocationRequest(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     actor_id: Mapped[str] = mapped_column(ForeignKey("actors.id"), nullable=False, index=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    # The migration must support databases whose initial revision is generated
+    # from the current metadata, so this historical reference is enforced by
+    # the service rather than an ALTER TABLE foreign key.
+    profile_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    # A routine MCP/UI claim is ready to run as soon as the scheduler assigns
+    # resources, including after waiting in the shared queue.
+    auto_activate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     task_ref: Mapped[str] = mapped_column(String(255), nullable=False)
     purpose: Mapped[str] = mapped_column(String(1000), nullable=False)
     constraints_json: Mapped[str] = mapped_column(Text, nullable=False)

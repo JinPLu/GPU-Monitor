@@ -8,6 +8,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+DEFAULT_LEASE_WINDOW_SECONDS = 8 * 60 * 60
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -66,8 +69,7 @@ class RequestCreate(StrictModel):
     project_id: str = Field(min_length=2, max_length=64)
     task_ref: str = Field(min_length=1, max_length=255)
     purpose: str = Field(min_length=1, max_length=1000)
-    duration_seconds: int = Field(default=3600, ge=60, le=60 * 60 * 24 * 30)
-    expected_duration_seconds: int | None = Field(default=None, ge=60, le=60 * 60 * 24 * 30)
+    duration_seconds: int = Field(default=DEFAULT_LEASE_WINDOW_SECONDS, ge=60, le=60 * 60 * 24 * 30)
     start_after: datetime | None = None
     deadline: datetime | None = None
     approval_ref: str | None = Field(default=None, max_length=500)
@@ -81,8 +83,6 @@ class RequestCreate(StrictModel):
             raise ValueError("deadline must include a timezone")
         if self.start_after and self.deadline and self.deadline <= self.start_after:
             raise ValueError("deadline must be after start_after")
-        if self.expected_duration_seconds and self.expected_duration_seconds > self.duration_seconds:
-            raise ValueError("expected_duration_seconds must not exceed duration_seconds")
         return self
 
 
@@ -93,8 +93,7 @@ class RequestCreateFlat(StrictModel):
     task_ref: str = Field(min_length=1, max_length=255)
     purpose: str = Field(min_length=1, max_length=1000)
     gpu_count: int = Field(ge=1)
-    duration_seconds: int = Field(default=3600, ge=60)
-    expected_duration_seconds: int | None = Field(default=None, ge=60)
+    duration_seconds: int = Field(default=DEFAULT_LEASE_WINDOW_SECONDS, ge=60)
     start_after: datetime | None = None
     deadline: datetime | None = None
     approval_ref: str | None = Field(default=None, max_length=500)
@@ -129,6 +128,12 @@ class LeaseBind(StrictModel):
         if len(value) > 1024:
             raise ValueError("too many process keys")
         return value
+
+
+class LeaseObservedBind(StrictModel):
+    """Bind every fresh observed process on a lease to one already-started run."""
+
+    run_id: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class ReservationCreate(StrictModel):
@@ -177,6 +182,28 @@ class ProjectUpsert(StrictModel):
     enabled: bool = True
 
 
+class WorkloadProfileUpsert(StrictModel):
+    """Admin-defined resource contract used by routine project workloads."""
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    project_id: str = Field(min_length=2, max_length=64)
+    display_name: str = Field(min_length=1, max_length=120)
+    purpose: str = Field(min_length=1, max_length=1000)
+    duration_seconds: int = Field(ge=60, le=60 * 60 * 24 * 30)
+    constraints: ResourceConstraints
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_placement(self) -> "WorkloadProfileUpsert":
+        if self.constraints.gpu_ids or self.constraints.placement == "exact":
+            raise ValueError("workload profile cannot pin exact gpu_ids")
+        return self
+
+
+class WorkloadProfileClaim(StrictModel):
+    task_ref: str = Field(min_length=1, max_length=255)
+
+
 class EndpointUpsert(StrictModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,127}$")
     host: str = Field(min_length=1, max_length=253)
@@ -198,6 +225,12 @@ class EndpointUpsert(StrictModel):
         if any(not value for value in values):
             raise ValueError("endpoint list values must not be empty")
         return values
+
+
+class EndpointProjectGrant(StrictModel):
+    """Add one project to an existing endpoint without replacing its current scope."""
+
+    project_id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
 
 
 class EndpointEnabled(StrictModel):

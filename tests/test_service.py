@@ -10,7 +10,17 @@ from sqlalchemy.exc import IntegrityError
 
 from gpu_broker.database import Database
 from gpu_broker.models import AuditEvent, Lease, LeaseResource, TelemetryCurrent, TelemetrySnapshot
-from gpu_broker.schemas import ActorCreate, EndpointEnabled, EndpointUpsert, ProjectUpsert, RequestCreate
+from gpu_broker.schemas import (
+    ActorCreate,
+    EndpointEnabled,
+    EndpointUpsert,
+    LeaseObservedBind,
+    ProjectUpsert,
+    ReservationCreate,
+    RequestCreate,
+    WorkloadProfileClaim,
+    WorkloadProfileUpsert,
+)
 from gpu_broker.service import ACTIVE_LEASE_STATES, BrokerError, BrokerService
 from gpu_broker.timeutil import utcnow
 from tests.helpers import observation, process_for_gpu
@@ -59,6 +69,107 @@ def test_idempotent_request_and_stable_uuid_identity(service, admin) -> None:
     gpu = service.list_gpus(admin)["data"][0]
     assert gpu["id"] == f"endpoint-a:{gpu['gpu_uuid']}"
     assert gpu["state"] == "HELD"
+
+
+def test_workload_profile_claim_uses_approved_contract_atomically(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+    created = service.upsert_workload_profile(
+        admin,
+        WorkloadProfileUpsert.model_validate(
+            {
+                "id": "benchmark-2gpu",
+                "project_id": "project-a",
+                "display_name": "Benchmark two GPU",
+                "purpose": "approved benchmark evaluation",
+                "duration_seconds": 7200,
+                "constraints": {
+                    "gpu_count": 2,
+                    "placement": "pack",
+                },
+            }
+        ),
+        idempotency_key="profile-upsert",
+    )
+    assert created["workload_profile"]["constraints"]["endpoint_ids"] == []
+
+    first = service.claim_workload_profile(
+        admin,
+        "benchmark-2gpu",
+        WorkloadProfileClaim(task_ref="run-2026-07-19"),
+        idempotency_key="profile-claim",
+    )
+    second = service.claim_workload_profile(
+        admin,
+        "benchmark-2gpu",
+        WorkloadProfileClaim(task_ref="run-2026-07-19"),
+        idempotency_key="profile-claim",
+    )
+
+    assert first == second
+    assert first["lease"] is not None
+    assert first["lease"]["state"] == "ACTIVE"
+    request = first["request"]
+    assert request["profile_id"] == "benchmark-2gpu"
+    assert request["purpose"] == "approved benchmark evaluation"
+    assert request["duration_seconds"] == 7200
+    assert request["constraints"]["gpu_count"] == 2
+    assert request["constraints"]["endpoint_ids"] == []
+    events = service.list_events(admin)["data"]
+    request_event = next(event for event in events if event["action"] == "request.created")
+    assert request_event["summary"]["profile_id"] == "benchmark-2gpu"
+
+
+def test_queued_routine_claim_auto_activates_when_capacity_arrives(service, admin) -> None:
+    service.upsert_workload_profile(
+        admin,
+        WorkloadProfileUpsert.model_validate(
+            {
+                "id": "queued-eval",
+                "project_id": "project-a",
+                "display_name": "Queued evaluation",
+                "purpose": "approved queued evaluation",
+                "duration_seconds": 7200,
+                "constraints": {"gpu_count": 1},
+            }
+        ),
+        idempotency_key="queued-profile",
+    )
+    queued = service.claim_workload_profile(
+        admin,
+        "queued-eval",
+        WorkloadProfileClaim(task_ref="queued-run"),
+        idempotency_key="queued-claim",
+    )
+    assert queued["lease"] is None
+    assert queued["request"]["state"] == "QUEUED"
+
+    service.ingest_observation(observation(count=1))
+    request = service.list_requests(admin)["data"][0]
+    lease = service.list_leases(admin)["data"][0]
+    assert request["state"] == lease["state"] == "ACTIVE"
+
+
+def test_renewal_cannot_cross_a_future_reservation(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    gpu_id = service.list_gpus(admin)["data"][0]["id"]
+    start_at = utcnow() + timedelta(minutes=65)
+    service.create_reservation(
+        admin,
+        ReservationCreate(
+            project_id="project-a",
+            gpu_ids=[gpu_id],
+            start_at=start_at,
+            end_at=start_at + timedelta(hours=1),
+            reason="next approved workload",
+        ),
+        idempotency_key="future-reservation",
+    )
+    claimed = service.create_request(admin, request_data("renewal-window"), idempotency_key="renewal-window")
+    assert claimed["lease"] is not None
+
+    with pytest.raises(BrokerError) as error:
+        service.renew_lease(admin, claimed["lease"]["id"], idempotency_key="renewal-conflict")
+    assert error.value.code == "lease_renewal_conflicts_with_reservation"
 
 
 def test_gang_all_or_nothing_and_no_partial_write(service, admin) -> None:
@@ -138,6 +249,153 @@ def test_quota_and_endpoint_identity_are_enforced(service, admin) -> None:
             idempotency_key="endpoint-move",
         )
     assert error.value.code == "endpoint_identity_immutable"
+
+
+def test_granting_existing_server_to_project_preserves_scope_and_unblocks_claim(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    service.upsert_project(
+        admin,
+        ProjectUpsert(
+            id="project-c",
+            display_name="Project C",
+            weight=1,
+            quota_gpus=None,
+            concurrency_limit=None,
+        ),
+        idempotency_key="project-c",
+    )
+    queued = service.create_request(
+        admin,
+        request_data("cross-project-claim", project_id="project-c"),
+        idempotency_key="cross-project-claim",
+        activate_if_allocated=True,
+    )
+    assert queued["lease"] is None
+    assert "project_endpoint_scope" in (queued["request"]["blocked_reason"] or "")
+
+    granted = service.grant_endpoint_project_access(
+        admin,
+        "endpoint-a",
+        "project-c",
+        idempotency_key="grant-project-c",
+    )
+    again = service.grant_endpoint_project_access(
+        admin,
+        "endpoint-a",
+        "project-c",
+        idempotency_key="grant-project-c",
+    )
+    assert granted == again
+    assert granted["project_ids"] == ["project-a", "project-b", "project-c"]
+    assert len(granted["allocated_lease_ids"]) == 1
+    request = next(item for item in service.list_requests(admin)["data"] if item["id"] == queued["request"]["id"])
+    assert request["state"] == "ACTIVE"
+
+
+def test_coordination_board_and_observed_binding_are_agent_self_service(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("coordination-run"),
+        idempotency_key="coordination-claim",
+        activate_if_allocated=True,
+    )
+    assert claimed["lease"] is not None
+    gpu = service.list_gpus(admin)["data"][0]
+    service.ingest_observation(observation(count=1, processes=[process_for_gpu(gpu["gpu_uuid"])]))
+
+    bound = service.bind_observed_workload(
+        admin,
+        claimed["lease"]["id"],
+        LeaseObservedBind(),
+        idempotency_key="coordination-bind",
+    )
+    assert bound["lease"]["workloads"][0]["run_id"] == f"lease:{claimed['lease']['id']}"
+    assert len(bound["lease"]["workloads"][0]["process_keys"]) == 1
+
+    gpu = service.list_gpus(admin)["data"][0]
+    assert gpu["state"] == "RUNNING_MANAGED"
+    assert gpu["processes"][0]["process_key"]
+    board = service.coordination(admin)["data"]
+    assert board["summary"]["active_agents"] == 1
+    assert board["summary"]["managed_running_gpus"] == 1
+    assert board["servers"][0]["consumers"][0]["agent_name"] == admin.id
+    assert board["leases"][0]["activity"] == "running"
+    assert board["agents"][0]["managed_running_gpus"] == 1
+
+
+def test_observed_workload_binding_survives_one_second_process_start_jitter(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("jitter-stable-run"),
+        idempotency_key="jitter-stable-claim",
+        activate_if_allocated=True,
+    )
+    assert claimed["lease"] is not None
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    started_at = utcnow() - timedelta(minutes=3)
+    initial_process = process_for_gpu(gpu_uuid).model_copy(
+        update={"process_started_at": started_at}
+    )
+    service.ingest_observation(observation(count=1, processes=[initial_process]))
+    service.bind_observed_workload(
+        admin,
+        claimed["lease"]["id"],
+        LeaseObservedBind(run_id="jitter-stable-run-1"),
+        idempotency_key="jitter-stable-bind",
+    )
+
+    jittered_process = initial_process.model_copy(
+        update={"process_started_at": started_at + timedelta(seconds=1)}
+    )
+    service.ingest_observation(observation(count=1, processes=[jittered_process]))
+
+    gpu = service.list_gpus(admin)["data"][0]
+    assert gpu["state"] == "RUNNING_MANAGED"
+    assert gpu["processes"][0]["observations"] == 2
+    assert gpu["lease"]["workloads"][0]["process_keys"] == [gpu["processes"][0]["process_key"]]
+
+
+def test_observed_binding_recovers_an_attribution_conflict_without_remote_control(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("recover-attribution-run"),
+        idempotency_key="recover-attribution-claim",
+        activate_if_allocated=True,
+    )
+    assert claimed["lease"] is not None
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    started_at = utcnow() - timedelta(minutes=3)
+    initial_process = process_for_gpu(gpu_uuid).model_copy(
+        update={"process_started_at": started_at}
+    )
+    service.ingest_observation(observation(count=1, processes=[initial_process]))
+    service.bind_observed_workload(
+        admin,
+        claimed["lease"]["id"],
+        LeaseObservedBind(run_id="recover-attribution-run-1"),
+        idempotency_key="recover-attribution-bind-initial",
+    )
+
+    replacement = initial_process.model_copy(
+        update={"process_started_at": started_at + timedelta(seconds=10)}
+    )
+    service.ingest_observation(observation(count=1, processes=[replacement]))
+    service.ingest_observation(observation(count=1, processes=[replacement]))
+    assert service.list_gpus(admin)["data"][0]["state"] == "CONFLICT"
+
+    recovered = service.bind_observed_workload(
+        admin,
+        claimed["lease"]["id"],
+        LeaseObservedBind(run_id="recover-attribution-run-1"),
+        idempotency_key="recover-attribution-bind-current",
+    )
+    assert recovered["conflict_resolved"] is True
+    gpu = service.list_gpus(admin)["data"][0]
+    assert gpu["state"] == "RUNNING_MANAGED"
+    assert gpu["lease"]["state"] == "ACTIVE"
 
 
 def test_process_and_stale_telemetry_block_admission(service, admin) -> None:

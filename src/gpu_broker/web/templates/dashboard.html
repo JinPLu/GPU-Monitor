@@ -117,18 +117,31 @@
 
 <dialog id="claim-dialog" class="modal-dialog">
   <div class="dialog-heading"><div><p class="eyebrow">当前认领者：{{ actor.id }}</p><h2>认领 GPU</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
-  <p class="muted">空闲时立即分配；资源不足时自动进入共享队列。</p>
-  <form method="post" action="/ui/action/request" class="stack form-grid">
-    <label>任务名称<input name="task_ref" required placeholder="例如 wan-video-eval"></label>
-    <label>项目<select name="project_id" required>{% for project in payload.projects %}<option value="{{ project.id }}">{{ project.display_name }}</option>{% endfor %}</select></label>
-    <label class="span-all">用途<input name="purpose" required placeholder="一句话说明这批 GPU 做什么"></label>
-    <label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
-    <label>使用时长<select name="duration_hours"><option value="1">1 小时</option><option value="2">2 小时</option><option value="4" selected>4 小时</option><option value="8">8 小时</option><option value="24">24 小时</option></select></label>
-    <label>指定服务器（可留空）<select name="endpoint_id"><option value="">自动选择</option>{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
-    <label class="span-all">或直接指定 GPU（可留空，按 ⌘ 多选）<select name="gpu_ids" multiple size="6">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label>
-    <input type="hidden" name="placement" value="pack"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
-    <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">立即认领 / 排队</button></div>
+  <p class="muted">日常工作直接选项目配置和任务；资源范围和用途由项目预先批准。完成后释放租约；空闲时直接可用，不足时自动进入共享队列。</p>
+  {% if payload.claimable_workload_profiles %}
+  <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
+    <label>项目配置<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ profile.constraints.gpu_count }} GPU</option>{% endfor %}</select></label>
+    <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
+    <p class="field-help span-all">按配置认领会直接登记为使用中，但不会启动远端任务。</p>
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
+    <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">按配置认领</button></div>
   </form>
+  {% else %}
+  <p class="field-help">还没有可用的项目配置；管理员可在“项目”页创建。临时需求请使用下方一次性认领。</p>
+  {% endif %}
+  <details class="stack">
+    <summary>一次性认领（需明确资源）</summary>
+    <form method="post" action="/ui/action/quick-claim" class="stack form-grid quick-claim-form">
+      <label>项目<select name="project_id" required>{% for project in payload.projects %}<option value="{{ project.id }}">{{ project.display_name }}</option>{% endfor %}</select></label>
+      <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
+      <label>服务器<select name="endpoint_id"><option value="">自动选择</option>{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
+      <label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
+      <details class="span-all"><summary>高级：指定精确 GPU</summary><label>GPU（可多选）<select name="gpu_ids" multiple size="6">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label><p class="field-help">选择后以所选 GPU 数量为准。</p></details>
+      <p class="field-help span-all">临时任务会把任务说明写入审计用途；完成后请释放租约。认领成功同样不会启动远端任务。</p>
+      <input type="hidden" name="placement" value="pack"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
+      <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">一次性认领</button></div>
+    </form>
+  </details>
 </dialog>
 
 <dialog id="schedule-dialog" class="modal-dialog">

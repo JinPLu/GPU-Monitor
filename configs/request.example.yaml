@@ -7,5 +7,3 @@ gpus_per_node: 1
 same_host: true
 placement: pack
 min_free_vram_mib: 16000
-expected_duration_seconds: 1800
-duration_seconds: 3600

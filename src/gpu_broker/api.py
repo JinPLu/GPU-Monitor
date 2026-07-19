@@ -27,7 +27,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from starlette.middleware.sessions import SessionMiddleware
 
-from gpu_broker import SCHEMA_VERSION, __version__
+from gpu_broker import API_CAPABILITIES, SCHEMA_VERSION, __version__
 from gpu_broker.collector import SSHCollector
 from gpu_broker.config import Settings, load_inventory
 from gpu_broker.database import Database
@@ -37,8 +37,10 @@ from gpu_broker.schemas import (
     AlertAcknowledge,
     EndpointEnabled,
     EndpointObservation,
+    EndpointProjectGrant,
     EndpointUpsert,
     LeaseBind,
+    LeaseObservedBind,
     MaintenanceCreate,
     ProjectUpsert,
     RequestCreate,
@@ -49,6 +51,8 @@ from gpu_broker.schemas import (
     SSHCommandRequest,
     SSHCommandsCommit,
     SSHCommandsRequest,
+    WorkloadProfileClaim,
+    WorkloadProfileUpsert,
 )
 from gpu_broker.service import ActorContext, BrokerError, BrokerService
 from gpu_broker.timeutil import json_dump
@@ -255,7 +259,12 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/health/live")
     def health_live() -> dict[str, Any]:
-        return {"status": "live", "schema_version": SCHEMA_VERSION, "version": __version__}
+        return {
+            "status": "live",
+            "schema_version": SCHEMA_VERSION,
+            "version": __version__,
+            "capabilities": list(API_CAPABILITIES),
+        }
 
     @app.get("/health/ready")
     def health_ready() -> JSONResponse:
@@ -293,6 +302,10 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/api/v1/endpoints")
     def endpoints(actor: ApiActor) -> dict[str, Any]:
         return service.list_endpoints(actor)
+
+    @app.get("/api/v1/coordination")
+    def coordination(actor: ApiActor) -> dict[str, Any]:
+        return service.coordination(actor)
 
     @app.get("/api/v1/gpus")
     def gpus(
@@ -381,6 +394,12 @@ def create_app(settings: Settings) -> FastAPI:
     def projects(actor: ApiActor) -> dict[str, Any]:
         return service.list_projects(actor)
 
+    @app.get("/api/v1/workload-profiles")
+    def workload_profiles(
+        actor: ApiActor, project_id: str | None = None
+    ) -> dict[str, Any]:
+        return service.list_workload_profiles(actor, project_id=project_id)
+
     @app.get("/api/v1/actors")
     def actors(actor: ApiActor) -> dict[str, Any]:
         return service.list_actors(actor)
@@ -402,6 +421,21 @@ def create_app(settings: Settings) -> FastAPI:
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
         return service.create_request(actor, request_data, idempotency_key=_idempotency_key(idempotency_key))
+
+    @app.post("/api/v1/claims")
+    def claim_now(
+        request_data: RequestCreate,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        """Create a routine agent claim and auto-activate it once allocated."""
+
+        return service.create_request(
+            actor,
+            request_data,
+            idempotency_key=_idempotency_key(idempotency_key),
+            activate_if_allocated=True,
+        )
 
     @app.post("/api/v1/requests/{request_id}/cancel")
     def cancel_request(
@@ -449,6 +483,20 @@ def create_app(settings: Settings) -> FastAPI:
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
         return service.bind_workload(
+            actor,
+            lease_id,
+            binding,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/leases/{lease_id}/bind-observed-workload")
+    def bind_observed_workload(
+        lease_id: str,
+        binding: LeaseObservedBind,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.bind_observed_workload(
             actor,
             lease_id,
             binding,
@@ -509,6 +557,30 @@ def create_app(settings: Settings) -> FastAPI:
             actor, project_data, idempotency_key=_idempotency_key(idempotency_key)
         )
 
+    @app.post("/api/v1/workload-profiles")
+    def upsert_workload_profile(
+        profile_data: WorkloadProfileUpsert,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.upsert_workload_profile(
+            actor, profile_data, idempotency_key=_idempotency_key(idempotency_key)
+        )
+
+    @app.post("/api/v1/workload-profiles/{profile_id}/claim")
+    def claim_workload_profile(
+        profile_id: str,
+        claim: WorkloadProfileClaim,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.claim_workload_profile(
+            actor,
+            profile_id,
+            claim,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
     @app.post("/api/v1/endpoints")
     def upsert_endpoint(
         endpoint_data: EndpointUpsert,
@@ -518,6 +590,20 @@ def create_app(settings: Settings) -> FastAPI:
         return service.upsert_endpoint(
             actor,
             endpoint_data,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/endpoints/{endpoint_id}/projects")
+    def grant_endpoint_project_access(
+        endpoint_id: str,
+        grant: EndpointProjectGrant,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.grant_endpoint_project_access(
+            actor,
+            endpoint_id,
+            grant.project_id,
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
@@ -829,10 +915,15 @@ def create_app(settings: Settings) -> FastAPI:
         project, endpoint, or GPU the current actor is not allowed to use.
         """
         snapshot = service.snapshot(actor)["data"]
+        workload_profiles = service.list_workload_profiles(actor)["data"]
         return {
             "projects": service.list_projects(actor)["data"],
             "endpoints": snapshot["endpoints"],
             "gpus": snapshot["gpus"],
+            "workload_profiles": workload_profiles,
+            "claimable_workload_profiles": [
+                profile for profile in workload_profiles if profile["enabled"]
+            ],
         }
 
     def page_payload(page: str, actor: ActorContext) -> Any:
@@ -842,7 +933,7 @@ def create_app(settings: Settings) -> FastAPI:
                 **overview["data"],
                 "snapshot_revision": overview["snapshot_revision"],
                 "server_time": overview["server_time"],
-                "projects": service.list_projects(actor)["data"],
+                **ui_reference_data(actor),
             }
         if page == "gpus":
             return {"gpus": service.list_gpus(actor)["data"]}
@@ -972,17 +1063,21 @@ def create_app(settings: Settings) -> FastAPI:
         validation and authorization still happen in the shared Pydantic/service
         boundary used by REST, CLI and MCP.
         """
-        if action == "request":
-            duration_hours = _form_int(form, "duration_hours", required=True, minimum=1, maximum=720)
+        if action == "profile-claim":
+            return {
+                "profile_id": _form_value(form, "profile_id", required=True),
+                "task_ref": _form_value(form, "task_ref", required=True),
+            }
+        if action in {"request", "quick-claim"}:
             min_free_gib = _form_int(form, "min_free_vram_gib", minimum=0)
             endpoint_id = _form_value(form, "endpoint_id")
             gpu_ids = _form_list(form, "gpu_ids")
+            task_ref = _form_value(form, "task_ref", required=True)
             return {
                 "project_id": _form_value(form, "project_id", required=True),
-                "task_ref": _form_value(form, "task_ref", required=True),
-                "purpose": _form_value(form, "purpose", required=True),
+                "task_ref": task_ref,
+                "purpose": task_ref if action == "quick-claim" else _form_value(form, "purpose", required=True),
                 "gpu_count": len(gpu_ids) or _form_int(form, "gpu_count", required=True, minimum=1),
-                "duration_seconds": duration_hours * 3600 if duration_hours is not None else None,
                 "min_free_vram_mib": min_free_gib * 1024 if min_free_gib is not None else None,
                 "placement": "exact" if gpu_ids else (_form_value(form, "placement") or "pack"),
                 "endpoint_ids": [endpoint_id] if endpoint_id else [],
@@ -1047,6 +1142,23 @@ def create_app(settings: Settings) -> FastAPI:
                 "concurrency_limit": _form_int(form, "concurrency_limit", minimum=1),
                 "enabled": _form_boolean(form, "enabled"),
             }
+        if action == "workload-profile":
+            duration_hours = _form_int(form, "duration_hours", required=True, minimum=1, maximum=720)
+            gpu_count = _form_int(form, "gpu_count", required=True, minimum=1)
+            assert duration_hours is not None and gpu_count is not None
+            return {
+                "id": _form_value(form, "id", required=True),
+                "project_id": _form_value(form, "project_id", required=True),
+                "display_name": _form_value(form, "display_name", required=True),
+                "purpose": _form_value(form, "purpose", required=True),
+                "duration_seconds": duration_hours * 3600,
+                "constraints": {
+                    "gpu_count": gpu_count,
+                    "placement": "pack",
+                    "endpoint_ids": _form_list(form, "endpoint_ids"),
+                },
+                "enabled": _form_boolean(form, "enabled"),
+            }
         if action == "actor":
             return {
                 "id": _form_value(form, "id", required=True),
@@ -1105,6 +1217,8 @@ def create_app(settings: Settings) -> FastAPI:
             "endpoint": "/",
             "endpoint-enabled": "/",
             "request": "/ui/requests",
+            "quick-claim": "/ui/requests",
+            "profile-claim": "/ui/requests",
             "cancel-request": "/ui/requests",
             "activate-lease": "/ui/leases",
             "renew-lease": "/ui/leases",
@@ -1115,6 +1229,7 @@ def create_app(settings: Settings) -> FastAPI:
             "maintenance": "/ui/maintenance",
             "ack-alert": "/ui/alerts",
             "project": "/ui/projects",
+            "workload-profile": "/ui/projects",
             "actor": "/ui/projects",
             "revoke-token": "/ui/projects",
             "reconcile": "/ui/doctor",
@@ -1135,8 +1250,20 @@ def create_app(settings: Settings) -> FastAPI:
             else:
                 data = ui_form_payload(action, await request.form())
             key = secrets.token_hex(16)
-            if action == "request":
-                result = service.create_request(actor, parse_ui_request(data), idempotency_key=key)
+            if action in {"request", "quick-claim"}:
+                result = service.create_request(
+                    actor,
+                    parse_ui_request(data),
+                    idempotency_key=key,
+                    activate_if_allocated=action == "quick-claim",
+                )
+            elif action == "profile-claim":
+                result = service.claim_workload_profile(
+                    actor,
+                    data["profile_id"],
+                    WorkloadProfileClaim.model_validate({"task_ref": data["task_ref"]}),
+                    idempotency_key=key,
+                )
             elif action == "endpoint":
                 result = service.upsert_endpoint(
                     actor,
@@ -1186,6 +1313,12 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             elif action == "project":
                 result = service.upsert_project(actor, ProjectUpsert.model_validate(data), idempotency_key=key)
+            elif action == "workload-profile":
+                result = service.upsert_workload_profile(
+                    actor,
+                    WorkloadProfileUpsert.model_validate(data),
+                    idempotency_key=key,
+                )
             elif action == "actor":
                 result = service.create_actor(actor, ActorCreate.model_validate(data), idempotency_key=key)
             elif action == "revoke-token":
@@ -1217,7 +1350,9 @@ def create_app(settings: Settings) -> FastAPI:
             response.headers["Pragma"] = "no-cache"
             return response
 
-        if action == "request":
+        if action in {"quick-claim", "profile-claim"}:
+            message = "GPU 已认领并登记为使用中；不会启动远端任务" if result.get("lease") else "资源请求已进入队列"
+        elif action == "request":
             message = "资源请求已获分配，租约等待激活" if result.get("lease") else "资源请求已进入队列"
         else:
             message = f"操作完成（事件 {result.get('event_id', 'no-event')}）"

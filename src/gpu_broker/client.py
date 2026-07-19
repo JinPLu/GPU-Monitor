@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import httpx
@@ -39,21 +40,42 @@ class BrokerClient:
         headers = {"X-GPU-Broker-Actor": self.actor}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        try:
-            response = httpx.request(
-                method,
-                f"{self.url}{path}",
-                headers=headers,
-                json=json_body,
-                params=params,
-                timeout=self.timeout_seconds,
-            )
-        except httpx.HTTPError as exc:
-            raise BrokerClientError(f"broker request failed: {type(exc).__name__}") from exc
+        # A loopback service can be briefly unavailable while it restarts. GET
+        # requests are safe to retry, and this client gives every mutation an
+        # idempotency key before retrying it, so a claim cannot be duplicated.
+        retryable = method.upper() == "GET" or idempotency_key is not None
+        attempts = 3 if retryable else 1
+        response: httpx.Response | None = None
+        last_transport_error: httpx.HTTPError | None = None
+        for attempt in range(attempts):
+            try:
+                response = httpx.request(
+                    method,
+                    f"{self.url}{path}",
+                    headers=headers,
+                    json=json_body,
+                    params=params,
+                    timeout=self.timeout_seconds,
+                )
+            except httpx.HTTPError as exc:
+                last_transport_error = exc
+                if attempt + 1 == attempts:
+                    raise BrokerClientError(f"broker request failed: {type(exc).__name__}") from exc
+            else:
+                if response.status_code not in {502, 503, 504} or attempt + 1 == attempts:
+                    break
+            time.sleep(0.1 * (attempt + 1))
+        if response is None:
+            assert last_transport_error is not None
+            raise BrokerClientError(f"broker request failed: {type(last_transport_error).__name__}")
         try:
             payload = response.json()
         except ValueError as exc:
-            raise BrokerClientError(f"broker returned non-JSON HTTP {response.status_code}") from exc
+            content_type = response.headers.get("content-type", "unknown")
+            suffix = " after retry" if attempts > 1 else ""
+            raise BrokerClientError(
+                f"broker returned non-JSON HTTP {response.status_code}{suffix} ({content_type})"
+            ) from exc
         if response.is_error:
             error = payload.get("error", {}) if isinstance(payload, dict) else {}
             raise BrokerClientError(
