@@ -41,8 +41,12 @@ class Database:
         cursor.close()
 
     def migrate(self) -> None:
-        config = Config(str(self.project_root / "alembic.ini"))
-        config.set_main_option("script_location", str(self.project_root / "migrations"))
+        config_path = self.project_root / "alembic.ini"
+        config = Config(str(config_path)) if config_path.is_file() else Config()
+        source_migrations = self.project_root / "src" / "gpu_broker" / "migrations"
+        packaged_migrations = Path(__file__).resolve().parent / "migrations"
+        script_location = source_migrations if source_migrations.is_dir() else packaged_migrations
+        config.set_main_option("script_location", str(script_location))
         config.set_main_option("sqlalchemy.url", self.url)
         command.upgrade(config, "head")
 

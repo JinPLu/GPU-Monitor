@@ -47,6 +47,8 @@ from gpu_broker.schemas import (
     ReservationCreate,
     SSHCommandCommit,
     SSHCommandRequest,
+    SSHCommandsCommit,
+    SSHCommandsRequest,
 )
 from gpu_broker.service import ActorContext, BrokerError, BrokerService
 from gpu_broker.timeutil import json_dump
@@ -207,7 +209,7 @@ def create_app(settings: Settings) -> FastAPI:
             )
         return selected
 
-    def ssh_preview_token(command: str, project_ids: list[str]) -> str:
+    def ssh_preview_token(command: str | list[str], project_ids: list[str]) -> str:
         binding = json.dumps(
             {"command": command, "project_ids": project_ids},
             ensure_ascii=True,
@@ -623,6 +625,112 @@ def create_app(settings: Settings) -> FastAPI:
             idempotency_key=secrets.token_hex(16),
         )
         return {"data": result}
+
+    @app.post("/ui/endpoints/ssh/batch/preview")
+    def preview_ssh_endpoints(
+        preview: SSHCommandsRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        actor = session_actor(request)
+        require_session_csrf(request, preview.csrf)
+        project_ids = ssh_projects(preview.project_ids)
+        endpoints = service.list_endpoints(actor)["data"]
+        seen_addresses: set[tuple[str, int]] = set()
+        entries: list[dict[str, Any]] = []
+
+        for line_number, command in enumerate(preview.commands, start=1):
+            try:
+                parsed = parsed_ssh_command(command)
+            except BrokerError as exc:
+                entries.append({"line": line_number, "command": command, "status": "invalid", "error": exc.message})
+                continue
+            address = (parsed.host, parsed.port)
+            if address in seen_addresses:
+                entries.append({"line": line_number, "command": command, "status": "duplicate", "error": "同一 host:port 已在本次粘贴中出现"})
+                continue
+            seen_addresses.add(address)
+            existing = next((endpoint for endpoint in endpoints if (endpoint["host"], endpoint["port"]) == address), None)
+            id_owner = next((endpoint for endpoint in endpoints if endpoint["id"] == parsed.endpoint_id), None)
+            id_collision = id_owner if id_owner is not None and id_owner is not existing else None
+            if id_collision is not None:
+                entries.append({"line": line_number, "command": command, "status": "id_collision", "error": "服务器名称与另一台服务器冲突"})
+                continue
+            endpoint_id = existing["id"] if existing is not None else parsed.endpoint_id
+            entries.append(
+                {
+                    "line": line_number,
+                    "command": command,
+                    "normalized_command": parsed.normalized_command,
+                    "status": "existing" if existing is not None else "new",
+                    "endpoint": {"id": endpoint_id, "host": parsed.host, "port": parsed.port, "ssh_user": parsed.user},
+                }
+            )
+        valid_count = sum(entry["status"] in {"new", "existing"} for entry in entries)
+        return {
+            "data": {
+                "entries": entries,
+                "valid_count": valid_count,
+                "preview_token": ssh_preview_token(preview.commands, project_ids),
+            }
+        }
+
+    @app.post("/ui/endpoints/ssh/batch/commit")
+    def commit_ssh_endpoints(
+        commit: SSHCommandsCommit,
+        request: Request,
+    ) -> dict[str, Any]:
+        actor = session_actor(request)
+        require_session_csrf(request, commit.csrf)
+        project_ids = ssh_projects(commit.project_ids)
+        expected_token = ssh_preview_token(commit.commands, project_ids)
+        if not hmac.compare_digest(commit.preview_token, expected_token):
+            raise BrokerError("invalid_ssh_preview_token", "SSH 命令或项目选择已在预览后改变，请重新检查", status_code=409)
+
+        endpoints = service.list_endpoints(actor)["data"]
+        seen_addresses: set[tuple[str, int]] = set()
+        results: list[dict[str, Any]] = []
+        for line_number, command in enumerate(commit.commands, start=1):
+            try:
+                parsed = parsed_ssh_command(command)
+            except BrokerError as exc:
+                results.append({"line": line_number, "status": "invalid", "error": exc.message})
+                continue
+            address = (parsed.host, parsed.port)
+            if address in seen_addresses:
+                results.append({"line": line_number, "status": "duplicate", "error": "同一 host:port 已在本次粘贴中出现"})
+                continue
+            seen_addresses.add(address)
+            existing = next((endpoint for endpoint in endpoints if (endpoint["host"], endpoint["port"]) == address), None)
+            id_owner = next((endpoint for endpoint in endpoints if endpoint["id"] == parsed.endpoint_id), None)
+            if id_owner is not None and id_owner is not existing:
+                results.append({"line": line_number, "status": "id_collision", "error": "服务器名称与另一台服务器冲突"})
+                continue
+            endpoint_id = existing["id"] if existing is not None else parsed.endpoint_id
+            try:
+                result = service.upsert_endpoint(
+                    actor,
+                    EndpointUpsert(
+                        id=endpoint_id,
+                        host=parsed.host,
+                        port=parsed.port,
+                        ssh_user=parsed.user,
+                        labels=["gpu", "direct-ssh"],
+                        storage_group=None,
+                        expected_gpu_count=None,
+                        expected_gpu_total_vram_mib=None,
+                        project_ids=project_ids,
+                        enabled=True,
+                    ),
+                    idempotency_key=secrets.token_hex(16),
+                )
+            except BrokerError as exc:
+                results.append({"line": line_number, "status": "error", "error": exc.message})
+                continue
+            endpoints.append(result["endpoint"])
+            results.append({"line": line_number, "status": "updated" if existing is not None else "registered", "endpoint": result["endpoint"]})
+        registered_count = sum(result["status"] == "registered" for result in results)
+        updated_count = sum(result["status"] == "updated" for result in results)
+        return {"data": {"entries": results, "registered_count": registered_count, "updated_count": updated_count}}
 
     @app.post("/api/v1/actors")
     def create_actor(
@@ -1120,18 +1228,14 @@ def create_app(settings: Settings) -> FastAPI:
 
 
 def _find_project_root() -> Path:
-    """Find the Alembic source tree for source installs and explicit local pilots.
-
-    Production package deployments should set `Settings.project_root` (or
-    `GPU_BROKER_PROJECT_ROOT`) to the reviewed release directory.
-    """
+    """Find the source release root, falling back to packaged migrations."""
 
     configured = os.environ.get("GPU_BROKER_PROJECT_ROOT")
     candidates = [Path(configured)] if configured else []
     candidates.extend([Path.cwd(), *Path.cwd().parents])
     for candidate in candidates:
-        if (candidate / "alembic.ini").is_file() and (candidate / "migrations").is_dir():
+        if (candidate / "alembic.ini").is_file() and (
+            candidate / "src" / "gpu_broker" / "migrations"
+        ).is_dir():
             return candidate
-    raise RuntimeError(
-        "cannot locate Alembic migrations; set GPU_BROKER_PROJECT_ROOT to the reviewed gpu-broker release root"
-    )
+    return Path(__file__).resolve().parent

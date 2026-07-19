@@ -23,7 +23,7 @@ private enum DesktopError: LocalizedError {
     }
 }
 
-final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler {
     private let port = 8787
     private var window: NSWindow?
     private var webView: WKWebView?
@@ -44,7 +44,8 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        let contentRect = NSRect(x: 0, y: 0, width: 1280, height: 860)
+        configureMainMenu()
+        let contentRect = NSRect(x: 0, y: 0, width: 1440, height: 820)
         let createdWindow = NSWindow(
             contentRect: contentRect,
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -52,11 +53,18 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             defer: false
         )
         createdWindow.title = "GPU Broker"
-        createdWindow.minSize = NSSize(width: 960, height: 640)
+        createdWindow.titleVisibility = .hidden
+        createdWindow.titlebarAppearsTransparent = true
+        createdWindow.toolbarStyle = .unifiedCompact
+        createdWindow.titlebarSeparatorStyle = .none
+        createdWindow.backgroundColor = .windowBackgroundColor
+        createdWindow.minSize = NSSize(width: 1024, height: 640)
         createdWindow.center()
         createdWindow.delegate = self
 
-        let view = WKWebView(frame: contentRect, configuration: WKWebViewConfiguration())
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController.add(self, name: "gpuBrokerClipboard")
+        let view = WKWebView(frame: contentRect, configuration: configuration)
         view.autoresizingMask = [.width, .height]
         createdWindow.contentView = view
         window = createdWindow
@@ -74,6 +82,72 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         if let process = serverProcess, process.isRunning {
             process.terminate()
         }
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard
+            message.name == "gpuBrokerClipboard",
+            message.webView === webView,
+            message.webView?.url?.host == "127.0.0.1",
+            message.webView?.url?.port == port,
+            let body = message.body as? [String: Any],
+            let action = body["action"] as? String,
+            ["paste-ssh-command", "paste-token"].contains(action)
+        else {
+            return
+        }
+
+        guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
+            deliverClipboardError("系统剪贴板中没有可粘贴的文本。")
+            return
+        }
+        let callback = action == "paste-ssh-command" ? "gpuBrokerSetSSHCommand" : "gpuBrokerSetToken"
+        deliverClipboardText(text, to: callback)
+    }
+
+    private func configureMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "退出 GPU Broker", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    private func deliverClipboardText(_ text: String, to callback: String) {
+        guard let argument = jsonArgument(text) else {
+            deliverClipboardError("无法读取系统剪贴板文本。")
+            return
+        }
+        webView?.evaluateJavaScript("window.\(callback)?.(\(argument));")
+    }
+
+    private func deliverClipboardError(_ message: String) {
+        guard let argument = jsonArgument(message) else { return }
+        webView?.evaluateJavaScript("window.gpuBrokerClipboardError?.(\(argument));")
+    }
+
+    private func jsonArgument(_ value: String) -> String? {
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: [value]),
+            let array = String(data: data, encoding: .utf8),
+            array.count >= 2
+        else {
+            return nil
+        }
+        return String(array.dropFirst().dropLast())
     }
 
     private func findProjectRoot(startingAt url: URL) -> URL? {
@@ -244,18 +318,17 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         process.arguments = arguments
         process.currentDirectoryURL = root
         process.environment = processEnvironment()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
         try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let errors = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let details = String(data: data, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
-            throw DesktopError.commandFailed("初始化本机状态失败：\(errors.isEmpty ? output : errors)")
+            throw DesktopError.commandFailed("初始化本机状态失败：\(details)")
         }
-        return output
+        return details
     }
 
     private func startServer(executable: URL, root: URL) throws {

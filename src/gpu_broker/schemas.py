@@ -226,6 +226,32 @@ class SSHCommandCommit(SSHCommandRequest):
     endpoint_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9-]{1,127}$")
 
 
+class SSHCommandsRequest(StrictModel):
+    """Line-oriented SSH commands pasted from the GUI; each line is parsed independently."""
+
+    commands: list[str] = Field(min_length=1, max_length=100)
+    project_ids: list[str] | None = Field(default=None, min_length=1)
+    csrf: str = Field(min_length=1, max_length=256)
+
+    @field_validator("commands")
+    @classmethod
+    def command_lengths(cls, values: list[str]) -> list[str]:
+        if any(not command or len(command) > 512 for command in values):
+            raise ValueError("each SSH command must be between 1 and 512 characters")
+        return values
+
+    @field_validator("project_ids")
+    @classmethod
+    def unique_projects(cls, values: list[str] | None) -> list[str] | None:
+        if values is not None and (len(values) != len(set(values)) or any(not value for value in values)):
+            raise ValueError("project_ids must contain unique non-empty values")
+        return values
+
+
+class SSHCommandsCommit(SSHCommandsRequest):
+    preview_token: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+
+
 class ActorCreate(StrictModel):
     id: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_.-]{1,127}$")
     display_name: str = Field(min_length=1, max_length=160)
@@ -265,10 +291,26 @@ class ProcessInput(StrictModel):
         return value
 
 
+class HostTelemetryInput(StrictModel):
+    """Host-wide telemetry captured with the GPU sample for one endpoint."""
+
+    cpu_count: int = Field(ge=1, le=1_048_576)
+    load_1m: float = Field(ge=0)
+    memory_total_mib: int = Field(ge=1)
+    memory_available_mib: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def available_memory_is_bounded(self) -> "HostTelemetryInput":
+        if self.memory_available_mib > self.memory_total_mib:
+            raise ValueError("memory_available_mib must not exceed memory_total_mib")
+        return self
+
+
 class EndpointObservation(StrictModel):
     endpoint_id: str = Field(min_length=1, max_length=128)
     observed_at: datetime
     boot_id: str = Field(min_length=1, max_length=120)
+    host: HostTelemetryInput
     gpus: list[TelemetryInput]
     processes: list[ProcessInput] = Field(default_factory=list)
 

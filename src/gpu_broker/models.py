@@ -64,6 +64,23 @@ class EndpointProject(Base):
     )
 
 
+class EndpointTelemetryCurrent(Base):
+    """Latest host-wide CPU and memory observation for one endpoint."""
+
+    __tablename__ = "endpoint_telemetry_current"
+
+    endpoint_id: Mapped[str] = mapped_column(
+        ForeignKey("endpoints.id", ondelete="CASCADE"), primary_key=True
+    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    cpu_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    load_1m: Mapped[float] = mapped_column(nullable=False)
+    memory_total_mib: Mapped[int] = mapped_column(Integer, nullable=False)
+    memory_available_mib: Mapped[int] = mapped_column(Integer, nullable=False)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="raw-ssh")
+
+
 class GPUDevice(Base):
     __tablename__ = "gpu_devices"
     __table_args__ = (UniqueConstraint("endpoint_id", "gpu_uuid", name="uq_endpoint_gpu_uuid"),)

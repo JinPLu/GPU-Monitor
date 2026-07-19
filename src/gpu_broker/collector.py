@@ -28,13 +28,21 @@ PROCESS_QUERY = (
     "--format=csv,noheader,nounits"
 )
 IDENTITY_QUERY = "hostname; cat /proc/sys/kernel/random/boot_id"
+HOST_RESOURCES_QUERY = (
+    "getconf _NPROCESSORS_ONLN; "
+    "awk '/MemTotal:/{total=$2} /MemAvailable:/{available=$2} "
+    "END {printf \"%d %d\\n\", total/1024, available/1024}' /proc/meminfo; "
+    "cut -d ' ' -f1 /proc/loadavg"
+)
 GPU_SECTION = "__GPU_BROKER_GPU__"
 PROCESS_SECTION = "__GPU_BROKER_PROCESSES__"
 IDENTITY_SECTION = "__GPU_BROKER_IDENTITY__"
+HOST_RESOURCES_SECTION = "__GPU_BROKER_HOST_RESOURCES__"
 COMBINED_QUERY = (
     f"set -e; printf '{GPU_SECTION}\\n'; {GPU_QUERY}; "
     f"printf '{PROCESS_SECTION}\\n'; {PROCESS_QUERY}; "
-    f"printf '{IDENTITY_SECTION}\\n'; {IDENTITY_QUERY}"
+    f"printf '{IDENTITY_SECTION}\\n'; {IDENTITY_QUERY}; "
+    f"printf '{HOST_RESOURCES_SECTION}\\n'; {HOST_RESOURCES_QUERY}"
 )
 
 
@@ -140,18 +148,44 @@ def parse_identity(raw: str) -> tuple[str, str]:
     return lines[0], lines[1]
 
 
-def parse_combined_probe(raw: str) -> tuple[str, str, str]:
-    """Split the single fixed SSH probe into GPU, process and host identity output."""
+def parse_host_resources(raw: str) -> tuple[int, float, int, int]:
+    """Parse CPU capacity/load and Linux MemAvailable from the immutable probe."""
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) != 3:
+        raise CollectionError("host resource probe must return CPU count, memory, and load")
+    cpu_count = _int(lines[0])
+    memory = lines[1].split()
+    load_1m = _float(lines[2])
+    if cpu_count is None or len(memory) != 2 or load_1m is None:
+        raise CollectionError("host resource probe returned invalid values")
+    memory_total = _int(memory[0])
+    memory_available = _int(memory[1])
+    if (
+        cpu_count < 1
+        or memory_total is None
+        or memory_total < 1
+        or memory_available is None
+        or memory_available < 0
+        or memory_available > memory_total
+    ):
+        raise CollectionError("host resource probe returned out-of-range values")
+    return cpu_count, load_1m, memory_total, memory_available
+
+
+def parse_combined_probe(raw: str) -> tuple[str, str, str, str]:
+    """Split the single fixed SSH probe into GPU, process, identity and host resource output."""
 
     try:
         gpu_marker, rest = raw.split(GPU_SECTION, maxsplit=1)
         gpu_raw, rest = rest.split(PROCESS_SECTION, maxsplit=1)
-        process_raw, identity_raw = rest.split(IDENTITY_SECTION, maxsplit=1)
+        process_raw, rest = rest.split(IDENTITY_SECTION, maxsplit=1)
+        identity_raw, host_raw = rest.split(HOST_RESOURCES_SECTION, maxsplit=1)
     except ValueError as exc:
         raise CollectionError("combined SSH probe returned incomplete section markers") from exc
     if gpu_marker.strip():
         raise CollectionError("combined SSH probe returned data before its first section marker")
-    return gpu_raw.strip(), process_raw.strip(), identity_raw.strip()
+    return gpu_raw.strip(), process_raw.strip(), identity_raw.strip(), host_raw.strip()
 
 
 def parse_ps_output(raw: str, observed_at) -> dict[int, tuple[str | None, object, str]]:  # noqa: ANN001
@@ -219,12 +253,13 @@ class SSHCollector:
 
     async def observe_endpoint(self, endpoint: EndpointConfig) -> EndpointObservation:
         observed_at = utcnow()
-        gpu_raw, process_raw, identity_raw = parse_combined_probe(
+        gpu_raw, process_raw, identity_raw, host_raw = parse_combined_probe(
             await self._run(endpoint, COMBINED_QUERY)
         )
         gpus = parse_gpu_csv(gpu_raw)
         apps = parse_process_csv(process_raw)
         _hostname, boot_id = parse_identity(identity_raw)
+        cpu_count, load_1m, memory_total_mib, memory_available_mib = parse_host_resources(host_raw)
         pids = sorted({app.pid for app in apps})
         details: dict[int, tuple[str | None, object, str]] = {}
         if pids:
@@ -250,6 +285,12 @@ class SSHCollector:
             endpoint_id=endpoint.id,
             observed_at=observed_at,
             boot_id=boot_id,
+            host={
+                "cpu_count": cpu_count,
+                "load_1m": load_1m,
+                "memory_total_mib": memory_total_mib,
+                "memory_available_mib": memory_available_mib,
+            },
             gpus=gpus,
             processes=processes,
         )

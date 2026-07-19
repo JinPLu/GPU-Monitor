@@ -93,6 +93,16 @@
     return parseJsonResponse(response);
   };
 
+  const requestSshBatchPreview = async (commands, csrf) => {
+    const response = await fetch("/ui/endpoints/ssh/batch/preview", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ commands, csrf }),
+    });
+    return parseJsonResponse(response);
+  };
+
   const commitSshEndpoint = async ({ command, previewToken, endpointId, projectIds, csrf }) => {
     const body = { command, preview_token: previewToken, csrf };
     if (endpointId) body.endpoint_id = endpointId;
@@ -106,6 +116,16 @@
     return parseJsonResponse(response);
   };
 
+  const commitSshBatch = async ({ commands, previewToken, csrf }) => {
+    const response = await fetch("/ui/endpoints/ssh/batch/commit", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ commands, preview_token: previewToken, csrf }),
+    });
+    return parseJsonResponse(response);
+  };
+
   const sshForm = document.getElementById("ssh-preview-form");
   if (sshForm) {
     const commandInput = document.getElementById("ssh-command");
@@ -115,7 +135,31 @@
     const errorNode = document.getElementById("ssh-error");
     const previewButton = document.getElementById("ssh-preview-button");
     const commitButton = document.getElementById("ssh-commit-button");
+    const endpointIdField = document.getElementById("ssh-endpoint-id-field");
+    const pasteButton = document.getElementById("paste-ssh-command");
+    const clipboardStatus = document.getElementById("ssh-clipboard-status");
+    const clipboardBridge = window.webkit?.messageHandlers?.gpuBrokerClipboard;
     let sshPreviewData = null;
+    let sshBatchCommands = null;
+
+    const setClipboardStatus = (message) => {
+      if (!clipboardStatus) return;
+      clipboardStatus.textContent = message;
+      clipboardStatus.hidden = false;
+    };
+    if (clipboardBridge && pasteButton) {
+      pasteButton.hidden = false;
+      window.gpuBrokerSetSSHCommand = (command) => {
+        commandInput.value = command;
+        commandInput.focus();
+        setClipboardStatus("已从系统剪贴板填入 SSH 命令；请检查后点击“检查命令”。");
+      };
+      window.gpuBrokerClipboardError = (message) => setClipboardStatus(message);
+      pasteButton.addEventListener("click", () => {
+        setClipboardStatus("正在从系统剪贴板读取…");
+        clipboardBridge.postMessage({ action: "paste-ssh-command" });
+      });
+    }
 
     const showSshError = (error) => {
       errorNode.textContent = error instanceof Error ? error.message : String(error);
@@ -132,6 +176,13 @@
         .filter(([key, value]) => !["preview_token", "command", "project_ids"].includes(key) && value !== null && value !== undefined && typeof value !== "object")
         .map(([key, value]) => [labels[key] || key.replaceAll("_", " "), value]);
     };
+    const renderBatchPreview = (entries) => {
+      const labels = { new: "可登记", existing: "将更新", invalid: "格式无效", duplicate: "重复", id_collision: "名称冲突" };
+      previewFields.innerHTML = `<table><thead><tr><th>行</th><th>服务器</th><th>结果</th></tr></thead><tbody>${entries.map((entry) => {
+        const target = entry.endpoint ? `${entry.endpoint.ssh_user}@${entry.endpoint.host}:${entry.endpoint.port}` : entry.command;
+        return `<tr><td>${entry.line}</td><td>${escapeForMarkup(target)}</td><td>${escapeForMarkup(entry.error || labels[entry.status] || entry.status)}</td></tr>`;
+      }).join("")}</tbody></table>`;
+    };
 
     sshForm.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -140,18 +191,26 @@
       previewButton.textContent = "正在检查…";
       try {
         const csrf = sshForm.elements.csrf.value;
-        sshPreviewData = await requestSshPreview(commandInput.value, csrf);
+        const commands = commandInput.value.split(/\r?\n/).map((command) => command.trim()).filter(Boolean);
+        sshBatchCommands = commands.length > 1 ? commands : null;
+        sshPreviewData = sshBatchCommands
+          ? await requestSshBatchPreview(sshBatchCommands, csrf)
+          : await requestSshPreview(commandInput.value, csrf);
         const entries = previewEntries(sshPreviewData || {});
         const statusTitles = {
           new: "确认新服务器信息",
           existing: "该服务器已登记，将更新配置",
           id_collision: "服务器名称冲突，请填写其他名称",
         };
-        previewTitle.textContent = statusTitles[sshPreviewData?.status] || "确认服务器信息";
+        previewTitle.textContent = sshBatchCommands
+          ? `检查结果：${sshPreviewData.valid_count} 台可登记`
+          : statusTitles[sshPreviewData?.status] || "确认服务器信息";
+        endpointIdField.hidden = Boolean(sshBatchCommands);
         document.getElementById("ssh-endpoint-id").value = sshPreviewData?.endpoint?.id || "";
-        previewFields.innerHTML = entries.length
+        if (sshBatchCommands) renderBatchPreview(sshPreviewData.entries);
+        else previewFields.innerHTML = `<dl>${entries.length
           ? entries.map(([label, value]) => `<dt>${escapeForMarkup(label)}</dt><dd>${escapeForMarkup(value)}</dd>`).join("")
-          : "<dt>命令</dt><dd>格式有效，可继续注册</dd>";
+          : "<dt>命令</dt><dd>格式有效，可继续注册</dd>"}</dl>`;
         sshForm.hidden = true;
         previewSection.hidden = false;
         commitButton.focus();
@@ -177,13 +236,22 @@
       try {
         const previewToken = sshPreviewData?.preview_token;
         if (!previewToken) throw new Error("预览已失效，请返回重新检查命令。");
-        await commitSshEndpoint({
-          command: commandInput.value,
-          previewToken,
-          endpointId: document.getElementById("ssh-endpoint-id").value.trim(),
-          projectIds: sshPreviewData.endpoint?.project_ids,
-          csrf: sshForm.elements.csrf.value,
-        });
+        const result = sshBatchCommands
+          ? await commitSshBatch({ commands: sshBatchCommands, previewToken, csrf: sshForm.elements.csrf.value })
+          : await commitSshEndpoint({
+            command: commandInput.value,
+            previewToken,
+            endpointId: document.getElementById("ssh-endpoint-id").value.trim(),
+            projectIds: sshPreviewData.endpoint?.project_ids,
+            csrf: sshForm.elements.csrf.value,
+          });
+        if (sshBatchCommands && result.entries.some((entry) => !["registered", "updated"].includes(entry.status))) {
+          renderBatchPreview(result.entries);
+          previewTitle.textContent = `已登记 ${result.registered_count} 台；其余行未写入`;
+          commitButton.disabled = false;
+          commitButton.textContent = "确认注册";
+          return;
+        }
         window.location.reload();
       } catch (error) {
         showSshError(error);
@@ -197,6 +265,8 @@
       sshForm.hidden = false;
       clearSshError();
       sshPreviewData = null;
+      sshBatchCommands = null;
+      endpointIdField.hidden = false;
       commitButton.disabled = false;
       commitButton.textContent = "确认注册";
       const commandTab = document.getElementById("ssh-command-tab");
@@ -275,8 +345,24 @@
   let chart = null;
   let chartAssets = null;
   let refreshing = false;
+  const refreshIntervals = new Set([0, 5_000, 10_000, 30_000]);
+  const refreshPreferenceKey = "gpu-broker.refresh-interval-ms";
+  let savedRefreshInterval = Number.NaN;
+  try {
+    const savedRefreshValue = window.localStorage?.getItem(refreshPreferenceKey);
+    savedRefreshInterval = savedRefreshValue === null ? Number.NaN : Number(savedRefreshValue);
+  } catch (_error) {
+    // Private browsing or an embedded webview can disable storage.
+  }
+  let refreshIntervalMs = refreshIntervals.has(savedRefreshInterval) ? savedRefreshInterval : 10_000;
+  let refreshTimer = null;
   const expandedServers = new Set();
   const serverGroups = document.getElementById("server-groups");
+  const dashboardLayout = document.getElementById("dashboard-layout");
+  const coordinationToggle = document.getElementById("toggle-coordination");
+  const coordinationReopen = document.getElementById("coordination-reopen");
+  const refreshButton = document.getElementById("refresh-dashboard");
+  const refreshIntervalSelect = document.getElementById("refresh-interval");
 
   const clusterMeter = (label, value, kind) => {
     const rounded = Math.round(clamp(value));
@@ -321,14 +407,22 @@
     const memoryPct = total ? used * 100 / total : 0;
     const utilValues = telemetry.map((item) => item.gpu_utilization_pct).filter((value) => value !== null && value !== undefined);
     const util = utilValues.length ? utilValues.reduce((sum, value) => sum + Number(value), 0) / utilValues.length : 0;
+    const host = endpoint.host_telemetry;
+    const cpuLoadPct = host?.cpu_count ? clamp((Number(host.load_1m) * 100) / Number(host.cpu_count)) : 0;
+    const memoryUsedPct = host?.memory_total_mib
+      ? clamp((1 - Number(host.memory_available_mib) / Number(host.memory_total_mib)) * 100)
+      : 0;
+    const hostSummary = host
+      ? ` · 内存可用 ${formatMemory(host.memory_available_mib)} / ${formatMemory(host.memory_total_mib)}`
+      : " · 等待 CPU / 内存采集";
     const expanded = allExpanded || expandedServers.has(endpoint.id);
     const status = endpoint.monitor?.status || "PENDING";
     return `
       <section class="server-block" data-server-id="${escapeHTML(endpoint.id)}" data-expanded="${expanded}">
         <button class="server-summary" type="button" data-toggle-server="${escapeHTML(endpoint.id)}" aria-expanded="${expanded}">
-          <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong>${escapeHTML(endpoint.id)}</strong><small>${escapeHTML(endpoint.ssh_user)}@${escapeHTML(endpoint.host)}:${endpoint.port} · ${escapeHTML(monitorLabels[status] || status)}</small></span></span>
-          <span class="server-counts"><span><strong>${gpus.length}</strong> 总数</span><span><strong>${available}</strong> 空闲</span><span><strong>${busy}</strong> 占用</span><span><strong>${claimed}</strong> 认领</span>${abnormal ? `<span class="count-alert"><strong>${abnormal}</strong> 异常</span>` : ""}</span>
-          <span class="server-aggregate">${clusterMeter("显存", memoryPct, "memory")}${clusterMeter("利用率", util, "utilization")}</span>
+          <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong>${escapeHTML(endpoint.id)}</strong><small>${escapeHTML(endpoint.ssh_user)}@${escapeHTML(endpoint.host)}:${endpoint.port} · ${escapeHTML(monitorLabels[status] || status)}${hostSummary}</small></span></span>
+          <span class="server-counts" aria-label="GPU 状态：共 ${gpus.length}，空闲 ${available}，占用 ${busy}，认领 ${claimed}，异常 ${abnormal}"><span title="总数"><strong>${gpus.length}</strong><small>总</small></span><span class="count-available" title="空闲"><strong>${available}</strong><small>空</small></span><span title="占用"><strong>${busy}</strong><small>占</small></span><span title="认领"><strong>${claimed}</strong><small>认</small></span><span class="${abnormal ? "count-alert" : ""}" title="异常"><strong>${abnormal}</strong><small>异</small></span></span>
+          <span class="server-aggregate">${clusterMeter("CPU 负载", cpuLoadPct, "cpu")}${clusterMeter("内存", memoryUsedPct, "memory")}${clusterMeter("显存", memoryPct, "memory")}${clusterMeter("GPU 利用率", util, "utilization")}</span>
           <span class="server-expand"><span>${expanded ? "收起 GPU" : "展开 GPU"}</span><i class="ph ph-caret-down" aria-hidden="true"></i></span>
         </button>
         <div class="gpu-tiles">${expanded ? (gpus.length ? gpus.map(gpuRow).join("") : '<p class="empty-inline">尚未发现 GPU；该服务器不会参与分配。</p>') : ""}</div>
@@ -449,6 +543,32 @@
     resourceQuery = event.currentTarget.value.trim().toLowerCase();
     renderServers();
   });
+
+  const coordinationPreferenceKey = "gpu-broker.coordination-collapsed";
+  const setCoordinationCollapsed = (collapsed, { focus = false } = {}) => {
+    dashboardLayout.classList.toggle("coordination-collapsed", collapsed);
+    coordinationToggle.setAttribute("aria-expanded", String(!collapsed));
+    coordinationToggle.setAttribute("aria-label", collapsed ? "协作安排已收起" : "收起协作安排");
+    coordinationToggle.title = collapsed ? "协作安排已收起" : "收起协作安排";
+    coordinationToggle.innerHTML = `<i class="ph ${collapsed ? "ph-caret-left" : "ph-caret-right"}" aria-hidden="true"></i>`;
+    coordinationReopen.hidden = !collapsed;
+    coordinationReopen.setAttribute("aria-expanded", String(collapsed));
+    if (focus) (collapsed ? coordinationReopen : coordinationToggle).focus();
+    try {
+      window.localStorage?.setItem(coordinationPreferenceKey, String(collapsed));
+    } catch (_error) {
+      // Private browsing or an embedded webview can disable storage.
+    }
+  };
+  let coordinationCollapsed = false;
+  try {
+    coordinationCollapsed = window.localStorage?.getItem(coordinationPreferenceKey) === "true";
+  } catch (_error) {
+    // Private browsing or an embedded webview can disable storage.
+  }
+  coordinationToggle.addEventListener("click", () => setCoordinationCollapsed(true, { focus: true }));
+  coordinationReopen.addEventListener("click", () => setCoordinationCollapsed(false, { focus: true }));
+  setCoordinationCollapsed(coordinationCollapsed);
 
   document.querySelectorAll("[data-side-tab]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -591,6 +711,9 @@
   const refresh = async () => {
     if (refreshing || document.hidden) return;
     refreshing = true;
+    refreshButton.disabled = true;
+    refreshButton.setAttribute("aria-busy", "true");
+    refreshButton.innerHTML = '<i class="ph ph-spinner-gap" aria-hidden="true"></i>';
     try {
       const response = await fetch("/api/v1/snapshot", { headers: { Accept: "application/json" }, cache: "no-store" });
       if (!response.ok) throw new Error(`snapshot ${response.status}`);
@@ -609,11 +732,34 @@
       setLiveState("error", "连接中断，正在重试");
     } finally {
       refreshing = false;
+      refreshButton.disabled = false;
+      refreshButton.removeAttribute("aria-busy");
+      refreshButton.innerHTML = '<i class="ph ph-arrow-clockwise" aria-hidden="true"></i>';
     }
   };
 
+  const scheduleRefresh = () => {
+    if (refreshTimer !== null) window.clearInterval(refreshTimer);
+    refreshTimer = refreshIntervalMs > 0 ? window.setInterval(refresh, refreshIntervalMs) : null;
+  };
+
+  refreshIntervalSelect.value = String(refreshIntervalMs);
+  refreshButton.addEventListener("click", refresh);
+  refreshIntervalSelect.addEventListener("change", (event) => {
+    const interval = Number(event.currentTarget.value);
+    refreshIntervalMs = refreshIntervals.has(interval) ? interval : 10_000;
+    try {
+      window.localStorage?.setItem(refreshPreferenceKey, String(refreshIntervalMs));
+    } catch (_error) {
+      // Private browsing or an embedded webview can disable storage; the setting still applies now.
+    }
+    scheduleRefresh();
+  });
+
   render();
   setLiveState("online", `已更新 ${formatDate(data.server_time)}`);
-  window.setInterval(refresh, 10_000);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+  scheduleRefresh();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && refreshIntervalMs > 0) refresh();
+  });
 })();

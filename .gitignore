@@ -13,6 +13,7 @@ coverage.xml
 .coverage
 build/
 dist/
+/GPU Broker.app
 *.egg-info/
 *.pem
 *.key

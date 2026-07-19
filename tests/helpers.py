@@ -17,6 +17,12 @@ def observation(
         endpoint_id=endpoint_id,
         observed_at=now,
         boot_id=f"boot-{endpoint_id}",
+        host={
+            "cpu_count": 64,
+            "load_1m": 4.0,
+            "memory_total_mib": 262_144,
+            "memory_available_mib": 196_608,
+        },
         gpus=[
             TelemetryInput(
                 gpu_uuid=f"{prefix}-{endpoint_id}-{index}",

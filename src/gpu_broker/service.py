@@ -27,6 +27,7 @@ from gpu_broker.models import (
     AuditEvent,
     Endpoint,
     EndpointProject,
+    EndpointTelemetryCurrent,
     GPUDevice,
     IdempotencyRecord,
     Lease,
@@ -685,6 +686,20 @@ class BrokerService:
             "provider": telemetry.provider,
         }
 
+    @staticmethod
+    def _host_telemetry_dict(telemetry: EndpointTelemetryCurrent | None) -> dict[str, Any] | None:
+        if telemetry is None:
+            return None
+        return {
+            "observed_at": _iso(telemetry.observed_at),
+            "collected_at": _iso(telemetry.collected_at),
+            "cpu_count": telemetry.cpu_count,
+            "load_1m": telemetry.load_1m,
+            "memory_total_mib": telemetry.memory_total_mib,
+            "memory_available_mib": telemetry.memory_available_mib,
+            "provider": telemetry.provider,
+        }
+
     def _current_processes(self, session: Session, gpu_id: str, now: datetime) -> list[ProcessObservation]:
         cutoff = now - timedelta(seconds=self.inventory.collector.stale_after_seconds)
         return session.scalars(
@@ -861,6 +876,18 @@ class BrokerService:
                 and (endpoint_id is None or endpoint.id == endpoint_id)
             ]
             visible_ids = {endpoint.id for endpoint in visible_endpoints}
+            host_telemetry_by_endpoint = (
+                {
+                    item.endpoint_id: item
+                    for item in session.scalars(
+                        select(EndpointTelemetryCurrent).where(
+                            EndpointTelemetryCurrent.endpoint_id.in_(visible_ids)
+                        )
+                    ).all()
+                }
+                if visible_ids
+                else {}
+            )
             gpus = (
                 session.scalars(
                     select(GPUDevice)
@@ -1039,6 +1066,9 @@ class BrokerService:
                     monitor_status = "ONLINE"
                 return {
                     **self._endpoint_dict(endpoint),
+                    "host_telemetry": self._host_telemetry_dict(
+                        host_telemetry_by_endpoint.get(endpoint.id)
+                    ),
                     "monitor": {
                         "status": monitor_status,
                         "gpu_count": gpu_counts[endpoint.id],
@@ -1367,6 +1397,27 @@ class BrokerService:
                 raise BrokerError("endpoint_not_found", "collector reported an unknown endpoint", status_code=404)
             revision = self._bump_revision(session, now)
             observed_at = ensure_utc(observation.observed_at)
+            host_telemetry = session.get(EndpointTelemetryCurrent, endpoint.id)
+            if host_telemetry is None:
+                host_telemetry = EndpointTelemetryCurrent(
+                    endpoint_id=endpoint.id,
+                    observed_at=observed_at,
+                    collected_at=now,
+                    cpu_count=observation.host.cpu_count,
+                    load_1m=observation.host.load_1m,
+                    memory_total_mib=observation.host.memory_total_mib,
+                    memory_available_mib=observation.host.memory_available_mib,
+                    provider=provider,
+                )
+                session.add(host_telemetry)
+            else:
+                host_telemetry.observed_at = observed_at
+                host_telemetry.collected_at = now
+                host_telemetry.cpu_count = observation.host.cpu_count
+                host_telemetry.load_1m = observation.host.load_1m
+                host_telemetry.memory_total_mib = observation.host.memory_total_mib
+                host_telemetry.memory_available_mib = observation.host.memory_available_mib
+                host_telemetry.provider = provider
             gpu_ids = [f"{endpoint.id}:{sample.gpu_uuid}" for sample in observation.gpus]
             existing_gpus = {
                 gpu.id: gpu

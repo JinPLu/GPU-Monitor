@@ -15,12 +15,19 @@ mcp = FastMCP(
     "gpu-broker",
     json_response=True,
     instructions=(
-        "For an already-authorized GPU workload, call gpu_claim with an explicit project_id, a "
-        "readable agent_name, task, GPU count, and duration. Use only the GPUs in a returned lease; "
-        "without a lease, do not run. After stopping the workload, call gpu_release with the same "
-        "agent_name and lease id. If the tool or service is unavailable, do not infer availability "
-        "from inventory, SSH, or nvidia-smi. A lease coordinates ownership only; it never authorizes, "
-        "starts, stops, or preempts a workload."
+        "Use this MCP only when the user asks to inspect or coordinate GPU resources. For an "
+        "allocation request, require explicit authorization, project_id, task, purpose, gpu_count, "
+        "and hours; add exact gpu_ids only when requested. Do not infer values from a repository or "
+        "defaults. Call gpu_claim atomically: lease=null or a queued response is not permission to "
+        "run. Use only GPUs in a returned held or active lease. For an existing lease, activate it "
+        "before work when available and call gpu_release after the workload stops or failed startup with "
+        "the same agent_name and lease_id where accepted plus a reason; cancel only explicitly abandoned "
+        "requests and renew only with explicit bounded "
+        "authorization. Reservations, server registration, and workload binding require separate "
+        "authorization. This MCP coordinates ownership only; it never authorizes, starts, stops, or "
+        "preempts remote work. The loopback actor label is audit metadata, not authentication. If "
+        "MCP or the service is unavailable, report that state and do not fall back to SSH, inventory, "
+        "SQLite, or nvidia-smi."
     ),
 )
 
@@ -42,7 +49,7 @@ def gpu_status(
     state: str | None = None,
     only_available: bool = False,
 ) -> dict[str, Any]:
-    """Return shared state; compact mode is designed for quick Agent scheduling decisions."""
+    """Return shared state, including per-server CPU load and available system memory for placement decisions."""
 
     params: dict[str, Any] = {"compact": compact, "only_available": only_available}
     if server_id:
@@ -174,11 +181,11 @@ def gpu_claim(
     agent_name: str,
     project_id: str,
     task: str,
-    gpu_count: int = 1,
-    hours: int = 4,
+    purpose: str,
+    gpu_count: int,
+    hours: int,
     server_id: str | None = None,
     gpu_ids: list[str] | None = None,
-    purpose: str | None = None,
 ) -> dict[str, Any]:
     """Claim GPUs now, or enter the shared queue when they are unavailable."""
 
@@ -197,7 +204,7 @@ def gpu_claim(
         {
             "project_id": project_id,
             "task_ref": task,
-            "purpose": purpose or task,
+            "purpose": purpose,
             "duration_seconds": hours * 3600,
             "constraints": constraints,
         },
@@ -206,7 +213,7 @@ def gpu_claim(
 
 
 @mcp.tool()
-def gpu_release(agent_name: str, lease_id: str, reason: str = "finished") -> dict[str, Any]:
+def gpu_release(agent_name: str, lease_id: str, reason: str) -> dict[str, Any]:
     """Release a prior claim; this never stops a process on the remote server."""
 
     return _client(agent_name).post(

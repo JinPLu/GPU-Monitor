@@ -33,7 +33,7 @@
   <button class="summary-item summary-warning" type="button" data-resource-filter="attention" aria-pressed="false"><i class="ph ph-warning" aria-hidden="true"></i><span>需注意</span><strong id="kpi-abnormal">{{ payload.summary.abnormal_gpus }}</strong><small>异常或待确认</small></button>
 </section>
 
-<div class="dashboard-layout{% if not payload.endpoints %} deferred-until-server{% endif %}">
+<div id="dashboard-layout" class="dashboard-layout{% if not payload.endpoints %} deferred-until-server{% endif %}">
   <section class="resource-panel" aria-labelledby="resource-table-title">
     <div class="panel-heading">
       <div>
@@ -42,16 +42,27 @@
       </div>
       <div class="resource-tools">
         <label class="resource-search"><i class="ph ph-magnifying-glass" aria-hidden="true"></i><span class="sr-only">筛选服务器</span><input id="resource-search" type="search" placeholder="搜索名称、IP 或端口" autocomplete="off"></label>
+        <div class="refresh-controls" aria-label="资源刷新">
+          <button class="quiet-action compact-action refresh-button" id="refresh-dashboard" type="button" title="刷新" aria-label="刷新"><i class="ph ph-arrow-clockwise" aria-hidden="true"></i></button>
+          <label class="refresh-interval"><span class="sr-only">自动刷新频率</span><select id="refresh-interval" aria-label="自动刷新频率"><option value="5000">每 5 秒</option><option value="10000" selected>每 10 秒</option><option value="30000">每 30 秒</option><option value="0">从不自动刷新</option></select></label>
+        </div>
         <button class="quiet-action compact-action" id="toggle-all-servers" type="button"><i class="ph ph-arrows-out-line-vertical" aria-hidden="true"></i>展开全部</button>
       </div>
+    </div>
+    <div class="resource-list-head" role="row" aria-label="资源列表表头">
+      <span>服务器</span>
+      <span>GPU 状态<small>总数 · 空闲 · 占用 · 认领 · 异常</small></span>
+      <span>资源使用<small>CPU · 内存 · 显存 · GPU 利用率</small></span>
+      <span>操作</span>
     </div>
     <div id="server-groups" class="server-groups" aria-live="polite"></div>
     <noscript><p class="empty">需要启用 JavaScript 才能显示实时资源表。</p></noscript>
   </section>
 
-  <aside class="coordination-panel" aria-labelledby="coordination-title">
+  <aside id="coordination-panel" class="coordination-panel" aria-labelledby="coordination-title">
     <div class="panel-heading compact-heading">
       <div><h2 id="coordination-title">协作安排</h2><p class="muted">谁在用、谁在等、接下来给谁</p></div>
+      <button id="toggle-coordination" class="icon-button" type="button" title="收起协作安排" aria-label="收起协作安排" aria-controls="coordination-panel" aria-expanded="true"><i class="ph ph-caret-right" aria-hidden="true"></i></button>
     </div>
     <div class="side-tabs" role="tablist" aria-label="协作安排分类">
       <button id="claims-tab" type="button" role="tab" aria-selected="true" aria-controls="coordination-content" data-side-tab="claims">当前认领 <span id="claims-count">0</span></button>
@@ -62,6 +73,7 @@
     <p class="advanced-link"><a href="/ui/requests">管理认领与队列</a> · <a href="/ui/doctor">高级设置</a></p>
   </aside>
 </div>
+<button id="coordination-reopen" class="coordination-reopen icon-button{% if not payload.endpoints %} deferred-until-server{% endif %}" type="button" title="展开协作安排" aria-label="展开协作安排" aria-controls="coordination-panel" hidden><i class="ph ph-caret-left" aria-hidden="true"></i></button>
 
 <dialog id="server-dialog" class="modal-dialog">
   <div class="dialog-heading"><div><p class="eyebrow">只读监控</p><h2>添加服务器</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
@@ -73,15 +85,17 @@
   <section id="ssh-command-panel" class="dialog-tab-panel" role="tabpanel" aria-labelledby="ssh-command-tab">
     <div id="ssh-error" class="inline-message error-message" role="alert" hidden></div>
     <form id="ssh-preview-form" class="stack">
-      <label>SSH 命令<textarea id="ssh-command" name="command" rows="4" required spellcheck="false" autocomplete="off" placeholder="ssh -p 22 user@gpu-host"></textarea></label>
-      <p class="field-help">仅解析常见的 <code>ssh</code> 用户、主机和端口参数，不会运行这条命令。</p>
+      <label>SSH 命令（每行一台服务器）<textarea id="ssh-command" name="command" rows="4" required spellcheck="false" autocomplete="off" placeholder="ssh -p 22 user@gpu-host"></textarea></label>
+      <button id="paste-ssh-command" class="quiet-action" type="button" hidden>从系统剪贴板粘贴</button>
+      <p id="ssh-clipboard-status" class="muted" role="status" hidden></p>
+      <p class="field-help">每行仅解析常见的 <code>ssh</code> 用户、主机和端口参数，不会运行任何命令。</p>
       <input type="hidden" name="csrf" value="{{ csrf }}">
       <div class="dialog-actions"><button class="quiet-action" type="button" data-close-dialog>取消</button><button id="ssh-preview-button" type="submit">检查命令</button></div>
     </form>
     <section id="ssh-preview" class="ssh-preview" aria-live="polite" hidden>
       <div class="preview-heading"><div><p class="eyebrow">注册预览</p><h3 id="ssh-preview-title">确认服务器信息</h3></div><span class="badge">未连接验证</span></div>
-      <dl id="ssh-preview-fields"></dl>
-      <label>服务器名称（可选）<input id="ssh-endpoint-id" name="endpoint_id" placeholder="例如 training-a"></label>
+      <div id="ssh-preview-fields" class="ssh-preview-fields"></div>
+      <label id="ssh-endpoint-id-field">服务器名称（可选）<input id="ssh-endpoint-id" name="endpoint_id" placeholder="例如 training-a"></label>
       <p class="field-help">继续只会登记配置。首次只读采集成功前，该服务器及 GPU 不会被视为可用。</p>
       <div class="dialog-actions"><button class="quiet-action" type="button" data-edit-ssh-command>返回修改</button><button id="ssh-commit-button" type="button">确认注册</button></div>
     </section>

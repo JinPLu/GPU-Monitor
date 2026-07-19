@@ -42,6 +42,13 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert 'id="server-groups"' in home.text
     assert 'id="gpu-detail"' in home.text
     assert 'id="resource-search"' in home.text
+    assert 'class="resource-list-head"' in home.text
+    assert 'id="toggle-coordination"' in home.text
+    assert 'id="coordination-reopen"' in home.text
+    assert 'id="refresh-dashboard"' in home.text
+    assert 'aria-label="刷新"' in home.text
+    assert 'id="refresh-interval"' in home.text
+    assert "从不自动刷新" in home.text
     assert 'data-resource-filter="attention"' in home.text
     assert "/static/assets/server-room-background.jpg" in home.text
     assert "展开全部" in home.text
@@ -182,6 +189,8 @@ def test_mcp_exposes_required_tools() -> None:
     }.issubset(names)
     for name in ("gpu_claim", "gpu_schedule", "gpu_add_server"):
         assert "project_id" in by_name[name].inputSchema["required"]
+    assert {"purpose", "gpu_count", "hours"}.issubset(by_name["gpu_claim"].inputSchema["required"])
+    assert "reason" in by_name["gpu_release"].inputSchema["required"]
 
 
 def test_ssh_preview_commit_is_bound_non_mutating_and_uses_defaults(tmp_path: Path, inventory) -> None:
@@ -327,6 +336,42 @@ def test_ssh_preview_reports_existing_address_and_id_collision(tmp_path: Path, i
     )
     assert resolved.status_code == 200
     assert resolved.json()["data"]["endpoint"]["id"] == "collision-host-explicit"
+
+
+def test_ssh_batch_registers_valid_lines_and_skips_invalid_or_duplicate_lines(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'ssh-batch.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    client = TestClient(app)
+    csrf = _csrf(client.get("/").text)
+    commands = [
+        "ssh -p 2201 gpu@batch-host",
+        "not an ssh command",
+        "ssh -p 2202 gpu@batch-host",
+        "ssh -p 2201 root@batch-host",
+    ]
+
+    preview = client.post("/ui/endpoints/ssh/batch/preview", json={"commands": commands, "csrf": csrf})
+    assert preview.status_code == 200
+    preview_data = preview.json()["data"]
+    assert preview_data["valid_count"] == 2
+    assert [entry["status"] for entry in preview_data["entries"]] == ["new", "invalid", "new", "duplicate"]
+
+    committed = client.post(
+        "/ui/endpoints/ssh/batch/commit",
+        json={"commands": commands, "preview_token": preview_data["preview_token"], "csrf": csrf},
+    )
+    assert committed.status_code == 200
+    result = committed.json()["data"]
+    assert result["registered_count"] == 2
+    assert result["updated_count"] == 0
+    assert [entry["status"] for entry in result["entries"]] == ["registered", "invalid", "registered", "duplicate"]
 
 
 def test_app_starts_with_projects_and_no_endpoints(tmp_path: Path) -> None:

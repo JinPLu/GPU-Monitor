@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from gpu_broker.collector import COMBINED_QUERY, SSHCollector, parse_gpu_csv, parse_process_csv
+from gpu_broker.collector import (
+    COMBINED_QUERY,
+    SSHCollector,
+    parse_gpu_csv,
+    parse_host_resources,
+    parse_process_csv,
+)
 from gpu_broker.config import InventoryConfig, ProjectConfig
 from gpu_broker.importer import import_servers_files, parse_ssh_command
 
@@ -16,6 +22,7 @@ def test_gpu_and_process_csv_parser() -> None:
     samples = parse_gpu_csv("0, GPU-0, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0\n")
     assert samples[0].gpu_uuid == "GPU-0"
     assert samples[0].memory_free_mib == 100000
+    assert parse_host_resources("64\n262144 196608\n4.25\n") == (64, 4.25, 262144, 196608)
     processes = parse_process_csv("GPU-0, 123, 1024, python\n")
     assert processes[0].pid == 123
     assert parse_process_csv("No running processes found\n") == []
@@ -31,12 +38,16 @@ def test_fake_collector_never_needs_a_shell(service, inventory) -> None:
                 "__GPU_BROKER_PROCESSES__\n"
                 "__GPU_BROKER_IDENTITY__\n"
                 "host-a\nboot-a\n"
+                "__GPU_BROKER_HOST_RESOURCES__\n"
+                "64\n262144 196608\n4.25\n"
             )
         raise AssertionError(f"unexpected command {command}")
 
     collector = SSHCollector(inventory, runner=fake_runner)
     result = asyncio.run(collector.collect_once(service, concurrency=1))
     assert result["endpoint-a"]["gpu_count"] == 1
+    snapshot = service.snapshot(service.local_actor("human"))["data"]
+    assert snapshot["endpoints"][0]["host_telemetry"]["memory_available_mib"] == 196608
     # endpoint-b is intentionally a fake failure; no network access happened.
     assert result["endpoint-b"]["error"] == "AssertionError"
 

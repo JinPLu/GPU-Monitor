@@ -174,6 +174,20 @@ def test_current_telemetry_is_bounded_and_routine_samples_do_not_audit(service, 
     assert audit_count == 0
 
 
+def test_endpoint_cpu_and_memory_telemetry_is_exposed_in_snapshot(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    endpoint = service.snapshot(admin)["data"]["endpoints"][0]
+    assert endpoint["host_telemetry"] == {
+        "observed_at": endpoint["host_telemetry"]["observed_at"],
+        "collected_at": endpoint["host_telemetry"]["collected_at"],
+        "cpu_count": 64,
+        "load_1m": 4.0,
+        "memory_total_mib": 262_144,
+        "memory_available_mib": 196_608,
+        "provider": "raw-ssh",
+    }
+
+
 def test_gpu_history_is_downsampled_to_requested_cap(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     gpu_id = service.list_gpus(admin)["data"][0]["id"]

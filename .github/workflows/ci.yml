@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv lock --check
+      - run: uv sync --extra dev --reinstall-package gpu-broker
+      - run: uv run --reinstall-package gpu-broker pytest
+      - run: uv run --reinstall-package gpu-broker ruff check .
+      - name: Build wheel and verify runtime assets
+        run: |
+          uv build --wheel --out-dir .ci-dist
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path(".ci-dist").glob("*.whl"))
+          required = {
+              "gpu_broker/web/static/assets/server-room-background.jpg",
+              "gpu_broker/web/static/vendor/phosphor/style.css",
+              "gpu_broker/web/static/vendor/phosphor/Phosphor.woff2",
+              "gpu_broker/migrations/env.py",
+              "gpu_broker/migrations/script.py.mako",
+          }
+          with ZipFile(wheel) as archive:
+              missing = required.difference(archive.namelist())
+          if missing:
+              raise SystemExit(f"wheel is missing: {sorted(missing)}")
+          PY

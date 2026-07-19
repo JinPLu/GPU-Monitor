@@ -10,6 +10,15 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "Jinpeng Lu" }]
+keywords = ["gpu", "gpu-scheduling", "mcp", "resource-coordination"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: System :: Distributed Computing",
+]
 dependencies = [
   "alembic>=1.14,<2",
   "fastapi>=0.115,<1",
@@ -24,6 +33,10 @@ dependencies = [
   "typer>=0.15,<1",
   "uvicorn[standard]>=0.34,<1",
 ]
+
+[project.urls]
+Repository = "https://github.com/JinPLu/GPU-Monitor"
+Issues = "https://github.com/JinPLu/GPU-Monitor/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -41,10 +54,15 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 gpu_broker = [
+  "migrations/*.py",
+  "migrations/*.mako",
+  "migrations/versions/*.py",
   "web/templates/*.html",
   "web/static/*.css",
   "web/static/*.js",
+  "web/static/assets/*",
   "web/static/vendor/*",
+  "web/static/vendor/phosphor/*",
 ]
 
 [tool.pytest.ini_options]
