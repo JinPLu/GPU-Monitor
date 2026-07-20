@@ -91,14 +91,19 @@ def test_cursor_print_is_paste_ready(
     assert output.startswith(MARKERS["cursor"][0])
 
 
-def test_global_adapter_defers_runtime_details_to_mcp_instructions() -> None:
+def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_questions() -> None:
     adapter = POLICY.read_text(encoding="utf-8")
     for boundary in (
-        "explicitly requested GPU inspection or coordination",
-        "server instructions and tool schemas",
-        "Do not infer profile, project, resource, or placement values",
-        "coordinates ownership only",
-        "separate explicit authorization",
+        "freely schedulable infrastructure",
+        "do not stop for duplicate confirmation",
+        "Call `gpu_claim_profile`",
+        "`gpu_claim` as soon as runtime preflight passes",
+        "monitor the request and continue when allocated",
+        "Use the full approved GPU count",
+        "Bind the observed workload after startup",
+        "tool schemas remain authoritative",
+        "Never invent a missing",
+        "explicit authority",
         "SSH",
         "SQLite",
         "inventory",
@@ -106,18 +111,17 @@ def test_global_adapter_defers_runtime_details_to_mcp_instructions() -> None:
     ):
         assert boundary in adapter
 
-    for runtime_detail in (
+    for runtime_contract in (
+        "routine infrastructure",
+        "do not ask for duplicate confirmation",
+        "gpu_claim_profile",
         "gpu_claim",
-        "lease",
-        "gpu_count",
-        "absolute",
-        "CPU cores",
-        "memory MiB",
+        "If queued, monitor the request",
+        "Use the full approved GPU count",
+        "gpu_bind_observed_workload",
         "gpu_release",
-        "pre-registration",
     ):
-        assert runtime_detail not in adapter
-        assert runtime_detail in mcp.instructions
+        assert runtime_contract in mcp.instructions
     assert "gpu_grant_server_project" not in adapter
     assert "gpu_grant_server_project" not in mcp.instructions
 
