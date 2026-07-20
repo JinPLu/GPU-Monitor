@@ -21,12 +21,6 @@
   <img src="https://img.shields.io/badge/Remote%20control-never-C2410C" alt="Does not control remote workloads">
 </p>
 
-<p align="center">
-  <img src="docs/assets/desktop-overview-sanitized.png" width="900" alt="GPU Broker dashboard with sanitized demo data">
-</p>
-
-<p align="center"><sub>示例图已去敏，不包含真实主机、端口、IP、用户或组织信息。</sub></p>
-
 > [!IMPORTANT]
 > GPU Broker 只协调“谁占用哪块 GPU”。租约不会授权、启动、停止或抢占远端任务。
 
