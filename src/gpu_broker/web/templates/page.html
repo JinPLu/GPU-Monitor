@@ -129,7 +129,7 @@
   <p class="muted">可直接填写任意项目标识和任务；完成后释放租约，空闲资源会立即归到这个名称下，不足时自动进入共享队列。</p>
   {% if payload.claimable_workload_profiles %}
   <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
-    <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ profile.constraints.gpu_count }} GPU</option>{% endfor %}</select></label>
+    <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ format_constraints(profile.constraints) }}</option>{% endfor %}</select></label>
     <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
     <p class="field-help span-all">按配置认领会直接登记为使用中，但不会启动远端任务。</p>
     <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
@@ -145,8 +145,12 @@
       <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
       <label>服务器<select name="endpoint_id"><option value="">自动选择</option>{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
       <label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
+      <label>可用 CPU 核数<input name="min_available_cpu_cores" type="number" min="0" step="0.5" placeholder="例如：16"></label>
+      <label>可用内存 GiB<input name="min_available_memory_gib" type="number" min="0" placeholder="例如：64"></label>
+      <label>单卡总显存 GiB<input name="min_total_vram_gib" type="number" min="1" placeholder="例如：80"></label>
+      <label>单卡可用显存 GiB<input name="min_free_vram_gib" type="number" min="0" placeholder="例如：60"></label>
       <details class="span-all"><summary>高级：指定精确 GPU</summary><label>GPU（可多选）<select name="gpu_ids" multiple size="6">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label><p class="field-help">选择后以所选 GPU 数量为准。</p></details>
-      <p class="field-help span-all">临时任务会把任务说明写入审计用途；完成后请释放租约。认领成功同样不会启动远端任务。</p>
+      <p class="field-help span-all">CPU、内存和显存请填绝对需求；Broker 只按这些下限调度，认领成功同样不会启动远端任务。</p>
       <input type="hidden" name="placement" value="pack"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
       <button type="submit">一次性认领</button>
     </form>
@@ -161,7 +165,7 @@
     <article class="card request-card state-{{ item.state|lower }}">
       <div class="card-title"><div><strong>{{ item.task_ref }}</strong><p class="muted">{{ item.project_id }} · {{ item.actor_id }}</p></div><span class="badge">{{ item.state }}</span></div>
       <p>{{ item.purpose }}</p>
-      <p>资源：{{ item.constraints.gpu_count }} GPU</p>
+      <p>资源：{{ format_constraints(item.constraints) }}</p>
       {% if item.profile_id %}<p class="muted">预设任务：<code>{{ item.profile_id }}</code></p>{% endif %}
       {% if item.blocked_reason %}<p class="warning-text">队列说明：{{ item.blocked_reason }}</p>{% endif %}
       {% if item.state == 'QUEUED' and actor.role in ['allocator', 'operator', 'admin'] %}
@@ -273,7 +277,7 @@
 
 {% elif page == 'identities' %}
 <section class="list-section"><h2>预设任务</h2><p class="muted">一次性认领可直接填写任意项目标识，不需要先创建项目。预设任务仅用于反复执行时固定 GPU 数量、用途和可选服务器范围。</p><div class="stacked-cards">
-{% for profile in payload.workload_profiles %}<article class="card"><div class="card-title"><strong>{{ profile.display_name }}</strong><span class="badge">{{ '启用' if profile.enabled else '禁用' }}</span></div><p><code>{{ profile.id }}</code> · {{ profile.project_id }}</p><p>{{ profile.constraints.gpu_count }} GPU · 服务器：{{ profile.constraints.endpoint_ids|join('、') }}</p><p class="muted">用途：{{ profile.purpose }}</p></article>{% else %}<p class="empty">尚无预设任务；一次性认领不需要预设。</p>{% endfor %}
+{% for profile in payload.workload_profiles %}<article class="card"><div class="card-title"><strong>{{ profile.display_name }}</strong><span class="badge">{{ '启用' if profile.enabled else '禁用' }}</span></div><p><code>{{ profile.id }}</code> · {{ profile.project_id }}</p><p>{{ format_constraints(profile.constraints) }}</p><p class="muted">用途：{{ profile.purpose }}</p></article>{% else %}<p class="empty">尚无预设任务；一次性认领不需要预设。</p>{% endfor %}
 </div></section>
 
 {% if actor.is_admin %}
@@ -284,10 +288,12 @@
     <form method="post" action="/ui/action/workload-profile" class="stack form-grid">
       <label>配置 ID<input name="id" required placeholder="wrbench-eval-2gpu"></label><label>显示名称<input name="display_name" required placeholder="WRBench 双卡评测"></label>
       <label>归属标识<input name="project_id" required placeholder="例如：storyboard"></label><label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
+      <label>可用 CPU 核数<input name="min_available_cpu_cores" type="number" min="0" step="0.5" placeholder="例如：16"></label><label>可用内存 GiB<input name="min_available_memory_gib" type="number" min="0" placeholder="例如：64"></label>
+      <label>单卡总显存 GiB<input name="min_total_vram_gib" type="number" min="1" placeholder="例如：80"></label><label>单卡可用显存 GiB<input name="min_free_vram_gib" type="number" min="0" placeholder="例如：60"></label>
       <label>最大租约窗口<select name="duration_hours"><option value="1">1 小时</option><option value="2" selected>2 小时</option><option value="4">4 小时</option><option value="8">8 小时</option><option value="24">24 小时</option></select></label><label>状态<select name="enabled"><option value="true">启用</option><option value="false">禁用</option></select></label>
       <label class="span-all">允许服务器（可多选，留空则由 Broker 在全部服务器中调度）<select name="endpoint_ids" multiple size="6">{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
       <label class="span-all">固定用途<textarea name="purpose" rows="2" required placeholder="例如：WRBench 图像/视频生成基准评测"></textarea></label>
-      <p class="field-help span-all">归属标识可任意填写，无需预先创建。配置 ID 一旦创建不能改归属标识；完成即释放租约。最大租约窗口是调度与未来预约共同遵守的硬边界，不是每次申请的预计时长。精确 GPU 固定选择仍应走一次性申请。</p>
+      <p class="field-help span-all">归属标识可任意填写，无需预先创建。CPU、内存和显存请填绝对资源需求；最大租约窗口是调度与未来预约共同遵守的硬边界。精确 GPU 固定选择仍应走一次性申请。</p>
       <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认这是可由 Agent 按配置重复认领的资源合同。</label><button type="submit">保存预设任务</button>
     </form>
   </details>

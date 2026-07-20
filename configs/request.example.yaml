@@ -6,4 +6,7 @@ nodes: 1
 gpus_per_node: 1
 same_host: true
 placement: pack
+min_available_cpu_cores: 16
+min_available_memory_mib: 65536
+min_total_vram_mib: 81920
 min_free_vram_mib: 16000

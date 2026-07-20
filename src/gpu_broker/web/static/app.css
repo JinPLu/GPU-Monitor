@@ -885,8 +885,9 @@ button.summary-item[aria-pressed="true"] strong { color: #365f69; }
 .server-counts span:nth-child(4) strong { color: #537a96; }
 .server-counts .count-alert strong { color: #bf5b54; }
 .server-aggregate { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
-.cluster-meter { gap: 5px; }
-.cluster-meter-label { justify-content: flex-end; gap: 4px; color: #617479; font-size: 10px; }
+.cluster-meter { min-width: 0; gap: 5px; }
+.cluster-meter-label { display: grid; min-width: 0; gap: 1px; color: #617479; font-size: 10px; line-height: 1.15; }
+.cluster-meter-label span, .cluster-meter-label strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cluster-meter-label strong { color: #385158; font-size: 10px; font-weight: 700; }
 .cluster-meter-track { height: 5px; background: #dce6e1; box-shadow: inset 0 1px 1px rgba(53, 76, 72, .08); }
 .cluster-meter-track > i { background: #6b849b; }

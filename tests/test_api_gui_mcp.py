@@ -65,7 +65,13 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
         "project_id": "project-a",
         "task_ref": "api-request",
         "purpose": "API test",
-        "constraints": {"gpu_count": 1},
+        "constraints": {
+            "gpu_count": 1,
+            "min_available_cpu_cores": 16,
+            "min_available_memory_mib": 64 * 1024,
+            "min_free_vram_mib": 60 * 1024,
+            "min_total_vram_mib": 80 * 1024,
+        },
     }
     first = client.post("/api/v1/requests", json=payload, headers=headers)
     second = client.post("/api/v1/requests", json=payload, headers=headers)
@@ -75,7 +81,9 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     snapshot = client.get("/api/v1/snapshot", headers={"X-GPU-Broker-Actor": "test-agent"})
     assert snapshot.status_code == 200
     assert snapshot.json()["data"]["gpus"][0]["state"] == "HELD"
-    assert client.get("/health/live").json()["capabilities"] == list(API_CAPABILITIES)
+    capabilities = client.get("/health/live").json()["capabilities"]
+    assert capabilities[: len(API_CAPABILITIES)] == list(API_CAPABILITIES)
+    assert "endpoint_deletion" in capabilities
     compact = client.get(
         "/api/v1/gpus?compact=true",
         headers={"X-GPU-Broker-Actor": "test-agent"},
@@ -92,6 +100,10 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     requests = client.get("/ui/requests")
     assert requests.status_code == 200
     assert "认领 GPU" in requests.text
+    assert "可用 CPU 核数" in requests.text
+    assert "可用内存 GiB" in requests.text
+    assert "单卡可用显存 GiB" in requests.text
+    assert "CPU 可用 16 核" in requests.text
 
 
 def test_workload_profile_rest_and_gui_claim(tmp_path: Path, inventory) -> None:
@@ -258,6 +270,15 @@ def test_coordination_api_and_observed_binding(tmp_path: Path, inventory) -> Non
     )
     assert bound.status_code == 200
     assert bound.json()["lease"]["workloads"][0]["run_id"] == f"lease:{lease_id}"
+    coordination = client.get(
+        "/api/v1/coordination",
+        headers={"X-GPU-Broker-Actor": "coordination-agent"},
+    )
+    assert coordination.status_code == 200
+    capacity = coordination.json()["data"]["servers"][0]["capacity"]
+    assert capacity["available_cpu_cores"] == 60.0
+    assert capacity["available_memory_mib"] == 196_608
+    assert capacity["total_vram_mib"] == 100_000
     board = client.get("/api/v1/coordination", headers={"X-GPU-Broker-Actor": "coordination-agent"})
     assert board.status_code == 200
     assert board.json()["data"]["servers"][0]["capacity"]["managed_running_gpus"] == 1
@@ -300,6 +321,7 @@ def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> 
         headers={"X-GPU-Broker-Actor": "endpoint-admin"},
     )
     assert missing_key.status_code == 422
+    assert missing_key.json()["error"]["code"] == "idempotency_key_required"
 
     headers = {"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "delete-endpoint-b"}
     deleted = client.delete("/api/v1/endpoints/endpoint-b", headers=headers)
@@ -310,6 +332,43 @@ def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> 
     assert deleted.json()["endpoint_id"] == "endpoint-b"
     listed = client.get("/api/v1/endpoints", headers={"X-GPU-Broker-Actor": "endpoint-admin"})
     assert [endpoint["id"] for endpoint in listed.json()["data"]] == ["endpoint-a"]
+
+
+def test_endpoint_delete_rest_route_preserves_nested_error_envelope(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'endpoint-delete-error.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    client = TestClient(app)
+    headers = {"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "endpoint-maintenance"}
+    created = client.post(
+        "/api/v1/maintenance",
+        json={
+            "endpoint_id": "endpoint-b",
+            "start_at": "2026-07-20T00:00:00+00:00",
+            "end_at": "2026-07-20T01:00:00+00:00",
+            "reason": "hardware inspection",
+        },
+        headers=headers,
+    )
+    assert created.status_code == 200
+
+    blocked = client.delete(
+        "/api/v1/endpoints/endpoint-b",
+        headers={"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "delete-maintained"},
+    )
+
+    assert blocked.status_code == 409
+    assert blocked.json()["error"] == {
+        "code": "endpoint_referenced_by_maintenance",
+        "message": "endpoint has maintenance history; cancel or retain the server disabled instead of deleting",
+        "details": {"maintenance_ids": [created.json()["maintenance"]["id"]]},
+    }
 
 
 def test_project_creation_route_and_gui_are_not_exposed(tmp_path: Path, inventory) -> None:

@@ -14,10 +14,12 @@ from gpu_broker.client import BrokerClient
 MCP_INSTRUCTIONS = (
     "Use gpu-broker only for user-authorized GPU inspection or coordination. "
     "Daily path: read gpu_coordination when state is needed; if a profile_id is named, call "
-    "gpu_claim_profile; otherwise call gpu_claim only when project_id, task, and gpu_count are "
-    "explicitly authorized. Do not infer profile_id, project_id, gpu_count, server_id, or gpu_ids "
-    "from a repo, directory, task title, free capacity, inventory, or defaults. Any non-empty "
-    "project_id is accepted directly and needs no pre-registration. Let the Broker place routine "
+    "gpu_claim_profile; otherwise call gpu_claim only when project_id, task, gpu_count, and any needed "
+    "CPU, system memory, or VRAM thresholds are explicitly authorized as absolute values. Do not infer "
+    "profile_id, project_id, gpu_count, CPU cores, memory MiB, VRAM MiB, server_id, or gpu_ids from a "
+    "repo, directory, task title, free capacity, inventory, or defaults. Any non-empty project_id is "
+    "accepted directly and needs no pre-registration. Prefer right-sized absolute resource requests so "
+    "agents can fully use shared server compute after a lease is granted. Let the Broker place routine "
     "claims unless the user explicitly names a server or exact GPUs. A queued response or lease=null "
     "is not permission to run; use only GPUs in a returned held or active lease. After starting an "
     "authorized workload, call gpu_bind_observed_workload(agent_name, lease_id, optional run_id) so "
@@ -226,13 +228,25 @@ def gpu_claim(
     gpu_count: int,
     server_id: str | None = None,
     gpu_ids: list[str] | None = None,
+    min_available_cpu_cores: float | None = None,
+    min_available_memory_mib: int | None = None,
+    min_free_vram_mib: int | None = None,
+    min_total_vram_mib: int | None = None,
     purpose: str | None = None,
 ) -> dict[str, Any]:
-    """Claim GPUs now, or enter the shared queue when they are unavailable."""
+    """Claim GPUs now, or queue. CPU, memory, and VRAM thresholds are absolute values."""
 
     task = task.strip()
     if gpu_count < 1 or not task:
         raise ValueError("task must not be empty and gpu_count must be positive")
+    if min_available_cpu_cores is not None and min_available_cpu_cores < 0:
+        raise ValueError("min_available_cpu_cores must be non-negative")
+    if min_available_memory_mib is not None and min_available_memory_mib < 0:
+        raise ValueError("min_available_memory_mib must be non-negative")
+    if min_free_vram_mib is not None and min_free_vram_mib < 0:
+        raise ValueError("min_free_vram_mib must be non-negative")
+    if min_total_vram_mib is not None and min_total_vram_mib < 1:
+        raise ValueError("min_total_vram_mib must be positive")
     exact_gpu_ids = gpu_ids or []
     constraints = {
         "gpu_count": len(exact_gpu_ids) or gpu_count,
@@ -240,6 +254,14 @@ def gpu_claim(
         "endpoint_ids": [server_id] if server_id else [],
         "gpu_ids": exact_gpu_ids,
     }
+    if min_available_cpu_cores is not None:
+        constraints["min_available_cpu_cores"] = min_available_cpu_cores
+    if min_available_memory_mib is not None:
+        constraints["min_available_memory_mib"] = min_available_memory_mib
+    if min_free_vram_mib is not None:
+        constraints["min_free_vram_mib"] = min_free_vram_mib
+    if min_total_vram_mib is not None:
+        constraints["min_total_vram_mib"] = min_total_vram_mib
     return _client(agent_name).post(
         "/api/v1/claims",
         {

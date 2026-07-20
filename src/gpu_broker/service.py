@@ -1139,6 +1139,18 @@ class BrokerService:
                 counts[gpu["state"]] += 1
             claimed_states = {"HELD", "LEASED_IDLE", "RUNNING_MANAGED", "ORPHANED_BUSY", "CONFLICT"}
             abnormal_states = {"UNKNOWN_RECOVERING", "UNKNOWN_STALE", "UNHEALTHY", "CONFLICT", "ORPHANED_BUSY"}
+            endpoint_attention_statuses = {"ERROR", "STALE"}
+            endpoint_attention_status_counts: dict[str, int] = defaultdict(int)
+            for endpoint in endpoint_payloads:
+                status = endpoint["monitor"]["status"]
+                if status in endpoint_attention_statuses:
+                    endpoint_attention_status_counts[status] += 1
+            gpu_attention_states = abnormal_states | {"BUSY_UNMANAGED"}
+            gpu_attention_state_counts = {
+                state: counts[state] for state in sorted(gpu_attention_states) if counts[state]
+            }
+            attention_endpoint_count = sum(endpoint_attention_status_counts.values())
+            attention_gpu_count = sum(gpu_attention_state_counts.values())
             summary = {
                 "online_servers": sum(
                     endpoint["monitor"]["status"] == "ONLINE" for endpoint in endpoint_payloads
@@ -1149,6 +1161,14 @@ class BrokerService:
                 "busy_gpus": counts["BUSY_UNMANAGED"] + counts["RUNNING_MANAGED"],
                 "claimed_gpus": sum(counts[item] for item in claimed_states),
                 "abnormal_gpus": sum(counts[item] for item in abnormal_states),
+                "attention": {
+                    "endpoint_count": attention_endpoint_count,
+                    "endpoint_status_counts": dict(sorted(endpoint_attention_status_counts.items())),
+                    "gpu_count": attention_gpu_count,
+                    "gpu_state_counts": gpu_attention_state_counts,
+                    "unmanaged_gpu_count": counts["BUSY_UNMANAGED"],
+                    "total_resource_count": attention_endpoint_count + attention_gpu_count,
+                },
             }
             ages = [
                 max(0.0, (now - (_as_utc(item.observed_at) or now)).total_seconds())
@@ -1350,11 +1370,12 @@ class BrokerService:
             endpoint_gpus = gpus_by_endpoint[endpoint["id"]]
             endpoint_telemetry = [gpu["telemetry"] for gpu in endpoint_gpus if gpu["telemetry"] is not None]
             state_counts = gpu_state_counts(endpoint_gpus)
+            host = endpoint["host_telemetry"]
             server_cards.append(
                 {
                     "server_id": endpoint["id"],
                     "monitor_status": endpoint["monitor"]["status"],
-                    "host_telemetry": endpoint["host_telemetry"],
+                    "host_telemetry": host,
                     "capacity": {
                         "total_gpus": len(endpoint_gpus),
                         "available_gpus": state_counts.get("AVAILABLE", 0),
@@ -1366,8 +1387,19 @@ class BrokerService:
                         "observed_gpu_utilization_pct": average(
                             item["gpu_utilization_pct"] for item in endpoint_telemetry
                         ),
+                        "available_cpu_cores": round(
+                            max(0.0, host["cpu_count"] - host["load_1m"]), 1
+                        )
+                        if host
+                        else None,
+                        "available_memory_mib": host["memory_available_mib"] if host else None,
+                        "total_system_memory_mib": host["memory_total_mib"] if host else None,
+                        "total_vram_mib": sum(gpu["total_vram_mib"] for gpu in endpoint_gpus),
                         "observed_memory_used_mib": sum(
                             item["memory_used_mib"] for item in endpoint_telemetry
+                        ),
+                        "observed_memory_free_mib": sum(
+                            item["memory_free_mib"] for item in endpoint_telemetry
                         ),
                     },
                     "consumers": sorted(
@@ -2048,6 +2080,22 @@ class BrokerService:
             if endpoint.id in constraints.deny_endpoint_ids:
                 excluded["endpoint_denylist"] += 1
                 continue
+            host_telemetry = session.get(EndpointTelemetryCurrent, endpoint.id)
+            if constraints.min_available_cpu_cores is not None:
+                if host_telemetry is None:
+                    excluded["host_telemetry"] += 1
+                    continue
+                available_cpu_cores = max(0.0, host_telemetry.cpu_count - host_telemetry.load_1m)
+                if available_cpu_cores < constraints.min_available_cpu_cores:
+                    excluded["available_cpu"] += 1
+                    continue
+            if constraints.min_available_memory_mib is not None:
+                if host_telemetry is None:
+                    excluded["host_telemetry"] += 1
+                    continue
+                if host_telemetry.memory_available_mib < constraints.min_available_memory_mib:
+                    excluded["available_memory"] += 1
+                    continue
             if constraints.gpu_ids and gpu.id not in constraints.gpu_ids:
                 excluded["gpu_allowlist"] += 1
                 continue
@@ -3025,6 +3073,15 @@ class BrokerService:
                 continue
             if endpoint.id in constraints.deny_endpoint_ids:
                 continue
+            host_telemetry = session.get(EndpointTelemetryCurrent, endpoint.id)
+            if constraints.min_available_cpu_cores is not None:
+                if host_telemetry is None:
+                    continue
+                if max(0.0, host_telemetry.cpu_count - host_telemetry.load_1m) < constraints.min_available_cpu_cores:
+                    continue
+            if constraints.min_available_memory_mib is not None:
+                if host_telemetry is None or host_telemetry.memory_available_mib < constraints.min_available_memory_mib:
+                    continue
             if constraints.gpu_ids and gpu.id not in constraints.gpu_ids:
                 continue
             if gpu.id in constraints.deny_gpu_ids:
@@ -3672,6 +3729,23 @@ class BrokerService:
                     status_code=409,
                     details={"lease_resource_count": lease_history_count},
                 )
+            maintenance_filters = [MaintenanceWindow.endpoint_id == endpoint.id]
+            if gpu_ids:
+                maintenance_filters.append(MaintenanceWindow.gpu_id.in_(gpu_ids))
+            blocking_maintenance = session.scalars(
+                select(MaintenanceWindow)
+                .where(or_(*maintenance_filters))
+                .order_by(MaintenanceWindow.start_at, MaintenanceWindow.id)
+            ).all()
+            if blocking_maintenance:
+                raise BrokerError(
+                    "endpoint_referenced_by_maintenance",
+                    "endpoint has maintenance history; cancel or retain the server disabled instead of deleting",
+                    status_code=409,
+                    details={
+                        "maintenance_ids": [window.id for window in blocking_maintenance[:20]],
+                    },
+                )
             blocking_requests = [
                 request.id
                 for request in session.scalars(
@@ -3739,6 +3813,47 @@ class BrokerService:
             alert_filters = [(Alert.resource_type == "endpoint") & (Alert.resource_id == endpoint.id)]
             if gpu_ids:
                 alert_filters.append((Alert.resource_type == "gpu") & Alert.resource_id.in_(gpu_ids))
+            deleted_monitoring_records = {
+                "alerts": session.scalar(select(func.count()).select_from(Alert).where(or_(*alert_filters))) or 0,
+                "provider_states": session.scalar(
+                    select(func.count()).select_from(ProviderState).where(ProviderState.endpoint_id == endpoint.id)
+                )
+                or 0,
+                "host_telemetry_current": session.scalar(
+                    select(func.count())
+                    .select_from(EndpointTelemetryCurrent)
+                    .where(EndpointTelemetryCurrent.endpoint_id == endpoint.id)
+                )
+                or 0,
+                "gpu_telemetry_current": (
+                    session.scalar(
+                        select(func.count())
+                        .select_from(TelemetryCurrent)
+                        .where(TelemetryCurrent.gpu_id.in_(gpu_ids))
+                    )
+                    or 0
+                    if gpu_ids
+                    else 0
+                ),
+                "gpu_telemetry_history": (
+                    session.scalar(
+                        select(func.count())
+                        .select_from(TelemetrySnapshot)
+                        .where(TelemetrySnapshot.gpu_id.in_(gpu_ids))
+                    )
+                    or 0
+                    if gpu_ids
+                    else 0
+                ),
+                "process_observations": (
+                    session.scalar(
+                        select(func.count())
+                        .select_from(ProcessObservation)
+                        .where(ProcessObservation.endpoint_id == endpoint.id)
+                    )
+                    or 0
+                ),
+            }
             session.execute(delete(Alert).where(or_(*alert_filters)))
             event = self._audit(
                 session,
@@ -3766,6 +3881,7 @@ class BrokerService:
                 "snapshot_revision": revision,
                 "endpoint_id": endpoint_id,
                 "deleted_gpu_count": len(gpu_ids),
+                "deleted_monitoring_records": deleted_monitoring_records,
             }
             self._remember_idempotency(
                 session,

@@ -365,10 +365,28 @@
   const refreshButton = document.getElementById("refresh-dashboard");
   const refreshIntervalSelect = document.getElementById("refresh-interval");
 
-  const clusterMeter = (label, value, kind) => {
+  const constraintsSummary = (constraints = {}) => {
+    const parts = [`${constraints.gpu_count || 1} 块 GPU`];
+    if (constraints.min_available_cpu_cores !== null && constraints.min_available_cpu_cores !== undefined) {
+      parts.push(`CPU 可用 ${Number(constraints.min_available_cpu_cores).toLocaleString("zh-CN")} 核`);
+    }
+    if (constraints.min_available_memory_mib !== null && constraints.min_available_memory_mib !== undefined) {
+      parts.push(`内存可用 ${formatMemory(constraints.min_available_memory_mib)}`);
+    }
+    if (constraints.min_total_vram_mib !== null && constraints.min_total_vram_mib !== undefined) {
+      parts.push(`单卡总显存 ${formatMemory(constraints.min_total_vram_mib)}`);
+    }
+    if (constraints.min_free_vram_mib !== null && constraints.min_free_vram_mib !== undefined) {
+      parts.push(`单卡可用显存 ${formatMemory(constraints.min_free_vram_mib)}`);
+    }
+    return parts.join(" · ");
+  };
+
+  const clusterMeter = (label, value, kind, detail = null) => {
     const rounded = Math.round(clamp(value));
     const level = rounded >= 85 ? "critical" : rounded >= 60 ? "elevated" : "normal";
-    return `<span class="cluster-meter ${kind} ${level}" role="img" aria-label="${label} ${rounded}%" title="${label} ${rounded}%"><span class="cluster-meter-label"><strong>${rounded}%</strong></span><span class="cluster-meter-track"><i style="--value:${rounded}%"></i></span></span>`;
+    const valueText = detail || `${rounded}%`;
+    return `<span class="cluster-meter ${kind} ${level}" role="img" aria-label="${label} ${valueText}，${rounded}%" title="${label} ${valueText} · ${rounded}%"><span class="cluster-meter-label"><span>${escapeHTML(label)}</span><strong>${escapeHTML(valueText)}</strong></span><span class="cluster-meter-track"><i style="--value:${rounded}%"></i></span></span>`;
   };
 
   const gpuRow = (gpu) => {
@@ -391,7 +409,7 @@
       <button class="gpu-tile state-${stateClass}" type="button" data-gpu-id="${escapeHTML(gpu.id)}" data-show-gpu="${escapeHTML(gpu.id)}" aria-label="查看 GPU ${gpu.gpu_index}，${escapeHTML(stateLabels[gpu.state] || gpu.state)}，详情">
         <span class="gpu-tile-top"><span class="gpu-tile-icon"><i class="ph ${stateIcon}" aria-hidden="true"></i></span><span class="gpu-tile-state">${escapeHTML(stateLabels[gpu.state] || gpu.state)}</span></span>
         <span class="gpu-tile-title"><strong>GPU ${gpu.gpu_index}</strong><small>${escapeHTML(gpu.name)}</small></span>
-        <span class="gpu-tile-metrics"><span>显存 ${Math.round(memoryPct)}%</span><span>利用率 ${utilization ?? "—"}%</span></span>
+        <span class="gpu-tile-metrics"><span>显存 ${formatMemory(telemetry.memory_free_mib)} 可用</span><span>利用率 ${utilization ?? "—"}%</span></span>
         <span class="gpu-tile-owner"><strong>${escapeHTML(owner)}</strong><small title="${escapeHTML(task)}">${escapeHTML(task)}</small></span>
       </button>`;
   };
@@ -410,9 +428,13 @@
     const util = utilValues.length ? utilValues.reduce((sum, value) => sum + Number(value), 0) / utilValues.length : 0;
     const host = endpoint.host_telemetry;
     const cpuLoadPct = host?.cpu_count ? clamp((Number(host.load_1m) * 100) / Number(host.cpu_count)) : 0;
+    const availableCpu = host ? Math.max(0, Number(host.cpu_count) - Number(host.load_1m)) : null;
     const memoryUsedPct = host?.memory_total_mib
       ? clamp((1 - Number(host.memory_available_mib) / Number(host.memory_total_mib)) * 100)
       : 0;
+    const cpuDetail = host ? `${availableCpu.toLocaleString("zh-CN", { maximumFractionDigits: 1 })}/${Number(host.cpu_count).toLocaleString("zh-CN")} 核可用` : "暂无数据";
+    const memoryDetail = host ? `${formatMemory(host.memory_available_mib)}/${formatMemory(host.memory_total_mib)} 可用` : "暂无数据";
+    const vramDetail = total ? `${formatMemory(used)}/${formatMemory(total)} 已用` : "暂无数据";
     const sshCommand = `ssh -p ${endpoint.port} ${endpoint.ssh_user}@${endpoint.host}`;
     const expanded = allExpanded || expandedServers.has(endpoint.id);
     const status = endpoint.monitor?.status || "PENDING";
@@ -421,7 +443,7 @@
         <div class="server-summary">
           <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong><code>${escapeHTML(sshCommand)}</code></strong><small>${escapeHTML(endpoint.id)} · ${escapeHTML(monitorLabels[status] || status)}</small></span></span>
           <span class="server-counts" aria-label="GPU 状态：共 ${gpus.length}，空闲 ${available}，占用 ${busy}，认领 ${claimed}，异常 ${abnormal}"><span title="总数"><strong>${gpus.length}</strong></span><span class="count-available" title="空闲"><strong>${available}</strong></span><span title="占用"><strong>${busy}</strong></span><span title="认领"><strong>${claimed}</strong></span><span class="${abnormal ? "count-alert" : ""}" title="异常"><strong>${abnormal}</strong></span></span>
-          <span class="server-aggregate">${clusterMeter("CPU 负载", cpuLoadPct, "cpu")}${clusterMeter("内存", memoryUsedPct, "memory")}${clusterMeter("显存", memoryPct, "memory")}${clusterMeter("GPU 利用率", util, "utilization")}</span>
+          <span class="server-aggregate">${clusterMeter("CPU", cpuLoadPct, "cpu", cpuDetail)}${clusterMeter("内存", memoryUsedPct, "memory", memoryDetail)}${clusterMeter("显存", memoryPct, "memory", vramDetail)}${clusterMeter("GPU", util, "utilization", `${Math.round(util)}% 利用率`)}</span>
           <span class="server-actions">
             <button class="server-expand" type="button" data-toggle-server="${escapeHTML(endpoint.id)}" aria-expanded="${expanded}" title="${expanded ? "收起 GPU" : "展开 GPU"}">
               <span>${expanded ? "收起 GPU" : "展开 GPU"}</span><i class="ph ph-caret-down" aria-hidden="true"></i>
@@ -484,7 +506,7 @@
     }
     if (activeSideTab === "queue") {
       return (data.requests || []).map((request) => `
-        <article class="coordination-item"><header><strong>${escapeHTML(request.actor_id)}</strong><span class="badge">排队</span></header><p>${escapeHTML(request.task_ref)}</p><p>需要 ${request.constraints?.gpu_count || 1} 块 GPU · ${escapeHTML(request.blocked_reason || "等待可用资源")}</p></article>`).join("");
+        <article class="coordination-item"><header><strong>${escapeHTML(request.actor_id)}</strong><span class="badge">排队</span></header><p>${escapeHTML(request.task_ref)}</p><p>${escapeHTML(constraintsSummary(request.constraints))}</p><p>${escapeHTML(request.blocked_reason || "等待可用资源")}</p></article>`).join("");
     }
     return (data.reservations || []).map((reservation) => `
       <article class="coordination-item"><header><strong>${escapeHTML(reservation.actor_id)}</strong><span class="badge">已安排</span></header><p>${escapeHTML(reservation.reason)}</p><p>${formatDate(reservation.start_at, true)} → ${formatDate(reservation.end_at, true)} · ${reservation.gpu_ids.length} 块 GPU</p></article>`).join("");

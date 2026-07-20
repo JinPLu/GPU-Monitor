@@ -17,6 +17,8 @@ class StrictModel(BaseModel):
 
 class ResourceConstraints(StrictModel):
     gpu_count: int = Field(ge=1, le=1024)
+    min_available_cpu_cores: float | None = Field(default=None, ge=0)
+    min_available_memory_mib: int | None = Field(default=None, ge=0)
     min_total_vram_mib: int | None = Field(default=None, ge=1)
     min_free_vram_mib: int | None = Field(default=None, ge=0)
     nodes: int = Field(default=1, ge=1, le=1024)
@@ -97,6 +99,8 @@ class RequestCreateFlat(StrictModel):
     start_after: datetime | None = None
     deadline: datetime | None = None
     approval_ref: str | None = Field(default=None, max_length=500)
+    min_available_cpu_cores: float | None = Field(default=None, ge=0)
+    min_available_memory_mib: int | None = Field(default=None, ge=0)
     min_total_vram_mib: int | None = Field(default=None, ge=1)
     min_free_vram_mib: int | None = Field(default=None, ge=0)
     nodes: int = Field(default=1, ge=1)

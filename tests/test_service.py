@@ -16,6 +16,7 @@ from gpu_broker.models import (
     GPUDevice,
     Lease,
     LeaseResource,
+    MaintenanceWindow,
     ProviderState,
     TelemetryCurrent,
     TelemetrySnapshot,
@@ -25,6 +26,7 @@ from gpu_broker.schemas import (
     EndpointEnabled,
     EndpointUpsert,
     LeaseObservedBind,
+    MaintenanceCreate,
     ReservationCreate,
     RequestCreate,
     WorkloadProfileClaim,
@@ -193,6 +195,52 @@ def test_gang_all_or_nothing_and_no_partial_write(service, admin) -> None:
     assert sum(len(lease["gpu_ids"]) for lease in leases if lease["state"] in ACTIVE_LEASE_STATES) == 2
 
 
+def test_host_resource_constraints_are_absolute_and_fail_closed(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+
+    too_much_cpu = RequestCreate.model_validate(
+        {
+            "project_id": "project-a",
+            "task_ref": "needs-absolute-cpu",
+            "purpose": "request more free CPU cores than the endpoint currently has",
+            "constraints": {"gpu_count": 1, "min_available_cpu_cores": 61},
+        }
+    )
+    cpu_blocked = service.create_request(admin, too_much_cpu, idempotency_key="absolute-cpu")
+    assert cpu_blocked["lease"] is None
+    assert cpu_blocked["request"]["state"] == "QUEUED"
+    assert "available_cpu" in cpu_blocked["request"]["blocked_reason"]
+
+    too_much_memory = RequestCreate.model_validate(
+        {
+            "project_id": "project-a",
+            "task_ref": "needs-absolute-memory",
+            "purpose": "request more free system memory than the endpoint currently has",
+            "constraints": {"gpu_count": 1, "min_available_memory_mib": 200 * 1024},
+        }
+    )
+    memory_blocked = service.create_request(admin, too_much_memory, idempotency_key="absolute-memory")
+    assert memory_blocked["lease"] is None
+    assert "available_memory" in memory_blocked["request"]["blocked_reason"]
+
+    right_sized = RequestCreate.model_validate(
+        {
+            "project_id": "project-a",
+            "task_ref": "right-sized-absolute-resources",
+            "purpose": "request absolute resources within current telemetry",
+            "constraints": {
+                "gpu_count": 1,
+                "min_available_cpu_cores": 16,
+                "min_available_memory_mib": 64 * 1024,
+                "min_free_vram_mib": 60 * 1024,
+                "min_total_vram_mib": 80 * 1024,
+            },
+        }
+    )
+    allocated = service.create_request(admin, right_sized, idempotency_key="absolute-right-sized")
+    assert allocated["lease"] is not None
+
+
 def test_fair_queue_interleaves_projects_after_fresh_telemetry(service, admin) -> None:
     # All requests initially queue because no GPU UUID has been observed yet.
     service.create_request(admin, request_data("story-a"), idempotency_key="story-a")
@@ -257,6 +305,14 @@ def test_endpoint_delete_removes_unleased_monitoring_state(service, admin) -> No
     assert retried == deleted
     assert deleted["endpoint_id"] == "endpoint-a"
     assert deleted["deleted_gpu_count"] == 2
+    assert deleted["deleted_monitoring_records"] == {
+        "alerts": 1,
+        "provider_states": 1,
+        "host_telemetry_current": 1,
+        "gpu_telemetry_current": 2,
+        "gpu_telemetry_history": 2,
+        "process_observations": 0,
+    }
     assert [endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]] == ["endpoint-b"]
     assert all(gpu["endpoint_id"] != "endpoint-a" for gpu in service.list_gpus(admin)["data"])
     assert any(event["action"] == "endpoint.deleted" for event in service.list_events(admin)["data"])
@@ -299,6 +355,27 @@ def test_endpoint_delete_refuses_active_and_historical_leases(service, admin) ->
     with pytest.raises(BrokerError) as history_error:
         service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-history")
     assert history_error.value.code == "endpoint_has_lease_history"
+
+
+def test_endpoint_delete_refuses_maintenance_history(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    created = service.create_maintenance(
+        admin,
+        MaintenanceCreate(
+            endpoint_id="endpoint-a",
+            start_at=utcnow() - timedelta(minutes=5),
+            end_at=utcnow() + timedelta(minutes=55),
+            reason="hardware inspection",
+        ),
+        idempotency_key="endpoint-maintenance",
+    )
+
+    with pytest.raises(BrokerError) as error:
+        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-maintenance")
+
+    assert error.value.code == "endpoint_referenced_by_maintenance"
+    assert error.value.details == {"maintenance_ids": [created["maintenance"]["id"]]}
+    assert service._read(lambda session: session.get(MaintenanceWindow, created["maintenance"]["id"])) is not None
 
 
 def test_endpoint_delete_refuses_enabled_workload_profile_references(service, admin) -> None:
@@ -457,6 +534,23 @@ def test_process_and_stale_telemetry_block_admission(service, admin) -> None:
 
     service._write(age_telemetry)
     assert service.list_gpus(admin)["data"][0]["state"] == "UNKNOWN_STALE"
+
+
+def test_attention_summary_separates_endpoint_and_gpu_units(service, admin) -> None:
+    service.ingest_observation(observation(count=2, processes=[process_for_gpu("GPU-endpoint-a-0")]))
+    service.record_provider_failure("endpoint-b", "timeout")
+
+    snapshot = service.snapshot(admin)["data"]
+
+    assert snapshot["summary"]["abnormal_gpus"] == 0
+    assert snapshot["summary"]["attention"] == {
+        "endpoint_count": 1,
+        "endpoint_status_counts": {"ERROR": 1},
+        "gpu_count": 1,
+        "gpu_state_counts": {"BUSY_UNMANAGED": 1},
+        "unmanaged_gpu_count": 1,
+        "total_resource_count": 2,
+    }
 
 
 def test_current_telemetry_is_bounded_and_routine_samples_do_not_audit(service, admin) -> None:

@@ -52,9 +52,11 @@ Cursor MCP 示例：
 Agent 不需要复制本仓库工作流，也不需要在其他项目写 GPU 说明。任务只给以下两种输入之一：
 
 - 预设任务：明确 `profile_id` 和任务名，Agent 调用 `gpu_claim_profile`。
-- 一次性认领：明确任意非空 `project_id`、任务名和 `gpu_count`，Agent 调用 `gpu_claim`。
+- 一次性认领：明确任意非空 `project_id`、任务名、`gpu_count`，以及需要的 CPU 核数、系统内存 MiB、显存 MiB 等绝对值下限，Agent 调用 `gpu_claim`。
 
-不要让 Agent 按工作目录、任务标题、空闲 GPU、profile 列表或 inventory 自己挑配置。除非任务明确指定服务器或 GPU，否则不传 placement，让 Broker 自己排队和选址。
+不要让 Agent 按工作目录、任务标题、空闲 GPU、profile 列表或 inventory 自己挑配置。CPU、内存和显存需求要按绝对值表达，例如 `min_available_cpu_cores=16`、`min_available_memory_mib=65536`、`min_free_vram_mib=61440`。除非任务明确指定服务器或 GPU，否则不传 placement，让 Broker 自己排队和选址。
+
+资源下限应尽量贴近任务真实需求；租约分配后，Agent 应把已认领服务器计算资源用于该任务，并在远端 workload 启动后绑定观测、结束后释放。
 
 远端 workload 已经启动后，Agent 调用 `gpu_bind_observed_workload(agent_name, lease_id)`；任务结束或启动失败后调用 `gpu_release(agent_name, lease_id)`。这些动作只记录归属，不启动、不停止、不抢占远端进程。
 

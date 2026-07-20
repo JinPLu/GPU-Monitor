@@ -253,7 +253,7 @@ def create_app(settings: Settings) -> FastAPI:
             "status": "live",
             "schema_version": SCHEMA_VERSION,
             "version": __version__,
-            "capabilities": list(API_CAPABILITIES),
+            "capabilities": list(dict.fromkeys((*API_CAPABILITIES, "endpoint_deletion"))),
         }
 
     @app.get("/health/ready")
@@ -883,7 +883,23 @@ def create_app(settings: Settings) -> FastAPI:
             "csrf": request.session.get("csrf"),
             "notice": request.query_params.get("notice"),
             "schema_version": SCHEMA_VERSION,
+            "format_constraints": _format_constraints,
         }
+
+    def _format_constraints(constraints: dict[str, Any]) -> str:
+        parts = [f"{constraints.get('gpu_count', 1)} GPU"]
+        if constraints.get("min_available_cpu_cores") is not None:
+            parts.append(f"CPU 可用 {constraints['min_available_cpu_cores']:g} 核")
+        if constraints.get("min_available_memory_mib") is not None:
+            parts.append(f"内存可用 {constraints['min_available_memory_mib'] / 1024:g} GiB")
+        if constraints.get("min_total_vram_mib") is not None:
+            parts.append(f"单卡显存总量 {constraints['min_total_vram_mib'] / 1024:g} GiB")
+        if constraints.get("min_free_vram_mib") is not None:
+            parts.append(f"单卡显存可用 {constraints['min_free_vram_mib'] / 1024:g} GiB")
+        endpoint_ids = constraints.get("endpoint_ids") or []
+        if endpoint_ids:
+            parts.append(f"服务器：{'、'.join(endpoint_ids)}")
+        return " · ".join(parts)
 
     def ui_reference_data(actor: ActorContext) -> dict[str, Any]:
         """Shared select options for server-rendered human forms.
@@ -1006,6 +1022,26 @@ def create_app(settings: Settings) -> FastAPI:
             raise BrokerError("invalid_form_number", f"{name} 不能大于 {maximum}", status_code=422)
         return number
 
+    def _form_float(
+        form: Any,
+        name: str,
+        *,
+        minimum: float | None = None,
+        maximum: float | None = None,
+    ) -> float | None:
+        value = _form_value(form, name)
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise BrokerError("invalid_form_number", f"{name} 必须是数字", status_code=422) from exc
+        if minimum is not None and number < minimum:
+            raise BrokerError("invalid_form_number", f"{name} 不能小于 {minimum:g}", status_code=422)
+        if maximum is not None and number > maximum:
+            raise BrokerError("invalid_form_number", f"{name} 不能大于 {maximum:g}", status_code=422)
+        return number
+
     def _form_boolean(form: Any, name: str) -> bool:
         value = (_form_value(form, name, required=True) or "").lower()
         if value in {"true", "1", "yes", "on"}:
@@ -1046,6 +1082,8 @@ def create_app(settings: Settings) -> FastAPI:
                 "task_ref": _form_value(form, "task_ref", required=True),
             }
         if action in {"request", "quick-claim"}:
+            min_available_memory_gib = _form_int(form, "min_available_memory_gib", minimum=0)
+            min_total_gib = _form_int(form, "min_total_vram_gib", minimum=1)
             min_free_gib = _form_int(form, "min_free_vram_gib", minimum=0)
             endpoint_id = _form_value(form, "endpoint_id")
             gpu_ids = _form_list(form, "gpu_ids")
@@ -1055,6 +1093,11 @@ def create_app(settings: Settings) -> FastAPI:
                 "task_ref": task_ref,
                 "purpose": task_ref if action == "quick-claim" else _form_value(form, "purpose", required=True),
                 "gpu_count": len(gpu_ids) or _form_int(form, "gpu_count", required=True, minimum=1),
+                "min_available_cpu_cores": _form_float(form, "min_available_cpu_cores", minimum=0),
+                "min_available_memory_mib": min_available_memory_gib * 1024
+                if min_available_memory_gib is not None
+                else None,
+                "min_total_vram_mib": min_total_gib * 1024 if min_total_gib is not None else None,
                 "min_free_vram_mib": min_free_gib * 1024 if min_free_gib is not None else None,
                 "placement": "exact" if gpu_ids else (_form_value(form, "placement") or "pack"),
                 "endpoint_ids": [endpoint_id] if endpoint_id else [],
@@ -1113,6 +1156,9 @@ def create_app(settings: Settings) -> FastAPI:
         if action == "workload-profile":
             duration_hours = _form_int(form, "duration_hours", required=True, minimum=1, maximum=720)
             gpu_count = _form_int(form, "gpu_count", required=True, minimum=1)
+            min_available_memory_gib = _form_int(form, "min_available_memory_gib", minimum=0)
+            min_total_gib = _form_int(form, "min_total_vram_gib", minimum=1)
+            min_free_gib = _form_int(form, "min_free_vram_gib", minimum=0)
             assert duration_hours is not None and gpu_count is not None
             return {
                 "id": _form_value(form, "id", required=True),
@@ -1122,6 +1168,12 @@ def create_app(settings: Settings) -> FastAPI:
                 "duration_seconds": duration_hours * 3600,
                 "constraints": {
                     "gpu_count": gpu_count,
+                    "min_available_cpu_cores": _form_float(form, "min_available_cpu_cores", minimum=0),
+                    "min_available_memory_mib": min_available_memory_gib * 1024
+                    if min_available_memory_gib is not None
+                    else None,
+                    "min_total_vram_mib": min_total_gib * 1024 if min_total_gib is not None else None,
+                    "min_free_vram_mib": min_free_gib * 1024 if min_free_gib is not None else None,
                     "placement": "pack",
                     "endpoint_ids": _form_list(form, "endpoint_ids"),
                 },

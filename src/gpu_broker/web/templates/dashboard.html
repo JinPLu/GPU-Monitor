@@ -120,7 +120,7 @@
   <p class="muted">可直接填写任意项目标识和任务；完成后释放租约。空闲时直接可用，不足时自动进入共享队列。</p>
   {% if payload.claimable_workload_profiles %}
   <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
-    <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ profile.constraints.gpu_count }} GPU</option>{% endfor %}</select></label>
+    <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ format_constraints(profile.constraints) }}</option>{% endfor %}</select></label>
     <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
     <p class="field-help span-all">按配置认领会直接登记为使用中，但不会启动远端任务。</p>
     <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
@@ -136,8 +136,12 @@
       <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
       <label>服务器<select name="endpoint_id"><option value="">自动选择</option>{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
       <label>GPU 数量<input name="gpu_count" type="number" min="1" value="1" required></label>
+      <label>可用 CPU 核数<input name="min_available_cpu_cores" type="number" min="0" step="0.5" placeholder="例如：16"></label>
+      <label>可用内存 GiB<input name="min_available_memory_gib" type="number" min="0" placeholder="例如：64"></label>
+      <label>单卡总显存 GiB<input name="min_total_vram_gib" type="number" min="1" placeholder="例如：80"></label>
+      <label>单卡可用显存 GiB<input name="min_free_vram_gib" type="number" min="0" placeholder="例如：60"></label>
       <details class="span-all"><summary>高级：指定精确 GPU</summary><label>GPU（可多选）<select name="gpu_ids" multiple size="6">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label><p class="field-help">选择后以所选 GPU 数量为准。</p></details>
-      <p class="field-help span-all">临时任务会把任务说明写入审计用途；完成后请释放租约。认领成功同样不会启动远端任务。</p>
+      <p class="field-help span-all">CPU、内存和显存请填绝对需求；Broker 只按这些下限调度，认领成功同样不会启动远端任务。</p>
       <input type="hidden" name="placement" value="pack"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
       <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">一次性认领</button></div>
     </form>
