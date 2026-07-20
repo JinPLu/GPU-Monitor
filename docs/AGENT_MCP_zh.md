@@ -1,6 +1,6 @@
 # Agent / MCP 全局安装
 
-MCP 的运行契约由 `gpu-broker` server instructions 提供；英文全局短规则见 [`AGENT_MCP_policy.en.md`](AGENT_MCP_policy.en.md)。本文件只保留安装、注册和日常输入。
+MCP 的完整运行契约由 `gpu-broker` server instructions 和工具 schema 提供；英文全局适配块见 [`AGENT_MCP_policy.en.md`](AGENT_MCP_policy.en.md)，只保留启用路由、禁止旁路、禁止推断输入和授权边界，不再复制认领与租约生命周期。本文件只保留安装、注册和日常输入。
 
 ## 一次性安装
 

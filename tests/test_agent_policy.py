@@ -91,9 +91,22 @@ def test_cursor_print_is_paste_ready(
     assert output.startswith(MARKERS["cursor"][0])
 
 
-def test_global_adapter_and_runtime_instructions_share_safety_invariants() -> None:
+def test_global_adapter_defers_runtime_details_to_mcp_instructions() -> None:
     adapter = POLICY.read_text(encoding="utf-8")
-    for phrase in (
+    for boundary in (
+        "explicitly requested GPU inspection or coordination",
+        "server instructions and tool schemas",
+        "Do not infer profile, project, resource, or placement values",
+        "coordinates ownership only",
+        "separate explicit authorization",
+        "SSH",
+        "SQLite",
+        "inventory",
+        "nvidia-smi",
+    ):
+        assert boundary in adapter
+
+    for runtime_detail in (
         "gpu_claim",
         "lease",
         "gpu_count",
@@ -101,11 +114,10 @@ def test_global_adapter_and_runtime_instructions_share_safety_invariants() -> No
         "CPU cores",
         "memory MiB",
         "gpu_release",
-        "nvidia-smi",
         "pre-registration",
     ):
-        assert phrase in adapter
-        assert phrase in mcp.instructions
+        assert runtime_detail not in adapter
+        assert runtime_detail in mcp.instructions
     assert "gpu_grant_server_project" not in adapter
     assert "gpu_grant_server_project" not in mcp.instructions
 

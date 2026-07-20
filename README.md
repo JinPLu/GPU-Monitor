@@ -112,7 +112,7 @@ gpu-broker lease release --help
 完整安装和全局规则见：
 
 - [安装与客户端适配](docs/AGENT_MCP_zh.md)
-- [英文全局规则](docs/AGENT_MCP_policy.en.md)
+- [英文全局路由与安全规则](docs/AGENT_MCP_policy.en.md)
 
 ## 权限与安全边界
 
