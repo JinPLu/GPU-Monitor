@@ -118,8 +118,9 @@ def test_workload_profile_claim_uses_approved_contract_atomically(service, admin
 
     assert first == second
     assert first["lease"] is not None
-    assert first["lease"]["state"] == "ACTIVE"
+    assert first["lease"]["state"] == "HELD"
     request = first["request"]
+    assert request["state"] == "LEASED"
     assert request["profile_id"] == "benchmark-2gpu"
     assert request["purpose"] == "approved benchmark evaluation"
     assert request["duration_seconds"] == 7200
@@ -130,7 +131,7 @@ def test_workload_profile_claim_uses_approved_contract_atomically(service, admin
     assert request_event["summary"]["profile_id"] == "benchmark-2gpu"
 
 
-def test_queued_routine_claim_auto_activates_when_capacity_arrives(service, admin) -> None:
+def test_queued_routine_claim_starts_held_when_capacity_arrives(service, admin) -> None:
     service.upsert_workload_profile(
         admin,
         WorkloadProfileUpsert.model_validate(
@@ -157,7 +158,58 @@ def test_queued_routine_claim_auto_activates_when_capacity_arrives(service, admi
     service.ingest_observation(observation(count=1))
     request = service.list_requests(admin)["data"][0]
     lease = service.list_leases(admin)["data"][0]
-    assert request["state"] == lease["state"] == "ACTIVE"
+    assert request["state"] == "LEASED"
+    assert lease["state"] == "HELD"
+
+
+def test_unstarted_held_claim_expires_after_startup_grace_and_retries_queue(
+    tmp_path: Path, inventory
+) -> None:
+    broker = BrokerService(
+        Database(f"sqlite:///{tmp_path / 'startup-grace.sqlite3'}", Path(__file__).resolve().parents[1]),
+        inventory.model_copy(update={"held_lease_startup_grace_seconds": 1}),
+    )
+    broker.initialize("a" * 32)
+    admin = broker.authenticate("a" * 32)
+    broker.ingest_observation(observation(count=1))
+
+    first = broker.create_request(
+        admin,
+        request_data("grace-first"),
+        idempotency_key="grace-first",
+        activate_if_allocated=True,
+    )
+    assert first["lease"] is not None
+    assert first["lease"]["state"] == "HELD"
+    second = broker.create_request(
+        admin,
+        request_data("grace-second"),
+        idempotency_key="grace-second",
+        activate_if_allocated=True,
+    )
+    assert second["lease"] is None
+    assert second["request"]["state"] == "QUEUED"
+
+    first_lease_id = first["lease"]["id"]
+
+    def age_held_lease(session) -> None:  # type: ignore[no-untyped-def]
+        lease = session.get(Lease, first_lease_id)
+        assert lease is not None
+        issued_at = utcnow() - timedelta(seconds=2)
+        lease.issued_at = issued_at
+        lease.last_heartbeat_at = issued_at
+
+    broker._write(age_held_lease)
+    broker.reconcile(admin)
+
+    leases = {lease["id"]: lease for lease in broker.list_leases(admin)["data"]}
+    assert leases[first_lease_id]["state"] == "EXPIRED_EMPTY"
+    assert leases[first_lease_id]["release_reason"] == "startup grace elapsed without observed process"
+    replacement = next(lease for lease in leases.values() if lease["id"] != first_lease_id)
+    assert replacement["state"] == "HELD"
+    requests = {request["task_ref"]: request for request in broker.list_requests(admin)["data"]}
+    assert requests["grace-first"]["state"] == "EXPIRED"
+    assert requests["grace-second"]["state"] == "LEASED"
 
 
 def test_renewal_cannot_cross_a_future_reservation(service, admin) -> None:
@@ -462,7 +514,8 @@ def test_claim_auto_creates_project_and_ignores_legacy_endpoint_scope(service, a
         activate_if_allocated=True,
     )
     assert claimed["lease"] is not None
-    assert claimed["request"]["state"] == "ACTIVE"
+    assert claimed["request"]["state"] == "LEASED"
+    assert claimed["lease"]["state"] == "HELD"
     assert claimed["lease"]["project_id"] == "storyboard"
     projects = {project["id"] for project in service.list_projects(admin)["data"]}
     assert "storyboard" in projects
@@ -486,8 +539,10 @@ def test_coordination_board_and_observed_binding_are_agent_self_service(service,
         LeaseObservedBind(),
         idempotency_key="coordination-bind",
     )
+    assert bound["lease"]["state"] == "ACTIVE"
     assert bound["lease"]["workloads"][0]["run_id"] == f"lease:{claimed['lease']['id']}"
     assert len(bound["lease"]["workloads"][0]["process_keys"]) == 1
+    assert service.list_requests(admin)["data"][0]["state"] == "ACTIVE"
 
     gpu = service.list_gpus(admin)["data"][0]
     assert gpu["state"] == "RUNNING_MANAGED"

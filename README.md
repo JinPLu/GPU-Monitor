@@ -134,10 +134,12 @@ placement，也不会停止已有远端任务；关联的活跃租约和排队�
 Agent 不依赖 GUI：MCP 首次调用会检查并启动用户级后台服务。日常流程很短：
 
 ```text
-看协调看板 -> 认领或排队 -> 读取 lease.resources[] -> 项目执行 workload -> 绑定观测 -> 释放
+profile/显式合同 claim -> 必要时等待 -> 读取 lease.resources[] -> 项目执行 workload -> 绑定观测 -> 释放
 ```
 
-预设任务使用 `profile_id` 和任务名。临时任务需要项目标识、任务名、GPU 数量，并按绝对值给出需要的 CPU 核数、系统内存和显存下限。资源合同已在当前任务、已接受计划或同一持续任务的历史认领中明确后，Agent 应主动 claim、排队等待并复用合同，不应反复询问能否使用 MCP。queued/null 结果不能执行；成功 lease 的实际落点只取自 `lease.resources[]`，其中含 endpoint、GPU、`cuda_visible_devices` 和 commitment。随后 Agent 可用项目既有执行路径运行或停止已获授权的 workload；Broker 不会替它启动或停止。对会重试的写操作复用调用方稳定的 `idempotency_key`。
+预设任务使用 `profile_id` 和任务名。临时任务需要项目标识、任务名、GPU 数量，并按绝对值给出需要的 CPU 核数、系统内存和显存下限。资源合同已在当前任务、已接受计划或同一持续任务的历史认领中明确后，Agent 应主动 claim、排队等待并复用合同，不应反复询问能否使用 MCP，也不必为了普通预批准 profile 或显式合同 claim 先读协调看板。queued/null 结果不能执行；可用 `gpu_wait_for_claim` 继续读取已有 request/lease，直到返回 `HELD` 或 `ACTIVE` lease、终止状态或超时。成功 lease 的实际落点只取自 `lease.resources[]`，其中含 endpoint、GPU、`cuda_visible_devices` 和 commitment。随后 Agent 可用项目既有执行路径运行或停止已获授权的 workload；Broker 不会替它启动或停止。启动后调用 `gpu_bind_observed_workload`，完成或启动失败后调用 `gpu_release`。对会重试的写操作复用调用方稳定的 `idempotency_key`。
+
+低层 request、activate、release-lease 和 bind-workload MCP 工具是高级兼容接口；新 Agent 优先走 claim / wait / execute / bind / release 路径。
 
 外部 Slurm 项目先调用 `gpu_scheduler_targets` 和
 `gpu_scheduler_access_status`。这是独立的 SchedulerTarget adapter：项目 owner

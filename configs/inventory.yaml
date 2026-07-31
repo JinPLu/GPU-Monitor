@@ -4,6 +4,7 @@ collector:
   interval_seconds: 10
   stale_after_seconds: 30
   ssh_connect_timeout_seconds: 8
+held_lease_startup_grace_seconds: 120
 projects:
   - id: default
     display_name: Default

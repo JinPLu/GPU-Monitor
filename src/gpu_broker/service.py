@@ -970,6 +970,17 @@ class BrokerService:
             .order_by(ProcessObservation.pid)
         ).all()
 
+    def _resources_have_fresh_telemetry(
+        self, session: Session, resources: Iterable[LeaseResource], now: datetime
+    ) -> bool:
+        cutoff = now - timedelta(seconds=self.inventory.collector.stale_after_seconds)
+        for resource in resources:
+            telemetry = session.get(TelemetryCurrent, resource.gpu_id)
+            observed_at = _as_utc(telemetry.observed_at) if telemetry is not None else None
+            if observed_at is None or observed_at < cutoff:
+                return False
+        return True
+
     def _active_lease_for_gpu(self, session: Session, gpu_id: str) -> Lease | None:
         return session.scalar(
             select(Lease)
@@ -2672,11 +2683,11 @@ class BrokerService:
                 request_id=request.id,
                 actor_id=request.actor_id,
                 project_id=request.project_id,
-                state="ACTIVE" if request.auto_activate else "HELD",
+                state="HELD",
                 issued_at=now,
                 expires_at=now + timedelta(seconds=request.duration_seconds),
                 last_heartbeat_at=now,
-                activated_at=now if request.auto_activate else None,
+                activated_at=None,
                 released_at=None,
                 release_reason=None,
                 issued_revision=revision,
@@ -2695,7 +2706,7 @@ class BrokerService:
                         created_at=now,
                     )
                 )
-            request.state = "ACTIVE" if request.auto_activate else "LEASED"
+            request.state = "LEASED"
             request.blocked_reason = None
             request.updated_at = now
             self._audit(
@@ -2790,28 +2801,6 @@ class BrokerService:
         session.flush()
         self._allocate_queued(session, now, revision)
         lease = session.scalar(select(Lease).where(Lease.request_id == request.id))
-        if lease is not None and activate_if_allocated and lease.state == "HELD":
-            before_lease = self._lease_dict(session, lease)
-            lease.state = "ACTIVE"
-            lease.activated_at = now
-            lease.last_heartbeat_at = now
-            request.state = "ACTIVE"
-            request.updated_at = now
-            activation_summary = {"activation": "immediate_claim"}
-            if profile_id is not None:
-                activation_summary["profile_id"] = profile_id
-            self._audit(
-                session,
-                actor_id=actor.id,
-                action="lease.activated",
-                resource_type="lease",
-                resource_id=lease.id,
-                result="success",
-                before=before_lease,
-                after=self._lease_dict(session, lease),
-                summary=activation_summary,
-                now=now,
-            )
         result = {
             "event_id": event.id,
             "snapshot_revision": revision,
@@ -3260,12 +3249,13 @@ class BrokerService:
                 )
             else:
                 existing_binding.process_keys_json = json_dump(process_keys)
+            should_promote = lease.state in {"HELD", "CONFLICT"}
             if was_conflict:
                 # A lease owner explicitly attesting the current, freshly
                 # observed process identities is the safe recovery action for
                 # an attribution conflict. It changes no remote workload;
                 # the lease remains blocked by any future unknown process.
-                lease.state = "ACTIVE" if lease.activated_at is not None else "HELD"
+                lease.state = "HELD"
                 for alert in session.scalars(
                     select(Alert).where(
                         Alert.alert_type == "lease_process_conflict",
@@ -3286,6 +3276,27 @@ class BrokerService:
                     before=conflict_before,
                     after=self._lease_dict(session, lease),
                     summary={"source": "collector_observed", "run_id": run_id},
+                    now=now,
+                )
+            if should_promote:
+                before_activation = conflict_before if was_conflict else self._lease_dict(session, lease)
+                lease.state = "ACTIVE"
+                lease.activated_at = lease.activated_at or now
+                lease.last_heartbeat_at = now
+                request = session.get(AllocationRequest, lease.request_id)
+                if request is not None:
+                    request.state = "ACTIVE"
+                    request.updated_at = now
+                self._audit(
+                    session,
+                    actor_id=actor.id,
+                    action="lease.activated",
+                    resource_type="lease",
+                    resource_id=lease.id,
+                    result="success",
+                    before=before_activation,
+                    after=self._lease_dict(session, lease),
+                    summary={"activation": "observed_workload_bind", "run_id": run_id},
                     now=now,
                 )
             event = self._audit(
@@ -3336,7 +3347,16 @@ class BrokerService:
                 for process in self._current_processes(session, resource.gpu_id, now)
             ]
             expires_at = _as_utc(lease.expires_at) or now
-            if lease.state in {"HELD", "ACTIVE"} and expires_at <= now:
+            startup_grace_deadline = (_as_utc(lease.issued_at) or now) + timedelta(
+                seconds=self.inventory.held_lease_startup_grace_seconds
+            )
+            startup_grace_expired = (
+                lease.state == "HELD"
+                and startup_grace_deadline <= now
+                and not processes
+                and self._resources_have_fresh_telemetry(session, resources, now)
+            )
+            if lease.state in {"HELD", "ACTIVE"} and (expires_at <= now or startup_grace_expired):
                 before = self._lease_dict(session, lease)
                 if processes:
                     lease.state = "ORPHANED_BUSY"
@@ -3352,7 +3372,11 @@ class BrokerService:
                 else:
                     lease.state = "EXPIRED_EMPTY"
                     lease.released_at = now
-                    lease.release_reason = "expired without observed process"
+                    lease.release_reason = (
+                        "startup grace elapsed without observed process"
+                        if startup_grace_expired
+                        else "expired without observed process"
+                    )
                     for resource in resources:
                         resource.active = False
                         resource.released_at = now
@@ -3370,6 +3394,7 @@ class BrokerService:
                     result="success",
                     before=before,
                     after=self._lease_dict(session, lease),
+                    summary={"reason": lease.release_reason},
                     now=now,
                 )
             elif lease.state in {"HELD", "ACTIVE"} and processes:

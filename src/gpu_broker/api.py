@@ -1473,7 +1473,7 @@ def create_app(settings: Settings) -> FastAPI:
             return response
 
         if action in {"quick-claim", "profile-claim"}:
-            message = "GPU 已认领并登记为使用中；不会启动远端任务" if result.get("lease") else "资源请求已进入队列"
+            message = "GPU 已保留，等待 workload 启动；不会启动远端任务" if result.get("lease") else "资源请求已进入队列"
         elif action == "request":
             message = "资源请求已获分配，租约等待激活" if result.get("lease") else "资源请求已进入队列"
         else:

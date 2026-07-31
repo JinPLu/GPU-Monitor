@@ -71,6 +71,12 @@ class InventoryConfig(BaseModel):
 
     schema_version: Literal[1]
     collector: CollectorConfig = Field(default_factory=CollectorConfig)
+    # Routine direct-GPU claims first receive a HELD lease while the caller
+    # starts its workload out-of-band.  If no fresh compute process appears
+    # before this grace elapses, reconciliation releases the empty hold and
+    # retries the shared queue.  Keep the default short for local coordination
+    # while allowing slower startup paths to opt in explicitly.
+    held_lease_startup_grace_seconds: int = Field(default=120, ge=1, le=3600)
     # Project policies are optional.  The broker creates a neutral record when
     # a claim first uses an otherwise unknown project_id.
     projects: list[ProjectConfig] = Field(default_factory=list)

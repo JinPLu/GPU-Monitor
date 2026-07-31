@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import re
 import secrets
+import time
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -12,23 +14,30 @@ from gpu_broker.client import BrokerClient
 from gpu_broker.daemon import ensure_broker_ready_for_mcp
 
 
+PLACED_LEASE_STATES = {"HELD", "ACTIVE"}
+TERMINAL_REQUEST_STATES = {"CANCELLED", "EXPIRED", "REJECTED", "RELEASED"}
+TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
+
 MCP_INSTRUCTIONS = (
-    "Use gpu-broker for GPU coordination and read-only resource discovery. The Broker is the only "
+    "Use gpu-broker for GPU work and read-only resource discovery. The Broker is the only "
     "allocation and freshness/probing authority: do not bypass it through SSH, SQLite, inventory, remote "
     "probes, or nvidia-smi. A request or accepted plan to run, continue, or monitor a GPU task makes its "
-    "owner-scoped coordination routine once a profile_id, or project_id, gpu_count, and needed thresholds "
+    "owner-scoped claim routine once a profile_id, or project_id, gpu_count, and needed thresholds "
     "are recorded. Reuse that contract without asking again; never infer missing inputs from a repository, "
     "task title, free capacity, or defaults. "
-    "The normal bare-metal path is gpu_coordination, then gpu_claim_profile or gpu_claim, then execute, "
-    "then gpu_release. A queued or null lease is not permission to run. When a held or active lease is "
-    "returned, take the placement only from its structured lease.resources[]: each resource provides an "
+    "The normal bare-metal path is gpu_claim_profile or gpu_claim, optionally gpu_wait_for_claim if queued, "
+    "then project execution on the returned held or active lease.resources[], then "
+    "gpu_bind_observed_workload, then gpu_release. Use gpu_coordination when shared state would help, but "
+    "ordinary pre-approved profile claims and explicit-contract claims do not require a separate "
+    "coordination read first. A queued or null lease is not permission to run. When a held or active lease "
+    "is returned, take the placement only from its structured lease.resources[]: each resource provides an "
     "endpoint, gpus, cuda_visible_devices, and commitment. Use the project's normal execution path to start "
     "or stop its workload there. The Broker does not launch or stop that workload. "
     "After it starts, gpu_bind_observed_workload records fresh observed processes; release when it stops "
     "or startup fails. Use the full requested allocation when the workload safely supports it. "
     "Provide an idempotency_key for a mutation when retrying it, and reuse that same caller-chosen key. "
-    "The low-level request, activate, release-lease, and bind-workload tools remain compatibility tools; "
-    "prefer the normal path. "
+    "The low-level request, activate, release-lease, and bind-workload tools remain advanced "
+    "compatibility tools; prefer the normal path. "
     "Endpoints belong to projects. Their owner may add them and retire them into draining; retirement "
     "prevents new placement and never stops an existing workload. "
     "External Slurm clusters such as Hanhai22 are SchedulerTargets, never raw SSH endpoints. Use "
@@ -58,6 +67,23 @@ def _require_request_fields(request: dict[str, Any]) -> None:
     missing = [field for field in ("project_id", "task_ref", "purpose") if not request.get(field)]
     if missing:
         raise ValueError(f"gpu_request requires {', '.join(missing)}")
+
+
+def _bounded_seconds(value: float, *, name: str, minimum: float, maximum: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{name} must be a number")
+    value = float(value)
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        raise ValueError(f"{name} must be between {minimum:g} and {maximum:g}")
+    return value
+
+
+def _matching_request(payload: dict[str, Any], request_id: str) -> dict[str, Any] | None:
+    return next((item for item in payload.get("data", []) if item.get("id") == request_id), None)
+
+
+def _matching_lease(payload: dict[str, Any], request_id: str) -> dict[str, Any] | None:
+    return next((item for item in payload.get("data", []) if item.get("request_id") == request_id), None)
 
 
 @mcp.tool()
@@ -323,6 +349,84 @@ def gpu_request_status(request_id: str | None = None) -> dict[str, Any]:
     if request_id:
         result["data"] = [item for item in result["data"] if item["id"] == request_id]
     return result
+
+
+@mcp.tool()
+def gpu_wait_for_claim(
+    agent_name: str,
+    request_id: str,
+    timeout_seconds: float = 25,
+    poll_interval_seconds: float = 1.0,
+) -> dict[str, Any]:
+    """Poll visible request and lease state until a prior claim is placed, terminal, or timed out."""
+
+    agent_name = agent_name.strip()
+    request_id = request_id.strip()
+    if not agent_name or not request_id:
+        raise ValueError("agent_name and request_id must not be empty")
+    timeout_seconds = _bounded_seconds(
+        timeout_seconds, name="timeout_seconds", minimum=0, maximum=300
+    )
+    poll_interval_seconds = _bounded_seconds(
+        poll_interval_seconds, name="poll_interval_seconds", minimum=0.1, maximum=10
+    )
+
+    client = _client(agent_name)
+    started_at = time.monotonic()
+    deadline = started_at + timeout_seconds
+    polls = 0
+    request: dict[str, Any] | None = None
+    lease: dict[str, Any] | None = None
+
+    while True:
+        polls += 1
+        requests_payload = client.get("/api/v1/requests")
+        leases_payload = client.get("/api/v1/leases")
+        request = _matching_request(requests_payload, request_id)
+        lease = _matching_lease(leases_payload, request_id)
+        elapsed_seconds = round(time.monotonic() - started_at, 3)
+
+        if request is None:
+            return {
+                "schema_version": requests_payload.get("schema_version", "v1"),
+                "state": "not_found",
+                "request": None,
+                "lease": lease,
+                "polls": polls,
+                "elapsed_seconds": elapsed_seconds,
+            }
+        if lease is not None and lease.get("state") in PLACED_LEASE_STATES:
+            return {
+                "schema_version": requests_payload.get("schema_version", "v1"),
+                "state": "allocated",
+                "request": request,
+                "lease": lease,
+                "polls": polls,
+                "elapsed_seconds": elapsed_seconds,
+            }
+        if request.get("state") in TERMINAL_REQUEST_STATES or (
+            lease is not None and lease.get("state") in TERMINAL_LEASE_STATES
+        ):
+            return {
+                "schema_version": requests_payload.get("schema_version", "v1"),
+                "state": "terminal",
+                "request": request,
+                "lease": lease,
+                "polls": polls,
+                "elapsed_seconds": elapsed_seconds,
+            }
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            return {
+                "schema_version": requests_payload.get("schema_version", "v1"),
+                "state": "timeout",
+                "request": request,
+                "lease": lease,
+                "polls": polls,
+                "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            }
+        time.sleep(min(poll_interval_seconds, remaining_seconds))
 
 
 @mcp.tool()

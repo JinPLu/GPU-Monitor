@@ -158,14 +158,14 @@ def test_workload_profile_rest_and_gui_claim(tmp_path: Path, inventory) -> None:
         follow_redirects=True,
     )
     assert claimed.status_code == 200
-    assert "GPU 已认领并登记为使用中" in claimed.text
+    assert "GPU 已保留，等待 workload 启动" in claimed.text
     request = service.list_requests(service.local_actor("human"))["data"][0]
     assert request["profile_id"] == "api-eval-1gpu"
     assert request["purpose"] == "approved API evaluation"
-    assert request["state"] == "ACTIVE"
+    assert request["state"] == "LEASED"
 
 
-def test_api_claim_auto_activates_without_a_duration_estimate(tmp_path: Path, inventory) -> None:
+def test_api_claim_starts_held_without_a_duration_estimate(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -188,8 +188,8 @@ def test_api_claim_auto_activates_without_a_duration_estimate(tmp_path: Path, in
         headers={"X-GPU-Broker-Actor": "claim-agent", "Idempotency-Key": "api-claim"},
     )
     assert claimed.status_code == 200
-    assert claimed.json()["request"]["state"] == "ACTIVE"
-    assert claimed.json()["lease"]["state"] == "ACTIVE"
+    assert claimed.json()["request"]["state"] == "LEASED"
+    assert claimed.json()["lease"]["state"] == "HELD"
     assert claimed.json()["lease"]["project_id"] == "s"
     assert claimed.json()["request"]["duration_seconds"] == 8 * 60 * 60
 
@@ -446,12 +446,12 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
         follow_redirects=True,
     )
     assert submitted.status_code == 200
-    assert "GPU 已认领并登记为使用中" in submitted.text
+    assert "GPU 已保留，等待 workload 启动" in submitted.text
 
     lease = service.list_leases(service.local_actor("human"))["data"][0]
-    assert lease["state"] == "ACTIVE"
+    assert lease["state"] == "HELD"
     request = service.list_requests(service.local_actor("human"))["data"][0]
-    assert request["state"] == "ACTIVE"
+    assert request["state"] == "LEASED"
     assert request["purpose"] == "click-first-request"
 
     home_page = client.get("/")

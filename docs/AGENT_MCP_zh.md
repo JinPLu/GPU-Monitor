@@ -50,7 +50,8 @@ Codex 推荐只启用日常工具，并让下面的 owner-scoped 工具不再逐
 command = "gpu-broker-mcp"
 enabled_tools = [
   "gpu_coordination", "gpu_status", "gpu_list", "gpu_who", "gpu_list_profiles",
-  "gpu_claim_profile", "gpu_claim", "gpu_bind_observed_workload", "gpu_release",
+  "gpu_claim_profile", "gpu_claim", "gpu_wait_for_claim",
+  "gpu_bind_observed_workload", "gpu_release",
   "gpu_add_server", "gpu_delete_server",
   "gpu_scheduler_targets", "gpu_scheduler_access_status", "gpu_scheduler_profiles",
   "gpu_scheduler_submit_profile", "gpu_scheduler_submit_once",
@@ -69,14 +70,14 @@ GPU_BROKER_URL = "http://127.0.0.1:8787"
 
 默认工作流：
 
-- `gpu_coordination`、`gpu_status`、`gpu_list`、`gpu_who` 与 `gpu_list_profiles` 读取 Broker 状态和可用资源合同。
-- 当前任务已给出 `profile_id`，或已给出 `project_id`、`gpu_count` 与必要阈值时，直接用 `gpu_claim_profile` 或 `gpu_claim`。得到 queued/null 结果时继续监控，不能据此执行；不要再为同一持续任务重复询问人工确认。
+- `gpu_coordination`、`gpu_status`、`gpu_list`、`gpu_who` 与 `gpu_list_profiles` 可读取 Broker 状态和可用资源合同；普通预批准 profile 或显式合同 claim 不要求先读协调看板。
+- 当前任务已给出 `profile_id`，或已给出 `project_id`、`gpu_count` 与必要阈值时，直接用 `gpu_claim_profile` 或 `gpu_claim`。得到 queued/null 结果时用 `gpu_wait_for_claim(agent_name, request_id)` 继续轮询已有 request/lease，直到获得 `HELD` 或 `ACTIVE` lease、终止状态或超时；queued/null 不能据此执行；不要再为同一持续任务重复询问人工确认。
 - 成功 lease 的具体落点只读返回的 `lease.resources[]`。每个 resource 提供 `endpoint`（`id`、`host`、`port`、`ssh_user`）、`gpus`（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 和 `commitment`；Agent 不自行拼接或推断 placement。随后它通过项目既有执行路径启动或停止获授权的 workload；Broker 不代为启动或停止。启动后调用 `gpu_bind_observed_workload`，完成或启动失败后调用 `gpu_release`。
 - 所有会重试的写操作都传入并复用同一个调用方生成的 `idempotency_key`。
 
 端点是项目资源，而不是全局管理员登记。端点返回 `owner_project_id` 和 `lifecycle_state`。项目 owner 可用 `gpu_add_server` 添加自己的只读监测 endpoint；`gpu_delete_server` 的常规语义是将 `lifecycle_state` 转为 `draining`：不再接收新 placement，已有 workload 不会被停止，待关联租约和队列需求排空后再完成退役。
 
-`gpu_request`、`gpu_request_status`、`gpu_cancel_request`、`gpu_activate_lease`、`gpu_release_lease` 与 `gpu_bind_workload` 是兼容性低层工具，不放在默认路径；新 Agent 优先采用上面的 claim / execute / release 流程。
+`gpu_request`、`gpu_request_status`、`gpu_cancel_request`、`gpu_activate_lease`、`gpu_release_lease` 与 `gpu_bind_workload` 是兼容性高级低层工具，不放在默认路径；新 Agent 优先采用上面的 claim / wait / execute / bind / release 流程。
 
 Cursor MCP 示例：
 
@@ -100,7 +101,7 @@ Agent 不需要复制本仓库工作流，也不需要在其他项目写 GPU 说
 
 不要让 Agent 按工作目录、任务标题、空闲 GPU、profile 列表或 inventory 自己挑配置。CPU、内存和显存需求要按绝对值表达，例如 `min_available_cpu_cores=16`、`min_available_memory_mib=65536`、`min_free_vram_mib=61440`。除非任务明确指定服务器或 GPU，否则不传 placement，让 Broker 自己排队和选址。
 
-同一个持续任务里已经明确过 `profile_id`，或已经明确过 `project_id` 与 `gpu_count` 时，Agent 应复用这份资源合同，不应重复询问。通过运行时 preflight 后，Agent 应主动调用 `gpu_claim_profile` 或 `gpu_claim`；如果进入队列，应继续监控直到获配或任务取消。
+同一个持续任务里已经明确过 `profile_id`，或已经明确过 `project_id` 与 `gpu_count` 时，Agent 应复用这份资源合同，不应重复询问。通过运行时 preflight 后，Agent 应主动调用 `gpu_claim_profile` 或 `gpu_claim`；如果进入队列，应调用 `gpu_wait_for_claim` 监控直到获配、终止或任务取消。
 
 资源下限应尽量贴近任务真实需求；租约分配后，Agent 只从 `lease.resources[]` 取得 placement：每项都有 endpoint（`id`、`host`、`port`、`ssh_user`）、GPU（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 与 `commitment`。它在 workload 支持时充分使用这些资源，例如把相互独立的 job 并行分布到租约内的 GPU 上，但不得启动 dummy 占卡进程或做不安全并发。Agent 通过项目已有执行路径启动或停止已获授权的 workload，而不是让 Broker 执行命令。
 
