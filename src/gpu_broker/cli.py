@@ -16,6 +16,12 @@ from gpu_broker.api import create_app
 from gpu_broker.client import BrokerClient, BrokerClientError
 from gpu_broker.collector import SSHCollector
 from gpu_broker.config import ProjectConfig, Settings, load_inventory
+from gpu_broker.daemon import (
+    DaemonError,
+    MacOSDaemonManager,
+    daemon_instance_id_for_paths,
+    format_status,
+)
 from gpu_broker.database import Database
 from gpu_broker.importer import import_servers_files, write_inventory
 from gpu_broker.schemas import RequestCreate, RequestCreateFlat
@@ -32,12 +38,17 @@ lease_app = typer.Typer(
 )
 reservation_app = typer.Typer(no_args_is_help=True)
 collect_app = typer.Typer(no_args_is_help=True)
+daemon_app = typer.Typer(
+    no_args_is_help=True,
+    help="Manage the macOS user daemon; data is preserved when the daemon stops.",
+)
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(gpu_app, name="gpu")
 app.add_typer(request_app, name="request")
 app.add_typer(lease_app, name="lease")
 app.add_typer(reservation_app, name="reservation")
 app.add_typer(collect_app, name="collect")
+app.add_typer(daemon_app, name="daemon")
 
 
 def _database_url(value: str) -> str:
@@ -121,17 +132,37 @@ def serve(
     inventory: Annotated[Path, typer.Option("--inventory", exists=True)] = Path("configs/inventory.yaml"),
     host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8787,
+    daemon_instance_id: Annotated[str | None, typer.Option("--daemon-instance-id")] = None,
 ) -> None:
     """Run the loopback-only FastAPI server; remote deployment requires separate approval."""
 
     if host not in {"127.0.0.1", "::1", "localhost"}:
         raise typer.BadParameter("non-loopback bind requires an approved production deployment")
+    if daemon_instance_id is not None:
+        if db.startswith("sqlite:///"):
+            database_path = Path(db.removeprefix("sqlite:///")).expanduser().resolve()
+        elif "://" in db:
+            raise typer.BadParameter(
+                "--daemon-instance-id requires a local SQLite database path"
+            )
+        else:
+            database_path = Path(db).expanduser().resolve()
+        expected_instance_id = daemon_instance_id_for_paths(
+            database_path,
+            inventory.expanduser().resolve(),
+        )
+        if daemon_instance_id != expected_instance_id:
+            raise typer.BadParameter(
+                "--daemon-instance-id does not match --db and --inventory"
+            )
+        daemon_instance_id = expected_instance_id
     settings = Settings(
         database_url=_database_url(db),
         inventory_path=inventory,
         project_root=Path.cwd(),
         bind_host=host,
         bind_port=port,
+        daemon_instance_id=daemon_instance_id,
     )
     uvicorn.run(
         create_app(settings),
@@ -143,6 +174,91 @@ def serve(
         http="h11",
         ws="none",
     )
+
+
+def _daemon_call(operation):  # type: ignore[no-untyped-def]
+    try:
+        return operation()
+    except DaemonError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@daemon_app.command("install")
+def daemon_install(
+    source_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--source-root",
+            exists=True,
+            file_okay=False,
+            help="Existing gpu-broker project whose inventory/state should be migrated once.",
+        ),
+    ] = None,
+    start: Annotated[bool, typer.Option("--start/--no-start")] = True,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Install the macOS user LaunchAgent and preserve/migrate existing local state."""
+
+    result = _daemon_call(
+        lambda: MacOSDaemonManager().install(source_root=source_root, start=start)
+    )
+    typer.echo(format_status(result, as_json=as_json))
+
+
+@daemon_app.command("ensure")
+def daemon_ensure(
+    source_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--source-root",
+            exists=True,
+            file_okay=False,
+            help="Existing gpu-broker project to migrate when no daemon data exists yet.",
+        ),
+    ] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Ensure the macOS user daemon is installed, running, and ready."""
+
+    result = _daemon_call(lambda: MacOSDaemonManager().ensure(source_root=source_root))
+    typer.echo(format_status(result, as_json=as_json))
+
+
+@daemon_app.command("status")
+def daemon_status(
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Report daemon installation, launchd, health, and canonical data paths."""
+
+    result = _daemon_call(lambda: MacOSDaemonManager().status())
+    typer.echo(format_status(result, as_json=as_json))
+
+
+@daemon_app.command("start")
+def daemon_start() -> None:
+    """Start the installed macOS user daemon."""
+
+    _daemon_call(lambda: MacOSDaemonManager().start())
+    typer.echo("started")
+
+
+@daemon_app.command("stop")
+def daemon_stop() -> None:
+    """Stop the macOS user daemon without deleting state or its installation."""
+
+    _daemon_call(lambda: MacOSDaemonManager().stop())
+    typer.echo("stopped")
+
+
+@daemon_app.command("uninstall")
+def daemon_uninstall(
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Remove the LaunchAgent while preserving inventory, database, and logs."""
+
+    result = _daemon_call(lambda: MacOSDaemonManager().uninstall())
+    typer.echo(format_status(result, as_json=as_json))
 
 
 @app.command("status")

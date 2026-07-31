@@ -36,7 +36,6 @@ from gpu_broker.schemas import (
     ActorCreate,
     AlertAcknowledge,
     EndpointEnabled,
-    EndpointObservation,
     EndpointUpsert,
     LeaseBind,
     LeaseObservedBind,
@@ -45,6 +44,11 @@ from gpu_broker.schemas import (
     RequestCreateFlat,
     RetentionPrune,
     ReservationCreate,
+    SchedulerJobCancel,
+    SchedulerOneOffSubmit,
+    SchedulerProfileSubmit,
+    SchedulerTargetUpsert,
+    SchedulerUploadRequest,
     SSHCommandCommit,
     SSHCommandRequest,
     SSHCommandsCommit,
@@ -266,6 +270,8 @@ def create_app(settings: Settings) -> FastAPI:
                 "database_ready": ready,
                 "inventory_readable": settings.inventory_path.exists(),
                 "single_writer": True,
+                "daemon_instance_id": settings.daemon_instance_id,
+                "process_id": os.getpid(),
             },
         )
 
@@ -389,6 +395,36 @@ def create_app(settings: Settings) -> FastAPI:
         actor: ApiActor, project_id: str | None = None
     ) -> dict[str, Any]:
         return service.list_workload_profiles(actor, project_id=project_id)
+
+    @app.get("/api/v1/scheduler-targets")
+    def scheduler_targets(actor: ApiActor) -> dict[str, Any]:
+        return service.list_scheduler_targets(actor)
+
+    @app.get("/api/v1/scheduler-targets/{target_id}/access")
+    def scheduler_target_access(target_id: str, actor: ApiActor) -> dict[str, Any]:
+        return service.scheduler_access_status(actor, target_id)
+
+    @app.get("/api/v1/scheduler-jobs")
+    def scheduler_jobs(
+        actor: ApiActor,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        return service.list_scheduler_jobs(actor, project_id=project_id)
+
+    @app.get("/api/v1/scheduler-jobs/{job_id}")
+    def scheduler_job(job_id: str, actor: ApiActor) -> dict[str, Any]:
+        return service.refresh_scheduler_job(actor, job_id)
+
+    @app.get("/api/v1/scheduler-transfers")
+    def scheduler_transfers(
+        actor: ApiActor,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        return service.list_scheduler_transfers(actor, project_id=project_id)
+
+    @app.get("/api/v1/scheduler-transfers/{transfer_id}")
+    def scheduler_transfer(transfer_id: str, actor: ApiActor) -> dict[str, Any]:
+        return service.scheduler_transfer_status(actor, transfer_id)
 
     @app.get("/api/v1/actors")
     def actors(actor: ApiActor) -> dict[str, Any]:
@@ -545,6 +581,70 @@ def create_app(settings: Settings) -> FastAPI:
     ) -> dict[str, Any]:
         return service.upsert_workload_profile(
             actor, profile_data, idempotency_key=_idempotency_key(idempotency_key)
+        )
+
+    @app.post("/api/v1/scheduler-targets")
+    def upsert_scheduler_target(
+        target_data: SchedulerTargetUpsert,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.upsert_scheduler_target(
+            actor,
+            target_data,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/workload-profiles/{profile_id}/scheduler-submit")
+    def submit_scheduler_profile(
+        profile_id: str,
+        submission: SchedulerProfileSubmit,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.submit_scheduler_profile(
+            actor,
+            profile_id,
+            submission,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/scheduler-jobs")
+    def submit_scheduler_one_off(
+        submission: SchedulerOneOffSubmit,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.submit_scheduler_one_off(
+            actor,
+            submission,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/scheduler-transfers")
+    def start_scheduler_upload(
+        upload: SchedulerUploadRequest,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.start_scheduler_upload(
+            actor,
+            upload,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/scheduler-jobs/{job_id}/cancel")
+    def cancel_scheduler_job(
+        job_id: str,
+        cancellation: SchedulerJobCancel,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.cancel_scheduler_job(
+            actor,
+            job_id,
+            cancellation,
+            idempotency_key=_idempotency_key(idempotency_key),
         )
 
     @app.post("/api/v1/workload-profiles/{profile_id}/claim")
@@ -831,12 +931,6 @@ def create_app(settings: Settings) -> FastAPI:
     ) -> dict[str, Any]:
         _idempotency_key(idempotency_key)  # reconciliation is auditable but not re-run by the service yet.
         return service.reconcile(actor)
-
-    @app.post("/api/v1/internal/observations")
-    def ingest_observation(observation: EndpointObservation, actor: ApiActor) -> dict[str, Any]:
-        if actor.role not in {"collector", "admin"}:
-            raise BrokerError("collector_role_required", "only collector/admin can submit telemetry", status_code=403)
-        return service.ingest_observation(observation)
 
     # ---- Server-sent event replay ---------------------------------------------
 
@@ -1189,6 +1283,7 @@ def create_app(settings: Settings) -> FastAPI:
         if action == "endpoint":
             host = _form_value(form, "host", required=True)
             port = _form_int(form, "port", required=True, minimum=1, maximum=65535)
+            owner_project_id = _form_value(form, "owner_project_id", required=True)
             assert host is not None and port is not None
             generated_id = "server-" + re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:96]
             generated_id = f"{generated_id}-p{port}"
@@ -1206,9 +1301,10 @@ def create_app(settings: Settings) -> FastAPI:
                 "storage_group": _form_value(form, "storage_group"),
                 "expected_gpu_count": _form_int(form, "expected_gpu_count", minimum=1),
                 "expected_gpu_total_vram_mib": _form_int(form, "expected_gpu_total_vram_mib", minimum=1),
-                # Kept in the REST schema for old clients, but endpoint project
-                # labels no longer affect placement and the GUI never asks for them.
-                "project_ids": [],
+                # Project ownership is the endpoint mutation boundary.  The
+                # legacy list stays populated for older REST clients.
+                "owner_project_id": owner_project_id,
+                "project_ids": [owner_project_id],
                 "enabled": _form_boolean(form, "enabled"),
             }
         if action == "endpoint-enabled":

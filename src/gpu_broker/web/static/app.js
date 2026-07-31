@@ -84,22 +84,22 @@
     return payload.data;
   };
 
-  const requestSshPreview = async (command, csrf) => {
+  const requestSshPreview = async (command, projectIds, csrf) => {
     const response = await fetch("/ui/endpoints/ssh/preview", {
       method: "POST",
       credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ command, csrf }),
+      body: JSON.stringify({ command, project_ids: projectIds, csrf }),
     });
     return parseJsonResponse(response);
   };
 
-  const requestSshBatchPreview = async (commands, csrf) => {
+  const requestSshBatchPreview = async (commands, projectIds, csrf) => {
     const response = await fetch("/ui/endpoints/ssh/batch/preview", {
       method: "POST",
       credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ commands, csrf }),
+      body: JSON.stringify({ commands, project_ids: projectIds, csrf }),
     });
     return parseJsonResponse(response);
   };
@@ -117,12 +117,12 @@
     return parseJsonResponse(response);
   };
 
-  const commitSshBatch = async ({ commands, previewToken, csrf }) => {
+  const commitSshBatch = async ({ commands, previewToken, projectIds, csrf }) => {
     const response = await fetch("/ui/endpoints/ssh/batch/commit", {
       method: "POST",
       credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ commands, preview_token: previewToken, csrf }),
+      body: JSON.stringify({ commands, project_ids: projectIds, preview_token: previewToken, csrf }),
     });
     return parseJsonResponse(response);
   };
@@ -130,6 +130,7 @@
   const sshForm = document.getElementById("ssh-preview-form");
   if (sshForm) {
     const commandInput = document.getElementById("ssh-command");
+    const projectInput = document.getElementById("ssh-project-id");
     const previewSection = document.getElementById("ssh-preview");
     const previewFields = document.getElementById("ssh-preview-fields");
     const previewTitle = document.getElementById("ssh-preview-title");
@@ -142,6 +143,7 @@
     const clipboardBridge = window.webkit?.messageHandlers?.gpuBrokerClipboard;
     let sshPreviewData = null;
     let sshBatchCommands = null;
+    let sshProjectIds = [];
 
     const setClipboardStatus = (message) => {
       if (!clipboardStatus) return;
@@ -193,10 +195,12 @@
       try {
         const csrf = sshForm.elements.csrf.value;
         const commands = commandInput.value.split(/\r?\n/).map((command) => command.trim()).filter(Boolean);
+        sshProjectIds = projectInput.value.trim() ? [projectInput.value.trim()] : [];
+        if (!sshProjectIds.length) throw new Error("请填写归属项目；项目 Agent 才能管理自己的 endpoint。");
         sshBatchCommands = commands.length > 1 ? commands : null;
         sshPreviewData = sshBatchCommands
-          ? await requestSshBatchPreview(sshBatchCommands, csrf)
-          : await requestSshPreview(commandInput.value, csrf);
+          ? await requestSshBatchPreview(sshBatchCommands, sshProjectIds, csrf)
+          : await requestSshPreview(commandInput.value, sshProjectIds, csrf);
         const entries = previewEntries(sshPreviewData || {});
         const statusTitles = {
           new: "确认新服务器信息",
@@ -238,7 +242,7 @@
         const previewToken = sshPreviewData?.preview_token;
         if (!previewToken) throw new Error("预览已失效，请返回重新检查命令。");
         const result = sshBatchCommands
-          ? await commitSshBatch({ commands: sshBatchCommands, previewToken, csrf: sshForm.elements.csrf.value })
+          ? await commitSshBatch({ commands: sshBatchCommands, previewToken, projectIds: sshProjectIds, csrf: sshForm.elements.csrf.value })
           : await commitSshEndpoint({
             command: commandInput.value,
             previewToken,
@@ -267,6 +271,7 @@
       clearSshError();
       sshPreviewData = null;
       sshBatchCommands = null;
+      sshProjectIds = [];
       endpointIdField.hidden = false;
       commitButton.disabled = false;
       commitButton.textContent = "确认注册";

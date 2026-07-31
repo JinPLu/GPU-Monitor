@@ -10,6 +10,10 @@ from scripts.install_agent_policy import MARKERS, install, main, merge, render
 from scripts.install_agent_policy import POLICY
 
 
+def _plain_policy_text(text: str) -> str:
+    return " ".join(text.replace("`", "").split())
+
+
 def test_policy_render_is_marked_for_each_platform() -> None:
     for platform in ("codex", "claude", "cursor"):
         start, end = MARKERS[platform]
@@ -92,38 +96,88 @@ def test_cursor_print_is_paste_ready(
 
 
 def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_questions() -> None:
-    adapter = POLICY.read_text(encoding="utf-8")
+    adapter = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
     for boundary in (
-        "freely schedulable infrastructure",
-        "do not stop for duplicate confirmation",
-        "Call `gpu_claim_profile`",
-        "`gpu_claim` as soon as runtime preflight passes",
-        "monitor the request and continue when allocated",
-        "Use the full approved GPU count",
-        "Bind the observed workload after startup",
-        "tool schemas remain authoritative",
-        "Never invent a missing",
-        "explicit authority",
-        "SSH",
-        "SQLite",
+        "use the local gpu-broker mcp proactively",
+        "server instructions",
+        "tool schemas are authoritative",
+        "owner-scoped coordination",
+        "profile_id",
+        "project_id",
+        "gpu_count",
+        "gpu_claim_profile",
+        "gpu_claim",
+        "never infer missing inputs",
+        "queued/null",
+        "lease.resources[]",
+        "cuda_visible_devices",
+        "project's normal execution path",
+        "idempotency_key",
+        "owner_project_id",
+        "draining",
+        "ssh",
+        "sqlite",
         "inventory",
         "nvidia-smi",
     ):
         assert boundary in adapter
 
+    mcp_instructions = _plain_policy_text(mcp.instructions).lower()
     for runtime_contract in (
-        "routine infrastructure",
-        "do not ask for duplicate confirmation",
+        "owner-scoped coordination",
         "gpu_claim_profile",
         "gpu_claim",
-        "If queued, monitor the request",
-        "Use the full approved GPU count",
+        "queued or null lease",
+        "lease.resources[]",
+        "cuda_visible_devices",
+        "project's normal execution path",
         "gpu_bind_observed_workload",
         "gpu_release",
+        "idempotency_key",
+        "endpoints belong to projects",
+        "draining",
     ):
-        assert runtime_contract in mcp.instructions
+        assert runtime_contract in mcp_instructions
     assert "gpu_grant_server_project" not in adapter
     assert "gpu_grant_server_project" not in mcp.instructions
+    assert "approval_ref" not in adapter
+    assert "approval_ref" not in mcp_instructions
+
+
+def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
+    global_policy = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
+    for boundary in (
+        "schedulertargets",
+        "never raw ssh endpoints",
+        "distinct scheduler adapter",
+        "owner-controlled submit, status, and cancel",
+        "slurm pending",
+        "alloctres",
+        "access_required",
+        "do not automate vpn",
+        "do not bypass broker allocation",
+        "sqlite",
+        "inventory",
+        "remote probes",
+        "nvidia-smi",
+    ):
+        assert boundary in global_policy
+
+    mcp_instructions = _plain_policy_text(mcp.instructions).lower()
+    for runtime_detail in (
+        "gpu_scheduler_targets",
+        "gpu_scheduler_access_status",
+        "access_required",
+        "owner-scoped submit, status, and cancel",
+        "slurm pending job",
+        "alloctres",
+        "broker does not launch or stop",
+    ):
+        assert runtime_detail in mcp_instructions
+    assert "approval_ref" not in global_policy
+    assert "approval_ref" not in mcp_instructions
+    assert "gpu_scheduler_upload" not in global_policy
+    assert "gpu_scheduler_upload" not in mcp_instructions
 
 
 def test_install_refuses_symlink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

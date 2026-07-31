@@ -4,18 +4,15 @@ import SwiftUI
 
 private enum DesktopError: LocalizedError {
     case projectRootMissing
-    case uvMissing
-    case serverExecutableMissing
+    case brokerExecutableMissing
     case commandFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .projectRootMissing:
             return "找不到 gpu-broker 项目目录。请将 GPU Broker.app 保留在项目的 dist/ 目录，或设置 GPU_BROKER_ROOT。"
-        case .uvMissing:
-            return "找不到 uv。请先安装 uv，或设置 GPU_BROKER_UV 指向它的绝对路径。"
-        case .serverExecutableMissing:
-            return "初始化完成，但找不到项目虚拟环境中的 gpu-broker 可执行文件。"
+        case .brokerExecutableMissing:
+            return "找不到全局 gpu-broker。请先运行 uv tool install --force /path/to/gpu-broker，或设置 GPU_BROKER_CLI。"
         case .commandFailed(let details):
             return details
         }
@@ -28,7 +25,6 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private let port = 8787
     private let brokerStore = BrokerStore()
     private var window: NSWindow?
-    private var serverProcess: Process?
     private var isStarting = false
 
     private lazy var projectRoot: URL? = {
@@ -77,17 +73,11 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         window = createdWindow
         createdWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        connectOrStartServer()
+        ensureDaemon()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        if let process = serverProcess, process.isRunning {
-            process.terminate()
-        }
     }
 
     private func configureMainMenu() {
@@ -125,14 +115,14 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         return nil
     }
 
-    private func uvExecutable() -> URL? {
+    private func brokerExecutable() -> URL? {
         let environment = ProcessInfo.processInfo.environment
         let home = environment["HOME"] ?? NSHomeDirectory()
         let candidates = [
-            environment["GPU_BROKER_UV"],
-            "\(home)/.local/bin/uv",
-            "/opt/homebrew/bin/uv",
-            "/usr/local/bin/uv"
+            environment["GPU_BROKER_CLI"],
+            "\(home)/.local/share/uv/tools/gpu-broker/bin/gpu-broker",
+            "/opt/homebrew/bin/gpu-broker",
+            "/usr/local/bin/gpu-broker"
         ].compactMap { $0 }
         return candidates
             .map { URL(fileURLWithPath: $0) }
@@ -161,8 +151,8 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
                 case .unavailable:
                     break
                 }
-                if self.serverProcess == nil && !self.isStarting {
-                    self.initializeAndStartServer()
+                if !self.isStarting {
+                    self.ensureDaemon()
                     return
                 }
                 if attempt < 80 {
@@ -205,13 +195,13 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         }.resume()
     }
 
-    private func initializeAndStartServer() {
+    private func ensureDaemon() {
         guard let root = projectRoot else {
             showFatalError(DesktopError.projectRootMissing.localizedDescription)
             return
         }
-        guard let uv = uvExecutable() else {
-            showFatalError(DesktopError.uvMissing.localizedDescription)
+        guard let broker = brokerExecutable() else {
+            showFatalError(DesktopError.brokerExecutableMissing.localizedDescription)
             return
         }
         isStarting = true
@@ -219,27 +209,15 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             guard let self else { return }
             do {
                 _ = try self.runCommand(
-                    executable: uv,
+                    executable: broker,
                     arguments: [
-                        "run", "--no-editable", "--reinstall-package", "gpu-broker",
-                        "gpu-broker", "init", "--db", "state/gpu-broker.sqlite3",
-                        "--inventory", "configs/inventory.yaml"
+                        "daemon", "ensure", "--source-root", root.path
                     ],
                     root: root
                 )
-                let serverExecutable = root.appendingPathComponent(".venv/bin/gpu-broker")
-                guard FileManager.default.isExecutableFile(atPath: serverExecutable.path) else {
-                    throw DesktopError.serverExecutableMissing
-                }
                 DispatchQueue.main.async {
-                    do {
-                        try self.startServer(executable: serverExecutable, root: root)
-                        self.isStarting = false
-                        self.connectOrStartServer()
-                    } catch {
-                        self.isStarting = false
-                        self.showFatalError(error.localizedDescription)
-                    }
+                    self.isStarting = false
+                    self.connectOrStartServer()
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -264,24 +242,9 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         process.waitUntilExit()
         let details = String(data: data, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
-            throw DesktopError.commandFailed("初始化本机状态失败：\(details)")
+            throw DesktopError.commandFailed("启动本机后台服务失败：\(details)")
         }
         return details
-    }
-
-    private func startServer(executable: URL, root: URL) throws {
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = [
-            "serve", "--db", "state/gpu-broker.sqlite3",
-            "--inventory", "configs/inventory.yaml", "--host", "127.0.0.1", "--port", "\(port)"
-        ]
-        process.currentDirectoryURL = root
-        process.environment = processEnvironment()
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        serverProcess = process
     }
 
     private func showFatalError(_ message: String) {
@@ -1260,7 +1223,6 @@ private struct NativeBrokerRoot: View {
     @ObservedObject var store: BrokerStore
     @State private var showAddServer = false
     @State private var showClaim = false
-    @State private var showSettings = false
     @State private var selectedEndpointID = ""
     @State private var selectedGPU: GPURecord?
     @State private var selectedEndpoint: EndpointRecord?
@@ -1279,8 +1241,7 @@ private struct NativeBrokerRoot: View {
                         store: store,
                         selectedSection: selectedDashboardSection,
                         compact: compactNavigation,
-                        navigate: { selectedDashboardSection = $0 },
-                        openSettings: { showSettings = true }
+                        navigate: { selectedDashboardSection = $0 }
                     )
                     .frame(width: sidebarWidth)
 
@@ -1331,20 +1292,11 @@ private struct NativeBrokerRoot: View {
         .sheet(isPresented: $showClaim) {
             ClaimSheet(store: store, initialEndpointID: selectedEndpointID)
         }
-        .sheet(isPresented: $showSettings) {
-            ActorSettingsSheet(store: store)
-        }
         .sheet(item: $selectedEndpoint) { endpoint in
             ServerDetailSheet(
                 store: store,
                 endpoint: endpoint,
-                gpus: store.snapshot.gpus(for: endpoint),
-                remove: {
-                    guard confirmEndpointRemoval(endpoint) else { return }
-                    store.deleteEndpoint(endpoint) { success, _ in
-                        if success { selectedEndpoint = nil }
-                    }
-                }
+                gpus: store.snapshot.gpus(for: endpoint)
             )
         }
         .sheet(item: $selectedGPU) { gpu in
@@ -1358,7 +1310,6 @@ private struct AppSidebar: View {
     let selectedSection: DashboardSection
     let compact: Bool
     let navigate: (DashboardSection) -> Void
-    let openSettings: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1407,25 +1358,7 @@ private struct AppSidebar: View {
 
             Spacer(minLength: 22)
 
-            VStack(alignment: compact ? .center : .leading, spacing: 10) {
-                Button(action: openSettings) {
-                    HStack(spacing: 7) {
-                        Image(systemName: "gearshape.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                            .frame(width: 16)
-                        if !compact {
-                            Text("桌面设置")
-                                .font(.system(size: 12, weight: .medium))
-                            Spacer(minLength: 0)
-                        }
-                    }
-                    .foregroundStyle(DesignTokens.ink)
-                    .frame(maxWidth: .infinity, alignment: compact ? .center : .leading)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("操作者与桌面设置")
-
+            VStack(alignment: compact ? .center : .leading, spacing: 6) {
                 HStack(spacing: 7) {
                     Circle()
                         .fill(store.isConnected ? DesignTokens.success : DesignTokens.warning)
@@ -1437,8 +1370,8 @@ private struct AppSidebar: View {
                     }
                 }
                 if !compact {
-                    Text("操作者：\(store.actorID)")
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    Text("状态仅供查看；操作由协调客户端提交")
+                        .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .lineLimit(1)
                 }
@@ -1560,14 +1493,9 @@ private struct DashboardView: View {
                 case .overview:
                     FleetOverview(
                         snapshot: store.snapshot,
-                        supportsEndpointDeletion: store.supportsEndpointDeletion,
-                        deletingEndpointIDs: store.deletingEndpointIDs,
                         isRefreshing: store.isRefreshing,
                         refresh: store.reload,
-                        addServer: addServer,
-                        claimGPU: claimGPU,
                         openEndpoint: openEndpoint,
-                        removeEndpoint: removeEndpoint,
                         selectGPU: selectGPU
                     )
                 case .serverPool:
@@ -3180,21 +3108,16 @@ private struct ServerDetailSheet: View {
     @ObservedObject var store: BrokerStore
     @Environment(\.dismiss) private var dismiss
     @State private var selectedGPU: GPURecord?
-    @State private var showClaim = false
     let endpoint: EndpointRecord
     let gpus: [GPURecord]
-    let remove: () -> Void
 
     private var availableGPUCount: Int {
-        gpus.filter { $0.state == "AVAILABLE" }.count
+        guard endpoint.monitorStatus == "ONLINE" else { return 0 }
+        return gpus.filter { $0.state == "AVAILABLE" }.count
     }
 
     private var claimedGPUCount: Int {
         gpus.filter(isGPUClaimed).count
-    }
-
-    private var isRemoving: Bool {
-        store.deletingEndpointIDs.contains(endpoint.id)
     }
 
     var body: some View {
@@ -3206,7 +3129,7 @@ private struct ServerDetailSheet: View {
             )
 
             HStack(spacing: 12) {
-                GPUDetailMetric(label: "GPU 可用", value: gpus.isEmpty ? "等待状态" : "\(availableGPUCount) / \(gpus.count)", accent: DesignTokens.success)
+                GPUDetailMetric(label: "GPU 可分配", value: capacityLabel, accent: DesignTokens.success)
                 GPUDetailMetric(label: "已认领", value: gpus.isEmpty ? "等待状态" : "\(claimedGPUCount) / \(gpus.count)", accent: DesignTokens.interaction)
                 GPUDetailMetric(label: "平均利用率", value: percentageLabel(endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus)), accent: DesignTokens.warning)
                 GPUDetailMetric(label: "平均显存", value: percentageLabel(endpointAverageMemoryFraction(endpoint: endpoint, gpus: gpus)), accent: DesignTokens.ink)
@@ -3243,13 +3166,9 @@ private struct ServerDetailSheet: View {
             }
 
             HStack {
-                Button("认领此服务器") { showClaim = true }
-                    .buttonStyle(SoftButtonStyle(tint: DesignTokens.ink, foreground: .white))
-                Button(isRemoving ? "移除中" : "移除服务器", role: .destructive) { remove() }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(DesignTokens.danger)
-                    .help(store.supportsEndpointDeletion ? "删除本机登记和采集历史；不会关闭远端机器" : "当前本机服务不支持移除服务器")
-                    .disabled(isRemoving || !store.supportsEndpointDeletion)
+                Label("此处显示上次采集到的协调状态", systemImage: "eye.fill")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
                 Spacer()
                 Button("关闭") { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -3261,9 +3180,12 @@ private struct ServerDetailSheet: View {
         .sheet(item: $selectedGPU) { gpu in
             GPUDetailSheet(gpu: gpu)
         }
-        .sheet(isPresented: $showClaim) {
-            ClaimSheet(store: store, initialEndpointID: endpoint.id)
-        }
+    }
+
+    private var capacityLabel: String {
+        guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线" }
+        guard !gpus.isEmpty else { return "等待状态" }
+        return "\(availableGPUCount) / \(gpus.count)"
     }
 }
 

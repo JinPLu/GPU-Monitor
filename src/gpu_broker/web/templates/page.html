@@ -64,6 +64,7 @@
     <label>主机或 SSH 地址<input name="host" required placeholder="10.0.0.1 或 gpu-host"></label>
     <label>SSH 端口<input name="port" type="number" min="1" max="65535" value="22" required></label>
     <label>SSH 用户<input name="ssh_user" value="root" required></label>
+    <label>归属项目<input name="owner_project_id" required placeholder="例如：storyboard"></label>
     <label>期望 GPU 数（可留空）<input name="expected_gpu_count" type="number" min="1" placeholder="自动发现"></label>
     <input type="hidden" name="labels" value="gpu">
     <input type="hidden" name="enabled" value="true">

@@ -17,6 +17,11 @@ class StrictModel(BaseModel):
 
 class ResourceConstraints(StrictModel):
     gpu_count: int = Field(ge=1, le=1024)
+    # A direct-GPU claim reserves these amounts at *each endpoint selected for
+    # the gang*.  Per-endpoint semantics prevent a multi-host request from
+    # silently dividing a host requirement across machines.
+    cpu_cores: float | None = Field(default=None, gt=0, le=4096)
+    memory_mib: int | None = Field(default=None, gt=0, le=16 * 1024 * 1024)
     min_available_cpu_cores: float | None = Field(default=None, ge=0)
     min_available_memory_mib: int | None = Field(default=None, ge=0)
     min_total_vram_mib: int | None = Field(default=None, ge=1)
@@ -186,17 +191,173 @@ class WorkloadProfileUpsert(StrictModel):
     purpose: str = Field(min_length=1, max_length=1000)
     duration_seconds: int = Field(ge=60, le=60 * 60 * 24 * 30)
     constraints: ResourceConstraints
+    runtime_kind: Literal["direct-gpu", "slurm"] = "direct-gpu"
+    scheduler_target_id: str | None = Field(
+        default=None, pattern=r"^[a-z][a-z0-9-]{1,63}$"
+    )
+    scheduler: "SlurmJobSpec | None" = None
+    scheduler_script: str | None = Field(default=None, min_length=1, max_length=128_000)
+    grant_project_ids: list[str] = Field(default_factory=list, max_length=256)
+    grant_all_projects: bool = False
+    retain_submission_body: bool = False
     enabled: bool = True
+
+    @field_validator("grant_project_ids")
+    @classmethod
+    def unique_grant_projects(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("grant_project_ids must not contain duplicates")
+        if any(not value for value in values):
+            raise ValueError("grant_project_ids must contain non-empty values")
+        return values
 
     @model_validator(mode="after")
     def validate_placement(self) -> "WorkloadProfileUpsert":
         if self.constraints.gpu_ids or self.constraints.placement == "exact":
             raise ValueError("workload profile cannot pin exact gpu_ids")
+        if self.runtime_kind == "direct-gpu":
+            if self.scheduler_target_id or self.scheduler or self.scheduler_script:
+                raise ValueError(
+                    "direct-gpu workload profile cannot define scheduler fields"
+                )
+        elif not self.scheduler_target_id or self.scheduler is None or not self.scheduler_script:
+            raise ValueError(
+                "slurm workload profile requires scheduler_target_id, scheduler and scheduler_script"
+            )
         return self
 
 
 class WorkloadProfileClaim(StrictModel):
     task_ref: str = Field(min_length=1, max_length=255)
+
+
+class SlurmJobSpec(StrictModel):
+    """Bounded Slurm flags controlled by the Broker, not raw command-line input."""
+
+    partition: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,64}$")
+    qos: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,64}$")
+    gpu_type: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,64}$")
+    cpu_cores: int = Field(default=1, ge=1, le=4096)
+    memory_mib: int = Field(default=1024, ge=1, le=16 * 1024 * 1024)
+    nodes: int = Field(default=1, ge=1, le=1024)
+    tasks_per_node: int = Field(default=1, ge=1, le=4096)
+    working_directory: str = Field(min_length=1, max_length=2000)
+    stdout_pattern: str = Field(default="gpu-broker-%j.out", min_length=1, max_length=2000)
+    stderr_pattern: str = Field(default="gpu-broker-%j.err", min_length=1, max_length=2000)
+
+    @field_validator("working_directory", "stdout_pattern", "stderr_pattern")
+    @classmethod
+    def safe_remote_path(cls, value: str) -> str:
+        if "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("remote paths must be single-line values without NUL bytes")
+        return value
+
+
+class SchedulerUploadConfig(StrictModel):
+    """Non-secret SSH mux metadata used only after the access helper authenticates."""
+
+    ssh_host: str = Field(pattern=r"^[A-Za-z0-9.-]{1,253}$")
+    ssh_user: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    control_path: str = Field(min_length=1, max_length=1000)
+
+    @field_validator("control_path")
+    @classmethod
+    def absolute_control_path(cls, value: str) -> str:
+        if not value.startswith("/") or "\x00" in value or "\n" in value:
+            raise ValueError("control_path must be an absolute single-line path")
+        return value
+
+
+class SchedulerTargetUpsert(StrictModel):
+    """Admin-owned external scheduler connection metadata; contains no secret values."""
+
+    id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    display_name: str = Field(min_length=1, max_length=120)
+    adapter: Literal["slurm-command"] = "slurm-command"
+    command_prefix: list[str] = Field(min_length=1, max_length=16)
+    upload: SchedulerUploadConfig | None = None
+    credential_refs: dict[str, str] = Field(default_factory=dict)
+    capabilities: list[
+        Literal["access-status", "submit", "status", "cancel", "data-transfer"]
+    ] = Field(default_factory=lambda: ["access-status", "submit", "status", "cancel"])
+    access_hint: str = Field(min_length=1, max_length=2000)
+    enabled: bool = True
+
+    @field_validator("command_prefix", "capabilities")
+    @classmethod
+    def unique_non_empty_values(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("target lists must not contain duplicates")
+        if any(not value or "\x00" in value for value in values):
+            raise ValueError("target lists must contain non-empty values without NUL bytes")
+        return values
+
+    @field_validator("credential_refs")
+    @classmethod
+    def credential_references_only(cls, values: dict[str, str]) -> dict[str, str]:
+        if any(not key or not value for key, value in values.items()):
+            raise ValueError("credential references must use non-empty keys and values")
+        forbidden = {"password", "secret", "token", "otp", "totp"}
+        if any(key.lower() in forbidden for key in values):
+            raise ValueError("store credential references, never credential values")
+        return values
+
+    @model_validator(mode="after")
+    def upload_matches_capability(self) -> "SchedulerTargetUpsert":
+        has_capability = "data-transfer" in self.capabilities
+        if has_capability != (self.upload is not None):
+            raise ValueError(
+                "data-transfer capability requires upload metadata and vice versa"
+            )
+        return self
+
+
+class SchedulerProfileSubmit(StrictModel):
+    project_id: str = Field(min_length=1, max_length=64)
+    task_ref: str = Field(min_length=1, max_length=255)
+
+
+class SchedulerOneOffSubmit(StrictModel):
+    target_id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    project_id: str = Field(min_length=1, max_length=64)
+    task_ref: str = Field(min_length=1, max_length=255)
+    purpose: str = Field(min_length=1, max_length=1000)
+    duration_seconds: int = Field(ge=60, le=60 * 60 * 24 * 30)
+    constraints: ResourceConstraints
+    scheduler: SlurmJobSpec
+    script_body: str = Field(min_length=1, max_length=128_000)
+    retain_submission_body: bool = False
+
+    @model_validator(mode="after")
+    def validate_scheduler_constraints(self) -> "SchedulerOneOffSubmit":
+        if self.constraints.gpu_ids or self.constraints.endpoint_ids:
+            raise ValueError(
+                "external scheduler submissions cannot pin Broker endpoint_ids or gpu_ids"
+            )
+        return self
+
+
+class SchedulerJobCancel(StrictModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class SchedulerUploadRequest(StrictModel):
+    target_id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
+    project_id: str = Field(min_length=1, max_length=64)
+    local_path: str = Field(min_length=1, max_length=4000)
+    remote_directory: str = Field(
+        pattern=r"^/[A-Za-z0-9._@+-]+(?:/[A-Za-z0-9._@+-]+)*$",
+        max_length=2000,
+    )
+    approval_ref: str = Field(min_length=1, max_length=500)
+
+    @field_validator("local_path")
+    @classmethod
+    def local_path_is_absolute(cls, value: str) -> str:
+        if not value.startswith("/") or "\x00" in value or "\n" in value:
+            raise ValueError("local_path must be an absolute single-line path")
+        return value
 
 
 class EndpointUpsert(StrictModel):
@@ -209,10 +370,12 @@ class EndpointUpsert(StrictModel):
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
     expected_gpu_total_vram_mib: int | None = Field(default=None, ge=1)
-    # Accepted for backward-compatible inventory imports only; endpoint scope
-    # does not participate in allocation.
+    owner_project_id: str | None = Field(default=None, min_length=1, max_length=64)
+    lifecycle_state: Literal["active", "draining", "retired"] | None = None
+    # Kept only for one-project legacy imports.  Endpoint ownership is now one
+    # project, rather than a scheduler placement allowlist.
     project_ids: list[str] = Field(default_factory=list)
-    enabled: bool = True
+    enabled: bool | None = None
 
     @field_validator("labels", "project_ids")
     @classmethod
@@ -222,6 +385,14 @@ class EndpointUpsert(StrictModel):
         if any(not value for value in values):
             raise ValueError("endpoint list values must not be empty")
         return values
+
+    @model_validator(mode="after")
+    def resolve_owner(self) -> "EndpointUpsert":
+        if self.owner_project_id and self.project_ids and self.project_ids != [self.owner_project_id]:
+            raise ValueError("project_ids may only repeat owner_project_id for legacy imports")
+        if self.owner_project_id is None and len(self.project_ids) == 1:
+            self.owner_project_id = self.project_ids[0]
+        return self
 
 
 class EndpointEnabled(StrictModel):

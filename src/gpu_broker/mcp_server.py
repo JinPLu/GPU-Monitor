@@ -9,31 +9,36 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from gpu_broker.client import BrokerClient
+from gpu_broker.daemon import ensure_broker_ready_for_mcp
 
 
 MCP_INSTRUCTIONS = (
-    "Use gpu-broker only for user-authorized GPU inspection or coordination. Treat Broker inspection "
-    "and coordination as routine infrastructure for GPU-relevant work: read gpu_coordination when "
-    "state is needed without asking whether MCP may be used. A user request or accepted plan to run, "
-    "continue, or monitor a GPU-dependent task authorizes a routine claim once an approved profile_id, "
-    "or project_id and gpu_count plus any needed CPU, system memory, or VRAM thresholds, are recorded "
-    "in the current task, an accepted plan, or a prior successful claim for the same continuing task. "
-    "Reuse that contract and do not ask for duplicate confirmation. If a profile_id is named, call "
-    "gpu_claim_profile; otherwise call gpu_claim as soon as runtime preflight passes. Do not infer "
-    "profile_id, project_id, gpu_count, CPU cores, memory MiB, VRAM MiB, server_id, or gpu_ids from a "
-    "repo, directory, task title, free capacity, inventory, or defaults. Any non-empty project_id is "
-    "accepted directly and needs no pre-registration. Let the Broker place routine claims unless the "
-    "user explicitly names a server or exact GPUs. If queued, monitor the request and continue when "
-    "allocated instead of ending with a user question. A queued response or lease=null is not permission "
-    "to run; use only GPUs in a returned held or active lease. Use the full approved GPU count when the "
-    "workload supports it by parallelizing independent jobs across the lease, without dummy processes "
-    "or unsafe concurrency. After starting an authorized workload, call "
-    "gpu_bind_observed_workload(agent_name, lease_id, optional run_id) so the Broker records only "
-    "already-observed processes; it never launches, stops, or changes remote work. Release with "
-    "gpu_release(agent_name, lease_id) when work stops or startup fails. "
-    "Reservations and server registration/deletion are admin actions requiring separate explicit authorization. "
-    "If MCP or the service is unavailable, report that state and do not fall back to SSH, SQLite, "
-    "inventory, remote probes, or nvidia-smi."
+    "Use gpu-broker for GPU coordination and read-only resource discovery. The Broker is the only "
+    "allocation and freshness/probing authority: do not bypass it through SSH, SQLite, inventory, remote "
+    "probes, or nvidia-smi. A request or accepted plan to run, continue, or monitor a GPU task makes its "
+    "owner-scoped coordination routine once a profile_id, or project_id, gpu_count, and needed thresholds "
+    "are recorded. Reuse that contract without asking again; never infer missing inputs from a repository, "
+    "task title, free capacity, or defaults. "
+    "The normal bare-metal path is gpu_coordination, then gpu_claim_profile or gpu_claim, then execute, "
+    "then gpu_release. A queued or null lease is not permission to run. When a held or active lease is "
+    "returned, take the placement only from its structured lease.resources[]: each resource provides an "
+    "endpoint, gpus, cuda_visible_devices, and commitment. Use the project's normal execution path to start "
+    "or stop its workload there. The Broker does not launch or stop that workload. "
+    "After it starts, gpu_bind_observed_workload records fresh observed processes; release when it stops "
+    "or startup fails. Use the full requested allocation when the workload safely supports it. "
+    "Provide an idempotency_key for a mutation when retrying it, and reuse that same caller-chosen key. "
+    "The low-level request, activate, release-lease, and bind-workload tools remain compatibility tools; "
+    "prefer the normal path. "
+    "Endpoints belong to projects. Their owner may add them and retire them into draining; retirement "
+    "prevents new placement and never stops an existing workload. "
+    "External Slurm clusters such as Hanhai22 are SchedulerTargets, never raw SSH endpoints. Use "
+    "gpu_scheduler_targets and gpu_scheduler_access_status to discover a target, then use owner-scoped "
+    "submit, status, and cancel operations. "
+    "A Slurm PENDING job is not a bare-metal lease; scheduler status and AllocTRES establish its allocation. "
+    "VPN access is detection only: access_required means ask the user to connect the approved VPN, then retry. "
+    "On macOS this adapter automatically ensures the shared headless loopback daemon before REST calls; "
+    "it does not depend on the GUI. If MCP or the service is unavailable, report that state and do not fall "
+    "back to a bypass."
 )
 
 
@@ -45,6 +50,7 @@ mcp = FastMCP(
 
 
 def _client(actor_name: str | None = None) -> BrokerClient:
+    ensure_broker_ready_for_mcp()
     return BrokerClient.from_env(actor=actor_name)
 
 
@@ -116,6 +122,185 @@ def gpu_list_profiles(project_id: str | None = None) -> dict[str, Any]:
 
     params = {"project_id": project_id} if project_id else None
     return _client().get("/api/v1/workload-profiles", params=params)
+
+
+@mcp.tool()
+def gpu_scheduler_targets() -> dict[str, Any]:
+    """List globally registered external schedulers such as Hanhai22.
+
+    Scheduler targets are not raw GPU servers. Their login helpers and access
+    hints are metadata; Slurm remains the resource allocator.
+    """
+
+    return _client().get("/api/v1/scheduler-targets")
+
+
+@mcp.tool()
+def gpu_scheduler_access_status(target_id: str) -> dict[str, Any]:
+    """Check whether an external scheduler is reachable through its approved access path.
+
+    This read-only check does not connect or change VPN state and does not submit a job.
+    """
+
+    return _client().get(f"/api/v1/scheduler-targets/{target_id}/access")
+
+
+@mcp.tool()
+def gpu_scheduler_profiles(project_id: str) -> dict[str, Any]:
+    """List enabled Slurm profiles explicitly granted to a project."""
+
+    result = _client().get(
+        "/api/v1/workload-profiles",
+        params={"project_id": project_id},
+    )
+    result["data"] = [
+        profile
+        for profile in result.get("data", [])
+        if profile.get("runtime_kind") == "slurm"
+    ]
+    return result
+
+
+@mcp.tool()
+def gpu_scheduler_submit_profile(
+    agent_name: str,
+    profile_id: str,
+    project_id: str,
+    task: str,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Submit a project-owned Slurm profile for its current task."""
+
+    if not profile_id.strip() or not project_id.strip() or not task.strip():
+        raise ValueError("profile_id, project_id and task must not be empty")
+    return _client(agent_name).post(
+        f"/api/v1/workload-profiles/{profile_id}/scheduler-submit",
+        {"project_id": project_id, "task_ref": task},
+        idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
+
+
+@mcp.tool()
+def gpu_scheduler_submit_once(
+    agent_name: str,
+    request: dict[str, Any],
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Submit one project-owned Slurm script and bounded resource request.
+
+    The request must include target_id, project_id, task_ref, purpose,
+    duration_seconds, constraints, scheduler, and script_body.
+    Broker stores the script digest by default; retain_submission_body must be
+    explicitly true to retain the exact body.
+    """
+
+    required = {
+        "target_id",
+        "project_id",
+        "task_ref",
+        "purpose",
+        "duration_seconds",
+        "constraints",
+        "scheduler",
+        "script_body",
+    }
+    missing = sorted(field for field in required if not request.get(field))
+    if missing:
+        raise ValueError(
+            "gpu_scheduler_submit_once requires " + ", ".join(missing)
+        )
+    return _client(agent_name).post(
+        "/api/v1/scheduler-jobs",
+        request,
+        idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
+
+
+@mcp.tool()
+def gpu_scheduler_job_status(
+    agent_name: str,
+    job_id: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Read one live Slurm job or list the Broker's persisted scheduler jobs."""
+
+    client = _client(agent_name)
+    if job_id:
+        return client.get(f"/api/v1/scheduler-jobs/{job_id}")
+    params = {"project_id": project_id} if project_id else None
+    return client.get("/api/v1/scheduler-jobs", params=params)
+
+
+@mcp.tool()
+def gpu_scheduler_cancel(
+    agent_name: str,
+    job_id: str,
+    reason: str,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Cancel a Slurm job owned by the calling project."""
+
+    if not job_id.strip() or not reason.strip():
+        raise ValueError("job_id and reason must not be empty")
+    return _client(agent_name).post(
+        f"/api/v1/scheduler-jobs/{job_id}/cancel",
+        {"reason": reason},
+        idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
+
+
+def gpu_scheduler_upload(
+    agent_name: str,
+    target_id: str,
+    project_id: str,
+    local_path: str,
+    remote_directory: str,
+    approval_ref: str,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Compatibility helper for the deferred staged-upload API.
+
+    It is intentionally not exposed as an MCP tool. Keep it import-compatible
+    while the public scheduler contract does not offer transfer operations.
+    """
+
+    if not all(
+        value.strip()
+        for value in (
+            agent_name,
+            target_id,
+            project_id,
+            local_path,
+            remote_directory,
+            approval_ref,
+        )
+    ):
+        raise ValueError("all staged upload fields must not be empty")
+    return _client(agent_name).post(
+        "/api/v1/scheduler-transfers",
+        {
+            "target_id": target_id,
+            "project_id": project_id,
+            "local_path": local_path,
+            "remote_directory": remote_directory,
+            "approval_ref": approval_ref,
+        },
+        idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
+
+
+def gpu_scheduler_transfer_status(
+    agent_name: str,
+    transfer_id: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Compatibility helper for the deferred staged-upload API."""
+
+    client = _client(agent_name)
+    if transfer_id:
+        return client.get(f"/api/v1/scheduler-transfers/{transfer_id}")
+    params = {"project_id": project_id} if project_id else None
+    return client.get("/api/v1/scheduler-transfers", params=params)
 
 
 @mcp.tool()
@@ -196,7 +381,10 @@ def gpu_bind_workload(
 
 @mcp.tool()
 def gpu_bind_observed_workload(
-    agent_name: str, lease_id: str, run_id: str | None = None
+    agent_name: str,
+    lease_id: str,
+    run_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Record fresh observed processes for an already-started workload on the caller's lease.
 
@@ -208,7 +396,7 @@ def gpu_bind_observed_workload(
     return _client(agent_name).post(
         f"/api/v1/leases/{lease_id}/bind-observed-workload",
         {"run_id": run_id} if run_id else {},
-        idempotency_key=secrets.token_hex(16),
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
@@ -239,6 +427,7 @@ def gpu_claim(
     min_free_vram_mib: int | None = None,
     min_total_vram_mib: int | None = None,
     purpose: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Claim GPUs now, or queue. CPU, memory, and VRAM thresholds are absolute values."""
 
@@ -276,31 +465,41 @@ def gpu_claim(
             "purpose": (purpose or task).strip(),
             "constraints": constraints,
         },
-        idempotency_key=secrets.token_hex(16),
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
 @mcp.tool()
-def gpu_claim_profile(agent_name: str, profile_id: str, task: str) -> dict[str, Any]:
-    """Claim a human-approved workload profile now; the profile fixes its resource contract."""
+def gpu_claim_profile(
+    agent_name: str,
+    profile_id: str,
+    task: str,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Claim a workload profile now; the profile fixes its resource contract."""
 
     if not profile_id.strip() or not task.strip():
         raise ValueError("profile_id and task must not be empty")
     return _client(agent_name).post(
         f"/api/v1/workload-profiles/{profile_id}/claim",
         {"task_ref": task},
-        idempotency_key=secrets.token_hex(16),
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
 @mcp.tool()
-def gpu_release(agent_name: str, lease_id: str, reason: str = "workload_completed") -> dict[str, Any]:
+def gpu_release(
+    agent_name: str,
+    lease_id: str,
+    reason: str = "workload_completed",
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
     """Release a prior claim; this never stops a process on the remote server."""
 
     return _client(agent_name).post(
         f"/api/v1/leases/{lease_id}/release",
         {"reason": reason},
-        idempotency_key=secrets.token_hex(16),
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
@@ -312,6 +511,7 @@ def gpu_schedule(
     start_at: str,
     end_at: str,
     reason: str,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Reserve specific GPUs for a future ISO-8601 time window."""
 
@@ -325,20 +525,24 @@ def gpu_schedule(
             "end_at": end_at,
             "reason": reason,
         },
-        idempotency_key=secrets.token_hex(16),
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
 @mcp.tool()
 def gpu_add_server(
     agent_name: str,
+    project_id: str,
     host: str,
     port: int = 22,
     ssh_user: str = "root",
     server_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Add an SSH server to continuous read-only GPU monitoring."""
+    """Add a project-owned endpoint to read-only monitoring."""
 
+    if not project_id.strip():
+        raise ValueError("project_id must not be empty")
     client = _client(agent_name)
     generated_id = "server-" + re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:96]
     generated_id = f"{generated_id}-p{port}"
@@ -349,20 +553,24 @@ def gpu_add_server(
             "host": host,
             "port": port,
             "ssh_user": ssh_user,
-            "project_ids": [],
+            "owner_project_id": project_id,
             "enabled": True,
         },
-        idempotency_key=secrets.token_hex(16),
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
 @mcp.tool()
-def gpu_delete_server(agent_name: str, server_id: str) -> dict[str, Any]:
-    """Delete an SSH server from monitoring; this never stops a remote workload."""
+def gpu_delete_server(
+    agent_name: str,
+    server_id: str,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Retire an endpoint into draining; this never stops a remote workload."""
 
     return _client(agent_name).delete(
         f"/api/v1/endpoints/{server_id}",
-        idempotency_key=secrets.token_hex(16),
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 

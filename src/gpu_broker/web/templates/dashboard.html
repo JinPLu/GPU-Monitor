@@ -86,6 +86,7 @@
     <div id="ssh-error" class="inline-message error-message" role="alert" hidden></div>
     <form id="ssh-preview-form" class="stack">
       <label>SSH 命令（每行一台服务器）<textarea id="ssh-command" name="command" rows="4" required spellcheck="false" autocomplete="off" placeholder="ssh -p 22 user@gpu-host"></textarea></label>
+      <label>归属项目<input id="ssh-project-id" name="owner_project_id" required placeholder="例如：storyboard"></label>
       <button id="paste-ssh-command" class="quiet-action" type="button" hidden>从系统剪贴板粘贴</button>
       <p id="ssh-clipboard-status" class="muted" role="status" hidden></p>
       <p class="field-help">每行仅解析常见的 <code>ssh</code> 用户、主机和端口参数，不会运行任何命令。</p>
@@ -106,6 +107,7 @@
       <label>主机或 SSH 地址<input name="host" required placeholder="10.0.0.1 或 gpu-host"></label>
       <label>SSH 端口<input name="port" type="number" min="1" max="65535" value="22" required></label>
       <label>SSH 用户<input name="ssh_user" value="root" required></label>
+      <label>归属项目<input name="owner_project_id" required placeholder="例如：storyboard"></label>
       <label>期望 GPU 数（可留空）<input name="expected_gpu_count" type="number" min="1" placeholder="自动发现"></label>
       <input type="hidden" name="labels" value="gpu"><input type="hidden" name="enabled" value="true">
       <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">

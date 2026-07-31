@@ -183,6 +183,38 @@ def test_renewal_cannot_cross_a_future_reservation(service, admin) -> None:
     assert error.value.code == "lease_renewal_conflicts_with_reservation"
 
 
+def test_reservation_cancellation_is_limited_to_creating_actor(service) -> None:
+    service.ingest_observation(observation(count=1))
+    owner = service.local_actor("reservation-owner")
+    other = service.local_actor("reservation-other")
+    gpu_id = service.list_gpus(owner)["data"][0]["id"]
+    start_at = utcnow() + timedelta(minutes=5)
+    created = service.create_reservation(
+        owner,
+        ReservationCreate(
+            project_id="project-a",
+            gpu_ids=[gpu_id],
+            start_at=start_at,
+            end_at=start_at + timedelta(hours=1),
+            reason="owner-only future reservation",
+        ),
+        idempotency_key="owner-reservation",
+    )
+    with pytest.raises(BrokerError) as error:
+        service.cancel_reservation(
+            other,
+            created["reservation"]["id"],
+            idempotency_key="cross-actor-cancel",
+        )
+    assert error.value.code == "reservation_forbidden"
+    cancelled = service.cancel_reservation(
+        owner,
+        created["reservation"]["id"],
+        idempotency_key="owner-cancel",
+    )
+    assert cancelled["reservation"]["state"] == "CANCELLED"
+
+
 def test_gang_all_or_nothing_and_no_partial_write(service, admin) -> None:
     service.ingest_observation(observation(count=3))
     first = service.create_request(admin, request_data("gang-a", count=2), idempotency_key="gang-a")
@@ -295,7 +327,7 @@ def test_endpoint_identity_is_enforced(service, admin) -> None:
     assert error.value.code == "endpoint_identity_immutable"
 
 
-def test_endpoint_delete_removes_unleased_monitoring_state(service, admin) -> None:
+def test_endpoint_delete_drains_then_retires_without_erasing_monitoring_state(service, admin) -> None:
     service.ingest_observation(observation(count=2))
     service.record_provider_failure("endpoint-a", "timeout")
 
@@ -304,18 +336,14 @@ def test_endpoint_delete_removes_unleased_monitoring_state(service, admin) -> No
 
     assert retried == deleted
     assert deleted["endpoint_id"] == "endpoint-a"
-    assert deleted["deleted_gpu_count"] == 2
-    assert deleted["deleted_monitoring_records"] == {
-        "alerts": 1,
-        "provider_states": 1,
-        "host_telemetry_current": 1,
-        "gpu_telemetry_current": 2,
-        "gpu_telemetry_history": 2,
-        "process_observations": 0,
-    }
-    assert [endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]] == ["endpoint-b"]
-    assert all(gpu["endpoint_id"] != "endpoint-a" for gpu in service.list_gpus(admin)["data"])
-    assert any(event["action"] == "endpoint.deleted" for event in service.list_events(admin)["data"])
+    assert deleted["endpoint"]["lifecycle_state"] == "draining"
+    assert deleted["history_retained"] is True
+    retired = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-retire")
+    assert retired["endpoint"]["lifecycle_state"] == "retired"
+    assert [endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]] == ["endpoint-a", "endpoint-b"]
+    assert any(gpu["endpoint_id"] == "endpoint-a" for gpu in service.list_gpus(admin)["data"])
+    assert any(event["action"] == "endpoint.draining" for event in service.list_events(admin)["data"])
+    assert any(event["action"] == "endpoint.retired" for event in service.list_events(admin)["data"])
 
     def deleted_rows(session):  # type: ignore[no-untyped-def]
         return (
@@ -331,19 +359,23 @@ def test_endpoint_delete_removes_unleased_monitoring_state(service, admin) -> No
         )
 
     endpoint, gpus, provider_states, alerts = service._read(deleted_rows)
-    assert endpoint is None
-    assert gpus == []
-    assert provider_states == []
-    assert alerts == []
+    assert endpoint is not None
+    assert endpoint.lifecycle_state == "retired"
+    assert len(gpus) == 2
+    assert len(provider_states) == 1
+    assert len(alerts) == 1
 
 
-def test_endpoint_delete_refuses_active_and_historical_leases(service, admin) -> None:
+def test_endpoint_delete_waits_for_active_lease_then_retires_with_history(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     claimed = service.create_request(admin, request_data("delete-blocked"), idempotency_key="delete-blocked")
     assert claimed["lease"] is not None
 
+    drained = service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-active")
+    assert drained["endpoint"]["lifecycle_state"] == "draining"
+
     with pytest.raises(BrokerError) as active_error:
-        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-active")
+        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-active-retire")
     assert active_error.value.code == "endpoint_has_active_leases"
 
     service.release_lease(
@@ -352,12 +384,38 @@ def test_endpoint_delete_refuses_active_and_historical_leases(service, admin) ->
         reason="finished",
         idempotency_key="delete-blocked-release",
     )
-    with pytest.raises(BrokerError) as history_error:
-        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-history")
-    assert history_error.value.code == "endpoint_has_lease_history"
+    retired = service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-history")
+    assert retired["endpoint"]["lifecycle_state"] == "retired"
 
 
-def test_endpoint_delete_refuses_maintenance_history(service, admin) -> None:
+def test_endpoint_retirement_waits_for_queued_request_pinned_to_endpoint(service, admin) -> None:
+    queued = service.create_request(
+        admin,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "endpoint-pinned-queue",
+                "purpose": "wait for a particular endpoint",
+                "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
+            }
+        ),
+        idempotency_key="endpoint-pinned-queue",
+    )
+    assert queued["lease"] is None
+    drained = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-drain")
+    assert drained["endpoint"]["lifecycle_state"] == "draining"
+
+    with pytest.raises(BrokerError) as error:
+        service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire")
+    assert error.value.code == "endpoint_has_queued_requests"
+    assert error.value.details == {"request_ids": [queued["request"]["id"]]}
+
+    service.cancel_request(admin, queued["request"]["id"], idempotency_key="endpoint-pinned-cancel")
+    retired = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire-after-cancel")
+    assert retired["endpoint"]["lifecycle_state"] == "retired"
+
+
+def test_endpoint_delete_preserves_maintenance_history(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     created = service.create_maintenance(
         admin,
@@ -370,15 +428,12 @@ def test_endpoint_delete_refuses_maintenance_history(service, admin) -> None:
         idempotency_key="endpoint-maintenance",
     )
 
-    with pytest.raises(BrokerError) as error:
-        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-maintenance")
-
-    assert error.value.code == "endpoint_referenced_by_maintenance"
-    assert error.value.details == {"maintenance_ids": [created["maintenance"]["id"]]}
+    drained = service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-maintenance")
+    assert drained["endpoint"]["lifecycle_state"] == "draining"
     assert service._read(lambda session: session.get(MaintenanceWindow, created["maintenance"]["id"])) is not None
 
 
-def test_endpoint_delete_refuses_enabled_workload_profile_references(service, admin) -> None:
+def test_endpoint_delete_preserves_enabled_workload_profile_references(service, admin) -> None:
     service.upsert_workload_profile(
         admin,
         WorkloadProfileUpsert.model_validate(
@@ -394,9 +449,8 @@ def test_endpoint_delete_refuses_enabled_workload_profile_references(service, ad
         idempotency_key="endpoint-bound-profile",
     )
 
-    with pytest.raises(BrokerError) as error:
-        service.delete_endpoint(admin, "endpoint-b", idempotency_key="delete-profile-ref")
-    assert error.value.code == "endpoint_referenced_by_profiles"
+    drained = service.delete_endpoint(admin, "endpoint-b", idempotency_key="delete-profile-ref")
+    assert drained["endpoint"]["lifecycle_state"] == "draining"
 
 
 def test_claim_auto_creates_project_and_ignores_legacy_endpoint_scope(service, admin) -> None:
@@ -718,3 +772,94 @@ def test_database_unique_index_rejects_duplicate_active_gpu(service, admin) -> N
 
     with pytest.raises(IntegrityError):
         service._write(illegal_duplicate)
+
+
+def test_cooperative_actor_labels_are_not_admin_and_lease_ownership_is_exact(service) -> None:
+    service.ingest_observation(observation(count=1))
+    owner = service.local_actor("lease-owner")
+    other = service.local_actor("lease-other")
+    assert owner.role == "allocator"
+    claimed = service.create_request(owner, request_data("owner-only"), idempotency_key="owner-only")
+    assert claimed["lease"] is not None
+    with pytest.raises(BrokerError, match="another actor's lease"):
+        service.release_lease(
+            other,
+            claimed["lease"]["id"],
+            reason="not the owner",
+            idempotency_key="other-release",
+        )
+    assert service.list_leases(other)["data"] == []
+    assert service.list_requests(other)["data"] == []
+
+
+def test_endpoint_lifecycle_retains_history_and_blocks_new_claims(service, admin) -> None:
+    service.ingest_observation(observation(endpoint_id="endpoint-a", count=1))
+    drained = service.delete_endpoint(admin, "endpoint-a", idempotency_key="drain-a")
+    assert drained["endpoint"]["lifecycle_state"] == "draining"
+    assert {endpoint.id for endpoint in service.collector_endpoints()} == {"endpoint-a", "endpoint-b"}
+    blocked = service.create_request(
+        admin,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "must-not-use-draining",
+                "purpose": "lifecycle admission test",
+                "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
+            }
+        ),
+        idempotency_key="draining-claim",
+    )
+    assert blocked["lease"] is None
+    assert "endpoint_lifecycle" in blocked["request"]["blocked_reason"]
+    with pytest.raises(BrokerError, match="pinned to it"):
+        service.delete_endpoint(admin, "endpoint-a", idempotency_key="retire-a-blocked")
+    service.cancel_request(
+        admin,
+        blocked["request"]["id"],
+        idempotency_key="cancel-draining-claim",
+    )
+    retired = service.delete_endpoint(admin, "endpoint-a", idempotency_key="retire-a")
+    assert retired["endpoint"]["lifecycle_state"] == "retired"
+    assert {endpoint.id for endpoint in service.collector_endpoints()} == {"endpoint-b"}
+    assert any(item["id"] == "endpoint-a" for item in service.list_endpoints(admin)["data"])
+
+
+def test_direct_lease_returns_executable_resources_and_accounts_endpoint_commitments(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+    first = service.create_request(
+        admin,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "commitment-one",
+                "purpose": "per endpoint commitment",
+                "constraints": {"gpu_count": 1, "cpu_cores": 40, "memory_mib": 200_000},
+            }
+        ),
+        idempotency_key="commitment-one",
+    )
+    assert first["lease"] is not None
+    resource = first["lease"]["resources"][0]
+    assert resource["endpoint"] == {
+        "id": "endpoint-a",
+        "host": "127.0.0.1",
+        "port": 2201,
+        "ssh_user": "gpu",
+    }
+    assert resource["gpus"][0]["gpu_uuid"].startswith("GPU-")
+    assert resource["cuda_visible_devices"] == resource["gpus"][0]["gpu_uuid"]
+    assert resource["commitment"] == {"cpu_cores": 40.0, "memory_mib": 200_000}
+    second = service.create_request(
+        admin,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "commitment-two",
+                "purpose": "must not overcommit endpoint",
+                "constraints": {"gpu_count": 1, "cpu_cores": 40, "memory_mib": 200_000},
+            }
+        ),
+        idempotency_key="commitment-two",
+    )
+    assert second["lease"] is None
+    assert "committed_cpu" in second["request"]["blocked_reason"]

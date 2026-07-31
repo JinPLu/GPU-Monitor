@@ -48,6 +48,13 @@ class Endpoint(Base):
     storage_group: Mapped[str | None] = mapped_column(String(120))
     expected_gpu_count: Mapped[int | None] = mapped_column(Integer)
     expected_gpu_total_vram_mib: Mapped[int | None] = mapped_column(Integer)
+    # The owning project controls endpoint lifecycle metadata.  This stays
+    # nullable only so pre-owner databases can be migrated without guessing a
+    # project; new self-service endpoints always supply an owner.
+    owner_project_id: Mapped[str | None] = mapped_column(
+        ForeignKey("projects.id", ondelete="RESTRICT"), index=True
+    )
+    lifecycle_state: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -198,9 +205,141 @@ class WorkloadProfile(Base):
     purpose: Mapped[str] = mapped_column(String(1000), nullable=False)
     duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     constraints_json: Mapped[str] = mapped_column(Text, nullable=False)
+    runtime_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="direct-gpu")
+    scheduler_target_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    scheduler_spec_json: Mapped[str | None] = mapped_column(Text)
+    scheduler_script: Mapped[str | None] = mapped_column(Text)
+    grant_all_projects: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    retain_submission_body: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WorkloadProfileGrant(Base):
+    """An explicit project allowed to consume a profile owned by another project."""
+
+    __tablename__ = "workload_profile_grants"
+
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("workload_profiles.id", ondelete="CASCADE"), primary_key=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
+class SchedulerTarget(Base):
+    """A globally discoverable external scheduler; never a raw GPU endpoint."""
+
+    __tablename__ = "scheduler_targets"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    adapter: Mapped[str] = mapped_column(String(40), nullable=False)
+    connection_json: Mapped[str] = mapped_column(Text, nullable=False)
+    credential_refs_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    capabilities_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    access_hint: Mapped[str] = mapped_column(String(2000), nullable=False)
+    access_status: Mapped[str | None] = mapped_column(String(40))
+    access_message: Mapped[str | None] = mapped_column(String(2000))
+    access_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SchedulerJob(Base):
+    """Broker-owned record of one job submitted to an external scheduler."""
+
+    __tablename__ = "scheduler_jobs"
+    __table_args__ = (
+        UniqueConstraint("actor_id", "submission_key", name="uq_scheduler_job_submission"),
+        Index("ix_scheduler_job_target_state", "target_id", "state"),
+        Index("ix_scheduler_job_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    target_id: Mapped[str] = mapped_column(
+        ForeignKey("scheduler_targets.id", ondelete="RESTRICT"), nullable=False
+    )
+    actor_id: Mapped[str] = mapped_column(ForeignKey("actors.id"), nullable=False)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    profile_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    submission_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    task_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(1000), nullable=False)
+    approval_ref: Mapped[str | None] = mapped_column(String(500))
+    request_json: Mapped[str] = mapped_column(Text, nullable=False)
+    script_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    script_body: Mapped[str | None] = mapped_column(Text)
+    retain_submission_body: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    scheduler_job_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    state: Mapped[str] = mapped_column(String(40), nullable=False)
+    raw_state: Mapped[str | None] = mapped_column(String(80))
+    allocated_tres_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    node_list: Mapped[str | None] = mapped_column(String(2000))
+    stdout_path: Mapped[str | None] = mapped_column(String(2000))
+    stderr_path: Mapped[str | None] = mapped_column(String(2000))
+    exit_code: Mapped[str | None] = mapped_column(String(80))
+    error_message: Mapped[str | None] = mapped_column(String(2000))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SchedulerJobEvent(Base):
+    """Append-only scheduler state transition history."""
+
+    __tablename__ = "scheduler_job_events"
+    __table_args__ = (Index("ix_scheduler_job_event_job_time", "job_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("scheduler_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    state: Mapped[str] = mapped_column(String(40), nullable=False)
+    raw_state: Mapped[str | None] = mapped_column(String(80))
+    detail_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SchedulerTransfer(Base):
+    """Audited staged upload to an external scheduler's shared filesystem."""
+
+    __tablename__ = "scheduler_transfers"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_id",
+            "submission_key",
+            name="uq_scheduler_transfer_submission",
+        ),
+        Index(
+            "ix_scheduler_transfer_project_created",
+            "project_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    target_id: Mapped[str] = mapped_column(
+        ForeignKey("scheduler_targets.id", ondelete="RESTRICT"), nullable=False
+    )
+    actor_id: Mapped[str] = mapped_column(ForeignKey("actors.id"), nullable=False)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False)
+    submission_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    approval_ref: Mapped[str] = mapped_column(String(500), nullable=False)
+    local_source_path: Mapped[str] = mapped_column(String(4000), nullable=False)
+    remote_directory: Mapped[str] = mapped_column(String(2000), nullable=False)
+    remote_staged_path: Mapped[str | None] = mapped_column(String(2000))
+    source_size_bytes: Mapped[int | None] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(40), nullable=False)
+    error_message: Mapped[str | None] = mapped_column(String(2000))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Actor(Base):
@@ -311,6 +450,32 @@ class LeaseResource(Base):
     )
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LeaseEndpointCommitment(Base):
+    """Per-endpoint CPU and memory promise held for a direct GPU lease.
+
+    A multi-host GPU lease may consume CPU and RAM at every selected endpoint.
+    Persisting one row per endpoint makes that admission accounting explicit
+    and keeps historical lease records intact after release.
+    """
+
+    __tablename__ = "lease_endpoint_commitments"
+    __table_args__ = (
+        UniqueConstraint("lease_id", "endpoint_id", name="uq_lease_endpoint_commitment"),
+        Index("ix_endpoint_commitment_endpoint", "endpoint_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lease_id: Mapped[str] = mapped_column(
+        ForeignKey("leases.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    endpoint_id: Mapped[str] = mapped_column(
+        ForeignKey("endpoints.id", ondelete="RESTRICT"), nullable=False
+    )
+    cpu_cores: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    memory_mib: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class WorkloadBinding(Base):

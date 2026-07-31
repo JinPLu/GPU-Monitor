@@ -10,4 +10,5 @@ API_CAPABILITIES = (
     "instant_claims",
     "coordination_board",
     "server_deletion",
+    "external_slurm_scheduler",
 )

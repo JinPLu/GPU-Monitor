@@ -41,8 +41,9 @@ class BrokerClient:
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         # A loopback service can be briefly unavailable while it restarts. GET
-        # requests are safe to retry, and this client gives every mutation an
-        # idempotency key before retrying it, so a claim cannot be duplicated.
+        # requests are safe to retry. Mutations retry only with the caller's
+        # idempotency key, so a tool caller can reuse one stable key across its
+        # own retries without creating a duplicate claim or release.
         retryable = method.upper() == "GET" or idempotency_key is not None
         attempts = 3 if retryable else 1
         response: httpx.Response | None = None

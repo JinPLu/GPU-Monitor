@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -30,6 +32,7 @@ from gpu_broker.models import (
     GPUDevice,
     IdempotencyRecord,
     Lease,
+    LeaseEndpointCommitment,
     LeaseResource,
     MaintenanceWindow,
     ProcessObservation,
@@ -37,10 +40,15 @@ from gpu_broker.models import (
     ProviderState,
     Reservation,
     Revision,
+    SchedulerJob,
+    SchedulerJobEvent,
+    SchedulerTarget,
+    SchedulerTransfer,
     TelemetryCurrent,
     TelemetrySnapshot,
     WorkloadBinding,
     WorkloadProfile,
+    WorkloadProfileGrant,
 )
 from gpu_broker.schemas import (
     ActorCreate,
@@ -55,8 +63,20 @@ from gpu_broker.schemas import (
     RequestCreate,
     ReservationCreate,
     ResourceConstraints,
+    SchedulerJobCancel,
+    SchedulerOneOffSubmit,
+    SchedulerProfileSubmit,
+    SchedulerTargetUpsert,
+    SchedulerUploadRequest,
     WorkloadProfileClaim,
     WorkloadProfileUpsert,
+)
+from gpu_broker.slurm import (
+    CommandSlurmProvider,
+    SlurmProvider,
+    SlurmProviderError,
+    broker_job_name,
+    broker_state,
 )
 from gpu_broker.timeutil import ensure_utc, json_dump, json_load, stable_hash, token_hash, utcnow
 
@@ -72,8 +92,14 @@ TELEMETRY_HISTORY_RETENTION_SECONDS = 24 * 60 * 60
 # collection and lose its workload attribution.
 PROCESS_START_TIME_JITTER_SECONDS = 2
 MUTATING_ROLES = {"allocator", "operator", "admin"}
-OPERATOR_ROLES = {"operator", "admin"}
+# Routine coordination is cooperative, not an administrative workflow.
+# Endpoint ownership and actor/request ownership remain the scope boundaries;
+# an external project agent must not need a separately granted "operator"
+# role merely to reserve capacity, drain its endpoint, or record maintenance.
+OPERATOR_ROLES = MUTATING_ROLES
 ADMIN_ROLES = {"admin"}
+ENDPOINT_LIFECYCLE_STATES = {"active", "draining", "retired"}
+CUDA_SELECTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
 
 T = TypeVar("T")
 
@@ -115,6 +141,16 @@ def _iso(value: datetime | None) -> str | None:
     return _as_utc(value).isoformat() if value is not None else None
 
 
+def _external_datetime(value: str | None) -> datetime | None:
+    if not value or value in {"Unknown", "N/A", "None"}:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ensure_utc(parsed)
+
+
 class BrokerService:
     """The only component allowed to mutate the broker database.
 
@@ -122,9 +158,17 @@ class BrokerService:
     and audit writes together so REST, CLI, MCP and GUI cannot drift.
     """
 
-    def __init__(self, database: Database, inventory: InventoryConfig) -> None:
+    def __init__(
+        self,
+        database: Database,
+        inventory: InventoryConfig,
+        slurm_provider: SlurmProvider | None = None,
+    ) -> None:
         self.database = database
         self.inventory = inventory
+        self.slurm_provider = slurm_provider or CommandSlurmProvider()
+        self._scheduler_submit_lock = threading.Lock()
+        self._scheduler_transfer_lock = threading.Lock()
 
     # ---- initialization, identity and transaction primitives -----------------
 
@@ -138,11 +182,20 @@ class BrokerService:
             if revision is None:
                 session.add(Revision(id=1, value=0, updated_at=now))
             has_inventory = (session.scalar(select(func.count()).select_from(Endpoint)) or 0) > 0
-            if sync_inventory or not has_inventory:
+            has_unowned_endpoints = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(Endpoint)
+                    .where(Endpoint.owner_project_id.is_(None))
+                )
+                or 0
+            ) > 0
+            if sync_inventory or not has_inventory or has_unowned_endpoints:
                 self._upsert_inventory(session, now)
             bootstrap_created = False
             if bootstrap_token:
                 bootstrap_created = self._ensure_bootstrap_admin(session, bootstrap_token, now)
+            self._defer_interrupted_scheduler_transfers(session, now)
             self._bump_revision(session, now)
             return bootstrap_created
 
@@ -185,6 +238,8 @@ class BrokerService:
                     storage_group=configured_endpoint.storage_group,
                     expected_gpu_count=configured_endpoint.expected_gpu_count,
                     expected_gpu_total_vram_mib=configured_endpoint.expected_gpu_total_vram_mib,
+                    owner_project_id=(configured_endpoint.project_ids[0] if configured_endpoint.project_ids else None),
+                    lifecycle_state="active",
                     enabled=True,
                     created_at=now,
                     updated_at=now,
@@ -206,6 +261,8 @@ class BrokerService:
                 endpoint.storage_group = configured_endpoint.storage_group
                 endpoint.expected_gpu_count = configured_endpoint.expected_gpu_count
                 endpoint.expected_gpu_total_vram_mib = configured_endpoint.expected_gpu_total_vram_mib
+                if endpoint.owner_project_id is None and configured_endpoint.project_ids:
+                    endpoint.owner_project_id = configured_endpoint.project_ids[0]
                 endpoint.updated_at = now
             session.flush()
 
@@ -253,7 +310,9 @@ class BrokerService:
         def operation(session: Session) -> list[EndpointConfig]:
             values: list[EndpointConfig] = []
             endpoints = session.scalars(
-                select(Endpoint).where(Endpoint.enabled.is_(True)).order_by(Endpoint.id)
+                select(Endpoint)
+                .where(Endpoint.lifecycle_state.in_({"active", "draining"}))
+                .order_by(Endpoint.id)
             ).all()
             for endpoint in endpoints:
                 values.append(
@@ -363,10 +422,12 @@ class BrokerService:
         return self._read(operation)
 
     def local_actor(self, actor_id: str) -> ActorContext:
-        """Resolve a human/Agent label for the keyless loopback application.
+        """Resolve a cooperative loopback label, never an administrator.
 
-        The label records who owns a claim; it is not an authentication
-        credential. Local actors can coordinate every configured project.
+        The label is intentionally not a credential.  It records ownership so
+        one local actor cannot mutate another actor's lease, request, or Slurm
+        job.  Existing inventory projects are visible as cooperative project
+        memberships; authenticated actors retain their explicit memberships.
         """
 
         normalized = actor_id.strip()
@@ -381,7 +442,7 @@ class BrokerService:
             if session.get(Actor, normalized) is None:
                 return None
             project_ids = frozenset(session.scalars(select(Project.id)).all())
-            return ActorContext(id=normalized, role="admin", project_ids=project_ids)
+            return ActorContext(id=normalized, role="allocator", project_ids=project_ids)
 
         existing = self._read(resolve)
         if existing is not None:
@@ -394,7 +455,7 @@ class BrokerService:
                     Actor(
                         id=normalized,
                         display_name=normalized,
-                        role="admin",
+                        role="allocator",
                         enabled=True,
                         created_at=now,
                         updated_at=now,
@@ -402,7 +463,7 @@ class BrokerService:
                 )
                 session.flush()
             project_ids = frozenset(session.scalars(select(Project.id)).all())
-            return ActorContext(id=normalized, role="admin", project_ids=project_ids)
+            return ActorContext(id=normalized, role="allocator", project_ids=project_ids)
 
         return self._write(create)
 
@@ -417,7 +478,22 @@ class BrokerService:
 
     @staticmethod
     def _can_manage_lease(actor: ActorContext, lease: Lease) -> bool:
-        return actor.is_admin or actor.role == "operator" or lease.actor_id == actor.id
+        return lease.actor_id == actor.id
+
+    @staticmethod
+    def _can_manage_endpoint(actor: ActorContext, endpoint: Endpoint) -> bool:
+        return actor.is_admin or (
+            endpoint.owner_project_id is not None and endpoint.owner_project_id in actor.project_ids
+        )
+
+    @classmethod
+    def _require_endpoint_manager(cls, actor: ActorContext, endpoint: Endpoint) -> None:
+        if not cls._can_manage_endpoint(actor, endpoint):
+            raise BrokerError(
+                "endpoint_forbidden",
+                "only a member of the endpoint owner project may manage this endpoint",
+                status_code=403,
+            )
 
     # ---- audit, idempotency and serialisation ---------------------------------
 
@@ -505,7 +581,9 @@ class BrokerService:
             "storage_group": endpoint.storage_group,
             "expected_gpu_count": endpoint.expected_gpu_count,
             "expected_gpu_total_vram_mib": endpoint.expected_gpu_total_vram_mib,
-            "enabled": endpoint.enabled,
+            "owner_project_id": endpoint.owner_project_id,
+            "lifecycle_state": endpoint.lifecycle_state,
+            "enabled": endpoint.lifecycle_state == "active",
             "created_at": _iso(endpoint.created_at),
             "updated_at": _iso(endpoint.updated_at),
         }
@@ -522,7 +600,10 @@ class BrokerService:
         }
 
     @staticmethod
-    def _workload_profile_dict(profile: WorkloadProfile) -> dict[str, Any]:
+    def _workload_profile_dict(
+        profile: WorkloadProfile,
+        grant_project_ids: Iterable[str] = (),
+    ) -> dict[str, Any]:
         return {
             "id": profile.id,
             "project_id": profile.project_id,
@@ -530,9 +611,117 @@ class BrokerService:
             "purpose": profile.purpose,
             "duration_seconds": profile.duration_seconds,
             "constraints": json_load(profile.constraints_json),
+            "runtime_kind": profile.runtime_kind,
+            "scheduler_target_id": profile.scheduler_target_id,
+            "scheduler": (
+                json_load(profile.scheduler_spec_json)
+                if profile.scheduler_spec_json is not None
+                else None
+            ),
+            "scheduler_script_digest": (
+                hashlib.sha256(profile.scheduler_script.encode("utf-8")).hexdigest()
+                if profile.scheduler_script is not None
+                else None
+            ),
+            "grant_project_ids": sorted(grant_project_ids),
+            "grant_all_projects": profile.grant_all_projects,
+            "retain_submission_body": profile.retain_submission_body,
             "enabled": profile.enabled,
             "created_at": _iso(profile.created_at),
             "updated_at": _iso(profile.updated_at),
+        }
+
+    @staticmethod
+    def _scheduler_target_dict(target: SchedulerTarget) -> dict[str, Any]:
+        connection = json_load(target.connection_json)
+        command_prefix = connection.get("command_prefix", []) if isinstance(connection, dict) else []
+        return {
+            "id": target.id,
+            "display_name": target.display_name,
+            "kind": "external-scheduler",
+            "adapter": target.adapter,
+            "command_helper": command_prefix[0] if command_prefix else None,
+            "credential_refs": json_load(target.credential_refs_json),
+            "capabilities": json_load(target.capabilities_json),
+            "access_hint": target.access_hint,
+            "last_access": {
+                "status": target.access_status or "unknown",
+                "message": target.access_message,
+                "checked_at": _iso(target.access_checked_at),
+            },
+            "data_transfer": (
+                {
+                    "mode": "staged-upload",
+                    "overwrite_existing_destination": False,
+                }
+                if "data-transfer" in json_load(target.capabilities_json)
+                else None
+            ),
+            "enabled": target.enabled,
+            "created_at": _iso(target.created_at),
+            "updated_at": _iso(target.updated_at),
+        }
+
+    @staticmethod
+    def _scheduler_job_dict(
+        job: SchedulerJob,
+        events: Iterable[SchedulerJobEvent] = (),
+    ) -> dict[str, Any]:
+        return {
+            "id": job.id,
+            "target_id": job.target_id,
+            "actor_id": job.actor_id,
+            "project_id": job.project_id,
+            "profile_id": job.profile_id,
+            "task_ref": job.task_ref,
+            "purpose": job.purpose,
+            "approval_ref": job.approval_ref,
+            "request": json_load(job.request_json),
+            "script_digest": job.script_digest,
+            "script_body_retained": job.script_body is not None and job.retain_submission_body,
+            "scheduler_job_id": job.scheduler_job_id,
+            "state": job.state,
+            "raw_state": job.raw_state,
+            "allocated_tres": json_load(job.allocated_tres_json),
+            "node_list": job.node_list,
+            "stdout_path": job.stdout_path,
+            "stderr_path": job.stderr_path,
+            "exit_code": job.exit_code,
+            "error_message": job.error_message,
+            "submitted_at": _iso(job.submitted_at),
+            "started_at": _iso(job.started_at),
+            "completed_at": _iso(job.completed_at),
+            "created_at": _iso(job.created_at),
+            "updated_at": _iso(job.updated_at),
+            "events": [
+                {
+                    "id": event.id,
+                    "state": event.state,
+                    "raw_state": event.raw_state,
+                    "detail": json_load(event.detail_json),
+                    "created_at": _iso(event.created_at),
+                }
+                for event in events
+            ],
+        }
+
+    @staticmethod
+    def _scheduler_transfer_dict(transfer: SchedulerTransfer) -> dict[str, Any]:
+        return {
+            "id": transfer.id,
+            "target_id": transfer.target_id,
+            "actor_id": transfer.actor_id,
+            "project_id": transfer.project_id,
+            "approval_ref": transfer.approval_ref,
+            "local_source_path": transfer.local_source_path,
+            "remote_directory": transfer.remote_directory,
+            "remote_staged_path": transfer.remote_staged_path,
+            "source_size_bytes": transfer.source_size_bytes,
+            "state": transfer.state,
+            "error_message": transfer.error_message,
+            "created_at": _iso(transfer.created_at),
+            "updated_at": _iso(transfer.updated_at),
+            "completed_at": _iso(transfer.completed_at),
         }
 
     @staticmethod
@@ -589,13 +778,79 @@ class BrokerService:
             ).all()
         if request is None:
             request = session.get(AllocationRequest, lease.request_id)
+        active_resources = [resource for resource in resources if resource.active]
+        gpu_by_id = {
+            gpu.id: gpu
+            for gpu in session.scalars(
+                select(GPUDevice).where(
+                    GPUDevice.id.in_([resource.gpu_id for resource in active_resources])
+                )
+            ).all()
+        } if active_resources else {}
+        endpoints = {
+            endpoint.id: endpoint
+            for endpoint in session.scalars(
+                select(Endpoint).where(
+                    Endpoint.id.in_({gpu.endpoint_id for gpu in gpu_by_id.values()})
+                )
+            ).all()
+        } if gpu_by_id else {}
+        commitments = {
+            commitment.endpoint_id: commitment
+            for commitment in session.scalars(
+                select(LeaseEndpointCommitment).where(
+                    LeaseEndpointCommitment.lease_id == lease.id
+                )
+            ).all()
+        }
+        by_endpoint: dict[str, list[GPUDevice]] = defaultdict(list)
+        for resource in active_resources:
+            gpu = gpu_by_id.get(resource.gpu_id)
+            if gpu is not None:
+                by_endpoint[gpu.endpoint_id].append(gpu)
+        executable_resources: list[dict[str, Any]] = []
+        for endpoint_id, gpus in sorted(by_endpoint.items()):
+            endpoint = endpoints.get(endpoint_id)
+            if endpoint is None:
+                continue
+            gpus.sort(key=lambda item: item.gpu_index)
+            selectors = [gpu.gpu_uuid for gpu in gpus]
+            # Admission rejects unsafe selectors, but never emit an unvalidated
+            # value should historical telemetry predate that invariant.
+            if not all(CUDA_SELECTOR_RE.fullmatch(selector) for selector in selectors):
+                continue
+            commitment = commitments.get(endpoint_id)
+            executable_resources.append(
+                {
+                    "endpoint": {
+                        "id": endpoint.id,
+                        "host": endpoint.host,
+                        "port": endpoint.port,
+                        "ssh_user": endpoint.ssh_user,
+                    },
+                    "gpus": [
+                        {
+                            "id": gpu.id,
+                            "gpu_uuid": gpu.gpu_uuid,
+                            "gpu_index": gpu.gpu_index,
+                        }
+                        for gpu in gpus
+                    ],
+                    "cuda_visible_devices": ",".join(selectors),
+                    "commitment": {
+                        "cpu_cores": commitment.cpu_cores if commitment else 0.0,
+                        "memory_mib": commitment.memory_mib if commitment else 0,
+                    },
+                }
+            )
         return {
             "id": lease.id,
             "request_id": lease.request_id,
             "actor_id": lease.actor_id,
             "project_id": lease.project_id,
             "state": lease.state,
-            "gpu_ids": [resource.gpu_id for resource in resources if resource.active],
+            "gpu_ids": [resource.gpu_id for resource in active_resources],
+            "resources": executable_resources,
             "issued_at": _iso(lease.issued_at),
             "expires_at": _iso(lease.expires_at),
             "last_heartbeat_at": _iso(lease.last_heartbeat_at),
@@ -753,8 +1008,14 @@ class BrokerService:
 
     def _gpu_state(self, session: Session, gpu: GPUDevice, now: datetime) -> tuple[str, str | None]:
         endpoint = session.get(Endpoint, gpu.endpoint_id)
-        if endpoint is None or not endpoint.enabled or not gpu.enabled:
+        if endpoint is None or not gpu.enabled:
             return "DISABLED", "endpoint or GPU is disabled"
+        if endpoint.lifecycle_state == "draining":
+            return "DRAINING", "endpoint is draining and blocks new claims"
+        if endpoint.lifecycle_state == "retired":
+            return "RETIRED", "endpoint is retired"
+        if not endpoint.enabled:
+            return "DISABLED", "endpoint is disabled"
         maintenance = self._maintenance_for_gpu(session, gpu, now)
         if maintenance is not None:
             return "MAINTENANCE", maintenance.reason
@@ -1039,7 +1300,11 @@ class BrokerService:
             def endpoint_snapshot(endpoint: Endpoint) -> dict[str, Any]:
                 provider_state = provider_states.get(endpoint.id)
                 last_success = _as_utc(provider_state.last_success_at) if provider_state else None
-                if not endpoint.enabled:
+                if endpoint.lifecycle_state == "retired":
+                    monitor_status = "RETIRED"
+                elif endpoint.lifecycle_state == "draining":
+                    monitor_status = "DRAINING"
+                elif not endpoint.enabled:
                     monitor_status = "DISABLED"
                 elif provider_state is None:
                     monitor_status = "PENDING"
@@ -1067,8 +1332,14 @@ class BrokerService:
 
             def derive_state(gpu: GPUDevice) -> tuple[str, str | None]:
                 endpoint = next(item for item in visible_endpoints if item.id == gpu.endpoint_id)
-                if not endpoint.enabled or not gpu.enabled:
+                if not gpu.enabled:
                     return "DISABLED", "endpoint or GPU is disabled"
+                if endpoint.lifecycle_state == "draining":
+                    return "DRAINING", "endpoint is draining and blocks new claims"
+                if endpoint.lifecycle_state == "retired":
+                    return "RETIRED", "endpoint is retired"
+                if not endpoint.enabled:
+                    return "DISABLED", "endpoint is disabled"
                 maintenance = maintenance_by_gpu.get(gpu.id) or maintenance_by_endpoint.get(
                     gpu.endpoint_id
                 )
@@ -1241,6 +1512,14 @@ class BrokerService:
 
         snapshot = self.snapshot(actor, compact=False)
         data = snapshot["data"]
+        scheduler_targets = self.list_scheduler_targets(actor)["data"]
+        scheduler_jobs = self.list_scheduler_jobs(actor)["data"]
+        active_scheduler_jobs = [
+            job
+            for job in scheduler_jobs
+            if job["state"]
+            not in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}
+        ]
         gpus: list[dict[str, Any]] = data["gpus"]
         gpus_by_id = {gpu["id"]: gpu for gpu in gpus}
         gpus_by_endpoint: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1421,6 +1700,26 @@ class BrokerService:
                     "message": request["blocked_reason"] or "waiting for scheduler placement",
                 }
             )
+        for job in active_scheduler_jobs:
+            signals.append(
+                {
+                    "kind": "external_scheduler_job",
+                    "severity": (
+                        "warning"
+                        if job["state"] in {"UNKNOWN", "ACCESS_REQUIRED"}
+                        else "info"
+                    ),
+                    "scheduler_job_id": job["id"],
+                    "target_id": job["target_id"],
+                    "project_id": job["project_id"],
+                    "task": job["task_ref"],
+                    "state": job["state"],
+                    "message": (
+                        job["error_message"]
+                        or "external scheduler owns placement; this is not a raw GPU lease"
+                    ),
+                }
+            )
 
         agent_cards = [
             {
@@ -1440,6 +1739,14 @@ class BrokerService:
             "active_agents": len(agent_cards),
             "queued_requests": len(data["requests"]),
             "queued_gpus": sum(item["constraints"]["gpu_count"] for item in data["requests"]),
+            "external_scheduler_targets": len(scheduler_targets),
+            "external_scheduler_jobs": len(active_scheduler_jobs),
+            "external_scheduler_pending_jobs": sum(
+                job["state"] == "PENDING" for job in active_scheduler_jobs
+            ),
+            "external_scheduler_running_jobs": sum(
+                job["state"] == "RUNNING" for job in active_scheduler_jobs
+            ),
             "managed_running_gpus": sum(
                 item["gpu_states"].get("RUNNING_MANAGED", 0) for item in lease_cards
             ),
@@ -1456,10 +1763,13 @@ class BrokerService:
                 "agents": agent_cards,
                 "leases": lease_cards,
                 "queue": data["requests"],
+                "scheduler_targets": scheduler_targets,
+                "scheduler_jobs": active_scheduler_jobs,
                 "signals": signals,
                 "guidance": (
                     "This board is read-only. Claims without a requested server are placed by the broker's "
-                    "shared scheduler; agents should not appoint or emulate a separate scheduler."
+                    "shared scheduler; external Slurm jobs remain separate from raw GPU leases and are "
+                    "allocated only when Slurm reports RUNNING with AllocTRES."
                 ),
             },
         }
@@ -2040,6 +2350,26 @@ class BrokerService:
         session.flush()
         return project
 
+    @staticmethod
+    def _endpoint_commitment_usage(
+        session: Session,
+    ) -> dict[str, tuple[float, int]]:
+        """Return active direct-lease commitments keyed by endpoint identity."""
+
+        usage: dict[str, tuple[float, int]] = {}
+        commitments = session.scalars(
+            select(LeaseEndpointCommitment)
+            .join(Lease, Lease.id == LeaseEndpointCommitment.lease_id)
+            .where(Lease.state.in_(ACTIVE_LEASE_STATES))
+        ).all()
+        for commitment in commitments:
+            cpu, memory = usage.get(commitment.endpoint_id, (0.0, 0))
+            usage[commitment.endpoint_id] = (
+                cpu + commitment.cpu_cores,
+                memory + commitment.memory_mib,
+            )
+        return usage
+
     def _reservation_blocks_gpu(
         self,
         session: Session,
@@ -2068,11 +2398,15 @@ class BrokerService:
         lease_end = now + timedelta(seconds=request.duration_seconds)
         excluded: dict[str, int] = defaultdict(int)
         values: list[GPUDevice] = []
+        commitment_usage = self._endpoint_commitment_usage(session)
         all_gpus = session.scalars(select(GPUDevice).order_by(GPUDevice.endpoint_id, GPUDevice.gpu_index)).all()
         for gpu in all_gpus:
             endpoint = session.get(Endpoint, gpu.endpoint_id)
             if endpoint is None:
                 excluded["missing_endpoint"] += 1
+                continue
+            if endpoint.lifecycle_state != "active":
+                excluded["endpoint_lifecycle"] += 1
                 continue
             if constraints.endpoint_ids and endpoint.id not in constraints.endpoint_ids:
                 excluded["endpoint_allowlist"] += 1
@@ -2081,6 +2415,23 @@ class BrokerService:
                 excluded["endpoint_denylist"] += 1
                 continue
             host_telemetry = session.get(EndpointTelemetryCurrent, endpoint.id)
+            if (constraints.cpu_cores is not None or constraints.memory_mib is not None) and host_telemetry is None:
+                excluded["host_telemetry"] += 1
+                continue
+            if host_telemetry is not None:
+                committed_cpu, committed_memory = commitment_usage.get(endpoint.id, (0.0, 0))
+                if (
+                    constraints.cpu_cores is not None
+                    and committed_cpu + constraints.cpu_cores > host_telemetry.cpu_count
+                ):
+                    excluded["committed_cpu"] += 1
+                    continue
+                if (
+                    constraints.memory_mib is not None
+                    and committed_memory + constraints.memory_mib > host_telemetry.memory_total_mib
+                ):
+                    excluded["committed_memory"] += 1
+                    continue
             if constraints.min_available_cpu_cores is not None:
                 if host_telemetry is None:
                     excluded["host_telemetry"] += 1
@@ -2098,6 +2449,9 @@ class BrokerService:
                     continue
             if constraints.gpu_ids and gpu.id not in constraints.gpu_ids:
                 excluded["gpu_allowlist"] += 1
+                continue
+            if not CUDA_SELECTOR_RE.fullmatch(gpu.gpu_uuid):
+                excluded["invalid_cuda_selector"] += 1
                 continue
             if gpu.id in constraints.deny_gpu_ids:
                 excluded["gpu_denylist"] += 1
@@ -2331,6 +2685,16 @@ class BrokerService:
             session.flush()
             for gpu in resources:
                 session.add(LeaseResource(lease_id=lease.id, gpu_id=gpu.id, active=True, released_at=None))
+            for endpoint_id in sorted({gpu.endpoint_id for gpu in resources}):
+                session.add(
+                    LeaseEndpointCommitment(
+                        lease_id=lease.id,
+                        endpoint_id=endpoint_id,
+                        cpu_cores=constraints.cpu_cores or 0.0,
+                        memory_mib=constraints.memory_mib or 0,
+                        created_at=now,
+                    )
+                )
             request.state = "ACTIVE" if request.auto_activate else "LEASED"
             request.blocked_reason = None
             request.updated_at = now
@@ -2341,7 +2705,17 @@ class BrokerService:
                 resource_type="lease",
                 resource_id=lease.id,
                 result="success",
-                after={"gpu_ids": [gpu.id for gpu in resources], "state": lease.state},
+                after={
+                    "gpu_ids": [gpu.id for gpu in resources],
+                    "state": lease.state,
+                    "endpoint_commitments": {
+                        endpoint_id: {
+                            "cpu_cores": constraints.cpu_cores or 0.0,
+                            "memory_mib": constraints.memory_mib or 0,
+                        }
+                        for endpoint_id in sorted({gpu.endpoint_id for gpu in resources})
+                    },
+                },
                 summary={
                     "request_id": request.id,
                     "project_id": request.project_id,
@@ -2491,7 +2865,7 @@ class BrokerService:
             request = session.get(AllocationRequest, request_id)
             if request is None:
                 raise BrokerError("request_not_found", "request does not exist", status_code=404)
-            if not actor.is_admin and actor.role != "operator" and request.actor_id != actor.id:
+            if request.actor_id != actor.id:
                 raise BrokerError("request_forbidden", "cannot cancel another actor's request", status_code=403)
             if request.state not in {"QUEUED", "PENDING_APPROVAL"}:
                 raise BrokerError(
@@ -3031,7 +3405,7 @@ class BrokerService:
             self._allocate_queued(session, now, self._revision(session))
 
     def reconcile(self, actor: ActorContext) -> dict[str, Any]:
-        self._require_role(actor, OPERATOR_ROLES)
+        self._require_role(actor, MUTATING_ROLES)
 
         def operation(session: Session) -> dict[str, Any]:
             now = utcnow()
@@ -3217,6 +3591,12 @@ class BrokerService:
             reservation = session.get(Reservation, reservation_id)
             if reservation is None:
                 raise BrokerError("reservation_not_found", "reservation does not exist", status_code=404)
+            if reservation.actor_id != actor.id:
+                raise BrokerError(
+                    "reservation_forbidden",
+                    "cannot cancel another actor's reservation",
+                    status_code=403,
+                )
             if reservation.state != "ACTIVE":
                 raise BrokerError("reservation_not_cancellable", "reservation is not active", status_code=409)
             now = utcnow()
@@ -3270,12 +3650,19 @@ class BrokerService:
             now = utcnow()
             endpoint_id = maintenance.endpoint_id
             gpu_id = maintenance.gpu_id
-            if endpoint_id and session.get(Endpoint, endpoint_id) is None:
-                raise BrokerError("endpoint_not_found", "maintenance endpoint does not exist", status_code=404)
+            if endpoint_id:
+                endpoint = session.get(Endpoint, endpoint_id)
+                if endpoint is None:
+                    raise BrokerError("endpoint_not_found", "maintenance endpoint does not exist", status_code=404)
+                self._require_endpoint_manager(actor, endpoint)
             if gpu_id:
                 gpu = session.get(GPUDevice, gpu_id)
                 if gpu is None:
                     raise BrokerError("gpu_not_found", "maintenance GPU does not exist", status_code=404)
+                endpoint = session.get(Endpoint, gpu.endpoint_id)
+                if endpoint is None:
+                    raise BrokerError("endpoint_not_found", "GPU endpoint does not exist", status_code=404)
+                self._require_endpoint_manager(actor, endpoint)
                 endpoint_id = None
             revision = self._bump_revision(session, now)
             window = MaintenanceWindow(
@@ -3377,7 +3764,7 @@ class BrokerService:
     ) -> dict[str, Any]:
         """Explicit retention action; current telemetry, audit and leases are never deleted."""
 
-        self._require_role(actor, ADMIN_ROLES)
+        self._require_role(actor, MUTATING_ROLES)
 
         def operation(session: Session) -> dict[str, Any]:
             existing = self._idempotent(
@@ -3435,6 +3822,29 @@ class BrokerService:
                 status_code=404,
             )
 
+    @staticmethod
+    def _workload_profile_grants(session: Session, profile_id: str) -> list[str]:
+        return list(
+            session.scalars(
+                select(WorkloadProfileGrant.project_id)
+                .where(WorkloadProfileGrant.profile_id == profile_id)
+                .order_by(WorkloadProfileGrant.project_id)
+            ).all()
+        )
+
+    @classmethod
+    def _profile_allows_project(
+        cls,
+        session: Session,
+        profile: WorkloadProfile,
+        project_id: str,
+    ) -> bool:
+        return (
+            profile.project_id == project_id
+            or profile.grant_all_projects
+            or project_id in cls._workload_profile_grants(session, profile.id)
+        )
+
     def upsert_workload_profile(
         self,
         actor: ActorContext,
@@ -3444,7 +3854,7 @@ class BrokerService:
     ) -> dict[str, Any]:
         """Store an admin-approved routine workload contract for one project."""
 
-        self._require_role(actor, ADMIN_ROLES)
+        self._require_role(actor, MUTATING_ROLES)
 
         def operation(session: Session) -> dict[str, Any]:
             existing = self._idempotent(
@@ -3454,13 +3864,37 @@ class BrokerService:
                 return existing
             now = utcnow()
             self._ensure_claim_project(session, profile_data.project_id, now)
-            self._validate_workload_profile_endpoints(
-                session,
-                constraints=profile_data.constraints,
-            )
+            for project_id in profile_data.grant_project_ids:
+                self._ensure_claim_project(session, project_id, now)
+            if profile_data.runtime_kind == "direct-gpu":
+                self._validate_workload_profile_endpoints(
+                    session,
+                    constraints=profile_data.constraints,
+                )
+            else:
+                target = session.get(SchedulerTarget, profile_data.scheduler_target_id)
+                if target is None:
+                    raise BrokerError(
+                        "scheduler_target_not_found",
+                        "scheduler target does not exist",
+                        status_code=404,
+                    )
+                if not target.enabled:
+                    raise BrokerError(
+                        "scheduler_target_disabled",
+                        "scheduler target is disabled",
+                        status_code=409,
+                    )
             revision = self._bump_revision(session, now)
             profile = session.get(WorkloadProfile, profile_data.id)
-            before = self._workload_profile_dict(profile) if profile else None
+            before = (
+                self._workload_profile_dict(
+                    profile,
+                    self._workload_profile_grants(session, profile.id),
+                )
+                if profile
+                else None
+            )
             if profile is None:
                 profile = WorkloadProfile(
                     id=profile_data.id,
@@ -3469,6 +3903,16 @@ class BrokerService:
                     purpose=profile_data.purpose,
                     duration_seconds=profile_data.duration_seconds,
                     constraints_json=json_dump(profile_data.constraints.model_dump(mode="json")),
+                    runtime_kind=profile_data.runtime_kind,
+                    scheduler_target_id=profile_data.scheduler_target_id,
+                    scheduler_spec_json=(
+                        json_dump(profile_data.scheduler.model_dump(mode="json"))
+                        if profile_data.scheduler is not None
+                        else None
+                    ),
+                    scheduler_script=profile_data.scheduler_script,
+                    grant_all_projects=profile_data.grant_all_projects,
+                    retain_submission_body=profile_data.retain_submission_body,
                     enabled=profile_data.enabled,
                     created_at=now,
                     updated_at=now,
@@ -3485,8 +3929,37 @@ class BrokerService:
                 profile.purpose = profile_data.purpose
                 profile.duration_seconds = profile_data.duration_seconds
                 profile.constraints_json = json_dump(profile_data.constraints.model_dump(mode="json"))
+                profile.runtime_kind = profile_data.runtime_kind
+                profile.scheduler_target_id = profile_data.scheduler_target_id
+                profile.scheduler_spec_json = (
+                    json_dump(profile_data.scheduler.model_dump(mode="json"))
+                    if profile_data.scheduler is not None
+                    else None
+                )
+                profile.scheduler_script = profile_data.scheduler_script
+                profile.grant_all_projects = profile_data.grant_all_projects
+                profile.retain_submission_body = profile_data.retain_submission_body
                 profile.enabled = profile_data.enabled
                 profile.updated_at = now
+            session.flush()
+            session.execute(
+                delete(WorkloadProfileGrant).where(
+                    WorkloadProfileGrant.profile_id == profile.id
+                )
+            )
+            for project_id in profile_data.grant_project_ids:
+                if project_id != profile.project_id:
+                    session.add(
+                        WorkloadProfileGrant(
+                            profile_id=profile.id,
+                            project_id=project_id,
+                        )
+                    )
+            session.flush()
+            after = self._workload_profile_dict(
+                profile,
+                self._workload_profile_grants(session, profile.id),
+            )
             event = self._audit(
                 session,
                 actor_id=actor.id,
@@ -3495,14 +3968,17 @@ class BrokerService:
                 resource_id=profile.id,
                 result="success",
                 before=before,
-                after=self._workload_profile_dict(profile),
-                summary={"project_id": profile.project_id},
+                after=after,
+                summary={
+                    "project_id": profile.project_id,
+                    "runtime_kind": profile.runtime_kind,
+                },
                 now=now,
             )
             result = {
                 "event_id": event.id,
                 "snapshot_revision": revision,
-                "workload_profile": self._workload_profile_dict(profile),
+                "workload_profile": after,
             }
             self._remember_idempotency(
                 session,
@@ -3541,6 +4017,12 @@ class BrokerService:
                 raise BrokerError(
                     "workload_profile_disabled", "workload profile is disabled", status_code=409
                 )
+            if profile.runtime_kind != "direct-gpu":
+                raise BrokerError(
+                    "scheduler_profile_requires_submit",
+                    "external scheduler profiles must use the scheduler submit operation",
+                    status_code=409,
+                )
             request_data = RequestCreate.model_validate(
                 {
                     "project_id": profile.project_id,
@@ -3563,6 +4045,1166 @@ class BrokerService:
 
         return self._write(operation)
 
+    def upsert_scheduler_target(
+        self,
+        actor: ActorContext,
+        target_data: SchedulerTargetUpsert,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Register non-secret metadata for a globally discoverable scheduler."""
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session,
+                actor=actor,
+                action="scheduler_target.upsert",
+                key=idempotency_key,
+            )
+            if existing is not None:
+                return existing
+            now = utcnow()
+            target = session.get(SchedulerTarget, target_data.id)
+            before = self._scheduler_target_dict(target) if target else None
+            connection = {
+                "command_prefix": target_data.command_prefix,
+                "upload": (
+                    target_data.upload.model_dump(mode="json")
+                    if target_data.upload is not None
+                    else None
+                ),
+            }
+            if target is None:
+                target = SchedulerTarget(
+                    id=target_data.id,
+                    display_name=target_data.display_name,
+                    adapter=target_data.adapter,
+                    connection_json=json_dump(connection),
+                    credential_refs_json=json_dump(target_data.credential_refs),
+                    capabilities_json=json_dump(target_data.capabilities),
+                    access_hint=target_data.access_hint,
+                    enabled=target_data.enabled,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(target)
+            else:
+                target.display_name = target_data.display_name
+                target.adapter = target_data.adapter
+                target.connection_json = json_dump(connection)
+                target.credential_refs_json = json_dump(target_data.credential_refs)
+                target.capabilities_json = json_dump(target_data.capabilities)
+                target.access_hint = target_data.access_hint
+                target.enabled = target_data.enabled
+                target.updated_at = now
+            revision = self._bump_revision(session, now)
+            after = self._scheduler_target_dict(target)
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="scheduler_target.upserted",
+                resource_type="scheduler_target",
+                resource_id=target.id,
+                result="success",
+                before=before,
+                after=after,
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "scheduler_target": after,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="scheduler_target.upsert",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def list_scheduler_targets(self, actor: ActorContext) -> dict[str, Any]:
+        """List scheduler identities globally without treating login nodes as endpoints."""
+
+        def operation(session: Session) -> dict[str, Any]:
+            values = [
+                self._scheduler_target_dict(target)
+                for target in session.scalars(
+                    select(SchedulerTarget).order_by(SchedulerTarget.id)
+                ).all()
+            ]
+            return self.envelope(session, values)
+
+        return self._read(operation)
+
+    def _scheduler_target_context(
+        self,
+        target_id: str,
+        *,
+        required_capability: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], int]:
+        def operation(
+            session: Session,
+        ) -> tuple[dict[str, Any], dict[str, Any], int]:
+            target = session.get(SchedulerTarget, target_id)
+            if target is None:
+                raise BrokerError(
+                    "scheduler_target_not_found",
+                    "scheduler target does not exist",
+                    status_code=404,
+                )
+            if not target.enabled:
+                raise BrokerError(
+                    "scheduler_target_disabled",
+                    "scheduler target is disabled",
+                    status_code=409,
+                )
+            capabilities = json_load(target.capabilities_json)
+            if required_capability is not None and required_capability not in capabilities:
+                raise BrokerError(
+                    "scheduler_capability_disabled",
+                    f"scheduler target does not allow {required_capability}",
+                    status_code=409,
+                )
+            connection = json_load(target.connection_json)
+            if not isinstance(connection, dict):
+                raise BrokerError(
+                    "scheduler_target_invalid",
+                    "scheduler target connection metadata is invalid",
+                    status_code=500,
+                )
+            return self._scheduler_target_dict(target), connection, self._revision(session)
+
+        return self._read(operation)
+
+    def _defer_interrupted_scheduler_transfers(self, session: Session, now: datetime) -> None:
+        """Make restart-interrupted staged uploads terminal and non-resumable.
+
+        An upload may have reached the remote stage just as the daemon exits.
+        Retrying it automatically could overwrite intent or duplicate data, so
+        recovery is an explicit fresh, approved transfer instead.
+        """
+
+        transfers = session.scalars(
+            select(SchedulerTransfer).where(SchedulerTransfer.state == "TRANSFERRING")
+        ).all()
+        for transfer in transfers:
+            transfer.state = "DEFERRED"
+            transfer.error_message = (
+                "daemon restart interrupted staged upload; transfer was not resumed automatically"
+            )
+            transfer.updated_at = now
+            transfer.completed_at = now
+            self._audit(
+                session,
+                actor_id=transfer.actor_id,
+                action="scheduler_transfer.deferred",
+                resource_type="scheduler_transfer",
+                resource_id=transfer.id,
+                result="success",
+                after=self._scheduler_transfer_dict(transfer),
+                summary={"reason": "daemon_restart", "requires_new_approved_transfer": True},
+                now=now,
+            )
+
+    def scheduler_access_status(
+        self,
+        actor: ActorContext,
+        target_id: str,
+    ) -> dict[str, Any]:
+        target, connection, revision = self._scheduler_target_context(
+            target_id,
+            required_capability="access-status",
+        )
+        access = self.slurm_provider.access_status(connection)
+        if access.get("status") != "ready":
+            access["access_hint"] = target["access_hint"]
+
+        def record(
+            session: Session,
+        ) -> tuple[dict[str, Any], int]:
+            stored = session.get(SchedulerTarget, target_id)
+            assert stored is not None
+            now = utcnow()
+            stored.access_status = str(access.get("status") or "unavailable")[:40]
+            message = access.get("message")
+            stored.access_message = str(message)[:2000] if message else None
+            stored.access_checked_at = now
+            stored.updated_at = now
+            return self._scheduler_target_dict(stored), self._bump_revision(session, now)
+
+        target, revision = self._write(record)
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "snapshot_revision": revision,
+            "target": target,
+            "access": access,
+        }
+
+    def _perform_scheduler_upload(self, transfer_id: str) -> None:
+        def resolve(
+            session: Session,
+        ) -> tuple[SchedulerTransfer, dict[str, Any]]:
+            transfer = session.get(SchedulerTransfer, transfer_id)
+            if transfer is None:
+                raise BrokerError(
+                    "scheduler_transfer_not_found",
+                    "scheduler transfer does not exist",
+                    status_code=404,
+                )
+            target = session.get(SchedulerTarget, transfer.target_id)
+            if target is None:
+                raise BrokerError(
+                    "scheduler_target_not_found",
+                    "scheduler target does not exist",
+                    status_code=404,
+                )
+            connection = json_load(target.connection_json)
+            assert isinstance(connection, dict)
+            if transfer.state != "TRANSFERRING":
+                raise BrokerError(
+                    "scheduler_transfer_not_runnable",
+                    "only a newly started transfer may run",
+                    status_code=409,
+                )
+            return transfer, connection
+
+        transfer, connection = self._read(resolve)
+        try:
+            remote_staged_path = self.slurm_provider.upload(
+                connection,
+                local_path=Path(transfer.local_source_path),
+                remote_directory=transfer.remote_directory,
+                transfer_id=transfer.id,
+            )
+        except SlurmProviderError as exc:
+            state = "UNKNOWN" if exc.uncertain else "ACCESS_REQUIRED" if exc.access_required else "FAILED"
+            message = str(exc)[:2000]
+
+            def record_failure(session: Session) -> None:
+                current = session.get(SchedulerTransfer, transfer_id)
+                if current is None:
+                    return
+                now = utcnow()
+                current.state = state
+                current.error_message = message
+                current.updated_at = now
+                if state == "UNKNOWN":
+                    current.completed_at = now
+                self._audit(
+                    session,
+                    actor_id=current.actor_id,
+                    action="scheduler_transfer.failed",
+                    resource_type="scheduler_transfer",
+                    resource_id=current.id,
+                    result="failure",
+                    after=self._scheduler_transfer_dict(current),
+                    summary={"state": state},
+                    now=now,
+                )
+                self._bump_revision(session, now)
+
+            self._write(record_failure)
+            return
+
+        def record_success(session: Session) -> None:
+            current = session.get(SchedulerTransfer, transfer_id)
+            if current is None:
+                return
+            now = utcnow()
+            current.state = "COMPLETED"
+            current.remote_staged_path = remote_staged_path
+            current.error_message = None
+            current.updated_at = now
+            current.completed_at = now
+            payload = self._scheduler_transfer_dict(current)
+            self._audit(
+                session,
+                actor_id=current.actor_id,
+                action="scheduler_transfer.completed",
+                resource_type="scheduler_transfer",
+                resource_id=current.id,
+                result="success",
+                after=payload,
+                summary={
+                    "target_id": current.target_id,
+                    "project_id": current.project_id,
+                    "remote_staged_path": remote_staged_path,
+                },
+                now=now,
+            )
+            self._bump_revision(session, now)
+
+        self._write(record_success)
+
+    def start_scheduler_upload(
+        self,
+        actor: ActorContext,
+        request: SchedulerUploadRequest,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Start an approved upload into a unique non-overwriting remote stage."""
+
+        self._require_role(actor, MUTATING_ROLES)
+        target, connection, _revision = self._scheduler_target_context(
+            request.target_id,
+            required_capability="data-transfer",
+        )
+        access = self.slurm_provider.access_status(connection)
+        if access.get("status") != "ready":
+            raise BrokerError(
+                "access_required",
+                "scheduler access is not ready; connect the approved VPN and retry",
+                status_code=409,
+                details={
+                    "target_id": request.target_id,
+                    "access": access,
+                    "access_hint": target["access_hint"],
+                },
+            )
+        try:
+            local_path = Path(request.local_path).resolve(strict=True)
+        except OSError as exc:
+            raise BrokerError(
+                "local_source_not_found",
+                "local upload source does not exist",
+                status_code=404,
+            ) from exc
+        if not (local_path.is_file() or local_path.is_dir()):
+            raise BrokerError(
+                "local_source_unsupported",
+                "local upload source must be a regular file or directory",
+                status_code=422,
+            )
+        if not re.fullmatch(r"[A-Za-z0-9._@+-]{1,255}", local_path.name):
+            raise BrokerError(
+                "local_source_name_unsupported",
+                "local source basename contains unsupported characters",
+                status_code=422,
+            )
+
+        def prepare(session: Session) -> tuple[str, bool]:
+            self._idempotent(
+                session,
+                actor=actor,
+                action="scheduler_transfer.start",
+                key=idempotency_key,
+            )
+            existing = session.scalar(
+                select(SchedulerTransfer).where(
+                    SchedulerTransfer.actor_id == actor.id,
+                    SchedulerTransfer.submission_key == idempotency_key,
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.target_id != request.target_id
+                    or existing.project_id != request.project_id
+                    or existing.local_source_path != str(local_path)
+                    or existing.remote_directory != request.remote_directory
+                ):
+                    raise BrokerError(
+                        "idempotency_conflict",
+                        "idempotency key was already used for different upload input",
+                        status_code=409,
+                    )
+                return existing.id, False
+            now = utcnow()
+            self._ensure_claim_project(session, request.project_id, now)
+            transfer = SchedulerTransfer(
+                id=secrets.token_hex(16),
+                target_id=request.target_id,
+                actor_id=actor.id,
+                project_id=request.project_id,
+                submission_key=idempotency_key,
+                approval_ref=request.approval_ref,
+                local_source_path=str(local_path),
+                remote_directory=request.remote_directory,
+                remote_staged_path=None,
+                source_size_bytes=local_path.stat().st_size if local_path.is_file() else None,
+                state="TRANSFERRING",
+                error_message=None,
+                created_at=now,
+                updated_at=now,
+                completed_at=None,
+            )
+            session.add(transfer)
+            revision = self._bump_revision(session, now)
+            self._audit(
+                session,
+                actor_id=actor.id,
+                action="scheduler_transfer.started",
+                resource_type="scheduler_transfer",
+                resource_id=transfer.id,
+                result="success",
+                after=self._scheduler_transfer_dict(transfer),
+                summary={
+                    "target_id": transfer.target_id,
+                    "project_id": transfer.project_id,
+                    "snapshot_revision": revision,
+                },
+                now=now,
+            )
+            return transfer.id, True
+
+        with self._scheduler_transfer_lock:
+            transfer_id, created = self._write(prepare)
+            if created:
+                threading.Thread(
+                    target=self._perform_scheduler_upload,
+                    args=(transfer_id,),
+                    name=f"gpu-broker-upload-{transfer_id[:8]}",
+                    daemon=True,
+                ).start()
+
+        return self.scheduler_transfer_status(actor, transfer_id)
+
+    @staticmethod
+    def _scheduler_transfer_visible(
+        actor: ActorContext,
+        transfer: SchedulerTransfer,
+    ) -> bool:
+        return transfer.actor_id == actor.id
+
+    def scheduler_transfer_status(
+        self,
+        actor: ActorContext,
+        transfer_id: str,
+    ) -> dict[str, Any]:
+        def operation(session: Session) -> dict[str, Any]:
+            transfer = session.get(SchedulerTransfer, transfer_id)
+            if transfer is None:
+                raise BrokerError(
+                    "scheduler_transfer_not_found",
+                    "scheduler transfer does not exist",
+                    status_code=404,
+                )
+            if not self._scheduler_transfer_visible(actor, transfer):
+                raise BrokerError(
+                    "scheduler_transfer_forbidden",
+                    "scheduler transfer is not visible to this actor",
+                    status_code=403,
+                )
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "snapshot_revision": self._revision(session),
+                "scheduler_transfer": self._scheduler_transfer_dict(transfer),
+            }
+
+        return self._read(operation)
+
+    def list_scheduler_transfers(
+        self,
+        actor: ActorContext,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        def operation(session: Session) -> dict[str, Any]:
+            transfers = session.scalars(
+                select(SchedulerTransfer).order_by(
+                    SchedulerTransfer.created_at.desc()
+                )
+            ).all()
+            values = [
+                self._scheduler_transfer_dict(transfer)
+                for transfer in transfers
+                if self._scheduler_transfer_visible(actor, transfer)
+                and (
+                    project_id is None
+                    or transfer.project_id == project_id
+                )
+            ]
+            return self.envelope(session, values)
+
+        return self._read(operation)
+
+    def _scheduler_job_payload(
+        self,
+        session: Session,
+        job: SchedulerJob,
+    ) -> dict[str, Any]:
+        events = session.scalars(
+            select(SchedulerJobEvent)
+            .where(SchedulerJobEvent.job_id == job.id)
+            .order_by(SchedulerJobEvent.id)
+        ).all()
+        return self._scheduler_job_dict(job, events)
+
+    @staticmethod
+    def _scheduler_job_visible(actor: ActorContext, job: SchedulerJob) -> bool:
+        return job.actor_id == actor.id
+
+    def _submit_scheduler_job(
+        self,
+        actor: ActorContext,
+        *,
+        target_id: str,
+        project_id: str,
+        profile_id: str | None,
+        task_ref: str,
+        purpose: str,
+        approval_ref: str | None,
+        request: dict[str, Any],
+        script_body: str,
+        retain_submission_body: bool,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._require_role(actor, MUTATING_ROLES)
+        target, connection, _revision = self._scheduler_target_context(
+            target_id,
+            required_capability="submit",
+        )
+        access = self.slurm_provider.access_status(connection)
+        if access.get("status") != "ready":
+            raise BrokerError(
+                "access_required",
+                "scheduler access is not ready; connect the approved VPN and retry",
+                status_code=409,
+                details={
+                    "target_id": target_id,
+                    "access": access,
+                    "access_hint": target["access_hint"],
+                },
+            )
+        script_digest = hashlib.sha256(script_body.encode("utf-8")).hexdigest()
+
+        def prepare(
+            session: Session,
+        ) -> tuple[str, bool, bool, dict[str, Any] | None]:
+            prior = self._idempotent(
+                session,
+                actor=actor,
+                action="scheduler_job.submit",
+                key=idempotency_key,
+            )
+            if prior is not None:
+                return prior["scheduler_job"]["id"], False, False, prior
+            existing_job = session.scalar(
+                select(SchedulerJob).where(
+                    SchedulerJob.actor_id == actor.id,
+                    SchedulerJob.submission_key == idempotency_key,
+                )
+            )
+            if existing_job is not None:
+                if (
+                    existing_job.target_id != target_id
+                    or existing_job.project_id != project_id
+                    or existing_job.task_ref != task_ref
+                    or existing_job.script_digest != script_digest
+                ):
+                    raise BrokerError(
+                        "idempotency_conflict",
+                        "idempotency key was already used for different scheduler input",
+                        status_code=409,
+                    )
+                retryable = existing_job.state in {
+                    "SUBMITTING",
+                    "ACCESS_REQUIRED",
+                    "FAILED",
+                }
+                recover_unknown = existing_job.state == "UNKNOWN"
+                if retryable and existing_job.state != "SUBMITTING":
+                    now = utcnow()
+                    existing_job.state = "SUBMITTING"
+                    existing_job.error_message = None
+                    existing_job.updated_at = now
+                    session.add(
+                        SchedulerJobEvent(
+                            job_id=existing_job.id,
+                            state="SUBMITTING",
+                            raw_state=existing_job.raw_state,
+                            detail_json=json_dump({"retry": True}),
+                            created_at=now,
+                        )
+                    )
+                    self._bump_revision(session, now)
+                return (
+                    existing_job.id,
+                    retryable,
+                    recover_unknown,
+                    None,
+                )
+            now = utcnow()
+            self._ensure_claim_project(session, project_id, now)
+            job = SchedulerJob(
+                id=secrets.token_hex(16),
+                target_id=target_id,
+                actor_id=actor.id,
+                project_id=project_id,
+                profile_id=profile_id,
+                submission_key=idempotency_key,
+                task_ref=task_ref,
+                purpose=purpose,
+                approval_ref=approval_ref,
+                request_json=json_dump(request),
+                script_digest=script_digest,
+                script_body=script_body if retain_submission_body else None,
+                retain_submission_body=retain_submission_body,
+                scheduler_job_id=None,
+                state="SUBMITTING",
+                raw_state=None,
+                allocated_tres_json="{}",
+                node_list=None,
+                stdout_path=None,
+                stderr_path=None,
+                exit_code=None,
+                error_message=None,
+                submitted_at=None,
+                started_at=None,
+                completed_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(job)
+            session.add(
+                SchedulerJobEvent(
+                    job_id=job.id,
+                    state="SUBMITTING",
+                    raw_state=None,
+                    detail_json=json_dump({"target_id": target_id}),
+                    created_at=now,
+                )
+            )
+            self._bump_revision(session, now)
+            return job.id, True, False, None
+
+        job_id, should_submit, recover_unknown, prior_response = self._write(prepare)
+        if prior_response is not None:
+            return prior_response
+        if recover_unknown:
+            try:
+                recovered_submission = self.slurm_provider.find_by_name(
+                    connection,
+                    broker_job_name(job_id),
+                )
+            except SlurmProviderError as exc:
+                raise BrokerError(
+                    "scheduler_recovery_failed",
+                    str(exc),
+                    status_code=409 if exc.access_required else 502,
+                    details={"scheduler_job_id": job_id, "state": "UNKNOWN"},
+                ) from exc
+            if recovered_submission is None:
+                def unknown_result(session: Session) -> dict[str, Any]:
+                    job = session.get(SchedulerJob, job_id)
+                    assert job is not None
+                    return {
+                        "snapshot_revision": self._revision(session),
+                        "scheduler_job": self._scheduler_job_payload(session, job),
+                    }
+
+                return self._read(unknown_result)
+            submission = recovered_submission
+            submission_recovered = True
+        if not should_submit:
+            def existing_result(session: Session) -> dict[str, Any]:
+                job = session.get(SchedulerJob, job_id)
+                assert job is not None
+                return {
+                    "snapshot_revision": self._revision(session),
+                    "scheduler_job": self._scheduler_job_payload(session, job),
+                }
+
+            if not recover_unknown:
+                return self._read(existing_result)
+
+        if should_submit:
+            try:
+                recovered = self.slurm_provider.find_by_name(
+                    connection,
+                    broker_job_name(job_id),
+                )
+                submission = recovered or self.slurm_provider.submit(
+                    connection,
+                    broker_job_id=job_id,
+                    request=request,
+                    script_body=script_body,
+                )
+                submission_recovered = recovered is not None
+            except SlurmProviderError as exc:
+                failure_state = (
+                    "UNKNOWN"
+                    if exc.uncertain
+                    else "ACCESS_REQUIRED"
+                    if exc.access_required
+                    else "FAILED"
+                )
+                failure_message = str(exc)[:2000]
+
+                def record_failure(session: Session) -> None:
+                    job = session.get(SchedulerJob, job_id)
+                    assert job is not None
+                    now = utcnow()
+                    job.state = failure_state
+                    job.error_message = failure_message
+                    job.updated_at = now
+                    session.add(
+                        SchedulerJobEvent(
+                            job_id=job.id,
+                            state=failure_state,
+                            raw_state=None,
+                            detail_json=json_dump({"message": job.error_message}),
+                            created_at=now,
+                        )
+                    )
+                    self._audit(
+                        session,
+                        actor_id=actor.id,
+                        action="scheduler_job.submit_unknown" if failure_state == "UNKNOWN" else "scheduler_job.submit_failed",
+                        resource_type="scheduler_job",
+                        resource_id=job.id,
+                        result="failure",
+                        after=self._scheduler_job_dict(job),
+                        summary={"state": failure_state, "resubmission_blocked": failure_state == "UNKNOWN"},
+                        now=now,
+                    )
+                    self._bump_revision(session, now)
+
+                self._write(record_failure)
+                raise BrokerError(
+                    "scheduler_submission_unknown" if failure_state == "UNKNOWN" else "access_required" if exc.access_required else "scheduler_submit_failed",
+                    str(exc),
+                    status_code=409 if failure_state in {"UNKNOWN", "ACCESS_REQUIRED"} else 502,
+                    details={"scheduler_job_id": job_id, "state": failure_state},
+                ) from exc
+
+        def complete(session: Session) -> dict[str, Any]:
+            job = session.get(SchedulerJob, job_id)
+            assert job is not None
+            now = utcnow()
+            raw_state = submission.raw_state
+            job.scheduler_job_id = submission.scheduler_job_id
+            job.raw_state = raw_state
+            job.state = "PENDING" if raw_state == "SUBMITTED" else broker_state(raw_state)
+            job.submitted_at = now
+            job.updated_at = now
+            job.error_message = None
+            scheduler = request["scheduler"]
+            job.stdout_path = scheduler["stdout_pattern"].replace(
+                "%j", submission.scheduler_job_id
+            )
+            job.stderr_path = scheduler["stderr_pattern"].replace(
+                "%j", submission.scheduler_job_id
+            )
+            if not job.retain_submission_body:
+                job.script_body = None
+            session.add(
+                SchedulerJobEvent(
+                    job_id=job.id,
+                    state=job.state,
+                    raw_state=raw_state,
+                    detail_json=json_dump(
+                        {"scheduler_job_id": submission.scheduler_job_id}
+                    ),
+                    created_at=now,
+                )
+            )
+            revision = self._bump_revision(session, now)
+            payload = self._scheduler_job_payload(session, job)
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="scheduler_job.recovered" if submission_recovered else "scheduler_job.submitted",
+                resource_type="scheduler_job",
+                resource_id=job.id,
+                result="success",
+                after=payload,
+                summary={
+                    "target_id": target_id,
+                    "project_id": project_id,
+                    "scheduler_job_id": submission.scheduler_job_id,
+                    "recovered": submission_recovered,
+                },
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "scheduler_job": payload,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="scheduler_job.submit",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(complete)
+
+    def submit_scheduler_profile(
+        self,
+        actor: ActorContext,
+        profile_id: str,
+        submission: SchedulerProfileSubmit,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        def resolve(
+            session: Session,
+        ) -> tuple[WorkloadProfile, dict[str, Any], dict[str, Any], str]:
+            profile = session.get(WorkloadProfile, profile_id)
+            if profile is None:
+                raise BrokerError(
+                    "workload_profile_not_found",
+                    "workload profile does not exist",
+                    status_code=404,
+                )
+            if not profile.enabled:
+                raise BrokerError(
+                    "workload_profile_disabled",
+                    "workload profile is disabled",
+                    status_code=409,
+                )
+            if profile.runtime_kind != "slurm":
+                raise BrokerError(
+                    "workload_profile_runtime_mismatch",
+                    "workload profile is not an external scheduler profile",
+                    status_code=409,
+                )
+            if not self._profile_allows_project(
+                session,
+                profile,
+                submission.project_id,
+            ):
+                raise BrokerError(
+                    "workload_profile_project_forbidden",
+                    "project is not granted this workload profile",
+                    status_code=403,
+                )
+            assert profile.scheduler_target_id is not None
+            assert profile.scheduler_spec_json is not None
+            assert profile.scheduler_script is not None
+            request = {
+                "duration_seconds": profile.duration_seconds,
+                "constraints": json_load(profile.constraints_json),
+                "scheduler": json_load(profile.scheduler_spec_json),
+            }
+            return (
+                profile,
+                request,
+                self._workload_profile_dict(
+                    profile,
+                    self._workload_profile_grants(session, profile.id),
+                ),
+                profile.scheduler_script,
+            )
+
+        profile, request, _profile_payload, script_body = self._read(resolve)
+        assert profile.scheduler_target_id is not None
+        with self._scheduler_submit_lock:
+            return self._submit_scheduler_job(
+                actor,
+                target_id=profile.scheduler_target_id,
+                project_id=submission.project_id,
+                profile_id=profile.id,
+                task_ref=submission.task_ref,
+                purpose=profile.purpose,
+                approval_ref=f"profile:{profile.id}",
+                request=request,
+                script_body=script_body,
+                retain_submission_body=profile.retain_submission_body,
+                idempotency_key=idempotency_key,
+            )
+
+    def submit_scheduler_one_off(
+        self,
+        actor: ActorContext,
+        submission: SchedulerOneOffSubmit,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        payload = submission.model_dump(mode="json")
+        script_body = payload.pop("script_body")
+        retain_submission_body = payload.pop("retain_submission_body")
+        target_id = payload.pop("target_id")
+        project_id = payload.pop("project_id")
+        task_ref = payload.pop("task_ref")
+        purpose = payload.pop("purpose")
+        with self._scheduler_submit_lock:
+            return self._submit_scheduler_job(
+                actor,
+                target_id=target_id,
+                project_id=project_id,
+                profile_id=None,
+                task_ref=task_ref,
+                purpose=purpose,
+                approval_ref=None,
+                request=payload,
+                script_body=script_body,
+                retain_submission_body=retain_submission_body,
+                idempotency_key=idempotency_key,
+            )
+
+    def list_scheduler_jobs(
+        self,
+        actor: ActorContext,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        def operation(session: Session) -> dict[str, Any]:
+            jobs = session.scalars(
+                select(SchedulerJob).order_by(SchedulerJob.created_at.desc())
+            ).all()
+            values = [
+                self._scheduler_job_payload(session, job)
+                for job in jobs
+                if self._scheduler_job_visible(actor, job)
+                and (project_id is None or job.project_id == project_id)
+            ]
+            return self.envelope(session, values)
+
+        return self._read(operation)
+
+    def refresh_scheduler_job(
+        self,
+        actor: ActorContext,
+        job_id: str,
+    ) -> dict[str, Any]:
+        def resolve(
+            session: Session,
+        ) -> tuple[SchedulerJob, dict[str, Any], int]:
+            job = session.get(SchedulerJob, job_id)
+            if job is None:
+                raise BrokerError(
+                    "scheduler_job_not_found",
+                    "scheduler job does not exist",
+                    status_code=404,
+                )
+            if not self._scheduler_job_visible(actor, job):
+                raise BrokerError(
+                    "scheduler_job_forbidden",
+                    "scheduler job is not visible to this actor",
+                    status_code=403,
+                )
+            target = session.get(SchedulerTarget, job.target_id)
+            if target is None:
+                raise BrokerError(
+                    "scheduler_target_not_found",
+                    "scheduler target does not exist",
+                    status_code=404,
+                )
+            connection = json_load(target.connection_json)
+            assert isinstance(connection, dict)
+            return job, connection, self._revision(session)
+
+        job, connection, revision = self._read(resolve)
+        if job.scheduler_job_id is None or job.state in {
+            "FAILED",
+            "UNKNOWN",
+            "ACCESS_REQUIRED",
+        }:
+            def current(session: Session) -> dict[str, Any]:
+                current_job = session.get(SchedulerJob, job_id)
+                assert current_job is not None
+                return {
+                    "schema_version": SCHEMA_VERSION,
+                    "snapshot_revision": revision,
+                    "scheduler_job": self._scheduler_job_payload(session, current_job),
+                }
+
+            return self._read(current)
+        try:
+            observation = self.slurm_provider.query(
+                connection,
+                job.scheduler_job_id,
+            )
+        except SlurmProviderError as exc:
+            if exc.access_required:
+                raise BrokerError(
+                    "access_required",
+                    str(exc),
+                    status_code=409,
+                    details={"scheduler_job_id": job.id},
+                ) from exc
+            raise BrokerError(
+                "scheduler_status_failed",
+                str(exc),
+                status_code=502,
+                details={"scheduler_job_id": job.id},
+            ) from exc
+
+        def update(session: Session) -> dict[str, Any]:
+            current_job = session.get(SchedulerJob, job_id)
+            assert current_job is not None
+            now = utcnow()
+            previous_state = current_job.state
+            current_job.state = observation["state"]
+            current_job.raw_state = observation["raw_state"]
+            current_job.allocated_tres_json = json_dump(
+                observation.get("allocated_tres") or {}
+            )
+            current_job.node_list = observation.get("node_list")
+            current_job.exit_code = observation.get("exit_code")
+            current_job.started_at = (
+                _external_datetime(observation.get("started_at"))
+                or current_job.started_at
+            )
+            current_job.completed_at = (
+                _external_datetime(observation.get("completed_at"))
+                or current_job.completed_at
+            )
+            if current_job.state in {
+                "COMPLETED",
+                "FAILED",
+                "CANCELLED",
+                "TIMEOUT",
+            } and current_job.completed_at is None:
+                current_job.completed_at = now
+            current_job.updated_at = now
+            if (
+                current_job.state != previous_state
+                or current_job.raw_state != job.raw_state
+            ):
+                session.add(
+                    SchedulerJobEvent(
+                        job_id=current_job.id,
+                        state=current_job.state,
+                        raw_state=current_job.raw_state,
+                        detail_json=json_dump(
+                            {
+                                "allocated_tres": observation.get(
+                                    "allocated_tres"
+                                )
+                                or {},
+                                "node_list": current_job.node_list,
+                            }
+                        ),
+                        created_at=now,
+                    )
+                )
+                revision_value = self._bump_revision(session, now)
+            else:
+                revision_value = self._revision(session)
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "snapshot_revision": revision_value,
+                "scheduler_job": self._scheduler_job_payload(
+                    session,
+                    current_job,
+                ),
+            }
+
+        return self._write(update)
+
+    def cancel_scheduler_job(
+        self,
+        actor: ActorContext,
+        job_id: str,
+        cancellation: SchedulerJobCancel,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        self._require_role(actor, MUTATING_ROLES)
+
+        def resolve(
+            session: Session,
+        ) -> tuple[SchedulerJob, dict[str, Any], dict[str, Any] | None]:
+            prior = self._idempotent(
+                session,
+                actor=actor,
+                action="scheduler_job.cancel",
+                key=idempotency_key,
+            )
+            job = session.get(SchedulerJob, job_id)
+            if job is None:
+                raise BrokerError(
+                    "scheduler_job_not_found",
+                    "scheduler job does not exist",
+                    status_code=404,
+                )
+            if job.actor_id != actor.id:
+                raise BrokerError(
+                    "scheduler_job_forbidden",
+                    "only the job owner or an authorized operator may cancel it",
+                    status_code=403,
+                )
+            target = session.get(SchedulerTarget, job.target_id)
+            if target is None:
+                raise BrokerError(
+                    "scheduler_target_not_found",
+                    "scheduler target does not exist",
+                    status_code=404,
+                )
+            connection = json_load(target.connection_json)
+            assert isinstance(connection, dict)
+            return job, connection, prior
+
+        job, connection, prior = self._read(resolve)
+        if prior is not None:
+            return prior
+        if job.scheduler_job_id is None:
+            raise BrokerError(
+                "scheduler_job_not_submitted",
+                "scheduler job has no external Job ID to cancel",
+                status_code=409,
+            )
+        try:
+            self.slurm_provider.cancel(connection, job.scheduler_job_id)
+        except SlurmProviderError as exc:
+            raise BrokerError(
+                "access_required" if exc.access_required else "scheduler_cancel_failed",
+                str(exc),
+                status_code=409 if exc.access_required else 502,
+                details={"scheduler_job_id": job.id},
+            ) from exc
+
+        def complete(session: Session) -> dict[str, Any]:
+            current_job = session.get(SchedulerJob, job_id)
+            assert current_job is not None
+            now = utcnow()
+            current_job.state = "CANCEL_REQUESTED"
+            current_job.raw_state = "CANCEL_REQUESTED"
+            current_job.updated_at = now
+            session.add(
+                SchedulerJobEvent(
+                    job_id=current_job.id,
+                    state=current_job.state,
+                    raw_state=current_job.raw_state,
+                    detail_json=json_dump({"reason": cancellation.reason}),
+                    created_at=now,
+                )
+            )
+            revision_value = self._bump_revision(session, now)
+            payload = self._scheduler_job_payload(session, current_job)
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="scheduler_job.cancel_requested",
+                resource_type="scheduler_job",
+                resource_id=current_job.id,
+                result="success",
+                before=self._scheduler_job_dict(job),
+                after=payload,
+                summary={"reason": cancellation.reason},
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision_value,
+                "scheduler_job": payload,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="scheduler_job.cancel",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(complete)
+
     @staticmethod
     def _constraints_reference_endpoint(
         constraints_json: str,
@@ -3582,7 +5224,7 @@ class BrokerService:
     ) -> dict[str, Any]:
         """Create/update inventory metadata while keeping endpoint id and host:port immutable."""
 
-        self._require_role(actor, ADMIN_ROLES)
+        self._require_role(actor, MUTATING_ROLES)
 
         def operation(session: Session) -> dict[str, Any]:
             existing = self._idempotent(
@@ -3607,6 +5249,25 @@ class BrokerService:
                     status_code=409,
                 )
             if endpoint is None:
+                if endpoint_data.owner_project_id is None:
+                    raise BrokerError(
+                        "endpoint_owner_required",
+                        "new endpoints must declare owner_project_id",
+                        status_code=422,
+                    )
+                if not actor.is_admin and endpoint_data.owner_project_id not in actor.project_ids:
+                    raise BrokerError(
+                        "endpoint_forbidden",
+                        "only a member of owner_project_id may create its endpoint",
+                        status_code=403,
+                    )
+                lifecycle_state = endpoint_data.lifecycle_state or "active"
+                if lifecycle_state != "active":
+                    raise BrokerError(
+                        "endpoint_lifecycle_invalid_transition",
+                        "a new endpoint must begin active",
+                        status_code=409,
+                    )
                 endpoint = Endpoint(
                     id=endpoint_data.id,
                     host=endpoint_data.host,
@@ -3617,25 +5278,64 @@ class BrokerService:
                     storage_group=endpoint_data.storage_group,
                     expected_gpu_count=endpoint_data.expected_gpu_count,
                     expected_gpu_total_vram_mib=endpoint_data.expected_gpu_total_vram_mib,
-                    enabled=endpoint_data.enabled,
+                    owner_project_id=endpoint_data.owner_project_id,
+                    lifecycle_state=lifecycle_state,
+                    enabled=True,
                     created_at=now,
                     updated_at=now,
                 )
                 session.add(endpoint)
             else:
+                if endpoint.owner_project_id is None:
+                    if (
+                        endpoint_data.owner_project_id is None
+                        or endpoint_data.owner_project_id not in actor.project_ids
+                    ):
+                        raise BrokerError(
+                            "endpoint_owner_required",
+                            "a legacy endpoint must be adopted by its owning project",
+                            status_code=422,
+                        )
+                    endpoint.owner_project_id = endpoint_data.owner_project_id
+                self._require_endpoint_manager(actor, endpoint)
                 if (endpoint.host, endpoint.port) != (endpoint_data.host, endpoint_data.port):
                     raise BrokerError(
                         "endpoint_identity_immutable",
                         "existing endpoint id cannot change host:port; create a new endpoint id",
                         status_code=409,
                     )
+                if (
+                    endpoint_data.owner_project_id is not None
+                    and endpoint_data.owner_project_id != endpoint.owner_project_id
+                ):
+                    raise BrokerError(
+                        "endpoint_owner_immutable",
+                        "endpoint ownership is immutable; retire it and create a new endpoint id",
+                        status_code=409,
+                    )
+                requested_lifecycle = endpoint_data.lifecycle_state
+                if requested_lifecycle is None and endpoint_data.enabled is False:
+                    requested_lifecycle = "draining"
+                if requested_lifecycle is not None and requested_lifecycle != endpoint.lifecycle_state:
+                    allowed_transitions = {
+                        "active": {"draining"},
+                        "draining": {"retired"},
+                        "retired": set(),
+                    }
+                    if requested_lifecycle not in allowed_transitions[endpoint.lifecycle_state]:
+                        raise BrokerError(
+                            "endpoint_lifecycle_invalid_transition",
+                            "endpoint lifecycle must transition active -> draining -> retired",
+                            status_code=409,
+                        )
+                    endpoint.lifecycle_state = requested_lifecycle
                 endpoint.ssh_user = endpoint_data.ssh_user
                 endpoint.ssh_alias = endpoint_data.ssh_alias
                 endpoint.labels_json = json_dump(endpoint_data.labels)
                 endpoint.storage_group = endpoint_data.storage_group
                 endpoint.expected_gpu_count = endpoint_data.expected_gpu_count
                 endpoint.expected_gpu_total_vram_mib = endpoint_data.expected_gpu_total_vram_mib
-                endpoint.enabled = endpoint_data.enabled
+                endpoint.enabled = endpoint.lifecycle_state == "active"
                 endpoint.updated_at = now
             session.flush()
             event = self._audit(
@@ -3666,7 +5366,7 @@ class BrokerService:
 
         return self._write(operation)
 
-    def delete_endpoint(
+    def _legacy_delete_endpoint(
         self,
         actor: ActorContext,
         endpoint_id: str,
@@ -3895,6 +5595,126 @@ class BrokerService:
 
         return self._write(operation)
 
+    def delete_endpoint(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Advance an endpoint lifecycle without deleting evidence or history.
+
+        A first self-service delete drains the endpoint immediately, which
+        blocks further claims but keeps the fixed collector active.  A second
+        request retires a drained endpoint only after its active leases have
+        ended; telemetry and audit evidence are deliberately retained.
+        """
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="endpoint.delete", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            if endpoint.lifecycle_state == "retired":
+                raise BrokerError(
+                    "endpoint_already_retired",
+                    "endpoint is already retired; identity and history are retained",
+                    status_code=409,
+                )
+            now = utcnow()
+            before = self._endpoint_dict(endpoint)
+            if endpoint.lifecycle_state == "active":
+                endpoint.lifecycle_state = "draining"
+                endpoint.enabled = False
+                action = "endpoint.draining"
+            else:
+                gpu_ids = set(
+                    session.scalars(
+                        select(GPUDevice.id).where(GPUDevice.endpoint_id == endpoint.id)
+                    ).all()
+                )
+                active_lease_count = session.scalar(
+                    select(func.count())
+                    .select_from(LeaseResource)
+                    .join(Lease, Lease.id == LeaseResource.lease_id)
+                    .join(GPUDevice, GPUDevice.id == LeaseResource.gpu_id)
+                    .where(
+                        GPUDevice.endpoint_id == endpoint.id,
+                        LeaseResource.active.is_(True),
+                        Lease.state.in_(ACTIVE_LEASE_STATES),
+                    )
+                ) or 0
+                if active_lease_count:
+                    raise BrokerError(
+                        "endpoint_has_active_leases",
+                        "a draining endpoint remains observable until active leases finish",
+                        status_code=409,
+                        details={"active_lease_count": active_lease_count},
+                    )
+                queued_request_ids = [
+                    request.id
+                    for request in session.scalars(
+                        select(AllocationRequest)
+                        .where(AllocationRequest.state.in_({"QUEUED", "PENDING_APPROVAL"}))
+                        .order_by(AllocationRequest.created_at)
+                    ).all()
+                    if self._constraints_reference_endpoint(
+                        request.constraints_json,
+                        endpoint_id=endpoint.id,
+                        gpu_ids=gpu_ids,
+                    )
+                ]
+                if queued_request_ids:
+                    raise BrokerError(
+                        "endpoint_has_queued_requests",
+                        "a draining endpoint remains until requests pinned to it are cancelled or changed",
+                        status_code=409,
+                        details={"request_ids": queued_request_ids[:20]},
+                    )
+                endpoint.lifecycle_state = "retired"
+                endpoint.enabled = False
+                action = "endpoint.retired"
+            endpoint.updated_at = now
+            revision = self._bump_revision(session, now)
+            payload = self._endpoint_dict(endpoint)
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action=action,
+                resource_type="endpoint",
+                resource_id=endpoint.id,
+                result="success",
+                before=before,
+                after=payload,
+                summary={"history_retained": True},
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "endpoint": payload,
+                "endpoint_id": endpoint.id,
+                "history_retained": True,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="endpoint.delete",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
     def set_endpoint_enabled(
         self,
         actor: ActorContext,
@@ -3903,7 +5723,7 @@ class BrokerService:
         *,
         idempotency_key: str,
     ) -> dict[str, Any]:
-        self._require_role(actor, ADMIN_ROLES)
+        self._require_role(actor, MUTATING_ROLES)
 
         def operation(session: Session) -> dict[str, Any]:
             existing = self._idempotent(
@@ -3914,9 +5734,17 @@ class BrokerService:
             endpoint = session.get(Endpoint, endpoint_id)
             if endpoint is None:
                 raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            if endpoint.lifecycle_state == "retired":
+                raise BrokerError(
+                    "endpoint_retired",
+                    "a retired endpoint cannot be reactivated; create a new endpoint id",
+                    status_code=409,
+                )
             now = utcnow()
             revision = self._bump_revision(session, now)
             before = self._endpoint_dict(endpoint)
+            endpoint.lifecycle_state = "active" if state.enabled else "draining"
             endpoint.enabled = state.enabled
             endpoint.updated_at = now
             if not state.enabled:
@@ -3944,7 +5772,7 @@ class BrokerService:
             event = self._audit(
                 session,
                 actor_id=actor.id,
-                action="endpoint.enabled_changed",
+                action="endpoint.lifecycle_changed",
                 resource_type="endpoint",
                 resource_id=endpoint.id,
                 result="success",
@@ -4095,7 +5923,11 @@ class BrokerService:
             requests = session.scalars(
                 select(AllocationRequest).order_by(AllocationRequest.created_at.desc())
             ).all()
-            visible = [self._request_dict(request) for request in requests]
+            visible = [
+                self._request_dict(request)
+                for request in requests
+                if request.actor_id == actor.id
+            ]
             return self.envelope(session, visible)
 
         return self._read(operation)
@@ -4103,7 +5935,11 @@ class BrokerService:
     def list_leases(self, actor: ActorContext) -> dict[str, Any]:
         def operation(session: Session) -> dict[str, Any]:
             leases = session.scalars(select(Lease).order_by(Lease.issued_at.desc())).all()
-            visible = [self._lease_dict(session, lease) for lease in leases]
+            visible = [
+                self._lease_dict(session, lease)
+                for lease in leases
+                if lease.actor_id == actor.id
+            ]
             return self.envelope(session, visible)
 
         return self._read(operation)
@@ -4239,11 +6075,26 @@ class BrokerService:
             profiles = session.scalars(
                 select(WorkloadProfile).order_by(WorkloadProfile.project_id, WorkloadProfile.id)
             ).all()
-            values = [
-                self._workload_profile_dict(profile)
-                for profile in profiles
-                if (project_id is None or profile.project_id == project_id)
-            ]
+            values = []
+            for profile in profiles:
+                grants = self._workload_profile_grants(session, profile.id)
+                if project_id is not None:
+                    visible = (
+                        profile.project_id == project_id
+                        or profile.grant_all_projects
+                        or project_id in grants
+                    )
+                elif actor.is_admin:
+                    visible = True
+                else:
+                    visible = any(
+                        profile.project_id == candidate
+                        or profile.grant_all_projects
+                        or candidate in grants
+                        for candidate in actor.project_ids
+                    )
+                if visible:
+                    values.append(self._workload_profile_dict(profile, grants))
             return self.envelope(session, values)
 
         return self._read(operation)

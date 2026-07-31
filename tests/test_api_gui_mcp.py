@@ -103,7 +103,6 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert "可用 CPU 核数" in requests.text
     assert "可用内存 GiB" in requests.text
     assert "单卡可用显存 GiB" in requests.text
-    assert "CPU 可用 16 核" in requests.text
 
 
 def test_workload_profile_rest_and_gui_claim(tmp_path: Path, inventory) -> None:
@@ -304,6 +303,25 @@ def test_endpoint_project_grant_route_is_not_exposed(tmp_path: Path, inventory) 
     assert response.status_code == 404
 
 
+def test_collector_observation_ingestion_is_not_a_public_actor_route(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'collector-private.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/internal/observations",
+        json=observation(count=1).model_dump(mode="json"),
+        headers={"X-GPU-Broker-Actor": "arbitrary-actor"},
+    )
+    assert response.status_code == 404
+
+
 def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
@@ -331,10 +349,11 @@ def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> 
     assert retried.json() == deleted.json()
     assert deleted.json()["endpoint_id"] == "endpoint-b"
     listed = client.get("/api/v1/endpoints", headers={"X-GPU-Broker-Actor": "endpoint-admin"})
-    assert [endpoint["id"] for endpoint in listed.json()["data"]] == ["endpoint-a"]
+    endpoints = {endpoint["id"]: endpoint for endpoint in listed.json()["data"]}
+    assert endpoints["endpoint-b"]["lifecycle_state"] == "draining"
 
 
-def test_endpoint_delete_rest_route_preserves_nested_error_envelope(tmp_path: Path, inventory) -> None:
+def test_endpoint_delete_rest_route_preserves_maintenance_history(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -345,7 +364,7 @@ def test_endpoint_delete_rest_route_preserves_nested_error_envelope(tmp_path: Pa
         )
     )
     client = TestClient(app)
-    headers = {"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "endpoint-maintenance"}
+    headers = {"X-GPU-Broker-Actor": "human", "Idempotency-Key": "endpoint-maintenance"}
     created = client.post(
         "/api/v1/maintenance",
         json={
@@ -358,17 +377,15 @@ def test_endpoint_delete_rest_route_preserves_nested_error_envelope(tmp_path: Pa
     )
     assert created.status_code == 200
 
-    blocked = client.delete(
+    drained = client.delete(
         "/api/v1/endpoints/endpoint-b",
-        headers={"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "delete-maintained"},
+        headers={"X-GPU-Broker-Actor": "human", "Idempotency-Key": "delete-maintained"},
     )
 
-    assert blocked.status_code == 409
-    assert blocked.json()["error"] == {
-        "code": "endpoint_referenced_by_maintenance",
-        "message": "endpoint has maintenance history; cancel or retain the server disabled instead of deleting",
-        "details": {"maintenance_ids": [created.json()["maintenance"]["id"]]},
-    }
+    assert drained.status_code == 200
+    assert drained.json()["history_retained"] is True
+    assert drained.json()["endpoint"]["lifecycle_state"] == "draining"
+    assert created.json()["maintenance"]["id"]
 
 
 def test_project_creation_route_and_gui_are_not_exposed(tmp_path: Path, inventory) -> None:
@@ -445,6 +462,7 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
             "host": "127.0.0.2",
             "port": "2203",
             "ssh_user": "gpu",
+            "owner_project_id": "project-a",
             "expected_gpu_count": "2",
             "enabled": "true",
             "csrf": _csrf(home_page.text),
@@ -464,7 +482,8 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
         follow_redirects=True,
     )
     assert removed_server.status_code == 200
-    assert "click-server" not in {endpoint["id"] for endpoint in service.list_endpoints(service.local_actor("human"))["data"]}
+    endpoints = {endpoint["id"]: endpoint for endpoint in service.list_endpoints(service.local_actor("human"))["data"]}
+    assert endpoints["click-server"]["lifecycle_state"] == "draining"
 
     switched = client.post("/ui/actor", data={"actor_id": "click-agent"}, follow_redirects=True)
     assert switched.status_code == 200
@@ -487,6 +506,13 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_list",
         "gpu_who",
         "gpu_list_profiles",
+        "gpu_scheduler_targets",
+        "gpu_scheduler_access_status",
+        "gpu_scheduler_profiles",
+        "gpu_scheduler_submit_profile",
+        "gpu_scheduler_submit_once",
+        "gpu_scheduler_job_status",
+        "gpu_scheduler_cancel",
         "gpu_request",
         "gpu_request_status",
         "gpu_cancel_request",
@@ -505,6 +531,8 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_delete_server",
     }.issubset(names)
     assert "gpu_grant_server_project" not in names
+    assert "gpu_scheduler_upload" not in names
+    assert "gpu_scheduler_transfer_status" not in names
     for name in ("gpu_claim", "gpu_schedule"):
         assert "project_id" in by_name[name].inputSchema["required"]
     assert {"agent_name", "project_id", "task", "gpu_count"}.issubset(
@@ -540,7 +568,7 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
     assert [call[:2] for call in calls] == [("POST", "/api/v1/claims")]
 
 
-def test_ssh_preview_commit_is_bound_non_mutating_and_has_no_project_scope_by_default(tmp_path: Path, inventory) -> None:
+def test_ssh_preview_commit_is_bound_non_mutating_and_requires_project_scope(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -559,7 +587,7 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_has_no_project_scope_by_de
 
     preview = client.post(
         "/ui/endpoints/ssh/preview",
-        json={"command": "  ssh GPU_User@New-Host  ", "csrf": csrf},
+        json={"command": "  ssh GPU_User@New-Host  ", "project_ids": ["project-a"], "csrf": csrf},
     )
     assert preview.status_code == 200
     data = preview.json()["data"]
@@ -575,7 +603,7 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_has_no_project_scope_by_de
         "storage_group": None,
         "expected_gpu_count": None,
         "expected_gpu_total_vram_mib": None,
-        "project_ids": [],
+        "project_ids": ["project-a"],
         "enabled": True,
     }
     assert len(data["preview_token"]) == 64
@@ -587,6 +615,7 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_has_no_project_scope_by_de
         json={
             "command": "ssh GPU_User@other-host",
             "preview_token": data["preview_token"],
+            "project_ids": ["project-a"],
             "csrf": csrf,
         },
     )
@@ -597,6 +626,7 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_has_no_project_scope_by_de
         json={
             "command": "  ssh GPU_User@New-Host  ",
             "preview_token": "0" * 64,
+            "project_ids": ["project-a"],
             "csrf": csrf,
         },
     )
@@ -609,6 +639,7 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_has_no_project_scope_by_de
         json={
             "command": "  ssh GPU_User@New-Host  ",
             "preview_token": data["preview_token"],
+            "project_ids": ["project-a"],
             "csrf": csrf,
         },
     )
@@ -704,7 +735,10 @@ def test_ssh_batch_registers_valid_lines_and_skips_invalid_or_duplicate_lines(tm
         "ssh -p 2201 root@batch-host",
     ]
 
-    preview = client.post("/ui/endpoints/ssh/batch/preview", json={"commands": commands, "csrf": csrf})
+    preview = client.post(
+        "/ui/endpoints/ssh/batch/preview",
+        json={"commands": commands, "project_ids": ["project-a"], "csrf": csrf},
+    )
     assert preview.status_code == 200
     preview_data = preview.json()["data"]
     assert preview_data["valid_count"] == 2
@@ -712,7 +746,12 @@ def test_ssh_batch_registers_valid_lines_and_skips_invalid_or_duplicate_lines(tm
 
     committed = client.post(
         "/ui/endpoints/ssh/batch/commit",
-        json={"commands": commands, "preview_token": preview_data["preview_token"], "csrf": csrf},
+        json={
+            "commands": commands,
+            "project_ids": ["project-a"],
+            "preview_token": preview_data["preview_token"],
+            "csrf": csrf,
+        },
     )
     assert committed.status_code == 200
     result = committed.json()["data"]

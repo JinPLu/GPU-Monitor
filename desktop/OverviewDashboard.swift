@@ -3,14 +3,9 @@ import SwiftUI
 
 struct FleetOverview: View {
     let snapshot: BrokerSnapshot
-    let supportsEndpointDeletion: Bool
-    let deletingEndpointIDs: Set<String>
     let isRefreshing: Bool
     let refresh: () -> Void
-    let addServer: () -> Void
-    let claimGPU: () -> Void
     let openEndpoint: (EndpointRecord) -> Void
-    let removeEndpoint: (EndpointRecord) -> Void
     let selectGPU: (GPURecord) -> Void
 
     private let attentionStates = Set([
@@ -26,6 +21,28 @@ struct FleetOverview: View {
         snapshot.gpus.filter { attentionStates.contains($0.state) }
     }
 
+    private var freshEndpointIDs: Set<String> {
+        Set(snapshot.endpoints.filter { $0.monitorStatus == "ONLINE" }.map(\.id))
+    }
+
+    private var freshGPUCount: Int {
+        snapshot.gpus.filter { freshEndpointIDs.contains($0.endpointID) }.count
+    }
+
+    private var allocatableGPUCount: Int {
+        snapshot.gpus.filter {
+            freshEndpointIDs.contains($0.endpointID) && $0.state == "AVAILABLE"
+        }.count
+    }
+
+    private var idleLeaseGPUCount: Int {
+        snapshot.gpus.filter { ["HELD", "LEASED_IDLE"].contains($0.state) }.count
+    }
+
+    private var queuedRequestCount: Int {
+        snapshot.requests.filter { $0.state == "QUEUED" }.count
+    }
+
     var body: some View {
         GeometryReader { proxy in
             let compact = proxy.size.width < 1000
@@ -35,6 +52,7 @@ struct FleetOverview: View {
             VStack(alignment: .leading, spacing: 10) {
                 overviewHeader
                 summaryGrid(compact: compact)
+                coordinationSignals
                 attentionSection
                 actionBar
                 serverPool(columns: serverColumns)
@@ -57,13 +75,13 @@ struct FleetOverview: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("实时概览")
                     .font(.system(size: 16, weight: .semibold))
-                Text("把异常、容量与正在使用的租约放在同一个工作面")
+                Text("查看已登记容量、最新在线状态与协调中的租约")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
                     .lineLimit(1)
             }
             Spacer(minLength: 12)
-            Text("\(snapshot.summary.onlineServers) / \(snapshot.summary.totalServers) 台在线 · \(snapshot.summary.totalGPUs) GPU")
+            Text("\(snapshot.summary.totalServers) 台已登记 · \(snapshot.summary.onlineServers) 台在线")
                 .lineLimit(1)
                 .padding(.horizontal, 9)
                 .padding(.vertical, 5)
@@ -75,16 +93,36 @@ struct FleetOverview: View {
 
     @ViewBuilder
     private func summaryGrid(compact: Bool) -> some View {
-        let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: compact ? 2 : 4)
+        let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: compact ? 1 : 3)
         LazyVGrid(columns: columns, spacing: 10) {
-            OverviewSummaryCard(title: "可用", value: snapshot.summary.availableGPUs, icon: "checkmark.circle.fill")
-            OverviewSummaryCard(title: "已认领", value: snapshot.summary.claimedGPUs, icon: "key.fill")
-            OverviewSummaryCard(title: "占用中", value: snapshot.summary.busyGPUs, icon: "bolt.fill")
-            OverviewSummaryCard(
-                title: "需处理",
-                value: snapshot.summary.attentionResources,
+            OverviewSummaryCard(title: "已登记 GPU", value: snapshot.summary.totalGPUs, icon: "square.grid.3x3.fill")
+            OverviewSummaryCard(title: "在线 / 最新 GPU", value: freshGPUCount, icon: "waveform.path.ecg")
+            OverviewSummaryCard(title: "当前可分配", value: allocatableGPUCount, icon: "checkmark.circle.fill")
+        }
+    }
+
+    private var coordinationSignals: some View {
+        HStack(spacing: 8) {
+            CoordinationSignal(
+                title: "空闲租约",
+                value: "\(idleLeaseGPUCount) GPU",
+                detail: "已归属、未运行",
+                icon: "pause.circle",
+                color: idleLeaseGPUCount > 0 ? DesignTokens.warning : DesignTokens.mutedInk
+            )
+            CoordinationSignal(
+                title: "排队请求",
+                value: "\(queuedRequestCount)",
+                detail: "等待分配",
+                icon: "hourglass",
+                color: queuedRequestCount > 0 ? DesignTokens.warning : DesignTokens.mutedInk
+            )
+            CoordinationSignal(
+                title: "状态例外",
+                value: "\(attentionEndpoints.count)",
+                detail: "过期或连接异常",
                 icon: "exclamationmark.triangle.fill",
-                isAttention: snapshot.summary.attentionResources > 0
+                color: attentionEndpoints.isEmpty ? DesignTokens.mutedInk : DesignTokens.danger
             )
         }
     }
@@ -92,7 +130,7 @@ struct FleetOverview: View {
     private var attentionSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("需要处理")
+                Text("状态例外")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 if !attentionEndpoints.isEmpty || !attentionGPUs.isEmpty {
@@ -103,7 +141,7 @@ struct FleetOverview: View {
             }
 
             if attentionEndpoints.isEmpty && attentionGPUs.isEmpty {
-                Label("当前没有异常资源", systemImage: "checkmark.circle.fill")
+                Label("所有端点均未报告过期或连接异常", systemImage: "checkmark.circle.fill")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(DesignTokens.success)
                     .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
@@ -142,11 +180,6 @@ struct FleetOverview: View {
 
     private var actionBar: some View {
         HStack(spacing: 8) {
-            Button(action: claimGPU) {
-                Label("认领 GPU", systemImage: "checkmark.seal.fill")
-            }
-            .buttonStyle(PrimaryActionButtonStyle())
-
             Button(action: refresh) {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.clockwise")
@@ -162,12 +195,10 @@ struct FleetOverview: View {
             .disabled(isRefreshing)
             .help("刷新资源状态")
 
-            Button(action: addServer) {
-                Label("添加服务器", systemImage: "plus")
-            }
-            .buttonStyle(SecondaryActionButtonStyle())
-
             Spacer()
+            Label(snapshotAgeLabel, systemImage: "clock.arrow.circlepath")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(DesignTokens.mutedInk)
         }
     }
 
@@ -191,10 +222,7 @@ struct FleetOverview: View {
                         OverviewServerCard(
                             endpoint: endpoint,
                             gpus: snapshot.gpus(for: endpoint),
-                            supportsDeletion: supportsEndpointDeletion,
-                            isDeleting: deletingEndpointIDs.contains(endpoint.id),
                             open: { openEndpoint(endpoint) },
-                            remove: { removeEndpoint(endpoint) },
                             selectGPU: selectGPU
                         )
                     }
@@ -259,6 +287,12 @@ struct FleetOverview: View {
             return indexed.joined(separator: " · ")
         }
         return lease.gpuIDs.map { String($0.suffix(6)) }.joined(separator: " · ")
+    }
+
+    private var snapshotAgeLabel: String {
+        guard let age = snapshot.dataAgeSeconds else { return "等待快照" }
+        if age < 5 { return "快照刚更新" }
+        return "快照 \(Int(age.rounded())) 秒前"
     }
 }
 
@@ -326,22 +360,53 @@ private struct AttentionCard: View {
     }
 }
 
+private struct CoordinationSignal: View {
+    let title: String
+    let value: String
+    let detail: String
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 24, height: 24)
+                .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("\(title) · \(value)")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                Text(detail)
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+        .overviewSurface(radius: 9)
+    }
+}
+
 private struct OverviewServerCard: View {
     let endpoint: EndpointRecord
     let gpus: [GPURecord]
-    let supportsDeletion: Bool
-    let isDeleting: Bool
     let open: () -> Void
-    let remove: () -> Void
     let selectGPU: (GPURecord) -> Void
 
     private var sortedGPUs: [GPURecord] { gpus.sorted { $0.index < $1.index } }
-    private var availableCount: Int { gpus.filter { $0.state == "AVAILABLE" }.count }
+    private var allocatableCount: Int {
+        guard endpoint.monitorStatus == "ONLINE" else { return 0 }
+        return gpus.filter { $0.state == "AVAILABLE" }.count
+    }
     private var averageUtilization: Double? {
+        guard endpoint.monitorStatus == "ONLINE" else { return nil }
         let values = gpus.compactMap { $0.utilization.map { Double($0) / 100 } }
         return values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
     }
     private var averageVRAM: Double? {
+        guard endpoint.monitorStatus == "ONLINE" else { return nil }
         guard !gpus.isEmpty else { return nil }
         return gpus.map(\.memoryFraction).reduce(0, +) / Double(gpus.count)
     }
@@ -372,18 +437,15 @@ private struct OverviewServerCard: View {
                 .buttonStyle(.plain)
 
                 Spacer(minLength: 4)
-                Text(gpus.isEmpty ? "—" : "\(availableCount)/\(gpus.count) 可用")
+                Text(capacityLabel)
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .foregroundStyle(DesignTokens.mutedInk)
+                    .foregroundStyle(endpoint.monitorStatus == "ONLINE" ? DesignTokens.mutedInk : DesignTokens.warning)
 
                 Menu {
                     Button("复制 SSH 命令", systemImage: "doc.on.doc") {
                         copyToPasteboard(endpoint.sshCommand)
                     }
                     Button("查看详情", systemImage: "info.circle", action: open)
-                    Divider()
-                    Button("移除服务器", systemImage: "trash", role: .destructive, action: remove)
-                        .disabled(!supportsDeletion || isDeleting)
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 12, weight: .semibold))
@@ -392,7 +454,7 @@ private struct OverviewServerCard: View {
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .fixedSize()
-                .help(supportsDeletion ? "服务器操作" : "当前服务版本不支持移除服务器")
+                .help("查看或复制服务器信息")
             }
 
             LazyVGrid(columns: metricColumns, spacing: 8) {
@@ -457,23 +519,33 @@ private struct OverviewServerCard: View {
     }
 
     private var cpuDetail: String {
+        guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线，不显示旧遥测" }
         guard let load = endpoint.load1m, let count = endpoint.cpuCount else { return "等待主机状态" }
         return String(format: "1m %.1f · %d 核", load, count)
     }
 
     private var memoryDetail: String {
+        guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线，不显示旧遥测" }
         guard let used = usedMemoryMiB, let total = endpoint.memoryTotalMiB else { return "等待主机状态" }
         return "\(gibibytes(used)) / \(gibibytes(total)) GB"
     }
 
     private var utilizationDetail: String {
+        guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线，不显示旧遥测" }
         guard !gpus.isEmpty else { return "等待 GPU 状态" }
         return "\(gpus.count) 块 GPU 平均"
     }
 
     private var vramDetail: String {
+        guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线，不显示旧遥测" }
         guard totalVRAMMiB > 0 else { return "等待 GPU 状态" }
         return "\(gibibytes(usedVRAMMiB)) / \(gibibytes(totalVRAMMiB)) GB"
+    }
+
+    private var capacityLabel: String {
+        guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线" }
+        guard !gpus.isEmpty else { return "等待 GPU 状态" }
+        return "\(allocatableCount)/\(gpus.count) 可分配"
     }
 }
 

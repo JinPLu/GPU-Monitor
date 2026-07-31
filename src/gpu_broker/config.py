@@ -116,6 +116,7 @@ class Settings:
     project_root: Path | None = None
     bind_host: str = "127.0.0.1"
     bind_port: int = 8787
+    daemon_instance_id: str | None = None
     bootstrap_token: str | None = None
     session_secret: str | None = None
     request_body_limit_bytes: int = 256_000
