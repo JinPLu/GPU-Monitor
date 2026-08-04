@@ -5,12 +5,15 @@ import subprocess
 import time
 from typing import Any
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from gpu_broker.api import create_app
 from gpu_broker.config import Settings
 from gpu_broker.models import SchedulerJob
+from gpu_broker.schemas import ResourceConstraints, SchedulerOneOffSubmit
 from gpu_broker.slurm import CommandSlurmProvider, SlurmProviderError, SlurmSubmission
 
 
@@ -243,6 +246,108 @@ def test_command_slurm_access_status_parses_fixed_inspection_output() -> None:
     assert calls[0][-1].startswith("bash -lc ")
 
 
+def test_command_slurm_cpu_only_submission_omits_gpu_gres() -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="123456\n", stderr="")
+
+    provider = CommandSlurmProvider(runner=runner)
+    submission = provider.submit(
+        {"command_prefix": ["/Users/test/.local/bin/hh22", "1"]},
+        broker_job_id="cpu-only-job",
+        request={
+            "duration_seconds": 3600,
+            "constraints": {"gpu_count": 0},
+            "scheduler": {
+                "partition": "CPU-64C256GB",
+                "qos": "cpu",
+                "cpu_cores": 64,
+                "memory_mib": 256 * 1024,
+                "nodes": 1,
+                "tasks_per_node": 1,
+                "working_directory": "/home/test/project",
+                "stdout_pattern": "cpu-%j.out",
+                "stderr_pattern": "cpu-%j.err",
+            },
+        },
+        script_body="set -euo pipefail\nsrun python -u cpu_job.py\n",
+    )
+
+    assert submission.scheduler_job_id == "123456"
+    assert len(calls) == 1
+    remote_command = calls[0][-1]
+    assert "--partition=CPU-64C256GB" in remote_command
+    assert "--cpus-per-task=64" in remote_command
+    assert "--mem=262144M" in remote_command
+    assert "--gres=" not in remote_command
+
+
+def test_command_slurm_gpu_submission_includes_gres() -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="123456\n", stderr="")
+
+    provider = CommandSlurmProvider(runner=runner)
+    submission = provider.submit(
+        {"command_prefix": ["/Users/test/.local/bin/hh22", "1"]},
+        broker_job_id="gpu-job",
+        request={
+            "duration_seconds": 3600,
+            "constraints": {"gpu_count": 1},
+            "scheduler": {
+                "partition": "GPU-8A100",
+                "qos": "gpu_8a100",
+                "gpu_type": "a100",
+                "cpu_cores": 8,
+                "memory_mib": 65536,
+                "nodes": 1,
+                "tasks_per_node": 1,
+                "working_directory": "/home/test/project",
+                "stdout_pattern": "gpu-%j.out",
+                "stderr_pattern": "gpu-%j.err",
+            },
+        },
+        script_body="set -euo pipefail\nsrun python -u gpu_job.py\n",
+    )
+
+    assert submission.scheduler_job_id == "123456"
+    assert "--gres=gpu:a100:1" in calls[0][-1]
+
+
+def test_scheduler_one_off_accepts_cpu_constraints_but_direct_constraints_reject_zero() -> None:
+    with pytest.raises(ValidationError):
+        ResourceConstraints.model_validate({"gpu_count": 0})
+
+    submission = SchedulerOneOffSubmit.model_validate(
+        {
+            "target_id": "hanhai22",
+            "project_id": "project-a",
+            "task_ref": "cpu-one-off",
+            "purpose": "approved CPU-only one-off job",
+            "approval_ref": "thread:approved-cpu-one-off",
+            "duration_seconds": 600,
+            "constraints": {"gpu_count": 0},
+            "scheduler": {
+                "partition": "CPU-64C256GB",
+                "qos": "cpu",
+                "cpu_cores": 64,
+                "memory_mib": 256 * 1024,
+                "nodes": 1,
+                "tasks_per_node": 1,
+                "working_directory": "/home/test",
+            },
+            "script_body": "true\n",
+        }
+    )
+
+    assert submission.constraints.gpu_count == 0
+    assert submission.approval_ref == "thread:approved-cpu-one-off"
+
+
 def test_scheduler_target_is_discoverable_and_access_is_read_only(
     tmp_path: Path,
     inventory,
@@ -356,6 +461,87 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
     assert provider.cancellations == ["123456"]
 
 
+def test_cpu_only_one_off_is_valid_and_reaches_provider_without_gpu_request(
+    tmp_path: Path,
+    inventory,
+) -> None:
+    client, provider = _client(tmp_path, inventory)
+    client.post(
+        "/api/v1/scheduler-targets",
+        json=_target(),
+        headers={
+            "X-GPU-Broker-Actor": "scheduler-admin",
+            "Idempotency-Key": "target-hanhai22",
+        },
+    )
+    submitted = client.post(
+        "/api/v1/scheduler-jobs",
+        json={
+            "target_id": "hanhai22",
+            "project_id": "project-b",
+            "task_ref": "cpu-staging",
+            "purpose": "approved CPU and memory staging work",
+            "approval_ref": "thread:approved-cpu-staging",
+            "duration_seconds": 600,
+            "constraints": {"gpu_count": 0},
+            "scheduler": {
+                "partition": "CPU-64C256GB",
+                "qos": "cpu",
+                "cpu_cores": 64,
+                "memory_mib": 256 * 1024,
+                "nodes": 1,
+                "tasks_per_node": 1,
+                "working_directory": "/home/test",
+            },
+            "script_body": "true\n",
+        },
+        headers={
+            "X-GPU-Broker-Actor": "storyboard-agent",
+            "Idempotency-Key": "storyboard-cpu-staging-1",
+        },
+    )
+    assert submitted.status_code == 200, submitted.text
+    assert provider.submissions[0]["request"]["constraints"]["gpu_count"] == 0
+    assert provider.submissions[0]["request"]["scheduler"]["gpu_type"] is None
+
+
+def test_cpu_only_scheduler_rejects_gpu_type(
+    tmp_path: Path,
+    inventory,
+) -> None:
+    client, _provider = _client(tmp_path, inventory)
+    request = {
+        "target_id": "hanhai22",
+        "project_id": "project-a",
+        "task_ref": "invalid-cpu-contract",
+        "purpose": "must not combine a CPU-only request with a GPU type",
+        "approval_ref": "thread:invalid-cpu-contract",
+        "duration_seconds": 600,
+        "constraints": {"gpu_count": 0},
+        "scheduler": {
+            "partition": "CPU-64C256GB",
+            "qos": "cpu",
+            "gpu_type": "a100",
+            "cpu_cores": 64,
+            "memory_mib": 256 * 1024,
+            "nodes": 1,
+            "tasks_per_node": 1,
+            "working_directory": "/home/test",
+        },
+        "script_body": "true\n",
+    }
+    response = client.post(
+        "/api/v1/scheduler-jobs",
+        json=request,
+        headers={
+            "X-GPU-Broker-Actor": "storyboard-agent",
+            "Idempotency-Key": "invalid-cpu-contract-1",
+        },
+    )
+    assert response.status_code == 422
+    assert "CPU-only Slurm submissions cannot define gpu_type" in response.text
+
+
 def test_one_off_requires_access_and_does_not_retain_script_by_default(
     tmp_path: Path,
     inventory,
@@ -374,6 +560,7 @@ def test_one_off_requires_access_and_does_not_retain_script_by_default(
         "project_id": "project-b",
         "task_ref": "one-off",
         "purpose": "one-off smoke test",
+        "approval_ref": "thread:one-off-approved",
         "duration_seconds": 1200,
         "constraints": {"gpu_count": 1},
         "scheduler": {
@@ -422,14 +609,17 @@ def test_one_off_requires_access_and_does_not_retain_script_by_default(
         },
     )
     assert submitted.status_code == 200, submitted.text
-    assert submitted.json()["scheduler_job"]["script_body_retained"] is False
+    job = submitted.json()["scheduler_job"]
+    assert job["approval_ref"] == "thread:one-off-approved"
+    assert job["script_body_retained"] is False
     service = client.app.state.service
     with service.database.session() as session:
         stored = session.get(
             SchedulerJob,
-            submitted.json()["scheduler_job"]["id"],
+            job["id"],
         )
         assert stored is not None
+        assert stored.approval_ref == "thread:one-off-approved"
         assert stored.script_body is None
         assert len(stored.script_digest) == 64
 
@@ -457,6 +647,7 @@ def test_access_failure_from_submit_is_reported_without_claiming_gpu(
         "project_id": "project-a",
         "task_ref": "route-loss",
         "purpose": "test route loss",
+        "approval_ref": "thread:route-loss-approved",
         "duration_seconds": 600,
         "constraints": {"gpu_count": 1},
         "scheduler": {

@@ -12,6 +12,7 @@ state/
 coverage.xml
 .coverage
 build/
+.build/
 dist/
 /GPU Broker.app
 /GPU Broker *.app
@@ -26,3 +27,19 @@ dist/
 /qa-*.png
 /design-qa.md
 .superdesign/
+
+# TEAMWORK_LOCAL_START
+# Teamwork local runtime state
+.codegraph/
+docs/teamwork/**
+.teamwork/runtime/**
+.teamwork/cold-archive/**
+.teamwork-init-transaction.json
+.*.teamwork-init-*
+docs/teamwork/.teamwork-init-transaction.json
+# Legacy v3 location retained as a fail-closed migration interlock.
+docs/teamwork/.discussion-transaction.json
+docs/teamwork/discussion/.discussion-transaction.json
+docs/teamwork/collaborate/.collaborate-transaction.json
+docs/teamwork/.*.teamwork-init-*
+# TEAMWORK_LOCAL_END

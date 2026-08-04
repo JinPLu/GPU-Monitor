@@ -20,6 +20,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Depends, FastAPI, Form, Header, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -176,7 +177,11 @@ def create_app(settings: Settings) -> FastAPI:
             status_code=422,
             content={
                 "schema_version": SCHEMA_VERSION,
-                "error": {"code": "validation_error", "message": "invalid request", "details": exc.errors()},
+                "error": {
+                    "code": "validation_error",
+                    "message": "invalid request",
+                    "details": jsonable_encoder(exc.errors()),
+                },
             },
         )
 

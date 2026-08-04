@@ -10,11 +10,11 @@
 
 ## Design decision
 
-Preserve the attractive native direction already established: a translucent, calm, room-based Apple Home style translated to an operations console. Product fixes should mature the interaction and copy without flattening the interface into a plain engineering table. The current composition is **Spatial Operations Desk**: one warm gray smoke-brown field, with transparent same-hue glass layers for navigation, collection, and detail.
+Preserve the attractive native direction already established: a translucent, calm, room-based Apple Home style translated to an operations console. Product fixes should mature the interaction and copy without flattening the interface into a plain engineering table. The current composition is **Spatial Operations Desk**: an Apple-neutral graphite/fog field over the warm compute-studio image, with transparent material layers for navigation, collection, and detail.
 
 ### Signature
 
-**Spatial Operations Desk** — the background is first unified into a warm gray smoke-brown color field. Any source texture is desaturated, softened, and color-graded into that field before UI is placed on top. Foreground panels are same-hue transparent glass, so the background texture passes through instead of being covered by white boards. Operational meaning comes from content density, semantic color, icons, and text. Do not use drifting orbs, parallax, animated gradients, or health-tinted haze as the primary state signal.
+**Spatial Operations Desk** — the background keeps the source image's cool daylight and warm practical-light contrast, then softens it behind native material. Foreground panels use neutral fog-white or graphite glass so the image passes through without competing with data. Operational meaning comes from content density, semantic color, icons, and text. Do not use drifting orbs, parallax, animated gradients, or health-tinted haze as the primary state signal.
 
 ## Tokens
 
@@ -24,14 +24,14 @@ Preserve the attractive native direction already established: a translucent, cal
 | --- | --- | --- |
 | Primary label | `NSColor.labelColor` | titles and primary text |
 | Secondary label | `NSColor.secondaryLabelColor` | metadata and helper text |
-| Warm field | smoke-brown neutral derived from the background | unified app field and glass tint |
-| Glass surface | same-hue translucent material, not `controlBackgroundColor` | navigation, collections, detail, and command island |
-| Interaction | adaptive smoke rose | deep in light appearance and brighter in dark appearance; app icon, selected navigation, primary button, lease/GPU icons, and global tint |
+| Ambient field | Apple fog `#F5F5F7` in light appearance; neutral graphite near `#1D1D1F` in dark appearance | unified app field behind the source image |
+| Glass surface | native material plus a light neutral tint, not an opaque custom board | navigation, collections, detail, and command island |
+| Interaction | `NSColor.controlAccentColor` | app icon, selected navigation, primary button, lease/GPU icons, meters, focus, and global tint |
 | Healthy | `systemGreen` | available / healthy state |
 | Attention | `systemOrange` | waiting / stale state |
 | Destructive | `systemRed` | error, conflict, confirmed destructive action |
 
-Do not hard-code a blue-gray brand palette. Use dynamic system colors for text and semantic states so vibrancy, contrast, and dark appearance remain coherent. The app's interaction tint is smoke rose, not system blue: it stays deep in light appearance and becomes brighter in dark appearance, and appears in the app icon, selected state, primary button, lease/GPU icons, and global tint. Green, orange, and red are retained but narrowed to semantic state only. Do not use `controlBackgroundColor` or white adaptive control fills as broad card/desk surfaces; they create a white-board stack and break the unified glass field. Color is semantic support, never the only state signal.
+Use dynamic system colors for text, interaction, and semantic states so vibrancy, contrast, dark appearance, and the user's macOS accent preference remain coherent. System blue is the default Apple-like interaction reading, while `controlAccentColor` preserves platform behavior. Green, orange, and red are narrowed to semantic state only. Do not use `controlBackgroundColor` or opaque white fills as broad desk surfaces; light appearance should read as fog-white material, while dark appearance should read as neutral graphite material rather than blue-black or tinted “tech” panels. Color is semantic support, never the only state signal.
 
 ### Typography
 
@@ -56,6 +56,7 @@ Do not hard-code a blue-gray brand palette. Use dynamic system colors for text a
 - Standard icon size: 16pt in navigation, 18–20pt on cards, 22pt in primary status tiles.
 - Icon color matches the semantic state only inside a soft, rounded 32pt tile; otherwise it inherits the text hierarchy.
 - No mixed icon families, emoji, bespoke glyphs, or multi-colour illustration style.
+- Custom button styles read SwiftUI's native `isEnabled` environment so disabled controls lose emphasis instead of retaining a bright interaction fill.
 
 ### Motion
 
@@ -79,11 +80,11 @@ Do not hard-code a blue-gray brand palette. Use dynamic system colors for text a
 └──────────────┴───────────────────────────────────────────────────────────┘
 ```
 
-- Sidebar: 236–246pt regular system material; grouped navigation for real pages only; selection uses the deep smoke rose interaction tint; the live-connection state sits compactly at the foot without another floating card.
+- Sidebar: 236–246pt regular system material; grouped navigation for real pages only; selection uses the macOS control accent tint; the live-connection state sits compactly at the foot without another floating card.
 - Title bar: one crisp title, not a glassy low-contrast label. Actor identity is a compact menu/control on the right.
 - Window: the initial size must fit within the visible screen area, accounting for menu bar and Dock. Prefer a polished first launch over a fixed oversized window.
-- Main region: the warm gray smoke-brown background fills the whole window, and the main content shares the window boundary. There is no outer margin, 30pt full-board corner radius, full-board stroke, or large desk shadow. Background texture should pass through every foreground layer; do not place white or `controlBackgroundColor` boards over it, and do not remove the atmospheric visual layer when fixing interactions.
-- Overview: a first-screen summary with available, claimed, occupied, and needs-attention counts; include concrete attention rows when action is needed instead of a duplicate quick-action strip.
+- Main region: the neutral ambient background fills the whole window, and the main content shares the window boundary. Preserve the compute-studio image's blue daylight and amber practical light at restrained saturation, following Apple Home's use of real rooms behind material. There is no outer margin, 30pt full-board corner radius, full-board stroke, or large desk shadow. Background texture should pass through every foreground layer; do not place opaque white or `controlBackgroundColor` boards over it, and do not remove the atmospheric visual layer when fixing interactions.
+- Overview: a first-screen summary with available, claimed, occupied, and needs-attention counts; include concrete attention rows when action is needed instead of a duplicate quick-action strip. Show at most eight exception rows on the overview, then provide one clearly labelled jump to the server pool so an exception storm cannot bury fleet and lease context.
 - Command island: refresh, add server, and claim GPU are the global command owners. Avoid repeating the same quick actions in both sidebar and overview.
 - Top state chips or hero stats: compact, rounded, icon-led status items in one line. Use real fleet state: Available, Claimed, Occupied, Needs attention.
 - Server pool: use collection + detail. Treat each endpoint as a “room” group in the collection. The primary identity is the exact `ssh -p <port> <user>@<host>` command in SF Mono; the endpoint ID is secondary metadata. Selecting a server opens a clearer detail layer with metrics, GPU list, and removal state.

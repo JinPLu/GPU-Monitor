@@ -353,7 +353,6 @@ class CommandSlurmProvider:
         scheduler = request["scheduler"]
         gpu_count = int(constraints["gpu_count"])
         gpu_type = scheduler.get("gpu_type")
-        gres = f"gpu:{gpu_type}:{gpu_count}" if gpu_type else f"gpu:{gpu_count}"
         encoded_script = base64.b64encode(script_body.encode("utf-8")).decode("ascii")
         wrapped = f"printf %s {shlex.quote(encoded_script)} | base64 -d | /bin/bash"
         arguments = [
@@ -363,7 +362,6 @@ class CommandSlurmProvider:
             f"--comment=gpu-broker:{broker_job_id}",
             f"--partition={scheduler['partition']}",
             f"--qos={scheduler['qos']}",
-            f"--gres={gres}",
             f"--nodes={scheduler['nodes']}",
             f"--ntasks-per-node={scheduler['tasks_per_node']}",
             f"--cpus-per-task={scheduler['cpu_cores']}",
@@ -374,6 +372,9 @@ class CommandSlurmProvider:
             f"--error={scheduler['stderr_pattern']}",
             f"--wrap={wrapped}",
         ]
+        if gpu_count:
+            gres = f"gpu:{gpu_type}:{gpu_count}" if gpu_type else f"gpu:{gpu_count}"
+            arguments.insert(6, f"--gres={gres}")
         output = self._run(connection, arguments, mutating=True)
         match = re.search(r"(?m)^\s*(\d+)(?:;[^\s]+)?\s*$", output)
         if match is None:

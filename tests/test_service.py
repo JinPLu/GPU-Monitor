@@ -5,6 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -24,6 +25,7 @@ from gpu_broker.models import (
 from gpu_broker.schemas import (
     ActorCreate,
     EndpointEnabled,
+    EndpointObservation,
     EndpointUpsert,
     LeaseObservedBind,
     MaintenanceCreate,
@@ -80,6 +82,199 @@ def test_idempotent_request_and_stable_uuid_identity(service, admin) -> None:
     gpu = service.list_gpus(admin)["data"][0]
     assert gpu["id"] == f"endpoint-a:{gpu['gpu_uuid']}"
     assert gpu["state"] == "HELD"
+
+
+def test_complete_observation_reconciles_active_gpu_set(service, admin) -> None:
+    service.ingest_observation(
+        observation(gpu_uuids=["GPU-old-0", "GPU-old-1", "GPU-stays"])
+    )
+    result = service.ingest_observation(observation(gpu_uuids=["GPU-new-0", "GPU-stays"]))
+
+    snapshot = service.snapshot(admin)["data"]
+
+    assert result["absent_gpu_count"] == 2
+    assert [gpu["id"] for gpu in snapshot["gpus"]] == [
+        "endpoint-a:GPU-new-0",
+        "endpoint-a:GPU-stays",
+    ]
+    assert snapshot["summary"]["total_gpus"] == 2
+    assert snapshot["endpoints"][0]["monitor"]["gpu_count"] == 2
+    assert snapshot["endpoints"][0]["monitor"]["absent_gpu_count"] == 2
+    assert snapshot["absent_gpu_ids"] == ["endpoint-a:GPU-old-0", "endpoint-a:GPU-old-1"]
+
+
+def test_incomplete_observation_does_not_mark_prior_gpus_absent(service, admin) -> None:
+    service.ingest_observation(observation(gpu_uuids=["GPU-old-0", "GPU-stays"]))
+    result = service.ingest_observation(
+        observation(gpu_uuids=["GPU-stays"], observation_complete=False)
+    )
+
+    snapshot = service.snapshot(admin)["data"]
+
+    assert result["absent_gpu_count"] == 0
+    assert result["observation_complete"] is False
+    assert [gpu["id"] for gpu in snapshot["gpus"]] == [
+        "endpoint-a:GPU-old-0",
+        "endpoint-a:GPU-stays",
+    ]
+
+
+def test_observation_gpu_uuid_and_index_must_be_unique() -> None:
+    with pytest.raises(ValidationError, match="unique gpu_uuid"):
+        observation(gpu_uuids=["GPU-dup", "GPU-dup"])
+
+    base = observation(gpu_uuids=["GPU-a", "GPU-b"]).model_dump()
+    base["gpus"][1]["gpu_index"] = base["gpus"][0]["gpu_index"]
+    with pytest.raises(ValidationError, match="unique gpu_index"):
+        EndpointObservation.model_validate(base)
+
+
+def test_absent_gpu_keeps_lease_but_is_not_eligible(service, admin) -> None:
+    service.ingest_observation(observation(gpu_uuids=["GPU-old", "GPU-new"]))
+    exact_old = RequestCreate.model_validate(
+        {
+            "project_id": "project-a",
+            "task_ref": "old-gpu",
+            "purpose": "hold old GPU",
+            "duration_seconds": 3600,
+            "constraints": {
+                "gpu_count": 1,
+                "placement": "exact",
+                "gpu_ids": ["endpoint-a:GPU-old"],
+            },
+        }
+    )
+    claimed_old = service.create_request(admin, exact_old, idempotency_key="old-gpu")
+    assert claimed_old["lease"] is not None
+
+    service.ingest_observation(observation(gpu_uuids=["GPU-new"]))
+    claim_new = service.create_request(admin, request_data("new-gpu"), idempotency_key="new-gpu")
+    queued = service.create_request(admin, request_data("no-more-gpus"), idempotency_key="no-more-gpus")
+    snapshot = service.snapshot(admin)["data"]
+
+    assert claim_new["lease"]["gpu_ids"] == ["endpoint-a:GPU-new"]
+    assert queued["lease"] is None
+    assert "absent=1" in queued["request"]["blocked_reason"]
+    assert snapshot["gpus"][0]["id"] == "endpoint-a:GPU-new"
+    assert any("endpoint-a:GPU-old" in lease["gpu_ids"] for lease in snapshot["leases"])
+
+
+def test_absent_gpu_in_multi_gpu_lease_suppresses_all_executable_resources(service, admin) -> None:
+    service.ingest_observation(observation(gpu_uuids=["GPU-old", "GPU-new"]))
+    claimed = service.create_request(
+        admin,
+        request_data("two-gpu-lease", count=2),
+        idempotency_key="two-gpu-lease",
+    )
+    assert claimed["lease"] is not None
+    assert len(claimed["lease"]["resources"]) == 1
+
+    service.ingest_observation(observation(gpu_uuids=["GPU-new"]))
+    lease = service.list_leases(admin)["data"][0]
+    snapshot_lease = service.snapshot(admin)["data"]["leases"][0]
+
+    assert set(lease["gpu_ids"]) == {"endpoint-a:GPU-old", "endpoint-a:GPU-new"}
+    assert lease["absent_gpu_ids"] == ["endpoint-a:GPU-old"]
+    assert lease["resources"] == []
+    assert snapshot_lease["resources"] == []
+
+
+def test_incomplete_observation_preserves_unobserved_process_and_blocks_exact_claim(
+    service, admin
+) -> None:
+    service.ingest_observation(
+        observation(
+            gpu_uuids=["GPU-old", "GPU-new"],
+            processes=[process_for_gpu("GPU-old")],
+        )
+    )
+    result = service.ingest_observation(
+        observation(gpu_uuids=["GPU-new"], observation_complete=False)
+    )
+
+    gpus = {gpu["id"]: gpu for gpu in service.list_gpus(admin)["data"]}
+    exact_old = RequestCreate.model_validate(
+        {
+            "project_id": "project-a",
+            "task_ref": "old-incomplete",
+            "purpose": "should remain blocked by preserved process",
+            "duration_seconds": 3600,
+            "constraints": {
+                "gpu_count": 1,
+                "placement": "exact",
+                "gpu_ids": ["endpoint-a:GPU-old"],
+            },
+        }
+    )
+    blocked = service.create_request(admin, exact_old, idempotency_key="old-incomplete")
+
+    assert result["observation_complete"] is False
+    assert gpus["endpoint-a:GPU-old"]["state"] == "BUSY_UNMANAGED"
+    assert len(gpus["endpoint-a:GPU-old"]["processes"]) == 1
+    assert blocked["lease"] is None
+    assert "busy_unmanaged=1" in blocked["request"]["blocked_reason"]
+
+
+def test_absent_gpu_reappearance_restores_presence(service, admin) -> None:
+    service.ingest_observation(observation(gpu_uuids=["GPU-old", "GPU-stays"]))
+    service.ingest_observation(observation(gpu_uuids=["GPU-stays"]))
+    service.ingest_observation(observation(gpu_uuids=["GPU-old", "GPU-stays"]))
+
+    snapshot = service.snapshot(admin)["data"]
+
+    assert [gpu["id"] for gpu in snapshot["gpus"]] == [
+        "endpoint-a:GPU-old",
+        "endpoint-a:GPU-stays",
+    ]
+    assert snapshot["absent_gpu_ids"] == []
+    assert snapshot["summary"]["total_gpus"] == 2
+
+
+def test_stale_observation_is_ignored_without_mutating_latest_presence(service, admin) -> None:
+    first_seen = utcnow()
+    second_seen = first_seen + timedelta(seconds=10)
+    service.ingest_observation(
+        observation(gpu_uuids=["GPU-new"], observed_at=second_seen)
+    )
+    before = service.snapshot(admin)
+
+    result = service.ingest_observation(
+        observation(gpu_uuids=["GPU-old"], observed_at=first_seen)
+    )
+    after = service.snapshot(admin)
+
+    assert result["ignored"] is True
+    assert result["ignore_reason"] == "stale_observation"
+    assert result["snapshot_revision"] == before["snapshot_revision"]
+    assert after["snapshot_revision"] == before["snapshot_revision"]
+    assert [gpu["id"] for gpu in after["data"]["gpus"]] == ["endpoint-a:GPU-new"]
+    assert after["data"]["absent_gpu_ids"] == []
+
+
+def test_explicit_reservation_rejects_absent_gpu_until_reappears(service, admin) -> None:
+    service.ingest_observation(observation(gpu_uuids=["GPU-old", "GPU-new"]))
+    service.ingest_observation(observation(gpu_uuids=["GPU-new"]))
+    start_at = utcnow() + timedelta(hours=1)
+    reservation = ReservationCreate(
+        project_id="project-a",
+        gpu_ids=["endpoint-a:GPU-old"],
+        start_at=start_at,
+        end_at=start_at + timedelta(hours=1),
+        reason="future use of returning GPU",
+    )
+
+    with pytest.raises(BrokerError) as error:
+        service.create_reservation(admin, reservation, idempotency_key="absent-reservation")
+    assert error.value.code == "gpu_absent"
+
+    service.ingest_observation(observation(gpu_uuids=["GPU-old", "GPU-new"]))
+    created = service.create_reservation(
+        admin,
+        reservation,
+        idempotency_key="present-reservation",
+    )
+
+    assert created["reservation"]["gpu_ids"] == ["endpoint-a:GPU-old"]
 
 
 def test_workload_profile_claim_uses_approved_contract_atomically(service, admin) -> None:

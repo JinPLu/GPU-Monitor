@@ -215,7 +215,7 @@ def gpu_scheduler_submit_once(
     """Submit one project-owned Slurm script and bounded resource request.
 
     The request must include target_id, project_id, task_ref, purpose,
-    duration_seconds, constraints, scheduler, and script_body.
+    approval_ref, duration_seconds, constraints, scheduler, and script_body.
     Broker stores the script digest by default; retain_submission_body must be
     explicitly true to retain the exact body.
     """
@@ -225,6 +225,7 @@ def gpu_scheduler_submit_once(
         "project_id",
         "task_ref",
         "purpose",
+        "approval_ref",
         "duration_seconds",
         "constraints",
         "scheduler",

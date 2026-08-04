@@ -77,8 +77,16 @@ gpu-broker daemon install --source-root "$PWD"
 
 ```bash
 zsh desktop/build-macos-app.sh
+zsh desktop/verify-macos-app.sh
 open "dist/GPU Broker.app"
 ```
+
+构建机需要 Python 3.12 和 `uv`；脚本会在构建环境中临时解析 PyInstaller。生成的
+`GPU Broker.app` 已内置后端、迁移和空 inventory，目标 Mac 不需要另装 Python、
+`uv` 或 `gpu-broker` CLI。验证脚本会从 `/tmp` 启动内置后端，并检查前端只链接
+macOS 系统库。为避免同步盘给 App 注入会破坏严格签名复验的 Finder 元数据，正式
+产物安装在 `~/Applications/GPU Broker.app`，项目内的 `dist/GPU Broker.app` 是该
+产物的入口链接；可用 `GPU_BROKER_USER_APPLICATIONS_DIR` 覆盖安装目录。
 
 ### Windows 桌面版
 
@@ -89,7 +97,8 @@ open "dist/GPU Broker.app"
 .\dist\windows\GPU Broker\GPU Broker.exe
 ```
 
-桌面版都是源码构建产物，不是已签名安装包。Windows 首次运行会在 `%LOCALAPPDATA%\GPU Broker\` 写入默认 inventory 和 SQLite state；路径和端口可用 `GPU_BROKER_DATA_DIR`、`GPU_BROKER_INVENTORY`、`GPU_BROKER_DATABASE_URL`、`GPU_BROKER_BIND_PORT` 覆盖。
+桌面版都是源码构建产物，不是经 Developer ID 公证的安装包；macOS 产物使用 ad-hoc
+签名。Windows 首次运行会在 `%LOCALAPPDATA%\GPU Broker\` 写入默认 inventory 和 SQLite state；路径和端口可用 `GPU_BROKER_DATA_DIR`、`GPU_BROKER_INVENTORY`、`GPU_BROKER_DATABASE_URL`、`GPU_BROKER_BIND_PORT` 覆盖。
 
 ## 直接使用
 

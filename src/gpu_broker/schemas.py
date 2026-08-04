@@ -72,6 +72,35 @@ class ResourceConstraints(StrictModel):
         return self
 
 
+class SchedulerResourceConstraints(ResourceConstraints):
+    gpu_count: int = Field(ge=0, le=1024)
+
+    @model_validator(mode="after")
+    def validate_topology(self) -> "SchedulerResourceConstraints":
+        if self.gpu_count == 0:
+            gpu_specific_constraints = any(
+                (
+                    self.gpus_per_node is not None,
+                    self.min_total_vram_mib is not None,
+                    self.min_free_vram_mib is not None,
+                    bool(self.gpu_labels),
+                    bool(self.gpu_ids),
+                    bool(self.deny_gpu_ids),
+                )
+            )
+            if gpu_specific_constraints:
+                raise ValueError(
+                    "gpu_count=0 cannot define GPU topology, labels, IDs, or VRAM thresholds"
+                )
+            if self.nodes != 1 or self.same_host or self.placement != "pack":
+                raise ValueError(
+                    "gpu_count=0 has no Broker topology; use scheduler nodes and placement instead"
+                )
+            return self
+        super().validate_topology()
+        return self
+
+
 class RequestCreate(StrictModel):
     project_id: str = Field(min_length=1, max_length=64)
     task_ref: str = Field(min_length=1, max_length=255)
@@ -84,6 +113,8 @@ class RequestCreate(StrictModel):
 
     @model_validator(mode="after")
     def validate_times(self) -> "RequestCreate":
+        if self.constraints.gpu_count == 0:
+            raise ValueError("bare-metal requests require gpu_count >= 1")
         if self.start_after and self.start_after.tzinfo is None:
             raise ValueError("start_after must include a timezone")
         if self.deadline and self.deadline.tzinfo is None:
@@ -161,6 +192,8 @@ class ReservationCreate(StrictModel):
             raise ValueError("reservation end_at must be after start_at")
         if not self.gpu_ids and self.constraints is None:
             raise ValueError("reservation requires gpu_ids or constraints")
+        if self.constraints is not None and self.constraints.gpu_count == 0:
+            raise ValueError("reservations require constraints.gpu_count >= 1")
         return self
 
 
@@ -216,14 +249,17 @@ class WorkloadProfileUpsert(StrictModel):
         if self.constraints.gpu_ids or self.constraints.placement == "exact":
             raise ValueError("workload profile cannot pin exact gpu_ids")
         if self.runtime_kind == "direct-gpu":
+            if self.constraints.gpu_count == 0:
+                raise ValueError("direct-gpu workload profiles require gpu_count >= 1")
             if self.scheduler_target_id or self.scheduler or self.scheduler_script:
                 raise ValueError(
                     "direct-gpu workload profile cannot define scheduler fields"
                 )
-        elif not self.scheduler_target_id or self.scheduler is None or not self.scheduler_script:
-            raise ValueError(
-                "slurm workload profile requires scheduler_target_id, scheduler and scheduler_script"
-            )
+        else:
+            if not self.scheduler_target_id or self.scheduler is None or not self.scheduler_script:
+                raise ValueError(
+                    "slurm workload profile requires scheduler_target_id, scheduler and scheduler_script"
+                )
         return self
 
 
@@ -324,7 +360,8 @@ class SchedulerOneOffSubmit(StrictModel):
     task_ref: str = Field(min_length=1, max_length=255)
     purpose: str = Field(min_length=1, max_length=1000)
     duration_seconds: int = Field(ge=60, le=60 * 60 * 24 * 30)
-    constraints: ResourceConstraints
+    approval_ref: str = Field(min_length=1, max_length=500)
+    constraints: SchedulerResourceConstraints
     scheduler: SlurmJobSpec
     script_body: str = Field(min_length=1, max_length=128_000)
     retain_submission_body: bool = False
@@ -335,6 +372,8 @@ class SchedulerOneOffSubmit(StrictModel):
             raise ValueError(
                 "external scheduler submissions cannot pin Broker endpoint_ids or gpu_ids"
             )
+        if self.constraints.gpu_count == 0 and self.scheduler.gpu_type is not None:
+            raise ValueError("CPU-only Slurm submissions cannot define gpu_type")
         return self
 
 
@@ -508,6 +547,7 @@ class EndpointObservation(StrictModel):
     host: HostTelemetryInput
     gpus: list[TelemetryInput]
     processes: list[ProcessInput] = Field(default_factory=list)
+    observation_complete: bool = True
 
     @field_validator("observed_at")
     @classmethod
@@ -515,6 +555,16 @@ class EndpointObservation(StrictModel):
         if value.tzinfo is None:
             raise ValueError("observed_at must include a timezone")
         return value
+
+    @model_validator(mode="after")
+    def gpu_identity_is_unique(self) -> "EndpointObservation":
+        gpu_uuids = [gpu.gpu_uuid for gpu in self.gpus]
+        if len(gpu_uuids) != len(set(gpu_uuids)):
+            raise ValueError("observation gpus must contain unique gpu_uuid values")
+        gpu_indexes = [gpu.gpu_index for gpu in self.gpus]
+        if len(gpu_indexes) != len(set(gpu_indexes)):
+            raise ValueError("observation gpus must contain unique gpu_index values")
+        return self
 
 
 class AlertAcknowledge(StrictModel):

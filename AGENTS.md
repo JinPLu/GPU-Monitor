@@ -18,3 +18,14 @@
 - Python 3.12；依赖改动同步 `uv.lock`。持久化或公共行为改动同步 migration、文档和测试。
 - 运行最贴近改动面的测试与 Ruff；除非用户明确要求只读 shadow 采集，否则不得连接真实 GPU。
 - 修改桌面壳或打包路径时运行 `zsh desktop/build-macos-app.sh`；`dist/GPU Broker.app` 只作为构建产物。
+
+<!-- TEAMWORK_PROJECT_START -->
+## Teamwork Project Instructions
+
+- Project label (local routing only): `gpu-broker`.
+- Read `docs/teamwork/index.json` first before choosing Teamwork memory routes.
+- Normal Teamwork workflow writes use case-v2 only; legacy-v1 and old collaboration modes are migration inputs, not runtime routes.
+- For Collaborate dialogue, brainstorm, and challenge checkpoints, use the selected v2 case manifest and `live/collaborate.md`; accepted decisions use `decision.md`. Route both through `case-inspect`, `case-schema`, and `case-apply`; never mirror them into ordinary memory, legacy Discussion/Design, or a report.
+- For ordinary durable memory, follow the relevant case manifest. Keep volatile progress in its actual artifact.
+- CodeGraph: this project has a local `.codegraph/` index.
+<!-- TEAMWORK_PROJECT_END -->

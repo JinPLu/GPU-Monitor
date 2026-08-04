@@ -13,7 +13,7 @@ from gpu_broker.api import create_app
 from gpu_broker.cli import app as cli_app
 from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
 from gpu_broker.mcp_server import mcp
-from gpu_broker.schemas import EndpointUpsert
+from gpu_broker.schemas import EndpointUpsert, RequestCreate
 from tests.helpers import observation, process_for_gpu
 
 
@@ -103,6 +103,75 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert "可用 CPU 核数" in requests.text
     assert "可用内存 GiB" in requests.text
     assert "单卡可用显存 GiB" in requests.text
+
+
+def test_snapshot_api_uses_latest_complete_gpu_set(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'latest.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    service.ingest_observation(
+        observation(gpu_uuids=["GPU-old-0", "GPU-old-1", "GPU-stays"])
+    )
+    service.ingest_observation(observation(gpu_uuids=["GPU-new-0", "GPU-stays"]))
+
+    client = TestClient(app)
+    snapshot = client.get("/api/v1/snapshot", headers={"X-GPU-Broker-Actor": "test-agent"})
+
+    assert snapshot.status_code == 200
+    data = snapshot.json()["data"]
+    assert [gpu["id"] for gpu in data["gpus"]] == [
+        "endpoint-a:GPU-new-0",
+        "endpoint-a:GPU-stays",
+    ]
+    assert data["summary"]["total_gpus"] == 2
+    assert data["endpoints"][0]["monitor"]["gpu_count"] == 2
+
+
+def test_lease_api_suppresses_executable_resources_when_claimed_gpu_absent(
+    tmp_path: Path, inventory
+) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'lease-presence.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    actor = service.local_actor("test-agent")
+    service.ingest_observation(observation(gpu_uuids=["GPU-old", "GPU-new"]))
+    service.create_request(
+        actor,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "api-two-gpu",
+                "purpose": "API resource suppression test",
+                "duration_seconds": 3600,
+                "constraints": {"gpu_count": 2, "placement": "pack"},
+            }
+        ),
+        idempotency_key="api-two-gpu",
+    )
+    service.ingest_observation(observation(gpu_uuids=["GPU-new"]))
+
+    client = TestClient(app)
+    leases = client.get("/api/v1/leases", headers={"X-GPU-Broker-Actor": "test-agent"})
+
+    assert leases.status_code == 200
+    lease = leases.json()["data"][0]
+    assert set(lease["gpu_ids"]) == {"endpoint-a:GPU-old", "endpoint-a:GPU-new"}
+    assert lease["absent_gpu_ids"] == ["endpoint-a:GPU-old"]
+    assert lease["resources"] == []
 
 
 def test_workload_profile_rest_and_gui_claim(tmp_path: Path, inventory) -> None:

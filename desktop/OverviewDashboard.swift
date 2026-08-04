@@ -3,22 +3,41 @@ import SwiftUI
 
 struct FleetOverview: View {
     let snapshot: BrokerSnapshot
-    let isRefreshing: Bool
-    let refresh: () -> Void
     let openEndpoint: (EndpointRecord) -> Void
     let selectGPU: (GPURecord) -> Void
+    let openServerPool: () -> Void
+
+    private let maximumVisibleAttentionItems = 8
 
     private let attentionStates = Set([
         "BUSY_UNMANAGED", "UNKNOWN_RECOVERING", "UNKNOWN_STALE",
-        "UNHEALTHY", "CONFLICT", "ORPHANED_BUSY"
+        "UNHEALTHY", "CONFLICT", "ORPHANED_BUSY", "DRAINING", "RETIRED",
+        "DISABLED", "MAINTENANCE"
     ])
 
     private var attentionEndpoints: [EndpointRecord] {
-        snapshot.endpoints.filter { ["ERROR", "STALE"].contains($0.monitorStatus) }
+        snapshot.endpoints.filter { ["ERROR", "STALE", "DRAINING", "RETIRED", "DISABLED"].contains($0.monitorStatus) }
     }
 
     private var attentionGPUs: [GPURecord] {
         snapshot.gpus.filter { attentionStates.contains($0.state) }
+    }
+
+    private var visibleAttentionEndpoints: [EndpointRecord] {
+        Array(attentionEndpoints.prefix(min(4, maximumVisibleAttentionItems)))
+    }
+
+    private var visibleAttentionGPUs: [GPURecord] {
+        let remainingSlots = max(0, maximumVisibleAttentionItems - visibleAttentionEndpoints.count)
+        return Array(attentionGPUs.prefix(remainingSlots))
+    }
+
+    private var hiddenAttentionCount: Int {
+        max(
+            0,
+            attentionEndpoints.count + attentionGPUs.count
+                - visibleAttentionEndpoints.count - visibleAttentionGPUs.count
+        )
     }
 
     private var freshEndpointIDs: Set<String> {
@@ -44,65 +63,66 @@ struct FleetOverview: View {
     }
 
     var body: some View {
-        GeometryReader { proxy in
-            let compact = proxy.size.width < 1000
-            let condensed = proxy.size.width < 1000
-            let serverColumns = overviewColumns(for: proxy.size.width)
-
+        ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 overviewHeader
-                summaryGrid(compact: compact)
+                summaryGrid
                 coordinationSignals
                 attentionSection
-                actionBar
-                serverPool(columns: serverColumns)
-                leaseSection(condensed: condensed)
+                serverPool
+                leaseSection
 
                 Label(snapshot.admissionBoundary, systemImage: "hand.raised.fill")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
-                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(.leading, compact ? 16 : 24)
-            .padding(.trailing, compact ? 40 : 24)
+            .padding(.horizontal, 24)
             .padding(.bottom, 16)
-            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+        .accessibilityLabel("资源总览")
     }
 
     private var overviewHeader: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("实时概览")
-                    .font(.system(size: 16, weight: .semibold))
-                Text("查看已登记容量、最新在线状态与协调中的租约")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(DesignTokens.mutedInk)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 12)
-            Text("\(snapshot.summary.totalServers) 台已登记 · \(snapshot.summary.onlineServers) 台在线")
-                .lineLimit(1)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
-                .background(.ultraThinMaterial, in: Capsule())
+        VStack(alignment: .leading, spacing: 7) {
+            overviewHeading
+            overviewCapacityBadge
         }
         .font(.system(size: 11, weight: .semibold, design: .rounded))
         .foregroundStyle(DesignTokens.mutedInk)
     }
 
-    @ViewBuilder
-    private func summaryGrid(compact: Bool) -> some View {
-        let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: compact ? 1 : 3)
+    private var overviewHeading: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("实时概览")
+                .font(.system(size: 16, weight: .semibold))
+            Text("查看已登记容量、最新在线状态与协调中的租约")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .lineLimit(1)
+        }
+    }
+
+    private var overviewCapacityBadge: some View {
+        Text("\(snapshot.summary.totalServers) 台已登记 · \(snapshot.summary.onlineServers) 台在线")
+            .lineLimit(1)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(.regularMaterial, in: Capsule())
+    }
+
+    private var summaryGrid: some View {
         LazyVGrid(columns: columns, spacing: 10) {
             OverviewSummaryCard(title: "已登记 GPU", value: snapshot.summary.totalGPUs, icon: "square.grid.3x3.fill")
             OverviewSummaryCard(title: "在线 / 最新 GPU", value: freshGPUCount, icon: "waveform.path.ecg")
             OverviewSummaryCard(title: "当前可分配", value: allocatableGPUCount, icon: "checkmark.circle.fill")
+            OverviewSummaryCard(title: "预约", value: snapshot.reservations.count, icon: "calendar.badge.clock")
         }
     }
 
     private var coordinationSignals: some View {
-        HStack(spacing: 8) {
+        LazyVGrid(columns: columns, spacing: 8) {
             CoordinationSignal(
                 title: "空闲租约",
                 value: "\(idleLeaseGPUCount) GPU",
@@ -119,10 +139,10 @@ struct FleetOverview: View {
             )
             CoordinationSignal(
                 title: "状态例外",
-                value: "\(attentionEndpoints.count)",
-                detail: "过期或连接异常",
+                value: "\(attentionEndpoints.count + attentionGPUs.count)",
+                detail: "需要人工确认",
                 icon: "exclamationmark.triangle.fill",
-                color: attentionEndpoints.isEmpty ? DesignTokens.mutedInk : DesignTokens.danger
+                color: (attentionEndpoints.isEmpty && attentionGPUs.isEmpty) ? DesignTokens.mutedInk : DesignTokens.danger
             )
         }
     }
@@ -148,61 +168,57 @@ struct FleetOverview: View {
                     .padding(.horizontal, 13)
                     .overviewSurface(radius: 10)
             } else {
-                ScrollView(.horizontal, showsIndicators: true) {
-                    HStack(spacing: 8) {
-                        ForEach(attentionEndpoints) { endpoint in
-                            Button { openEndpoint(endpoint) } label: {
-                                AttentionCard(
-                                    title: endpoint.sshCommand,
-                                    detail: endpoint.monitorDetail ?? endpoint.monitorLabel,
-                                    icon: "server.rack"
-                                )
-                            }
-                            .buttonStyle(.plain)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 260, maximum: 420), spacing: 8)], spacing: 8) {
+                    ForEach(visibleAttentionEndpoints) { endpoint in
+                        Button { openEndpoint(endpoint) } label: {
+                            AttentionCard(
+                                title: endpoint.sshCommand,
+                                detail: endpoint.monitorDetail ?? endpoint.monitorLabel,
+                                icon: endpointIcon(endpoint.monitorStatus)
+                            )
                         }
-                        ForEach(attentionGPUs) { gpu in
-                            Button { selectGPU(gpu) } label: {
-                                AttentionCard(
-                                    title: "GPU \(gpu.index) · \(gpu.name)",
-                                    detail: overviewGPUStateLabel(gpu.state),
-                                    icon: "square.3.layers.3d"
-                                )
-                            }
-                            .buttonStyle(.plain)
-                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("端点状态例外")
+                        .accessibilityValue("\(endpoint.displayName)，\(endpoint.monitorLabel)")
                     }
-                    .padding(.bottom, 3)
+                    ForEach(visibleAttentionGPUs) { gpu in
+                        Button { selectGPU(gpu) } label: {
+                            AttentionCard(
+                                title: "GPU \(gpu.index) · \(gpu.name)",
+                                detail: overviewGPUStateLabel(gpu.state),
+                                icon: overviewGPUStateIcon(gpu.state)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("GPU 状态例外")
+                        .accessibilityValue("GPU \(gpu.index)，\(overviewGPUStateLabel(gpu.state))")
+                    }
                 }
-                .frame(height: 58)
+                if hiddenAttentionCount > 0 {
+                    Button(action: openServerPool) {
+                        HStack(spacing: 8) {
+                            Label("另有 \(hiddenAttentionCount) 项状态例外", systemImage: "ellipsis.circle.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                            Spacer(minLength: 8)
+                            Text("在服务器池查看")
+                                .font(.system(size: 10, weight: .semibold))
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 9, weight: .semibold))
+                        }
+                        .foregroundStyle(DesignTokens.interaction)
+                        .padding(.horizontal, 12)
+                        .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+                        .overviewSurface(radius: 9)
+                    }
+                    .buttonStyle(.plain)
+                    .help("打开服务器池查看全部状态例外")
+                    .accessibilityLabel("另有 \(hiddenAttentionCount) 项状态例外，在服务器池查看全部")
+                }
             }
         }
     }
 
-    private var actionBar: some View {
-        HStack(spacing: 8) {
-            Button(action: refresh) {
-                HStack(spacing: 5) {
-                    Image(systemName: "arrow.clockwise")
-                        .rotationEffect(.degrees(isRefreshing ? 360 : 0))
-                    Text("刷新")
-                }
-                .animation(
-                    isRefreshing ? .linear(duration: 0.7).repeatForever(autoreverses: false) : .easeOut(duration: 0.15),
-                    value: isRefreshing
-                )
-            }
-            .buttonStyle(SecondaryActionButtonStyle())
-            .disabled(isRefreshing)
-            .help("刷新资源状态")
-
-            Spacer()
-            Label(snapshotAgeLabel, systemImage: "clock.arrow.circlepath")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(DesignTokens.mutedInk)
-        }
-    }
-
-    private func serverPool(columns: [GridItem]) -> some View {
+    private var serverPool: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
                 Text("服务器池")
@@ -211,31 +227,32 @@ struct FleetOverview: View {
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(DesignTokens.mutedInk)
                 Spacer()
-                Text("上下滚动查看更多服务器")
+                Text(snapshotAgeLabel)
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
             }
 
-            ScrollView(.vertical, showsIndicators: true) {
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 10) {
-                    ForEach(snapshot.endpoints) { endpoint in
-                        OverviewServerCard(
-                            endpoint: endpoint,
-                            gpus: snapshot.gpus(for: endpoint),
-                            open: { openEndpoint(endpoint) },
-                            selectGPU: selectGPU
-                        )
-                    }
+            LazyVGrid(
+                columns: [
+                    GridItem(.flexible(minimum: 0), spacing: 10),
+                    GridItem(.flexible(minimum: 0), spacing: 10)
+                ],
+                alignment: .leading,
+                spacing: 10
+            ) {
+                ForEach(snapshot.endpoints) { endpoint in
+                    OverviewServerCard(
+                        endpoint: endpoint,
+                        gpus: snapshot.gpus(for: endpoint),
+                        open: { openEndpoint(endpoint) },
+                        selectGPU: selectGPU
+                    )
                 }
-                .padding(.trailing, 3)
-                .padding(.bottom, 4)
             }
-            .frame(maxHeight: .infinity)
         }
-        .frame(maxHeight: .infinity)
     }
 
-    private func leaseSection(condensed: Bool) -> some View {
+    private var leaseSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("当前租约")
@@ -244,39 +261,36 @@ struct FleetOverview: View {
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(DesignTokens.mutedInk)
                 Spacer()
-                Text("上下滚动")
+                Text("\(snapshot.requests.count) 个排队 · \(snapshot.reservations.count) 个预约")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
             }
 
-            ScrollView(.vertical, showsIndicators: true) {
-                LazyVStack(spacing: 6) {
-                    if snapshot.leases.isEmpty {
-                        Text("暂无活动租约")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(DesignTokens.mutedInk)
-                            .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
-                            .padding(.horizontal, 13)
-                            .overviewSurface(radius: 9)
-                    } else {
-                        ForEach(snapshot.leases) { lease in
-                            OverviewLeaseRow(
-                                lease: lease,
-                                gpuLabel: gpuLabel(for: lease),
-                                condensed: condensed
-                            )
-                        }
+            LazyVStack(spacing: 6) {
+                if snapshot.leases.isEmpty {
+                    Text("暂无活动租约")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+                        .padding(.horizontal, 13)
+                        .overviewSurface(radius: 9)
+                } else {
+                    ForEach(snapshot.leases) { lease in
+                        OverviewLeaseRow(
+                            lease: lease,
+                            gpuLabel: gpuLabel(for: lease)
+                        )
                     }
                 }
-                .padding(.trailing, 3)
+                ForEach(snapshot.reservations) { reservation in
+                    ReservationOverviewRow(reservation: reservation)
+                }
             }
-            .frame(height: 52)
         }
     }
 
-    private func overviewColumns(for width: CGFloat) -> [GridItem] {
-        let count = width >= 1060 ? 3 : (width >= 1000 ? 2 : 1)
-        return Array(repeating: GridItem(.flexible(), spacing: 10), count: count)
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: 180, maximum: 320), spacing: 10)]
     }
 
     private func gpuLabel(for lease: LeaseRecord) -> String {
@@ -355,7 +369,7 @@ private struct AttentionCard: View {
                 .foregroundStyle(DesignTokens.mutedInk)
         }
         .padding(.horizontal, 11)
-        .frame(width: 292, height: 50)
+        .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
         .overviewSurface(radius: 9)
     }
 }
@@ -489,11 +503,18 @@ private struct OverviewServerCard: View {
                     .frame(maxWidth: .infinity, minHeight: 70)
             } else {
                 LazyVGrid(columns: gpuColumns, spacing: 7) {
-                    ForEach(sortedGPUs) { gpu in
+                    ForEach(visibleGPUs) { gpu in
                         Button { selectGPU(gpu) } label: {
                             OverviewGPUTile(gpu: gpu)
                         }
                         .buttonStyle(.plain)
+                    }
+                    if hiddenGPUCount > 0 {
+                        Text("+\(hiddenGPUCount)")
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundStyle(DesignTokens.mutedInk)
+                            .frame(maxWidth: .infinity, minHeight: 62)
+                            .background(DesignTokens.ink.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     }
                 }
             }
@@ -510,10 +531,18 @@ private struct OverviewServerCard: View {
         Array(repeating: GridItem(.flexible(), spacing: 6), count: 4)
     }
 
+    private var visibleGPUs: [GPURecord] {
+        Array(sortedGPUs.prefix(12))
+    }
+
+    private var hiddenGPUCount: Int {
+        max(0, sortedGPUs.count - visibleGPUs.count)
+    }
+
     private var statusColor: Color {
         switch endpoint.monitorStatus {
         case "ONLINE": return DesignTokens.success
-        case "PENDING", "STALE": return DesignTokens.warning
+        case "PENDING", "STALE", "DRAINING": return DesignTokens.warning
         default: return DesignTokens.danger
         }
     }
@@ -617,7 +646,6 @@ private struct OverviewGPUTile: View {
 private struct OverviewLeaseRow: View {
     let lease: LeaseRecord
     let gpuLabel: String
-    let condensed: Bool
 
     var body: some View {
         HStack(spacing: 12) {
@@ -635,13 +663,19 @@ private struct OverviewLeaseRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
-            if !condensed {
-                LeaseFact(label: "操作者", value: lease.actorID, width: 230)
-                LeaseFact(label: "GPU ID", value: gpuLabel, width: 112)
-                    .help(lease.gpuIDs.joined(separator: "\n"))
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    LeaseFact(label: "操作者", value: lease.actorID, width: 170)
+                    LeaseFact(label: "GPU ID", value: gpuLabel, width: 112)
+                        .help(lease.gpuIDs.joined(separator: "\n"))
+                    LeaseFact(label: "GPU", value: "\(lease.gpuIDs.count) 块", width: 54)
+                    LeaseFact(label: "到期", value: overviewTimestamp(lease.expiresAt), width: 74)
+                }
+                HStack(spacing: 12) {
+                    LeaseFact(label: "GPU", value: "\(lease.gpuIDs.count) 块", width: 54)
+                    LeaseFact(label: "到期", value: overviewTimestamp(lease.expiresAt), width: 74)
+                }
             }
-            LeaseFact(label: "GPU", value: "\(lease.gpuIDs.count) 块", width: 54)
-            LeaseFact(label: "到期", value: overviewTimestamp(lease.expiresAt), width: 74)
             Text(lease.stateLabel)
                 .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(lease.state == "CONFLICT" ? DesignTokens.danger : DesignTokens.interaction)
@@ -649,6 +683,43 @@ private struct OverviewLeaseRow: View {
         .padding(.horizontal, 12)
         .frame(minHeight: 44)
         .overviewSurface(radius: 9)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("租约 \(lease.projectID)")
+        .accessibilityValue("\(lease.stateLabel)，\(lease.gpuIDs.count) 块 GPU")
+    }
+}
+
+private struct ReservationOverviewRow: View {
+    let reservation: ReservationRecord
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "calendar.badge.clock")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(DesignTokens.warning)
+                .frame(width: 28, height: 28)
+                .background(DesignTokens.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(reservation.projectID ?? "未标注项目")
+                    .font(.system(size: 10, weight: .semibold))
+                Text(reservation.purpose ?? "预约资源")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            LeaseFact(label: "GPU", value: "\(reservation.gpuIDs.count) 块", width: 54)
+            LeaseFact(label: "结束", value: overviewTimestamp(reservation.endsAt), width: 74)
+            Text(reservation.stateLabel)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(DesignTokens.warning)
+        }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 44)
+        .overviewSurface(radius: 9)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("预约 \(reservation.projectID ?? reservation.id)")
+        .accessibilityValue("\(reservation.stateLabel)，\(reservation.gpuIDs.count) 块 GPU")
     }
 }
 
@@ -672,11 +743,13 @@ private struct LeaseFact: View {
 
 private extension View {
     func overviewSurface(radius: CGFloat) -> some View {
-        background(DesignTokens.surface.opacity(0.78), in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        return background(.regularMaterial, in: shape)
+            .background(DesignTokens.surface.opacity(0.32), in: shape)
             .overlay(
-                RoundedRectangle(cornerRadius: radius, style: .continuous)
-                    .stroke(DesignTokens.surfaceStroke, lineWidth: 1)
+                shape.stroke(DesignTokens.surfaceStroke, lineWidth: 0.8)
             )
+            .shadow(color: DesignTokens.surfaceShadow, radius: 8, x: 0, y: 2)
     }
 }
 
@@ -703,7 +776,40 @@ private func overviewGPUStateLabel(_ state: String) -> String {
     case "CONFLICT": return "需要处理"
     case "DISABLED": return "已停用"
     case "MAINTENANCE": return "维护中"
+    case "DRAINING": return "排空中"
+    case "RETIRED": return "已退役"
     default: return "需处理"
+    }
+}
+
+private func overviewGPUStateIcon(_ state: String) -> String {
+    switch state {
+    case "AVAILABLE": return "checkmark.circle.fill"
+    case "HELD", "LEASED_IDLE": return "key.fill"
+    case "RUNNING_MANAGED": return "play.circle.fill"
+    case "BUSY_UNMANAGED", "ORPHANED_BUSY": return "person.crop.circle.badge.exclamationmark"
+    case "RESERVED": return "calendar.badge.clock"
+    case "MAINTENANCE": return "wrench.and.screwdriver.fill"
+    case "UNKNOWN_RECOVERING", "UNKNOWN_STALE": return "clock.badge.exclamationmark"
+    case "UNHEALTHY": return "cross.case.fill"
+    case "CONFLICT": return "exclamationmark.triangle.fill"
+    case "DISABLED": return "pause.circle.fill"
+    case "DRAINING": return "arrow.down.forward.and.arrow.up.backward"
+    case "RETIRED": return "archivebox.fill"
+    default: return "questionmark.diamond.fill"
+    }
+}
+
+private func endpointIcon(_ state: String) -> String {
+    switch state {
+    case "ONLINE": return "server.rack"
+    case "PENDING": return "hourglass"
+    case "STALE": return "clock.badge.exclamationmark"
+    case "ERROR": return "exclamationmark.triangle.fill"
+    case "DISABLED": return "pause.circle.fill"
+    case "DRAINING": return "arrow.down.forward.and.arrow.up.backward"
+    case "RETIRED": return "archivebox.fill"
+    default: return "questionmark.diamond.fill"
     }
 }
 

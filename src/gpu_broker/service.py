@@ -804,45 +804,50 @@ class BrokerService:
             ).all()
         }
         by_endpoint: dict[str, list[GPUDevice]] = defaultdict(list)
+        absent_gpu_ids: list[str] = []
         for resource in active_resources:
             gpu = gpu_by_id.get(resource.gpu_id)
             if gpu is not None:
-                by_endpoint[gpu.endpoint_id].append(gpu)
+                if gpu.present:
+                    by_endpoint[gpu.endpoint_id].append(gpu)
+                else:
+                    absent_gpu_ids.append(gpu.id)
         executable_resources: list[dict[str, Any]] = []
-        for endpoint_id, gpus in sorted(by_endpoint.items()):
-            endpoint = endpoints.get(endpoint_id)
-            if endpoint is None:
-                continue
-            gpus.sort(key=lambda item: item.gpu_index)
-            selectors = [gpu.gpu_uuid for gpu in gpus]
-            # Admission rejects unsafe selectors, but never emit an unvalidated
-            # value should historical telemetry predate that invariant.
-            if not all(CUDA_SELECTOR_RE.fullmatch(selector) for selector in selectors):
-                continue
-            commitment = commitments.get(endpoint_id)
-            executable_resources.append(
-                {
-                    "endpoint": {
-                        "id": endpoint.id,
-                        "host": endpoint.host,
-                        "port": endpoint.port,
-                        "ssh_user": endpoint.ssh_user,
-                    },
-                    "gpus": [
-                        {
-                            "id": gpu.id,
-                            "gpu_uuid": gpu.gpu_uuid,
-                            "gpu_index": gpu.gpu_index,
-                        }
-                        for gpu in gpus
-                    ],
-                    "cuda_visible_devices": ",".join(selectors),
-                    "commitment": {
-                        "cpu_cores": commitment.cpu_cores if commitment else 0.0,
-                        "memory_mib": commitment.memory_mib if commitment else 0,
-                    },
-                }
-            )
+        if not absent_gpu_ids:
+            for endpoint_id, gpus in sorted(by_endpoint.items()):
+                endpoint = endpoints.get(endpoint_id)
+                if endpoint is None:
+                    continue
+                gpus.sort(key=lambda item: item.gpu_index)
+                selectors = [gpu.gpu_uuid for gpu in gpus]
+                # Admission rejects unsafe selectors, but never emit an unvalidated
+                # value should historical telemetry predate that invariant.
+                if not all(CUDA_SELECTOR_RE.fullmatch(selector) for selector in selectors):
+                    continue
+                commitment = commitments.get(endpoint_id)
+                executable_resources.append(
+                    {
+                        "endpoint": {
+                            "id": endpoint.id,
+                            "host": endpoint.host,
+                            "port": endpoint.port,
+                            "ssh_user": endpoint.ssh_user,
+                        },
+                        "gpus": [
+                            {
+                                "id": gpu.id,
+                                "gpu_uuid": gpu.gpu_uuid,
+                                "gpu_index": gpu.gpu_index,
+                            }
+                            for gpu in gpus
+                        ],
+                        "cuda_visible_devices": ",".join(selectors),
+                        "commitment": {
+                            "cpu_cores": commitment.cpu_cores if commitment else 0.0,
+                            "memory_mib": commitment.memory_mib if commitment else 0,
+                        },
+                    }
+                )
         return {
             "id": lease.id,
             "request_id": lease.request_id,
@@ -850,6 +855,7 @@ class BrokerService:
             "project_id": lease.project_id,
             "state": lease.state,
             "gpu_ids": [resource.gpu_id for resource in active_resources],
+            "absent_gpu_ids": absent_gpu_ids,
             "resources": executable_resources,
             "issued_at": _iso(lease.issued_at),
             "expires_at": _iso(lease.expires_at),
@@ -975,6 +981,9 @@ class BrokerService:
     ) -> bool:
         cutoff = now - timedelta(seconds=self.inventory.collector.stale_after_seconds)
         for resource in resources:
+            gpu = session.get(GPUDevice, resource.gpu_id)
+            if gpu is None or not gpu.present:
+                return False
             telemetry = session.get(TelemetryCurrent, resource.gpu_id)
             observed_at = _as_utc(telemetry.observed_at) if telemetry is not None else None
             if observed_at is None or observed_at < cutoff:
@@ -1021,6 +1030,8 @@ class BrokerService:
         endpoint = session.get(Endpoint, gpu.endpoint_id)
         if endpoint is None or not gpu.enabled:
             return "DISABLED", "endpoint or GPU is disabled"
+        if not gpu.present:
+            return "UNKNOWN_STALE", "GPU absent from latest complete endpoint observation"
         if endpoint.lifecycle_state == "draining":
             return "DRAINING", "endpoint is draining and blocks new claims"
         if endpoint.lifecycle_state == "retired":
@@ -1110,10 +1121,12 @@ class BrokerService:
             "labels": json_load(gpu.labels_json),
             "health": gpu.health,
             "enabled": gpu.enabled,
+            "present": gpu.present,
             "state": state,
             "state_reason": reason,
             "first_seen_at": _iso(gpu.first_seen_at),
             "last_seen_at": _iso(gpu.last_seen_at),
+            "absent_at": _iso(gpu.absent_at),
             "telemetry": self._telemetry_dict(telemetry),
             "processes": [self._process_dict(process) for process in processes],
             "lease": self._lease_dict(session, lease) if lease else None,
@@ -1164,7 +1177,7 @@ class BrokerService:
                 if visible_ids
                 else {}
             )
-            gpus = (
+            endpoint_gpus = (
                 session.scalars(
                     select(GPUDevice)
                     .where(GPUDevice.endpoint_id.in_(visible_ids))
@@ -1173,6 +1186,8 @@ class BrokerService:
                 if visible_ids
                 else []
             )
+            gpus = [gpu for gpu in endpoint_gpus if gpu.present]
+            absent_gpu_ids = [gpu.id for gpu in endpoint_gpus if not gpu.present]
             gpu_ids = {gpu.id for gpu in gpus}
             gpu_counts: dict[str, int] = defaultdict(int)
             for gpu in gpus:
@@ -1333,6 +1348,11 @@ class BrokerService:
                     "monitor": {
                         "status": monitor_status,
                         "gpu_count": gpu_counts[endpoint.id],
+                        "absent_gpu_count": sum(
+                            1
+                            for gpu in endpoint_gpus
+                            if gpu.endpoint_id == endpoint.id and not gpu.present
+                        ),
                         "last_success_at": _iso(provider_state.last_success_at) if provider_state else None,
                         "last_attempt_at": _iso(provider_state.last_attempt_at) if provider_state else None,
                         "last_error": provider_state.last_error if provider_state else None,
@@ -1345,6 +1365,8 @@ class BrokerService:
                 endpoint = next(item for item in visible_endpoints if item.id == gpu.endpoint_id)
                 if not gpu.enabled:
                     return "DISABLED", "endpoint or GPU is disabled"
+                if not gpu.present:
+                    return "UNKNOWN_STALE", "GPU absent from latest complete endpoint observation"
                 if endpoint.lifecycle_state == "draining":
                     return "DRAINING", "endpoint is draining and blocks new claims"
                 if endpoint.lifecycle_state == "retired":
@@ -1405,10 +1427,12 @@ class BrokerService:
                     "labels": json_load(gpu.labels_json),
                     "health": gpu.health,
                     "enabled": gpu.enabled,
+                    "present": gpu.present,
                     "state": gpu_state,
                     "state_reason": reason,
                     "first_seen_at": _iso(gpu.first_seen_at),
                     "last_seen_at": _iso(gpu.last_seen_at),
+                    "absent_at": _iso(gpu.absent_at),
                     "telemetry": self._telemetry_dict(telemetry),
                     "processes": [self._process_dict(process) for process in processes],
                     "lease": lease_payloads.get(lease.id) if lease else None,
@@ -1447,11 +1471,16 @@ class BrokerService:
                     "endpoint_count": attention_endpoint_count,
                     "endpoint_status_counts": dict(sorted(endpoint_attention_status_counts.items())),
                     "gpu_count": attention_gpu_count,
+                    "absent_gpu_count": len(absent_gpu_ids),
                     "gpu_state_counts": gpu_attention_state_counts,
                     "unmanaged_gpu_count": counts["BUSY_UNMANAGED"],
-                    "total_resource_count": attention_endpoint_count + attention_gpu_count,
+                    "total_resource_count": attention_endpoint_count
+                    + attention_gpu_count
+                    + len(absent_gpu_ids),
                 },
             }
+            if not absent_gpu_ids:
+                summary["attention"].pop("absent_gpu_count")
             ages = [
                 max(0.0, (now - (_as_utc(item.observed_at) or now)).total_seconds())
                 for item in telemetry_by_gpu.values()
@@ -1489,12 +1518,13 @@ class BrokerService:
                     for item in gpu_payloads
                 ]
 
-            visible_gpu_ids = {gpu.id for gpu in gpus}
+            visible_gpu_ids = {gpu.id for gpu in endpoint_gpus}
             data = {
                 "summary": summary,
                 "data_age_seconds": round(max(ages), 1) if ages else None,
                 "endpoints": endpoint_payloads,
                 "gpus": gpu_payloads,
+                "absent_gpu_ids": absent_gpu_ids,
                 "leases": [
                     lease_payloads[lease.id]
                     for lease in visible_leases
@@ -1931,9 +1961,25 @@ class BrokerService:
             endpoint = session.get(Endpoint, observation.endpoint_id)
             if endpoint is None:
                 raise BrokerError("endpoint_not_found", "collector reported an unknown endpoint", status_code=404)
-            revision = self._bump_revision(session, now)
+            observed_gpu_ids = {f"{endpoint.id}:{sample.gpu_uuid}" for sample in observation.gpus}
             observed_at = ensure_utc(observation.observed_at)
             host_telemetry = session.get(EndpointTelemetryCurrent, endpoint.id)
+            current_observed_at = _as_utc(host_telemetry.observed_at) if host_telemetry else None
+            if current_observed_at is not None and observed_at < current_observed_at:
+                return {
+                    "event_id": None,
+                    "snapshot_revision": self._revision(session),
+                    "endpoint_id": endpoint.id,
+                    "gpu_count": len(observation.gpus),
+                    "absent_gpu_count": 0,
+                    "observation_complete": observation.observation_complete,
+                    "process_count": len(observation.processes),
+                    "history_points_written": 0,
+                    "ignored": True,
+                    "ignore_reason": "stale_observation",
+                    "current_observed_at": _iso(current_observed_at),
+                }
+            revision = self._bump_revision(session, now)
             if host_telemetry is None:
                 host_telemetry = EndpointTelemetryCurrent(
                     endpoint_id=endpoint.id,
@@ -1954,7 +2000,7 @@ class BrokerService:
                 host_telemetry.memory_total_mib = observation.host.memory_total_mib
                 host_telemetry.memory_available_mib = observation.host.memory_available_mib
                 host_telemetry.provider = provider
-            gpu_ids = [f"{endpoint.id}:{sample.gpu_uuid}" for sample in observation.gpus]
+            gpu_ids = list(observed_gpu_ids)
             existing_gpus = {
                 gpu.id: gpu
                 for gpu in session.scalars(
@@ -1991,8 +2037,10 @@ class BrokerService:
                         labels_json="[]",
                         health=sample.health,
                         enabled=True,
+                        present=True,
                         first_seen_at=observed_at,
                         last_seen_at=observed_at,
+                        absent_at=None,
                     )
                     session.add(gpu)
                 else:
@@ -2000,7 +2048,9 @@ class BrokerService:
                     gpu.name = sample.name
                     gpu.total_vram_mib = sample.total_vram_mib
                     gpu.health = sample.health
+                    gpu.present = True
                     gpu.last_seen_at = observed_at
+                    gpu.absent_at = None
                 by_uuid[sample.gpu_uuid] = gpu
                 current = current_telemetry.get(gpu_id)
                 if current is None:
@@ -2052,6 +2102,16 @@ class BrokerService:
                         )
                     )
                     history_points_written += 1
+            absent_gpu_count = 0
+            if observation.observation_complete:
+                prior_gpus = session.scalars(
+                    select(GPUDevice).where(GPUDevice.endpoint_id == endpoint.id)
+                ).all()
+                for gpu in prior_gpus:
+                    if gpu.id not in observed_gpu_ids and gpu.present:
+                        gpu.present = False
+                        gpu.absent_at = observed_at
+                        absent_gpu_count += 1
             session.flush()
             observed_process_keys: set[tuple[str, int, str, datetime]] = set()
             for process in observation.processes:
@@ -2130,16 +2190,17 @@ class BrokerService:
                     current.observations += 1
                     current.active = True
             session.flush()
-            current_processes = session.scalars(
-                select(ProcessObservation).where(
-                    ProcessObservation.endpoint_id == endpoint.id,
-                    ProcessObservation.active.is_(True),
-                )
-            ).all()
-            for prior in current_processes:
-                key = (prior.gpu_id, prior.pid, prior.boot_id, _as_utc(prior.process_started_at))
-                if key not in observed_process_keys:
-                    prior.active = False
+            if observation.observation_complete:
+                current_processes = session.scalars(
+                    select(ProcessObservation).where(
+                        ProcessObservation.endpoint_id == endpoint.id,
+                        ProcessObservation.active.is_(True),
+                    )
+                ).all()
+                for prior in current_processes:
+                    key = (prior.gpu_id, prior.pid, prior.boot_id, _as_utc(prior.process_started_at))
+                    if key not in observed_process_keys:
+                        prior.active = False
             provider_state = session.scalar(
                 select(ProviderState).where(
                     ProviderState.provider == provider, ProviderState.endpoint_id == endpoint.id
@@ -2197,8 +2258,11 @@ class BrokerService:
                 "snapshot_revision": revision,
                 "endpoint_id": endpoint.id,
                 "gpu_count": len(observation.gpus),
+                "absent_gpu_count": absent_gpu_count,
+                "observation_complete": observation.observation_complete,
                 "process_count": len(observation.processes),
                 "history_points_written": history_points_written,
+                "ignored": False,
             }
 
         return self._write(operation)
@@ -2412,6 +2476,9 @@ class BrokerService:
         commitment_usage = self._endpoint_commitment_usage(session)
         all_gpus = session.scalars(select(GPUDevice).order_by(GPUDevice.endpoint_id, GPUDevice.gpu_index)).all()
         for gpu in all_gpus:
+            if not gpu.present:
+                excluded["absent"] += 1
+                continue
             endpoint = session.get(Endpoint, gpu.endpoint_id)
             if endpoint is None:
                 excluded["missing_endpoint"] += 1
@@ -3465,6 +3532,8 @@ class BrokerService:
 
         candidates: list[GPUDevice] = []
         for gpu in session.scalars(select(GPUDevice).order_by(GPUDevice.endpoint_id, GPUDevice.gpu_index)).all():
+            if not gpu.present:
+                continue
             endpoint = session.get(Endpoint, gpu.endpoint_id)
             if endpoint is None or not endpoint.enabled or not gpu.enabled:
                 continue
@@ -3536,6 +3605,12 @@ class BrokerService:
                 gpu = session.get(GPUDevice, gpu_id)
                 if gpu is None:
                     raise BrokerError("gpu_not_found", f"GPU {gpu_id} does not exist", status_code=404)
+                if not gpu.present:
+                    raise BrokerError(
+                        "gpu_absent",
+                        f"GPU {gpu_id} is absent from the latest complete endpoint observation",
+                        status_code=409,
+                    )
                 if self._reservation_blocks_gpu(session, gpu_id, start=start_at, end=end_at):
                     raise BrokerError(
                         "reservation_conflict",
@@ -4955,6 +5030,7 @@ class BrokerService:
         project_id = payload.pop("project_id")
         task_ref = payload.pop("task_ref")
         purpose = payload.pop("purpose")
+        approval_ref = payload.pop("approval_ref")
         with self._scheduler_submit_lock:
             return self._submit_scheduler_job(
                 actor,
@@ -4963,7 +5039,7 @@ class BrokerService:
                 profile_id=None,
                 task_ref=task_ref,
                 purpose=purpose,
-                approval_ref=None,
+                approval_ref=approval_ref,
                 request=payload,
                 script_body=script_body,
                 retain_submission_body=retain_submission_body,
@@ -6187,9 +6263,10 @@ class BrokerService:
         def operation(session: Session) -> dict[str, Any]:
             now = utcnow()
             gpus = session.scalars(select(GPUDevice)).all()
+            present_gpus = [gpu for gpu in gpus if gpu.present]
             stale = sum(
                 1
-                for gpu in gpus
+                for gpu in present_gpus
                 if self._gpu_state(session, gpu, now)[0] in {"UNKNOWN_STALE", "UNKNOWN_RECOVERING"}
             )
             provider_states = session.scalars(select(ProviderState).order_by(ProviderState.endpoint_id)).all()
@@ -6199,7 +6276,8 @@ class BrokerService:
                     "database_ready": self.database.ready(),
                     "snapshot_revision": self._revision(session),
                     "inventory_endpoints": session.scalar(select(func.count()).select_from(Endpoint)),
-                    "discovered_gpus": len(gpus),
+                    "discovered_gpus": len(present_gpus),
+                    "historical_gpu_records": len(gpus),
                     "stale_or_recovering_gpus": stale,
                     "collector_enabled": self.inventory.collector.enabled,
                     "providers": [
@@ -6223,7 +6301,7 @@ class BrokerService:
 
         def operation(session: Session) -> str:
             now = utcnow()
-            gpus = session.scalars(select(GPUDevice)).all()
+            gpus = session.scalars(select(GPUDevice).where(GPUDevice.present.is_(True))).all()
             states: dict[str, int] = defaultdict(int)
             for gpu in gpus:
                 states[self._gpu_state(session, gpu, now)[0]] += 1

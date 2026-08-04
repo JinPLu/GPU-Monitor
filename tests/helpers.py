@@ -11,8 +11,16 @@ def observation(
     count: int = 4,
     processes: list[ProcessInput] | None = None,
     prefix: str = "GPU",
+    gpu_uuids: list[str] | None = None,
+    observation_complete: bool = True,
+    observed_at: datetime | None = None,
 ) -> EndpointObservation:
-    now = datetime.now(UTC)
+    now = observed_at or datetime.now(UTC)
+    uuids = (
+        gpu_uuids
+        if gpu_uuids is not None
+        else [f"{prefix}-{endpoint_id}-{index}" for index in range(count)]
+    )
     return EndpointObservation(
         endpoint_id=endpoint_id,
         observed_at=now,
@@ -25,7 +33,7 @@ def observation(
         },
         gpus=[
             TelemetryInput(
-                gpu_uuid=f"{prefix}-{endpoint_id}-{index}",
+                gpu_uuid=gpu_uuid,
                 gpu_index=index,
                 name="Test GPU",
                 total_vram_mib=100_000,
@@ -38,9 +46,10 @@ def observation(
                 pstate="P0",
                 health="OK",
             )
-            for index in range(count)
+            for index, gpu_uuid in enumerate(uuids)
         ],
         processes=processes or [],
+        observation_complete=observation_complete,
     )
 
 

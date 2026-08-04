@@ -31,6 +31,8 @@ def test_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
     }.issubset(
         inspect(database.engine).get_table_names()
     )
+    gpu_columns = {column["name"] for column in inspect(database.engine).get_columns("gpu_devices")}
+    assert {"present", "absent_at"}.issubset(gpu_columns)
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "src" / "gpu_broker" / "migrations"))
     config.set_main_option("sqlalchemy.url", database.url)
@@ -67,6 +69,8 @@ def test_migration_upgrades_existing_schema_to_endpoint_telemetry(tmp_path: Path
         column["name"] for column in inspect(database.engine).get_columns("endpoints")
     }
     assert {"owner_project_id", "lifecycle_state"}.issubset(endpoint_columns)
+    gpu_columns = {column["name"] for column in inspect(database.engine).get_columns("gpu_devices")}
+    assert {"present", "absent_at"}.issubset(gpu_columns)
     assert "lease_endpoint_commitments" in inspect(database.engine).get_table_names()
 
 
@@ -78,4 +82,7 @@ def test_migration_uses_packaged_scripts_without_project_tree(tmp_path: Path) ->
 
     database.migrate()
 
-    assert "endpoint_telemetry_current" in inspect(database.engine).get_table_names()
+    inspector = inspect(database.engine)
+    assert "endpoint_telemetry_current" in inspector.get_table_names()
+    gpu_columns = {column["name"] for column in inspector.get_columns("gpu_devices")}
+    assert {"present", "absent_at"}.issubset(gpu_columns)

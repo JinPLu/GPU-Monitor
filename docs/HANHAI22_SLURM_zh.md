@@ -1,4 +1,4 @@
-# 瀚海22：GPU Broker 外部 Slurm 调度使用指南
+# 瀚海22：GPU Broker 外部 Slurm（CPU / GPU）调度使用指南
 
 更新时间：2026-07-31（Asia/Shanghai）
 
@@ -121,17 +121,22 @@ hh22 1 squeue -u '$USER'
 | --- | --- |
 | `project_id` | 本地任务归属标签；当前不改变 Slurm account |
 | `task_ref` | `--job-name`，并记录返回的 Job ID |
-| `gpu_count` | `--gres=gpu:a100:<N>` |
+| `gpu_count > 0` | `--gres=gpu:<type>:<N>`（未指定 type 时为 `gpu:<N>`） |
+| `gpu_count = 0` | 纯 CPU / 内存作业：不传 `--gres`，也不得填写 `gpu_type` |
 | CPU 核数 | `--cpus-per-task=<N>` 或 MPI 的 `--ntasks=<N>` |
 | 系统内存 | `--mem=<SIZE>` |
 | 最长运行时间 | `--time=<D-HH:MM:SS>` |
-| GPU 类型 / 队列 | `--partition=GPU-8A100` |
-| QoS | `--qos=gpu_8a100` |
-| 节点拓扑 | `--nodes`、`--ntasks-per-node` 和每节点 GRES |
+| 分区 | `--partition`（CPU-only 合同选择实际可用的 CPU 分区） |
+| QoS | `--qos`（使用该分区允许的 QoS） |
+| 节点拓扑 | `--nodes`、`--ntasks-per-node`；GPU 作业另有 GRES |
 
 这里的合同用于明确用户意图和生成 Slurm 请求，不能在 Slurm 返回资源前被解释为
-“已经获得 GPU”。真正的授权证据是作业进入 `RUNNING` 且
+“已经获得计算资源”。真正的授权证据是作业进入 `RUNNING` 且
 `scontrol show job <JOB_ID>` / `sacct` 报告了已分配的 TRES。
+
+CPU-only 合同适合没有 GPU、但可提供 CPU 和内存的分区或节点。它仍必须指定
+真实的分区、QoS、CPU 核数、内存、节点数和运行时限；Broker 不会因省略 GPU
+而绕过 Slurm 或把登录节点视作计算资源。
 
 ## 提交一个正式 GPU 作业
 
