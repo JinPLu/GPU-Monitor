@@ -127,7 +127,7 @@ hh22 1 squeue -u '$USER'
 | 系统内存 | `--mem=<SIZE>` |
 | 最长运行时间 | `--time=<D-HH:MM:SS>` |
 | 分区 | `--partition`（CPU-only 合同选择实际可用的 CPU 分区） |
-| QoS | `--qos`（使用该分区允许的 QoS） |
+| QoS | 可选 `--qos`；提供时必须是该分区允许的值 |
 | 节点拓扑 | `--nodes`、`--ntasks-per-node`；GPU 作业另有 GRES |
 
 这里的合同用于明确用户意图和生成 Slurm 请求，不能在 Slurm 返回资源前被解释为
@@ -135,8 +135,8 @@ hh22 1 squeue -u '$USER'
 `scontrol show job <JOB_ID>` / `sacct` 报告了已分配的 TRES。
 
 CPU-only 合同适合没有 GPU、但可提供 CPU 和内存的分区或节点。它仍必须指定
-真实的分区、QoS、CPU 核数、内存、节点数和运行时限；Broker 不会因省略 GPU
-而绕过 Slurm 或把登录节点视作计算资源。
+真实的分区、CPU 核数、内存、节点数和运行时限；在分区要求或合同明确时指定
+QoS。Broker 不会因省略 GPU 而绕过 Slurm 或把登录节点视作计算资源。
 
 ## 提交一个正式 GPU 作业
 

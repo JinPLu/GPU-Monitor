@@ -361,7 +361,6 @@ class CommandSlurmProvider:
             f"--job-name={broker_job_name(broker_job_id)}",
             f"--comment=gpu-broker:{broker_job_id}",
             f"--partition={scheduler['partition']}",
-            f"--qos={scheduler['qos']}",
             f"--nodes={scheduler['nodes']}",
             f"--ntasks-per-node={scheduler['tasks_per_node']}",
             f"--cpus-per-task={scheduler['cpu_cores']}",
@@ -372,6 +371,8 @@ class CommandSlurmProvider:
             f"--error={scheduler['stderr_pattern']}",
             f"--wrap={wrapped}",
         ]
+        if scheduler.get("qos"):
+            arguments.insert(5, f"--qos={scheduler['qos']}")
         if gpu_count:
             gres = f"gpu:{gpu_type}:{gpu_count}" if gpu_type else f"gpu:{gpu_count}"
             arguments.insert(6, f"--gres={gres}")

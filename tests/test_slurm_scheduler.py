@@ -262,7 +262,6 @@ def test_command_slurm_cpu_only_submission_omits_gpu_gres() -> None:
             "constraints": {"gpu_count": 0},
             "scheduler": {
                 "partition": "CPU-64C256GB",
-                "qos": "cpu",
                 "cpu_cores": 64,
                 "memory_mib": 256 * 1024,
                 "nodes": 1,
@@ -282,6 +281,7 @@ def test_command_slurm_cpu_only_submission_omits_gpu_gres() -> None:
     assert "--cpus-per-task=64" in remote_command
     assert "--mem=262144M" in remote_command
     assert "--gres=" not in remote_command
+    assert "--qos=" not in remote_command
 
 
 def test_command_slurm_gpu_submission_includes_gres() -> None:
@@ -316,6 +316,7 @@ def test_command_slurm_gpu_submission_includes_gres() -> None:
 
     assert submission.scheduler_job_id == "123456"
     assert "--gres=gpu:a100:1" in calls[0][-1]
+    assert "--qos=gpu_8a100" in calls[0][-1]
 
 
 def test_scheduler_one_off_accepts_cpu_constraints_but_direct_constraints_reject_zero() -> None:
@@ -333,7 +334,6 @@ def test_scheduler_one_off_accepts_cpu_constraints_but_direct_constraints_reject
             "constraints": {"gpu_count": 0},
             "scheduler": {
                 "partition": "CPU-64C256GB",
-                "qos": "cpu",
                 "cpu_cores": 64,
                 "memory_mib": 256 * 1024,
                 "nodes": 1,
@@ -345,6 +345,7 @@ def test_scheduler_one_off_accepts_cpu_constraints_but_direct_constraints_reject
     )
 
     assert submission.constraints.gpu_count == 0
+    assert submission.scheduler.qos is None
     assert submission.approval_ref == "thread:approved-cpu-one-off"
 
 
@@ -486,7 +487,6 @@ def test_cpu_only_one_off_is_valid_and_reaches_provider_without_gpu_request(
             "constraints": {"gpu_count": 0},
             "scheduler": {
                 "partition": "CPU-64C256GB",
-                "qos": "cpu",
                 "cpu_cores": 64,
                 "memory_mib": 256 * 1024,
                 "nodes": 1,
@@ -502,6 +502,7 @@ def test_cpu_only_one_off_is_valid_and_reaches_provider_without_gpu_request(
     )
     assert submitted.status_code == 200, submitted.text
     assert provider.submissions[0]["request"]["constraints"]["gpu_count"] == 0
+    assert provider.submissions[0]["request"]["scheduler"]["qos"] is None
     assert provider.submissions[0]["request"]["scheduler"]["gpu_type"] is None
 
 

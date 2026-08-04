@@ -271,7 +271,7 @@ class SlurmJobSpec(StrictModel):
     """Bounded Slurm flags controlled by the Broker, not raw command-line input."""
 
     partition: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,64}$")
-    qos: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,64}$")
+    qos: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,64}$")
     gpu_type: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,64}$")
     cpu_cores: int = Field(default=1, ge=1, le=4096)
     memory_mib: int = Field(default=1024, ge=1, le=16 * 1024 * 1024)
