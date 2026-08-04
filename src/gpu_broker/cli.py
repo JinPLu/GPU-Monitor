@@ -24,7 +24,13 @@ from gpu_broker.daemon import (
 )
 from gpu_broker.database import Database
 from gpu_broker.importer import import_servers_files, write_inventory
-from gpu_broker.schemas import RequestCreate, RequestCreateFlat
+from gpu_broker.schemas import (
+    RequestCreate,
+    RequestCreateFlat,
+    ResourceClaim,
+    ResourcePlanEvaluationInput,
+    ResourceRunActualInput,
+)
 from gpu_broker.service import BrokerService
 
 
@@ -37,6 +43,10 @@ lease_app = typer.Typer(
     help="Update cooperative lease state; never start or stop workloads.",
 )
 reservation_app = typer.Typer(no_args_is_help=True)
+resource_app = typer.Typer(
+    no_args_is_help=True,
+    help="Cross-project, cross-agent CPU/memory/GPU/scheduler resource contracts.",
+)
 collect_app = typer.Typer(no_args_is_help=True)
 daemon_app = typer.Typer(
     no_args_is_help=True,
@@ -47,6 +57,7 @@ app.add_typer(gpu_app, name="gpu")
 app.add_typer(request_app, name="request")
 app.add_typer(lease_app, name="lease")
 app.add_typer(reservation_app, name="reservation")
+app.add_typer(resource_app, name="resource")
 app.add_typer(collect_app, name="collect")
 app.add_typer(daemon_app, name="daemon")
 
@@ -329,6 +340,13 @@ def _request_from_file(path: Path) -> RequestCreate:
     return RequestCreate.model_validate(raw) if "constraints" in raw else RequestCreateFlat.model_validate(raw).canonical()
 
 
+def _mapping_from_file(path: Path, label: str) -> dict[str, Any]:
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise typer.BadParameter(f"{label} YAML must be a mapping")
+    return raw
+
+
 @request_app.command("create")
 def request_create(
     file: Annotated[Path, typer.Option("--file", exists=True, readable=True)],
@@ -402,6 +420,156 @@ def reservation_create(file: Annotated[Path, typer.Option("--file", exists=True)
 @reservation_app.command("cancel")
 def reservation_cancel(reservation_id: str, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None) -> None:
     _print(_call(lambda: _client(url, actor).post(f"/api/v1/reservations/{reservation_id}/cancel", {}, idempotency_key=secrets.token_hex(16))), as_json)
+
+
+@resource_app.command("providers")
+def resource_providers(
+    provider_type: Annotated[str | None, typer.Option("--provider-type")] = None,
+    enabled: Annotated[bool | None, typer.Option("--enabled/--disabled")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    _print(
+        _call(
+            lambda: _client(url, actor).resource_providers(
+                provider_type=provider_type,
+                enabled=enabled,
+            )
+        ),
+        as_json,
+    )
+
+
+@resource_app.command("monitor")
+def resource_monitor(
+    project_id: Annotated[str | None, typer.Option("--project-id")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    _print(_call(lambda: _client(url, actor).resource_monitor(project_id=project_id)), as_json)
+
+
+@resource_app.command("claims")
+def resource_claims(
+    project_id: Annotated[str | None, typer.Option("--project-id")] = None,
+    state: Annotated[str | None, typer.Option("--state")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    _print(
+        _call(lambda: _client(url, actor).resource_claims(project_id=project_id, state=state)),
+        as_json,
+    )
+
+
+@resource_app.command("evaluations")
+def resource_evaluations(
+    project_id: Annotated[str | None, typer.Option("--project-id")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    _print(_call(lambda: _client(url, actor).resource_plan_evaluations(project_id=project_id)), as_json)
+
+
+@resource_app.command("actuals")
+def resource_actuals(
+    project_id: Annotated[str | None, typer.Option("--project-id")] = None,
+    task_ref: Annotated[str | None, typer.Option("--task-ref")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    _print(
+        _call(lambda: _client(url, actor).resource_run_actuals(project_id=project_id, task_ref=task_ref)),
+        as_json,
+    )
+
+
+@resource_app.command("evaluate")
+def resource_evaluate(
+    file: Annotated[Path, typer.Option("--file", exists=True, readable=True)],
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    evaluation = ResourcePlanEvaluationInput.model_validate(
+        _mapping_from_file(file, "resource plan evaluation")
+    )
+    _print(
+        _call(
+            lambda: _client(url, actor).evaluate_resource_plan(
+                evaluation.model_dump(mode="json"),
+                idempotency_key=secrets.token_hex(16),
+            )
+        ),
+        as_json,
+    )
+
+
+@resource_app.command("claim")
+def resource_claim(
+    file: Annotated[Path, typer.Option("--file", exists=True, readable=True)],
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    claim = ResourceClaim.model_validate(_mapping_from_file(file, "resource claim"))
+    _print(
+        _call(
+            lambda: _client(url, actor).claim_resource(
+                claim.model_dump(mode="json"),
+                idempotency_key=secrets.token_hex(16),
+            )
+        ),
+        as_json,
+    )
+
+
+@resource_app.command("release")
+def resource_release(
+    claim_id: str,
+    reason: Annotated[str, typer.Option("--reason")] = "workload_completed",
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    _print(
+        _call(
+            lambda: _client(url, actor).release_resource_claim(
+                claim_id,
+                reason=reason,
+                idempotency_key=secrets.token_hex(16),
+            )
+        ),
+        as_json,
+    )
+
+
+@resource_app.command("record-actual")
+def resource_record_actual(
+    file: Annotated[Path, typer.Option("--file", exists=True, readable=True)],
+    claim_id: Annotated[str | None, typer.Option("--claim-id")] = None,
+    evaluation_id: Annotated[str | None, typer.Option("--evaluation-id")] = None,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    actual = ResourceRunActualInput.model_validate(_mapping_from_file(file, "resource run actual"))
+    _print(
+        _call(
+            lambda: _client(url, actor).record_resource_run_actual(
+                actual.model_dump(mode="json"),
+                claim_id=claim_id,
+                evaluation_id=evaluation_id,
+                idempotency_key=secrets.token_hex(16),
+            )
+        ),
+        as_json,
+    )
 
 
 @app.command("history")

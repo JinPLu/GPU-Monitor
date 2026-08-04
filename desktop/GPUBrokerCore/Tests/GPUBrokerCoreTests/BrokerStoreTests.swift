@@ -155,6 +155,111 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(BrokerSnapshot.empty.stableEndpointSelection(currentID: "missing"), "")
     }
 
+    func testGeneralResourceMonitoringProjectionParsesAndKeepsSchedulerPendingSeparate() throws {
+        let snapshot = BrokerSnapshot(envelope: [
+            "schema_version": "v1",
+            "snapshot_revision": 42,
+            "server_time": "2026-08-04T00:00:00Z",
+            "data": [
+                "summary": [:],
+                "resource_providers": [
+                    [
+                        "id": "host:fixture",
+                        "provider_type": "host-capacity",
+                        "display_name": "fixture host",
+                        "state": "ONLINE",
+                        "total": ["cpu_cores": 32, "memory_mib": 131072],
+                        "committed": ["cpu_cores": 8, "memory_mib": 32768],
+                        "available": ["cpu_cores": 24, "memory_mib": 98304]
+                    ],
+                    [
+                        "id": "scheduler:hanhai22",
+                        "provider_type": "scheduler",
+                        "display_name": "Hanhai22",
+                        "state": "PENDING",
+                        "available": ["node_count": 2, "scheduler_units": 2]
+                    ]
+                ],
+                "allocatable_units": [
+                    [
+                        "id": "scheduler-target:hanhai22",
+                        "provider_id": "scheduler:hanhai22",
+                        "unit_type": "scheduler-target",
+                        "state": "PENDING",
+                        "quantities": ["node_count": 2, "scheduler_units": 2]
+                    ]
+                ],
+                "resource_claims": [
+                    [
+                        "id": "claim-1",
+                        "actor_id": "agent-a",
+                        "project_id": "project-a",
+                        "task_ref": "train",
+                        "state": "QUEUED",
+                        "provider_type": "host-capacity",
+                        "quantities": ["cpu_cores": 4, "memory_mib": 8192]
+                    ]
+                ],
+                "resource_plan_evaluations": [
+                    [
+                        "id": "eval-1",
+                        "actor_id": "agent-a",
+                        "project_id": "project-a",
+                        "task_ref": "train",
+                        "selected_candidate_key": "small",
+                        "minimum_saved_seconds": 120,
+                        "minimum_saved_ratio": 0.10,
+                        "candidates": [
+                            [
+                                "candidate_key": "small",
+                                "provider_type": "host-capacity",
+                                "quantities": ["cpu_cores": 4, "memory_mib": 8192],
+                                "predicted_runtime_seconds": 1800,
+                                "predicted_saved_seconds": 0,
+                                "predicted_saved_ratio": 0,
+                                "selected": true
+                            ],
+                            [
+                                "candidate_key": "large",
+                                "provider_type": "host-capacity",
+                                "quantities": ["cpu_cores": 8, "memory_mib": 16384],
+                                "predicted_runtime_seconds": 1720,
+                                "predicted_saved_seconds": 80,
+                                "predicted_saved_ratio": 0.04,
+                                "rejection_reason": "below marginal benefit"
+                            ]
+                        ]
+                    ]
+                ],
+                "resource_run_actuals": [
+                    [
+                        "id": "actual-1",
+                        "evaluation_id": "eval-1",
+                        "actor_id": "agent-a",
+                        "project_id": "project-a",
+                        "task_ref": "train",
+                        "quantities": ["cpu_cores": 4, "memory_mib": 8192],
+                        "predicted_duration_seconds": 1800,
+                        "actual_duration_seconds": 1760
+                    ]
+                ],
+                "data_age_seconds": 2,
+                "freshness_seconds": 30,
+                "admission_boundary": "test"
+            ]
+        ])
+
+        XCTAssertEqual(snapshot.monitoringProviders.count, 2)
+        XCTAssertEqual(snapshot.monitoringProviders.first?.available.compactLabel, "24 CPU · 96 GB RAM")
+        let scheduler = try XCTUnwrap(snapshot.monitoringProviders.last)
+        XCTAssertEqual(scheduler.providerType, "scheduler")
+        XCTAssertEqual(scheduler.trustBoundary, "等待外部调度器确认；不计入裸机可用容量")
+        XCTAssertEqual(snapshot.allocatableUnits.first?.unitType, "scheduler-target")
+        XCTAssertEqual(snapshot.resourceClaims.first?.quantities.compactLabel, "4 CPU · 8 GB RAM")
+        XCTAssertEqual(snapshot.resourcePlanEvaluations.first?.selectedCandidate?.candidateKey, "small")
+        XCTAssertEqual(snapshot.resourceRunActuals.first?.actualDurationSeconds, 1760)
+    }
+
     func testFixturesResolveInsideDesktopFixturesAndRejectProjectState() throws {
         let fixturesRoot = Self.fixturesRoot
         let projectRoot = fixturesRoot.deletingLastPathComponent().deletingLastPathComponent()

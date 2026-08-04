@@ -56,6 +56,8 @@ enabled_tools = [
   "gpu_scheduler_targets", "gpu_scheduler_access_status", "gpu_scheduler_profiles",
   "gpu_scheduler_submit_profile", "gpu_scheduler_submit_once",
   "gpu_scheduler_job_status", "gpu_scheduler_cancel",
+  "resource_providers", "resource_monitor", "resource_claims",
+  "resource_evaluate_plan", "resource_claim", "resource_release", "resource_record_actual",
 ]
 
 [mcp_servers.gpu-broker.env]
@@ -74,6 +76,12 @@ GPU_BROKER_URL = "http://127.0.0.1:8787"
 - 当前任务已给出 `profile_id`，或已给出 `project_id`、`gpu_count` 与必要阈值时，直接用 `gpu_claim_profile` 或 `gpu_claim`。得到 queued/null 结果时用 `gpu_wait_for_claim(agent_name, request_id)` 继续轮询已有 request/lease，直到获得 `HELD` 或 `ACTIVE` lease、终止状态或超时；queued/null 不能据此执行；不要再为同一持续任务重复询问人工确认。
 - 成功 lease 的具体落点只读返回的 `lease.resources[]`。每个 resource 提供 `endpoint`（`id`、`host`、`port`、`ssh_user`）、`gpus`（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 和 `commitment`；Agent 不自行拼接或推断 placement。随后它通过项目既有执行路径启动或停止获授权的 workload；Broker 不代为启动或停止。启动后调用 `gpu_bind_observed_workload`，完成或启动失败后调用 `gpu_release`。
 - 所有会重试的写操作都传入并复用同一个调用方生成的 `idempotency_key`。
+
+通用资源工作流：
+
+- `resource_providers` 与 `resource_monitor` 用于查看 GPU、主机 CPU/内存和外部 scheduler 三类资源；调度队列或 `PENDING` 作业不是裸机可用容量。
+- Agent 对当前任务提供由自身基准或历史运行得出的、从小到大的候选资源合同，先调用 `resource_evaluate_plan`。Broker 只在相邻扩容同时节省至少 10% 剩余时间且至少 120 秒时选择更大合同；首个收益不足的候选会终止扩容。
+- CPU/内存-only 合同允许 `gpu_count=0`。已获配的主机容量通过 `resource_claim` 认领，完成后 `resource_release`；实际耗时用 `resource_record_actual` 追加记录。这些工具不会启动远端命令、绕过 owner、配额或新鲜 telemetry 校验。
 
 端点是项目资源，而不是全局管理员登记。端点返回 `owner_project_id` 和 `lifecycle_state`。项目 owner 可用 `gpu_add_server` 添加自己的只读监测 endpoint；`gpu_delete_server` 的常规语义是将 `lifecycle_state` 转为 `draining`：不再接收新 placement，已有 workload 不会被停止，待关联租约和队列需求排空后再完成退役。
 

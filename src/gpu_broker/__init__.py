@@ -11,4 +11,5 @@ API_CAPABILITIES = (
     "coordination_board",
     "server_deletion",
     "external_slurm_scheduler",
+    "general_resource_scheduler",
 )

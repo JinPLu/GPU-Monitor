@@ -344,6 +344,253 @@ class SchedulerTransfer(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class ResourceProvider(Base):
+    """Typed resource source used by the generic cross-provider scheduler."""
+
+    __tablename__ = "resource_providers"
+    __table_args__ = (
+        CheckConstraint(
+            "provider_type IN ('direct-gpu', 'host-capacity', 'scheduler')",
+            name="ck_resource_provider_type",
+        ),
+        CheckConstraint(
+            "("
+            "provider_type IN ('direct-gpu', 'host-capacity') "
+            "AND endpoint_id IS NOT NULL "
+            "AND scheduler_target_id IS NULL"
+            ") OR ("
+            "provider_type = 'scheduler' "
+            "AND endpoint_id IS NULL "
+            "AND scheduler_target_id IS NOT NULL"
+            ")",
+            name="ck_resource_provider_native_ref",
+        ),
+        UniqueConstraint("provider_type", "endpoint_id", name="uq_resource_provider_endpoint"),
+        UniqueConstraint(
+            "provider_type",
+            "scheduler_target_id",
+            name="uq_resource_provider_scheduler_target",
+        ),
+        Index("ix_resource_provider_type_enabled", "provider_type", "enabled"),
+    )
+
+    id: Mapped[str] = mapped_column(String(260), primary_key=True)
+    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    endpoint_id: Mapped[str | None] = mapped_column(
+        ForeignKey("endpoints.id", ondelete="CASCADE"), index=True
+    )
+    scheduler_target_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scheduler_targets.id", ondelete="CASCADE"), index=True
+    )
+    native_ref_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AllocatableUnit(Base):
+    """One schedulable capacity unit without changing historical GPU lease rows."""
+
+    __tablename__ = "allocatable_units"
+    __table_args__ = (
+        CheckConstraint(
+            "unit_type IN ('gpu', 'host', 'scheduler-target')",
+            name="ck_allocatable_unit_type",
+        ),
+        CheckConstraint(
+            "total_gpu_count >= 0 "
+            "AND (total_cpu_cores IS NULL OR total_cpu_cores >= 0) "
+            "AND (total_memory_mib IS NULL OR total_memory_mib >= 0) "
+            "AND (total_vram_mib IS NULL OR total_vram_mib >= 0)",
+            name="ck_allocatable_unit_quantities_nonnegative",
+        ),
+        CheckConstraint(
+            "("
+            "unit_type = 'gpu' "
+            "AND endpoint_id IS NOT NULL "
+            "AND gpu_id IS NOT NULL "
+            "AND scheduler_target_id IS NULL "
+            "AND total_gpu_count = 1 "
+            "AND total_vram_mib > 0"
+            ") OR ("
+            "unit_type = 'host' "
+            "AND endpoint_id IS NOT NULL "
+            "AND gpu_id IS NULL "
+            "AND scheduler_target_id IS NULL "
+            "AND (total_cpu_cores > 0 OR total_memory_mib > 0)"
+            ") OR ("
+            "unit_type = 'scheduler-target' "
+            "AND endpoint_id IS NULL "
+            "AND gpu_id IS NULL "
+            "AND scheduler_target_id IS NOT NULL"
+            ")",
+            name="ck_allocatable_unit_native_ref",
+        ),
+        UniqueConstraint("provider_id", "unit_key", name="uq_allocatable_unit_provider_key"),
+        Index("ix_allocatable_unit_type_state", "unit_type", "state"),
+    )
+
+    id: Mapped[str] = mapped_column(String(320), primary_key=True)
+    provider_id: Mapped[str] = mapped_column(
+        ForeignKey("resource_providers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    unit_key: Mapped[str] = mapped_column(String(260), nullable=False)
+    unit_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    endpoint_id: Mapped[str | None] = mapped_column(
+        ForeignKey("endpoints.id", ondelete="CASCADE"), index=True
+    )
+    gpu_id: Mapped[str | None] = mapped_column(
+        ForeignKey("gpu_devices.id", ondelete="CASCADE"), index=True
+    )
+    scheduler_target_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scheduler_targets.id", ondelete="CASCADE"), index=True
+    )
+    total_gpu_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_cpu_cores: Mapped[float | None] = mapped_column()
+    total_memory_mib: Mapped[int | None] = mapped_column(Integer)
+    total_vram_mib: Mapped[int | None] = mapped_column(Integer)
+    labels_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    native_ref_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="available")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResourceClaim(Base):
+    """A generic resource request produced by an agent policy decision."""
+
+    __tablename__ = "resource_claims"
+    __table_args__ = (
+        CheckConstraint(
+            "provider_type IS NULL OR provider_type IN ('direct-gpu', 'host-capacity', 'scheduler')",
+            name="ck_resource_claim_provider_type",
+        ),
+        Index("ix_resource_claim_project_state", "project_id", "state"),
+        Index("ix_resource_claim_actor_created", "actor_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    actor_id: Mapped[str] = mapped_column(ForeignKey("actors.id"), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    task_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(1000), nullable=False)
+    provider_type: Mapped[str | None] = mapped_column(String(32))
+    requested_quantities_json: Mapped[str] = mapped_column(Text, nullable=False)
+    forecast_json: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResourceAllocation(Base):
+    """Generic allocation row linked to native Broker lease or scheduler job when one exists."""
+
+    __tablename__ = "resource_allocations"
+    __table_args__ = (
+        Index("ix_resource_allocation_claim_state", "claim_id", "state"),
+        Index("ix_resource_allocation_unit_state", "unit_id", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    claim_id: Mapped[str] = mapped_column(
+        ForeignKey("resource_claims.id", ondelete="CASCADE"), nullable=False
+    )
+    unit_id: Mapped[str] = mapped_column(
+        ForeignKey("allocatable_units.id", ondelete="RESTRICT"), nullable=False
+    )
+    native_lease_id: Mapped[str | None] = mapped_column(ForeignKey("leases.id", ondelete="SET NULL"))
+    native_scheduler_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("scheduler_jobs.id", ondelete="SET NULL")
+    )
+    quantities_json: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResourcePlanEvaluation(Base):
+    """Agent-visible marginal-utility decision record."""
+
+    __tablename__ = "resource_plan_evaluations"
+    __table_args__ = (
+        Index("ix_resource_plan_eval_project_created", "project_id", "created_at"),
+        Index("ix_resource_plan_eval_actor_created", "actor_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    claim_id: Mapped[str | None] = mapped_column(
+        ForeignKey("resource_claims.id", ondelete="SET NULL"), index=True
+    )
+    actor_id: Mapped[str] = mapped_column(ForeignKey("actors.id"), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    task_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    baseline_runtime_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    marginal_min_saved_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=120)
+    marginal_min_saved_ratio: Mapped[float] = mapped_column(nullable=False, default=0.10)
+    selected_candidate_key: Mapped[str | None] = mapped_column(String(120))
+    forecast_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ResourcePlanCandidate(Base):
+    """One candidate considered by a marginal-utility resource decision."""
+
+    __tablename__ = "resource_plan_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "evaluation_id",
+            "candidate_key",
+            name="uq_resource_plan_candidate_eval_key",
+        ),
+        Index("ix_resource_plan_candidate_selected", "evaluation_id", "selected"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    evaluation_id: Mapped[str] = mapped_column(
+        ForeignKey("resource_plan_evaluations.id", ondelete="CASCADE"), nullable=False
+    )
+    candidate_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    provider_type: Mapped[str | None] = mapped_column(String(32))
+    quantities_json: Mapped[str] = mapped_column(Text, nullable=False)
+    predicted_runtime_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    predicted_saved_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    predicted_saved_ratio: Mapped[float] = mapped_column(nullable=False)
+    satisfies_marginal_threshold: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    rejection_reason: Mapped[str | None] = mapped_column(String(500))
+
+
+class ResourceRunActual(Base):
+    """Observed runtime result used to calibrate later resource decisions."""
+
+    __tablename__ = "resource_run_actuals"
+    __table_args__ = (
+        Index("ix_resource_run_actual_project_created", "project_id", "created_at"),
+        Index("ix_resource_run_actual_task_ref", "task_ref"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    evaluation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("resource_plan_evaluations.id", ondelete="SET NULL"), index=True
+    )
+    claim_id: Mapped[str | None] = mapped_column(
+        ForeignKey("resource_claims.id", ondelete="SET NULL"), index=True
+    )
+    actor_id: Mapped[str] = mapped_column(ForeignKey("actors.id"), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    task_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    actual_duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    quantities_json: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    notes_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Actor(Base):
     __tablename__ = "actors"
 

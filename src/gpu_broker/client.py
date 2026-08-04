@@ -105,3 +105,112 @@ class BrokerClient:
 
     def delete(self, path: str, *, idempotency_key: str) -> dict[str, Any]:
         return self.request("DELETE", path, idempotency_key=idempotency_key)
+
+    def resource_providers(
+        self,
+        *,
+        provider_type: str | None = None,
+        enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if provider_type:
+            params["provider_type"] = provider_type
+        if enabled is not None:
+            params["enabled"] = enabled
+        return self.get("/api/v1/resource-providers", params=params or None)
+
+    def resource_monitor(self, *, project_id: str | None = None) -> dict[str, Any]:
+        params = {"project_id": project_id} if project_id else None
+        return self.get("/api/v1/resource-monitor", params=params)
+
+    def resource_claims(
+        self,
+        *,
+        project_id: str | None = None,
+        state: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if project_id:
+            params["project_id"] = project_id
+        if state:
+            params["state"] = state
+        return self.get("/api/v1/resource-claims", params=params or None)
+
+    def resource_plan_evaluations(
+        self,
+        *,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        params = {"project_id": project_id} if project_id else None
+        return self.get("/api/v1/resource-plan-evaluations", params=params)
+
+    def resource_run_actuals(
+        self,
+        *,
+        project_id: str | None = None,
+        task_ref: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if project_id:
+            params["project_id"] = project_id
+        if task_ref:
+            params["task_ref"] = task_ref
+        return self.get("/api/v1/resource-run-actuals", params=params or None)
+
+    def evaluate_resource_plan(
+        self,
+        evaluation: dict[str, Any],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/api/v1/resource-plan-evaluations",
+            evaluation,
+            idempotency_key=idempotency_key,
+        )
+
+    def claim_resource(
+        self,
+        claim: dict[str, Any],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.post(
+            "/api/v1/resource-claims",
+            claim,
+            idempotency_key=idempotency_key,
+        )
+
+    def release_resource_claim(
+        self,
+        claim_id: str,
+        *,
+        reason: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.post(
+            f"/api/v1/resource-claims/{claim_id}/release",
+            {"reason": reason},
+            idempotency_key=idempotency_key,
+        )
+
+    def record_resource_run_actual(
+        self,
+        actual: dict[str, Any],
+        *,
+        claim_id: str | None = None,
+        evaluation_id: str | None = None,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
+        if claim_id:
+            params["claim_id"] = claim_id
+        if evaluation_id:
+            params["evaluation_id"] = evaluation_id
+        return self.request(
+            "POST",
+            "/api/v1/resource-run-actuals",
+            json_body=actual,
+            params=params or None,
+            idempotency_key=idempotency_key,
+        )

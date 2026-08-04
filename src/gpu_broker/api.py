@@ -45,6 +45,9 @@ from gpu_broker.schemas import (
     RequestCreateFlat,
     RetentionPrune,
     ReservationCreate,
+    ResourceClaim,
+    ResourcePlanEvaluationInput,
+    ResourceRunActualInput,
     SchedulerJobCancel,
     SchedulerOneOffSubmit,
     SchedulerProfileSubmit,
@@ -252,6 +255,17 @@ def create_app(settings: Settings) -> FastAPI:
         id_collision = id_owner if id_owner is not None and id_owner is not same_address else None
         return same_address, id_collision
 
+    def service_contract(method_name: str):  # type: ignore[no-untyped-def]
+        method = getattr(service, method_name, None)
+        if not callable(method):
+            raise BrokerError(
+                "contract_missing",
+                f"service method {method_name} is not implemented",
+                status_code=501,
+                details={"method": method_name},
+            )
+        return method
+
     ApiActor = Annotated[ActorContext, Depends(api_actor)]
 
     # ---- health and REST read routes ------------------------------------------
@@ -431,6 +445,59 @@ def create_app(settings: Settings) -> FastAPI:
     def scheduler_transfer(transfer_id: str, actor: ApiActor) -> dict[str, Any]:
         return service.scheduler_transfer_status(actor, transfer_id)
 
+    @app.get("/api/v1/resource-providers")
+    def resource_providers(
+        actor: ApiActor,
+        provider_type: str | None = None,
+        enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        return service_contract("list_resource_providers")(
+            actor,
+            provider_type=provider_type,
+            enabled=enabled,
+        )
+
+    @app.get("/api/v1/resource-monitor")
+    def resource_monitor(
+        actor: ApiActor,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        return service_contract("resource_monitor")(actor, project_id=project_id)
+
+    @app.get("/api/v1/resource-claims")
+    def resource_claims(
+        actor: ApiActor,
+        project_id: str | None = None,
+        state: str | None = None,
+    ) -> dict[str, Any]:
+        return service_contract("list_resource_claims")(
+            actor,
+            project_id=project_id,
+            state=state,
+        )
+
+    @app.get("/api/v1/resource-plan-evaluations")
+    def resource_plan_evaluations(
+        actor: ApiActor,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        return service_contract("list_resource_plan_evaluations")(
+            actor,
+            project_id=project_id,
+        )
+
+    @app.get("/api/v1/resource-run-actuals")
+    def resource_run_actuals(
+        actor: ApiActor,
+        project_id: str | None = None,
+        task_ref: str | None = None,
+    ) -> dict[str, Any]:
+        return service_contract("list_resource_run_actuals")(
+            actor,
+            project_id=project_id,
+            task_ref=task_ref,
+        )
+
     @app.get("/api/v1/actors")
     def actors(actor: ApiActor) -> dict[str, Any]:
         return service.list_actors(actor)
@@ -466,6 +533,60 @@ def create_app(settings: Settings) -> FastAPI:
             request_data,
             idempotency_key=_idempotency_key(idempotency_key),
             activate_if_allocated=True,
+        )
+
+    @app.post("/api/v1/resource-plan-evaluations")
+    def evaluate_resource_plan(
+        evaluation: ResourcePlanEvaluationInput,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service_contract("evaluate_resource_plan")(
+            actor,
+            evaluation,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/resource-claims")
+    def create_resource_claim(
+        claim: ResourceClaim,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service_contract("claim_resource")(
+            actor,
+            claim,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/resource-claims/{claim_id}/release")
+    def release_resource_claim(
+        claim_id: str,
+        body: dict[str, str],
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service_contract("release_resource_claim")(
+            actor,
+            claim_id,
+            reason=body.get("reason", "workload_completed"),
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/resource-run-actuals")
+    def record_resource_run_actual(
+        actual: ResourceRunActualInput,
+        actor: ApiActor,
+        claim_id: str | None = None,
+        evaluation_id: str | None = None,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service_contract("record_resource_run_actual")(
+            actor,
+            actual,
+            claim_id=claim_id,
+            evaluation_id=evaluation_id,
+            idempotency_key=_idempotency_key(idempotency_key),
         )
 
     @app.post("/api/v1/requests/{request_id}/cancel")

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from gpu_broker import API_CAPABILITIES, mcp_server
+from gpu_broker import API_CAPABILITIES, cli as cli_module, mcp_server
 from gpu_broker.api import create_app
 from gpu_broker.cli import app as cli_app
 from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
@@ -300,6 +302,142 @@ def test_api_claim_bootstraps_an_empty_project_registry(tmp_path: Path) -> None:
 
     assert claimed.status_code == 200
     assert claimed.json()["lease"]["project_id"] == "x"
+
+
+def test_general_resource_rest_contracts_delegate_and_fail_closed(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'general-resources.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    calls = []
+
+    service.list_resource_providers = lambda actor, provider_type=None, enabled=None: {  # type: ignore[attr-defined]
+        "schema_version": "v1",
+        "data": [{"actor": actor.id, "provider_type": provider_type, "enabled": enabled}],
+    }
+    service.resource_monitor = lambda actor, project_id=None: {  # type: ignore[attr-defined]
+        "schema_version": "v1",
+        "data": {"actor": actor.id, "project_id": project_id},
+    }
+
+    def evaluate_resource_plan(actor, evaluation, *, idempotency_key):  # type: ignore[no-untyped-def]
+        calls.append(("evaluate", actor.id, evaluation.project_id, idempotency_key))
+        return {"schema_version": "v1", "evaluation": {"project_id": evaluation.project_id}}
+
+    def claim_resource(actor, claim, *, idempotency_key):  # type: ignore[no-untyped-def]
+        calls.append(("claim", actor.id, claim.quantities.cpu_cores, idempotency_key))
+        return {"schema_version": "v1", "claim": {"project_id": claim.project_id}}
+
+    def release_resource_claim(actor, claim_id, *, reason, idempotency_key):  # type: ignore[no-untyped-def]
+        calls.append(("release", actor.id, claim_id, reason, idempotency_key))
+        return {"schema_version": "v1", "claim": {"id": claim_id, "state": "RELEASED"}}
+
+    def record_resource_run_actual(actor, actual, *, claim_id=None, evaluation_id=None, idempotency_key):  # type: ignore[no-untyped-def]
+        calls.append(("actual", actor.id, actual.outcome, claim_id, evaluation_id, idempotency_key))
+        return {"schema_version": "v1", "actual": {"outcome": actual.outcome}}
+
+    service.evaluate_resource_plan = evaluate_resource_plan  # type: ignore[attr-defined]
+    service.claim_resource = claim_resource  # type: ignore[attr-defined]
+    service.release_resource_claim = release_resource_claim  # type: ignore[attr-defined]
+    service.record_resource_run_actual = record_resource_run_actual  # type: ignore[attr-defined]
+
+    client = TestClient(app)
+    headers = {"X-GPU-Broker-Actor": "resource-agent", "Idempotency-Key": "resource-key"}
+    providers = client.get(
+        "/api/v1/resource-providers?provider_type=host-capacity&enabled=true",
+        headers={"X-GPU-Broker-Actor": "resource-agent"},
+    )
+    assert providers.status_code == 200
+    assert providers.json()["data"][0] == {
+        "actor": "resource-agent",
+        "provider_type": "host-capacity",
+        "enabled": True,
+    }
+    monitor = client.get(
+        "/api/v1/resource-monitor?project_id=project-a",
+        headers={"X-GPU-Broker-Actor": "resource-agent"},
+    )
+    assert monitor.status_code == 200
+    assert monitor.json()["data"]["project_id"] == "project-a"
+    missing = client.get(
+        "/api/v1/resource-claims",
+        headers={"X-GPU-Broker-Actor": "resource-agent"},
+    )
+    assert missing.status_code == 200
+    assert missing.json()["data"] == []
+
+    evaluation = {
+        "project_id": "project-a",
+        "task_ref": "train-1",
+        "baseline_runtime_seconds": 1200,
+        "marginal_min_saved_seconds": 120,
+        "marginal_min_saved_ratio": 0.10,
+        "selected_candidate_key": "cpu-8",
+        "candidates": [
+            {
+                "candidate_key": "cpu-8",
+                "provider_type": "host-capacity",
+                "quantities": {"cpu_cores": 8, "memory_mib": 32768},
+                "predicted_runtime_seconds": 600,
+                "predicted_saved_seconds": 600,
+                "predicted_saved_ratio": 0.5,
+                "satisfies_marginal_threshold": True,
+                "selected": True,
+            }
+        ],
+    }
+    assert client.post("/api/v1/resource-plan-evaluations", json=evaluation, headers=headers).status_code == 200
+    claim = {
+        "project_id": "project-a",
+        "task_ref": "train-1",
+        "purpose": "cpu-only training",
+        "provider_type": "host-capacity",
+        "quantities": {"cpu_cores": 8, "memory_mib": 32768},
+        "forecast": {
+            "quantities": {"cpu_cores": 8, "memory_mib": 32768},
+            "predicted_runtime_seconds": 600,
+            "predicted_saved_seconds": 600,
+            "predicted_saved_ratio": 0.5,
+        },
+    }
+    assert client.post("/api/v1/resource-claims", json=claim, headers=headers).status_code == 200
+    assert (
+        client.post(
+            "/api/v1/resource-claims/claim-1/release",
+            json={"reason": "done"},
+            headers=headers,
+        ).status_code
+        == 200
+    )
+    actual = {
+        "project_id": "project-a",
+        "task_ref": "train-1",
+        "quantities": {"cpu_cores": 8, "memory_mib": 32768},
+        "started_at": datetime(2026, 8, 4, 1, 0, tzinfo=UTC).isoformat(),
+        "completed_at": datetime(2026, 8, 4, 1, 10, tzinfo=UTC).isoformat(),
+        "actual_duration_seconds": 600,
+        "outcome": "succeeded",
+    }
+    assert (
+        client.post(
+            "/api/v1/resource-run-actuals?claim_id=claim-1&evaluation_id=eval-1",
+            json=actual,
+            headers=headers,
+        ).status_code
+        == 200
+    )
+    assert calls == [
+        ("evaluate", "resource-agent", "project-a", "resource-key"),
+        ("claim", "resource-agent", 8.0, "resource-key"),
+        ("release", "resource-agent", "claim-1", "done", "resource-key"),
+        ("actual", "resource-agent", "succeeded", "claim-1", "eval-1", "resource-key"),
+    ]
 
 
 def test_coordination_api_and_observed_binding(tmp_path: Path, inventory) -> None:
@@ -598,6 +736,13 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_schedule",
         "gpu_add_server",
         "gpu_delete_server",
+        "resource_providers",
+        "resource_monitor",
+        "resource_claims",
+        "resource_evaluate_plan",
+        "resource_claim",
+        "resource_release",
+        "resource_record_actual",
     }.issubset(names)
     assert "gpu_grant_server_project" not in names
     assert "gpu_scheduler_upload" not in names
@@ -635,6 +780,110 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
     calls.clear()
     assert mcp_server.gpu_claim("agent", "project", "task", 1)["request"] == {}
     assert [call[:2] for call in calls] == [("POST", "/api/v1/claims")]
+
+
+def test_mcp_general_resource_tools_delegate_and_enforce_marginal_policy(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = []
+
+    class FakeClient:
+        def resource_providers(self, *, provider_type=None, enabled=None):  # type: ignore[no-untyped-def]
+            calls.append(("providers", provider_type, enabled))
+            return {"schema_version": "v1", "data": []}
+
+        def resource_monitor(self, *, project_id=None):  # type: ignore[no-untyped-def]
+            calls.append(("monitor", project_id))
+            return {"schema_version": "v1", "data": {}}
+
+        def resource_claims(self, *, project_id=None, state=None):  # type: ignore[no-untyped-def]
+            calls.append(("claims", project_id, state))
+            return {"schema_version": "v1", "data": []}
+
+        def evaluate_resource_plan(self, evaluation, *, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append(("evaluate", evaluation["selected_candidate_key"], idempotency_key))
+            return {"schema_version": "v1", "evaluation": {}}
+
+        def claim_resource(self, claim, *, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append(("claim", claim["quantities"]["cpu_cores"], idempotency_key))
+            return {"schema_version": "v1", "claim": {}}
+
+        def release_resource_claim(self, claim_id, *, reason, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append(("release", claim_id, reason, idempotency_key))
+            return {"schema_version": "v1", "claim": {}}
+
+        def record_resource_run_actual(self, actual, *, claim_id=None, evaluation_id=None, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append(("actual", actual["outcome"], claim_id, evaluation_id, idempotency_key))
+            return {"schema_version": "v1", "actual": {}}
+
+    monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
+
+    evaluation = {
+        "project_id": "project-a",
+        "task_ref": "task",
+        "baseline_runtime_seconds": 1200,
+        "marginal_min_saved_seconds": 120,
+        "marginal_min_saved_ratio": 0.10,
+        "selected_candidate_key": "cpu-8",
+        "candidates": [
+            {
+                "candidate_key": "cpu-8",
+                "quantities": {"cpu_cores": 8, "memory_mib": 32768},
+                "predicted_runtime_seconds": 600,
+                "predicted_saved_seconds": 600,
+                "predicted_saved_ratio": 0.5,
+                "satisfies_marginal_threshold": True,
+                "selected": True,
+            }
+        ],
+    }
+    assert mcp_server.resource_providers(provider_type="host-capacity")["data"] == []
+    assert mcp_server.resource_monitor(project_id="project-a")["data"] == {}
+    assert mcp_server.resource_claims(state="ACTIVE")["data"] == []
+    assert mcp_server.resource_evaluate_plan("agent", evaluation, idempotency_key="eval-key")["evaluation"] == {}
+
+    invalid_threshold = {**evaluation, "marginal_min_saved_seconds": 60}
+    with pytest.raises(ValueError, match="marginal_min_saved_seconds must be 120"):
+        mcp_server.resource_evaluate_plan("agent", invalid_threshold)
+
+    claim = {
+        "project_id": "project-a",
+        "task_ref": "task",
+        "purpose": "cpu-only",
+        "quantities": {"cpu_cores": 8},
+        "forecast": {
+            "quantities": {"cpu_cores": 8},
+            "predicted_runtime_seconds": 600,
+        },
+    }
+    assert mcp_server.resource_claim("agent", claim, idempotency_key="claim-key")["claim"] == {}
+    assert (
+        mcp_server.resource_release("agent", "claim-1", reason="done", idempotency_key="release-key")["claim"]
+        == {}
+    )
+    actual = {
+        "project_id": "project-a",
+        "task_ref": "task",
+        "quantities": {"cpu_cores": 8},
+        "outcome": "succeeded",
+    }
+    assert (
+        mcp_server.resource_record_actual(
+            "agent",
+            actual,
+            claim_id="claim-1",
+            evaluation_id="eval-1",
+            idempotency_key="actual-key",
+        )["actual"]
+        == {}
+    )
+    assert calls == [
+        ("providers", "host-capacity", None),
+        ("monitor", "project-a"),
+        ("claims", None, "ACTIVE"),
+        ("evaluate", "cpu-8", "eval-key"),
+        ("claim", 8, "claim-key"),
+        ("release", "claim-1", "done", "release-key"),
+        ("actual", "succeeded", "claim-1", "eval-1", "actual-key"),
+    ]
 
 
 def test_ssh_preview_commit_is_bound_non_mutating_and_requires_project_scope(tmp_path: Path, inventory) -> None:
@@ -858,3 +1107,40 @@ def test_cli_help_is_available() -> None:
     result = CliRunner().invoke(cli_app, ["--help"])
     assert result.exit_code == 0
     assert "status" in result.stdout
+
+
+def test_cli_resource_evaluate_uses_client_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class FakeClient:
+        def evaluate_resource_plan(self, evaluation, *, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append((evaluation["selected_candidate_key"], bool(idempotency_key)))
+            return {"schema_version": "v1", "evaluation": {"id": "eval-1"}}
+
+    monkeypatch.setattr(cli_module, "_client", lambda url, actor: FakeClient())
+    payload = {
+        "project_id": "project-a",
+        "task_ref": "cpu-task",
+        "baseline_runtime_seconds": 1200,
+        "selected_candidate_key": "cpu-8",
+        "candidates": [
+            {
+                "candidate_key": "cpu-8",
+                "provider_type": "host-capacity",
+                "quantities": {"cpu_cores": 8, "memory_mib": 32768},
+                "predicted_runtime_seconds": 600,
+                "predicted_saved_seconds": 600,
+                "predicted_saved_ratio": 0.5,
+                "satisfies_marginal_threshold": True,
+                "selected": True,
+            }
+        ],
+    }
+    path = tmp_path / "evaluation.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    result = CliRunner().invoke(cli_app, ["resource", "evaluate", "--file", str(path), "--json"])
+
+    assert result.exit_code == 0
+    assert '"eval-1"' in result.stdout
+    assert calls == [("cpu-8", True)]

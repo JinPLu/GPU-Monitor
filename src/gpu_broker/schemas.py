@@ -101,6 +101,123 @@ class SchedulerResourceConstraints(ResourceConstraints):
         return self
 
 
+ResourceProviderType = Literal["direct-gpu", "host-capacity", "scheduler"]
+
+
+class ResourceQuantities(StrictModel):
+    """Non-negative quantities used by generic resource planning."""
+
+    gpu_count: int = Field(default=0, ge=0, le=1024)
+    cpu_cores: float = Field(default=0, ge=0, le=4096)
+    memory_mib: int = Field(default=0, ge=0, le=16 * 1024 * 1024)
+    nodes: int = Field(default=0, ge=0, le=1024)
+    scheduler_units: int = Field(default=0, ge=0, le=1024)
+
+    def has_resource(self) -> bool:
+        return any(
+            (
+                self.gpu_count > 0,
+                self.cpu_cores > 0,
+                self.memory_mib > 0,
+                self.nodes > 0,
+                self.scheduler_units > 0,
+            )
+        )
+
+
+class ResourceForecast(StrictModel):
+    """Runtime forecast for one resource quantity point."""
+
+    quantities: ResourceQuantities
+    predicted_runtime_seconds: int = Field(ge=1, le=60 * 60 * 24 * 365)
+    predicted_saved_seconds: int = Field(default=0, ge=0, le=60 * 60 * 24 * 365)
+    predicted_saved_ratio: float = Field(default=0, ge=0, le=1)
+
+
+class ResourceClaim(StrictModel):
+    """Generic agent resource claim; zero-resource claims are never admitted."""
+
+    project_id: str = Field(min_length=1, max_length=64)
+    task_ref: str = Field(min_length=1, max_length=255)
+    purpose: str = Field(min_length=1, max_length=1000)
+    provider_type: ResourceProviderType | None = None
+    quantities: ResourceQuantities
+    forecast: ResourceForecast | None = None
+
+    @model_validator(mode="after")
+    def reject_zero_resource(self) -> "ResourceClaim":
+        if not self.quantities.has_resource():
+            raise ValueError("resource claim must request at least one CPU, memory, GPU, node, or scheduler unit")
+        return self
+
+
+class ResourcePlanCandidateInput(StrictModel):
+    candidate_key: str = Field(min_length=1, max_length=120)
+    provider_type: ResourceProviderType | None = None
+    quantities: ResourceQuantities
+    predicted_runtime_seconds: int = Field(ge=1, le=60 * 60 * 24 * 365)
+    predicted_saved_seconds: int = Field(ge=0, le=60 * 60 * 24 * 365)
+    predicted_saved_ratio: float = Field(ge=0, le=1)
+    satisfies_marginal_threshold: bool
+    selected: bool = False
+    rejection_reason: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_candidate(self) -> "ResourcePlanCandidateInput":
+        if not self.quantities.has_resource():
+            raise ValueError("resource plan candidate must include at least one resource")
+        if self.selected and self.rejection_reason:
+            raise ValueError("selected resource plan candidate cannot include a rejection reason")
+        return self
+
+
+class ResourcePlanEvaluationInput(StrictModel):
+    project_id: str = Field(min_length=1, max_length=64)
+    task_ref: str = Field(min_length=1, max_length=255)
+    baseline_runtime_seconds: int = Field(ge=1, le=60 * 60 * 24 * 365)
+    marginal_min_saved_seconds: int = Field(default=120, ge=0, le=60 * 60 * 24)
+    marginal_min_saved_ratio: float = Field(default=0.10, ge=0, le=1)
+    candidates: list[ResourcePlanCandidateInput] = Field(min_length=1, max_length=256)
+    selected_candidate_key: str | None = Field(default=None, min_length=1, max_length=120)
+
+    @model_validator(mode="after")
+    def validate_selected_candidate(self) -> "ResourcePlanEvaluationInput":
+        candidate_keys = [candidate.candidate_key for candidate in self.candidates]
+        if len(candidate_keys) != len(set(candidate_keys)):
+            raise ValueError("resource plan candidate keys must be unique")
+        selected = [candidate.candidate_key for candidate in self.candidates if candidate.selected]
+        if len(selected) > 1:
+            raise ValueError("resource plan evaluation can select at most one candidate")
+        if self.selected_candidate_key is not None and self.selected_candidate_key not in candidate_keys:
+            raise ValueError("selected_candidate_key must match a candidate")
+        if selected and self.selected_candidate_key is not None and selected[0] != self.selected_candidate_key:
+            raise ValueError("selected candidate flag must match selected_candidate_key")
+        return self
+
+
+class ResourceRunActualInput(StrictModel):
+    project_id: str = Field(min_length=1, max_length=64)
+    task_ref: str = Field(min_length=1, max_length=255)
+    quantities: ResourceQuantities
+    started_at: datetime
+    completed_at: datetime | None = None
+    actual_duration_seconds: int | None = Field(default=None, ge=0, le=60 * 60 * 24 * 365)
+    outcome: Literal["succeeded", "failed", "cancelled", "unknown"]
+
+    @model_validator(mode="after")
+    def validate_actual(self) -> "ResourceRunActualInput":
+        if not self.quantities.has_resource():
+            raise ValueError("resource run actual must include at least one resource")
+        if self.started_at.tzinfo is None:
+            raise ValueError("started_at must include a timezone")
+        if self.completed_at is not None:
+            if self.completed_at.tzinfo is None:
+                raise ValueError("completed_at must include a timezone")
+            if self.completed_at < self.started_at:
+                raise ValueError("completed_at must not be before started_at")
+        return self
+
+
 class RequestCreate(StrictModel):
     project_id: str = Field(min_length=1, max_length=64)
     task_ref: str = Field(min_length=1, max_length=255)

@@ -62,12 +62,34 @@ struct FleetOverview: View {
         snapshot.requests.filter { $0.state == "QUEUED" }.count
     }
 
+    private var monitoringProviders: [ResourceProviderRecord] {
+        snapshot.monitoringProviders
+    }
+
+    private var hostCapacityProviders: [ResourceProviderRecord] {
+        monitoringProviders.filter { $0.providerType == "host-capacity" }
+    }
+
+    private var schedulerProviders: [ResourceProviderRecord] {
+        monitoringProviders.filter { $0.providerType == "scheduler" }
+    }
+
+    private var availableHostCPU: Int {
+        Int(hostCapacityProviders.reduce(0) { $0 + $1.available.cpuCores }.rounded())
+    }
+
+    private var availableHostMemoryGiB: Int {
+        hostCapacityProviders.reduce(0) { $0 + $1.available.memoryMiB } / 1024
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 overviewHeader
                 summaryGrid
                 coordinationSignals
+                resourceProjectionSection
+                planningAuditSection
                 attentionSection
                 serverPool
                 leaseSection
@@ -117,7 +139,9 @@ struct FleetOverview: View {
             OverviewSummaryCard(title: "已登记 GPU", value: snapshot.summary.totalGPUs, icon: "square.grid.3x3.fill")
             OverviewSummaryCard(title: "在线 / 最新 GPU", value: freshGPUCount, icon: "waveform.path.ecg")
             OverviewSummaryCard(title: "当前可分配", value: allocatableGPUCount, icon: "checkmark.circle.fill")
-            OverviewSummaryCard(title: "预约", value: snapshot.reservations.count, icon: "calendar.badge.clock")
+            OverviewSummaryCard(title: "可用 CPU", value: availableHostCPU, icon: "cpu")
+            OverviewSummaryCard(title: "可用内存 GB", value: availableHostMemoryGiB, icon: "memorychip")
+            OverviewSummaryCard(title: "调度目标", value: schedulerProviders.count, icon: "point.3.connected.trianglepath.dotted")
         }
     }
 
@@ -132,10 +156,24 @@ struct FleetOverview: View {
             )
             CoordinationSignal(
                 title: "排队请求",
-                value: "\(queuedRequestCount)",
-                detail: "等待分配",
+                value: "\(queuedRequestCount + snapshot.resourceClaims.filter { $0.state == "QUEUED" }.count)",
+                detail: "GPU 与通用资源请求",
                 icon: "hourglass",
-                color: queuedRequestCount > 0 ? DesignTokens.warning : DesignTokens.mutedInk
+                color: (queuedRequestCount > 0 || snapshot.resourceClaims.contains { $0.state == "QUEUED" }) ? DesignTokens.warning : DesignTokens.mutedInk
+            )
+            CoordinationSignal(
+                title: "边际收益决策",
+                value: "\(snapshot.resourcePlanEvaluations.count)",
+                detail: "扩容需 ≥10% 且 ≥2 分钟",
+                icon: "chart.line.uptrend.xyaxis",
+                color: snapshot.resourcePlanEvaluations.isEmpty ? DesignTokens.mutedInk : DesignTokens.interaction
+            )
+            CoordinationSignal(
+                title: "运行实绩",
+                value: "\(snapshot.resourceRunActuals.count)",
+                detail: "预测 vs 实际",
+                icon: "checklist.checked",
+                color: snapshot.resourceRunActuals.isEmpty ? DesignTokens.mutedInk : DesignTokens.success
             )
             CoordinationSignal(
                 title: "状态例外",
@@ -145,6 +183,72 @@ struct FleetOverview: View {
                 color: (attentionEndpoints.isEmpty && attentionGPUs.isEmpty) ? DesignTokens.mutedInk : DesignTokens.danger
             )
         }
+    }
+
+    private var resourceProjectionSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("资源调度投影")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("\(monitoringProviders.count)")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                Spacer()
+                Text("GPU、主机容量、外部调度分开显示")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+            }
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 260, maximum: 420), spacing: 8)], spacing: 8) {
+                ForEach(monitoringProviders) { provider in
+                    ResourceProjectionCard(
+                        provider: provider,
+                        unitCount: snapshot.allocatableUnits.filter { $0.providerID == provider.id }.count
+                    )
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("资源调度投影")
+    }
+
+    private var planningAuditSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("Agent 调度决策")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("\(snapshot.resourcePlanEvaluations.count)")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                Spacer()
+                Text("候选方案、选择/拒绝与预测-实际")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+            }
+
+            if snapshot.resourcePlanEvaluations.isEmpty && snapshot.resourceRunActuals.isEmpty && snapshot.resourceClaims.isEmpty {
+                Label("等待 Agent 提交通用资源计划；旧快照保持兼容", systemImage: "clock")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+                    .padding(.horizontal, 13)
+                    .overviewSurface(radius: 9)
+            } else {
+                LazyVStack(spacing: 6) {
+                    ForEach(snapshot.resourceClaims.prefix(4)) { claim in
+                        ResourceClaimOverviewRow(claim: claim)
+                    }
+                    ForEach(snapshot.resourcePlanEvaluations.prefix(4)) { evaluation in
+                        ResourcePlanOverviewRow(evaluation: evaluation)
+                    }
+                    ForEach(snapshot.resourceRunActuals.prefix(4)) { actual in
+                        ResourceActualOverviewRow(actual: actual)
+                    }
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Agent 调度决策")
     }
 
     private var attentionSection: some View {
@@ -400,6 +504,230 @@ private struct CoordinationSignal: View {
         .padding(.horizontal, 10)
         .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
         .overviewSurface(radius: 9)
+    }
+}
+
+private struct ResourceProjectionCard: View {
+    let provider: ResourceProviderRecord
+    let unitCount: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Image(systemName: providerIcon(provider.providerType))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(providerColor)
+                    .frame(width: 28, height: 28)
+                    .background(providerColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(provider.displayName)
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("\(provider.providerLabel) · \(provider.stateLabel)")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                }
+                Spacer(minLength: 4)
+                Text(provider.enabled ? "可观察" : "停用")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(provider.enabled ? providerColor : DesignTokens.mutedInk)
+            }
+
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 7) {
+                ResourceProjectionFact(title: "总容量", value: provider.total.compactLabel)
+                ResourceProjectionFact(title: "已承诺", value: provider.committed.compactLabel)
+                ResourceProjectionFact(title: "当前可认领", value: availableLabel)
+                ResourceProjectionFact(title: "单元", value: "\(unitCount)")
+            }
+
+            if let boundary = provider.trustBoundary {
+                Label(boundary, systemImage: "hand.raised.fill")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(provider.providerType == "scheduler" ? DesignTokens.warning : DesignTokens.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(11)
+        .overviewSurface(radius: 10)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(provider.providerLabel) \(provider.displayName)")
+        .accessibilityValue("\(provider.stateLabel)，可认领 \(availableLabel)，已承诺 \(provider.committed.compactLabel)")
+    }
+
+    private var providerColor: Color {
+        if provider.providerType == "scheduler", ["PENDING", "QUEUED", "SUBMITTED"].contains(provider.state) {
+            return DesignTokens.warning
+        }
+        switch provider.state {
+        case "ONLINE", "READY", "AVAILABLE": return DesignTokens.success
+        case "PENDING", "QUEUED", "SUBMITTED", "DRAINING": return DesignTokens.warning
+        case "ALLOCATED", "LEASED", "RUNNING": return DesignTokens.interaction
+        default: return DesignTokens.danger
+        }
+    }
+
+    private var availableLabel: String {
+        if provider.providerType == "scheduler", ["PENDING", "QUEUED", "SUBMITTED"].contains(provider.state) {
+            return "等待调度确认"
+        }
+        return provider.available.compactLabel
+    }
+}
+
+private struct ResourceProjectionFact: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(title)
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(DesignTokens.mutedInk)
+            Text(value)
+                .font(.system(size: 9, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ResourceClaimOverviewRow: View {
+    let claim: ResourceClaimRecord
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "person.crop.circle.badge.clock")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(DesignTokens.interaction)
+                .frame(width: 28, height: 28)
+                .background(DesignTokens.interaction.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(claim.projectID)
+                    .font(.system(size: 10, weight: .semibold))
+                Text("\(claim.actorID) · \(claim.taskReference.isEmpty ? (claim.purpose ?? "未命名任务") : claim.taskReference)")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            LeaseFact(label: "请求", value: claim.quantities.compactLabel, width: 150)
+            Text(claim.stateLabel)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(claim.state == "REJECTED" ? DesignTokens.danger : DesignTokens.interaction)
+        }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 44)
+        .overviewSurface(radius: 9)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("资源认领 \(claim.projectID)")
+        .accessibilityValue("\(claim.stateLabel)，\(claim.quantities.compactLabel)")
+    }
+}
+
+private struct ResourcePlanOverviewRow: View {
+    let evaluation: ResourcePlanEvaluationRecord
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                Image(systemName: "chart.line.uptrend.xyaxis")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(DesignTokens.interaction)
+                    .frame(width: 28, height: 28)
+                    .background(DesignTokens.interaction.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(evaluation.projectID)
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("\(evaluation.actorID) · \(evaluation.taskReference.isEmpty ? evaluation.id : evaluation.taskReference)")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                Text(thresholdLabel)
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(DesignTokens.mutedInk)
+            }
+
+            ForEach(evaluation.candidates.prefix(3)) { candidate in
+                ResourceCandidateRow(candidate: candidate)
+            }
+        }
+        .padding(12)
+        .overviewSurface(radius: 9)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("资源计划 \(evaluation.projectID)")
+    }
+
+    private var thresholdLabel: String {
+        let seconds = evaluation.minimumSavedSeconds ?? 120
+        let ratio = Int(((evaluation.minimumSavedRatio ?? 0.10) * 100).rounded())
+        return "门槛 ≥\(ratio)% 且 ≥\(seconds / 60) 分钟"
+    }
+}
+
+private struct ResourceCandidateRow: View {
+    let candidate: ResourcePlanCandidateRecord
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: candidate.selected ? "checkmark.circle.fill" : "xmark.circle")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(candidate.selected ? DesignTokens.success : DesignTokens.mutedInk)
+            Text(candidate.candidateKey)
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            Text(candidate.quantities.compactLabel)
+                .font(.system(size: 9, weight: .medium, design: .rounded))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .lineLimit(1)
+            Text("\(durationLabel(candidate.predictedRuntimeSeconds)) · 省 \(durationLabel(candidate.predictedSavedSeconds))")
+                .font(.system(size: 9, weight: .semibold, design: .rounded))
+                .foregroundStyle(candidate.selected ? DesignTokens.success : DesignTokens.mutedInk)
+                .lineLimit(1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("候选方案 \(candidate.candidateKey)")
+        .accessibilityValue("\(candidate.decisionLabel)，预测 \(durationLabel(candidate.predictedRuntimeSeconds))，节省 \(durationLabel(candidate.predictedSavedSeconds))")
+    }
+}
+
+private struct ResourceActualOverviewRow: View {
+    let actual: ResourceRunActualRecord
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "checklist.checked")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(DesignTokens.success)
+                .frame(width: 28, height: 28)
+                .background(DesignTokens.success.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(actual.projectID)
+                    .font(.system(size: 10, weight: .semibold))
+                Text("\(actual.actorID) · \(actual.taskReference.isEmpty ? actual.id : actual.taskReference)")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            LeaseFact(label: "资源", value: actual.quantities.compactLabel, width: 150)
+            LeaseFact(label: "预测/实际", value: actualDurationLabel, width: 96)
+        }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 44)
+        .overviewSurface(radius: 9)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("运行实绩 \(actual.projectID)")
+        .accessibilityValue("预测和实际耗时 \(actualDurationLabel)")
+    }
+
+    private var actualDurationLabel: String {
+        "\(durationLabel(actual.predictedDurationSeconds)) / \(durationLabel(actual.actualDurationSeconds))"
     }
 }
 
@@ -756,6 +1084,24 @@ private extension View {
 private func percent(_ value: Double?) -> String {
     guard let value else { return "—" }
     return "\(Int((value * 100).rounded()))%"
+}
+
+private func providerIcon(_ providerType: String) -> String {
+    switch providerType {
+    case "direct-gpu": return "square.grid.3x3.fill"
+    case "host-capacity": return "cpu"
+    case "scheduler": return "point.3.connected.trianglepath.dotted"
+    default: return "shippingbox"
+    }
+}
+
+private func durationLabel(_ seconds: Int?) -> String {
+    guard let seconds else { return "—" }
+    if seconds < 60 { return "\(seconds)s" }
+    if seconds < 3600 { return "\(seconds / 60)m" }
+    let hours = seconds / 3600
+    let minutes = (seconds % 3600) / 60
+    return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m"
 }
 
 private func gibibytes(_ mebibytes: Int) -> Int {

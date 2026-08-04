@@ -17,14 +17,23 @@ from gpu_broker.daemon import ensure_broker_ready_for_mcp
 PLACED_LEASE_STATES = {"HELD", "ACTIVE"}
 TERMINAL_REQUEST_STATES = {"CANCELLED", "EXPIRED", "REJECTED", "RELEASED"}
 TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
+RESOURCE_MARGINAL_MIN_SAVED_RATIO = 0.10
+RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
 
 MCP_INSTRUCTIONS = (
-    "Use gpu-broker for GPU work and read-only resource discovery. The Broker is the only "
+    "Use gpu-broker for GPU, CPU, memory, scheduler work, and read-only resource discovery. The Broker is the only "
     "allocation and freshness/probing authority: do not bypass it through SSH, SQLite, inventory, remote "
-    "probes, or nvidia-smi. A request or accepted plan to run, continue, or monitor a GPU task makes its "
-    "owner-scoped claim routine once a profile_id, or project_id, gpu_count, and needed thresholds "
+    "probes, or nvidia-smi. A request or accepted plan to run, continue, or monitor a resource task makes its "
+    "owner-scoped claim routine once a profile_id, or project_id, resource quantities, and needed thresholds "
     "are recorded. Reuse that contract without asking again; never infer missing inputs from a repository, "
     "task title, free capacity, or defaults. "
+    "For cross-project and cross-agent resource scheduling, prefer resource_providers and resource_monitor for "
+    "discovery, then resource_evaluate_plan with explicit candidate forecasts, then resource_claim for the "
+    "selected smallest useful plan. Start from the smallest feasible CPU, memory, GPU, node, or scheduler "
+    "quantity and expand only when the next candidate is forecast to save at least 10% remaining time and "
+    "at least 120 seconds. Record rejected expansions and actual runtime with resource_record_actual so humans "
+    "can monitor decisions and outcomes in real time. A zero-GPU CPU/memory or scheduler plan is valid when "
+    "its resource quantities are explicit. "
     "The normal bare-metal path is gpu_claim_profile or gpu_claim, optionally gpu_wait_for_claim if queued, "
     "then project execution on the returned held or active lease.resources[], then "
     "gpu_bind_observed_workload, then gpu_release. Use gpu_coordination when shared state would help, but "
@@ -67,6 +76,63 @@ def _require_request_fields(request: dict[str, Any]) -> None:
     missing = [field for field in ("project_id", "task_ref", "purpose") if not request.get(field)]
     if missing:
         raise ValueError(f"gpu_request requires {', '.join(missing)}")
+
+
+def _has_resource_quantity(quantities: dict[str, Any]) -> bool:
+    return any(
+        float(quantities.get(field) or 0) > 0
+        for field in ("gpu_count", "cpu_cores", "memory_mib", "nodes", "scheduler_units")
+    )
+
+
+def _require_resource_claim_fields(claim: dict[str, Any]) -> None:
+    missing = [field for field in ("project_id", "task_ref", "purpose", "quantities", "forecast") if not claim.get(field)]
+    if missing:
+        raise ValueError("resource_claim requires " + ", ".join(missing))
+    quantities = claim["quantities"]
+    if not isinstance(quantities, dict) or not _has_resource_quantity(quantities):
+        raise ValueError("resource_claim quantities must request CPU, memory, GPU, nodes, or scheduler units")
+    forecast = claim["forecast"]
+    if not isinstance(forecast, dict):
+        raise ValueError("resource_claim forecast must be a mapping")
+    if not isinstance(forecast.get("quantities"), dict) or not forecast.get("predicted_runtime_seconds"):
+        raise ValueError("resource_claim forecast requires quantities and predicted_runtime_seconds")
+
+
+def _require_resource_plan_fields(evaluation: dict[str, Any]) -> None:
+    missing = [
+        field
+        for field in ("project_id", "task_ref", "baseline_runtime_seconds", "candidates")
+        if not evaluation.get(field)
+    ]
+    if missing:
+        raise ValueError("resource_evaluate_plan requires " + ", ".join(missing))
+    if evaluation.get("marginal_min_saved_ratio", RESOURCE_MARGINAL_MIN_SAVED_RATIO) != RESOURCE_MARGINAL_MIN_SAVED_RATIO:
+        raise ValueError("resource_evaluate_plan marginal_min_saved_ratio must be 0.10")
+    if evaluation.get("marginal_min_saved_seconds", RESOURCE_MARGINAL_MIN_SAVED_SECONDS) != RESOURCE_MARGINAL_MIN_SAVED_SECONDS:
+        raise ValueError("resource_evaluate_plan marginal_min_saved_seconds must be 120")
+    candidates = evaluation["candidates"]
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("resource_evaluate_plan candidates must be a non-empty list")
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"resource_evaluate_plan candidate {index} must be a mapping")
+        required = (
+            "candidate_key",
+            "quantities",
+            "predicted_runtime_seconds",
+            "predicted_saved_seconds",
+            "predicted_saved_ratio",
+            "satisfies_marginal_threshold",
+        )
+        missing_candidate = [field for field in required if field not in candidate]
+        if missing_candidate:
+            raise ValueError(
+                f"resource_evaluate_plan candidate {index} requires "
+                + ", ".join(missing_candidate)
+            )
+        if not isinstance(candidate["quantities"], dict) or not _has_resource_quantity(candidate["quantities"]):
+            raise ValueError(f"resource_evaluate_plan candidate {index} quantities must include a resource")
 
 
 def _bounded_seconds(value: float, *, name: str, minimum: float, maximum: float) -> float:
@@ -517,6 +583,116 @@ def gpu_history(after_id: int = 0) -> dict[str, Any]:
     """Read the append-only, redacted audit history for visible resources."""
 
     return _client().get("/api/v1/events", params={"after_id": after_id})
+
+
+@mcp.tool()
+def resource_providers(
+    agent_name: str | None = None,
+    provider_type: str | None = None,
+    enabled: bool | None = None,
+) -> dict[str, Any]:
+    """List generic resource providers: direct GPU, host CPU/memory capacity, and external schedulers."""
+
+    return _client(agent_name).resource_providers(provider_type=provider_type, enabled=enabled)
+
+
+@mcp.tool()
+def resource_monitor(
+    agent_name: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Return real-time human/agent monitor data for generic resources and active claims."""
+
+    return _client(agent_name).resource_monitor(project_id=project_id)
+
+
+@mcp.tool()
+def resource_claims(
+    agent_name: str | None = None,
+    project_id: str | None = None,
+    state: str | None = None,
+) -> dict[str, Any]:
+    """List generic resource claims across visible projects and agents."""
+
+    return _client(agent_name).resource_claims(project_id=project_id, state=state)
+
+
+@mcp.tool()
+def resource_evaluate_plan(
+    agent_name: str,
+    evaluation: dict[str, Any],
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Persist an explicit marginal-utility resource decision.
+
+    The evaluation must include candidate forecasts. The only accepted expansion
+    threshold is 10% remaining-time savings and 120 seconds absolute savings.
+    """
+
+    _require_resource_plan_fields(evaluation)
+    return _client(agent_name).evaluate_resource_plan(
+        evaluation,
+        idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
+
+
+@mcp.tool()
+def resource_claim(
+    agent_name: str,
+    claim: dict[str, Any],
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Claim the selected generic resource plan.
+
+    Claims must include explicit quantities and a forecast. The Broker returns
+    the placement; a queued or null allocation is not permission to run.
+    """
+
+    _require_resource_claim_fields(claim)
+    return _client(agent_name).claim_resource(
+        claim,
+        idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
+
+
+@mcp.tool()
+def resource_release(
+    agent_name: str,
+    claim_id: str,
+    reason: str = "workload_completed",
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Release a generic resource claim; this never stops remote work."""
+
+    if not claim_id.strip():
+        raise ValueError("claim_id must not be empty")
+    return _client(agent_name).release_resource_claim(
+        claim_id,
+        reason=reason,
+        idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
+
+
+@mcp.tool()
+def resource_record_actual(
+    agent_name: str,
+    actual: dict[str, Any],
+    claim_id: str | None = None,
+    evaluation_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Record observed runtime and outcome for later scheduling calibration and human monitoring."""
+
+    if not actual.get("project_id") or not actual.get("task_ref") or not actual.get("quantities") or not actual.get("outcome"):
+        raise ValueError("resource_record_actual requires project_id, task_ref, quantities, and outcome")
+    if not isinstance(actual["quantities"], dict) or not _has_resource_quantity(actual["quantities"]):
+        raise ValueError("resource_record_actual quantities must include a resource")
+    return _client(agent_name).record_resource_run_actual(
+        actual,
+        claim_id=claim_id,
+        evaluation_id=evaluation_id,
+        idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
 
 
 @mcp.tool()

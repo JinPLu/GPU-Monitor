@@ -1,10 +1,11 @@
 # gpu-broker 实施状态
 
-更新时间：2026-08-02（Asia/Shanghai）
+更新时间：2026-08-04（Asia/Shanghai）
 
 ## 当前状态
 
 - 本机功能版已交付：GUI、CLI 和 MCP 共用 REST 领域逻辑，可查看、认领、排队、预约和释放 GPU。
+- 通用资源控制面已追加支持 direct GPU、主机 CPU/内存和 SchedulerTarget 三类资源：CPU-only 合同不再因缺少 GPU 阻塞；主机认领以新鲜 telemetry 的可用 CPU/内存扣除既有承诺后 fail-closed 分配。Agent 以从小到大的显式候选预测认领资源，只有扩容同时节省至少 10% 剩余时间和 120 秒才扩大合同。候选、选择/拒绝原因与实际耗时均写入审计；REST、CLI、MCP 和 macOS 总览展示同一监控投影。GPU 旧接口、租约和 Slurm 作业语义保持兼容；Scheduler 的 PENDING 容量不作为裸机可用资源显示。
 - macOS 控制面改由用户级 headless LaunchAgent 长期持有，唯一数据目录是
   `~/Library/Application Support/GPU Broker/`。MCP 首次 REST 调用会执行
   带 daemon identity 的 health/ready 检查并在单进程锁内自动 ensure；迁移先在
