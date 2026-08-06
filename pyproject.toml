@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gpu-broker"
 version = "1.0.0"
-description = "Local shared-GPU status and lease coordination."
+description = "Single-user GPU/CPU coordination across servers, projects, and agents."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"

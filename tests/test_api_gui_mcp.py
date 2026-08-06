@@ -41,7 +41,7 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     client = TestClient(app)
     home = client.get("/")
     assert home.status_code == 200
-    assert "GPU 资源空间" in home.text
+    assert "我的计算资源" in home.text
     assert "添加服务器" in home.text
     assert 'id="server-groups"' in home.text
     assert 'id="gpu-detail"' in home.text
@@ -102,7 +102,7 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert history.json()["data"]["point_count"] <= 120
     requests = client.get("/ui/requests")
     assert requests.status_code == 200
-    assert "认领 GPU" in requests.text
+    assert "申请 GPU" in requests.text
     assert "可用 CPU 核数" in requests.text
     assert "可用内存 GiB" in requests.text
     assert "单卡可用显存 GiB" in requests.text

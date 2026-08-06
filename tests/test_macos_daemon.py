@@ -479,6 +479,36 @@ def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry
         assert resource_label in usage_source
 
 
+def test_product_copy_is_anchored_on_one_user_with_projects_and_agents() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    readme = (project_root / "README.md").read_text(encoding="utf-8")
+    window_source = (project_root / "desktop" / "GPU Broker.swift").read_text(
+        encoding="utf-8"
+    )
+    usage_source = (
+        project_root / "desktop" / "ResourceUsageDashboard.swift"
+    ).read_text(encoding="utf-8")
+    base_template = (
+        project_root / "src" / "gpu_broker" / "web" / "templates" / "base.html"
+    ).read_text(encoding="utf-8")
+    dashboard_template = (
+        project_root
+        / "src"
+        / "gpu_broker"
+        / "web"
+        / "templates"
+        / "dashboard.html"
+    ).read_text(encoding="utf-8")
+
+    assert "一个本机用户，管理多台服务器、多个项目和多个 Agent" in readme
+    assert 'SidebarSelection(title: "项目与 Agent"' in window_source
+    assert 'Text("项目与 Agent")' in usage_source
+    assert "一个本机用户 · 同一份状态" in base_template
+    assert "一个本机用户 · 多项目与 Agent" in dashboard_template
+    for retired_copy in ("共享 GPU 工作区", "协作安排", "当前操作者"):
+        assert retired_copy not in base_template + dashboard_template
+
+
 def test_resource_ownership_fixture_covers_all_resource_usage_dimensions() -> None:
     project_root = Path(__file__).resolve().parents[1]
     fixture = json.loads(

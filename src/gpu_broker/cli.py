@@ -34,7 +34,10 @@ from gpu_broker.schemas import (
 from gpu_broker.service import BrokerService
 
 
-app = typer.Typer(no_args_is_help=True, help="Local shared-GPU status and coordination.")
+app = typer.Typer(
+    no_args_is_help=True,
+    help="Single-user GPU/CPU coordination across projects and agents.",
+)
 endpoint_app = typer.Typer(no_args_is_help=True)
 gpu_app = typer.Typer(no_args_is_help=True)
 request_app = typer.Typer(no_args_is_help=True)

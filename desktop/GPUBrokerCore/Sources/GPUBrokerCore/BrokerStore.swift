@@ -197,12 +197,12 @@ public final class BrokerStore: ObservableObject {
     public func setActor(_ value: String) {
         let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else {
-            errorMessage = "操作者标识不能为空。"
+            errorMessage = "本机操作标识不能为空。"
             return
         }
         actorID = cleaned
         UserDefaults.standard.set(cleaned, forKey: "gpuBrokerActorID")
-        notice = "已切换操作者：\(cleaned)。"
+        notice = "本机操作记录已切换为：\(cleaned)。"
         invalidateActiveRefresh()
         requestRefresh()
     }

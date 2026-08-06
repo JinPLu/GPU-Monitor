@@ -308,7 +308,7 @@
       ],
       "data_age_seconds": 2,
       "freshness_seconds": 30,
-      "admission_boundary": "只记录资源归属，不会启动或停止服务器上的任务。",
+      "admission_boundary": "只协调资源，不执行服务器上的任务。",
       "absent_gpu_ids": [],
       "maintenance": [],
       "alerts": [],

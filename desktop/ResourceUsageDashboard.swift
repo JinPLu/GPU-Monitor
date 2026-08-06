@@ -294,9 +294,9 @@ struct ResourceUsageDashboard: View {
                         .id(selectedGroup.id)
                     } else {
                         ContentUnavailableView(
-                            "暂无资源使用记录",
+                            "还没有项目或 Agent 申请资源",
                             systemImage: "person.2.slash",
-                            description: Text("提交资源申请后，可按项目、Agent 或任务查看资源归属。")
+                            description: Text("点击“申请 GPU”开始分配资源。")
                         )
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
@@ -309,22 +309,22 @@ struct ResourceUsageDashboard: View {
         .onAppear { ensureSelectedGroup() }
         .onChange(of: scope) { _, _ in ensureSelectedGroup(reset: true) }
         .onChange(of: store.snapshot.snapshotRevision) { _, _ in ensureSelectedGroup() }
-        .accessibilityLabel("资源使用")
+        .accessibilityLabel("项目与 Agent")
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("资源使用")
+                    Text("项目与 Agent")
                         .font(.system(size: 22, weight: .semibold))
                         .foregroundStyle(DesignTokens.ink)
-                    Text("从项目、Agent 或任务查看已分配资源和等待中的申请")
+                    Text("按项目、Agent 或任务查看资源分配、运行和排队状态")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                 }
                 Spacer(minLength: 20)
-                Label("只记录资源归属，不会停止远端任务", systemImage: "hand.raised.fill")
+                Label("记录资源归属，不控制远端任务", systemImage: "hand.raised.fill")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
             }
@@ -581,19 +581,19 @@ private struct ResourceUsageGroupDetail: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 180, maximum: 320), spacing: 12)], spacing: 12) {
                     ResourceQuantityPanel(
                         title: "已分配",
-                        subtitle: "资源已确认归属，尚未检测到运行中的托管进程",
+                        subtitle: "资源已归属，尚未检测到任务进程",
                         quantities: group.assignedQuantities,
                         icon: "checkmark.circle.fill"
                     )
                     ResourceQuantityPanel(
                         title: "运行中",
-                        subtitle: "已检测到托管进程；这里显示对应分配量，不是瞬时用量",
+                        subtitle: "已检测到任务进程；数值为分配量",
                         quantities: group.runningQuantities,
                         icon: "play.circle.fill"
                     )
                     ResourceQuantityPanel(
                         title: "申请中",
-                        subtitle: "等待批准或等待分配的资源",
+                        subtitle: "等待分配的资源",
                         quantities: group.requestedQuantities,
                         icon: "hourglass"
                     )

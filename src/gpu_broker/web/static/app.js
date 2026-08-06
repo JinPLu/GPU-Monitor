@@ -196,7 +196,7 @@
         const csrf = sshForm.elements.csrf.value;
         const commands = commandInput.value.split(/\r?\n/).map((command) => command.trim()).filter(Boolean);
         sshProjectIds = projectInput.value.trim() ? [projectInput.value.trim()] : [];
-        if (!sshProjectIds.length) throw new Error("请填写归属项目；项目 Agent 才能管理自己的 endpoint。");
+        if (!sshProjectIds.length) throw new Error("请填写这台服务器的归属项目。");
         sshBatchCommands = commands.length > 1 ? commands : null;
         sshPreviewData = sshBatchCommands
           ? await requestSshBatchPreview(sshBatchCommands, sshProjectIds, csrf)
@@ -297,11 +297,11 @@
   const escapeHTML = escapeForMarkup;
   const clamp = (value) => Math.max(0, Math.min(100, Number(value) || 0));
   const stateLabels = {
-    AVAILABLE: "空闲",
+    AVAILABLE: "可分配",
     BUSY_UNMANAGED: "占用（未登记）",
     RUNNING_MANAGED: "运行中",
-    HELD: "已认领",
-    LEASED_IDLE: "已认领",
+    HELD: "已分配",
+    LEASED_IDLE: "已分配",
     RESERVED: "已安排",
     MAINTENANCE: "维护",
     DISABLED: "停用",
@@ -447,7 +447,7 @@
       <section class="server-block" data-server-id="${escapeHTML(endpoint.id)}" data-expanded="${expanded}">
         <div class="server-summary">
           <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong><code>${escapeHTML(sshCommand)}</code></strong><small>${escapeHTML(endpoint.id)} · ${escapeHTML(monitorLabels[status] || status)}</small></span></span>
-          <span class="server-counts" aria-label="GPU 状态：共 ${gpus.length}，空闲 ${available}，占用 ${busy}，认领 ${claimed}，异常 ${abnormal}"><span title="总数"><strong>${gpus.length}</strong></span><span class="count-available" title="空闲"><strong>${available}</strong></span><span title="占用"><strong>${busy}</strong></span><span title="认领"><strong>${claimed}</strong></span><span class="${abnormal ? "count-alert" : ""}" title="异常"><strong>${abnormal}</strong></span></span>
+          <span class="server-counts" aria-label="GPU 状态：共 ${gpus.length}，可分配 ${available}，占用 ${busy}，已分配 ${claimed}，异常 ${abnormal}"><span title="总数"><strong>${gpus.length}</strong></span><span class="count-available" title="可分配"><strong>${available}</strong></span><span title="占用"><strong>${busy}</strong></span><span title="已分配"><strong>${claimed}</strong></span><span class="${abnormal ? "count-alert" : ""}" title="异常"><strong>${abnormal}</strong></span></span>
           <span class="server-aggregate">${clusterMeter("CPU", cpuLoadPct, "cpu", cpuDetail)}${clusterMeter("内存", memoryUsedPct, "memory", memoryDetail)}${clusterMeter("显存", memoryPct, "memory", vramDetail)}${clusterMeter("GPU", util, "utilization", `${Math.round(util)}% 利用率`)}</span>
           <span class="server-actions">
             <button class="server-expand" type="button" data-toggle-server="${escapeHTML(endpoint.id)}" aria-expanded="${expanded}" title="${expanded ? "收起 GPU" : "展开 GPU"}">
@@ -457,7 +457,7 @@
               <input type="hidden" name="endpoint_id" value="${escapeHTML(endpoint.id)}">
               <input type="hidden" name="csrf" value="${escapeHTML(csrfToken)}">
               <input type="hidden" name="confirmed" value="yes">
-              <button class="icon-button server-delete" type="submit" title="删除服务器" aria-label="删除服务器 ${escapeHTML(endpoint.id)}"><i class="ph ph-trash" aria-hidden="true"></i></button>
+              <button class="icon-button server-delete" type="submit" title="移除服务器" aria-label="移除服务器 ${escapeHTML(endpoint.id)}"><i class="ph ph-trash" aria-hidden="true"></i></button>
             </form>
           </span>
         </div>
@@ -522,7 +522,7 @@
     document.getElementById("queue-count").textContent = (data.requests || []).length;
     document.getElementById("schedule-count").textContent = (data.reservations || []).length;
     document.getElementById("coordination-content").innerHTML = sideItems()
-      || `<p class="empty-inline">${activeSideTab === "claims" ? "当前没有认领" : activeSideTab === "queue" ? "当前没有排队" : "当前没有未来安排"}</p>`;
+      || `<p class="empty-inline">${activeSideTab === "claims" ? "当前没有资源分配" : activeSideTab === "queue" ? "当前没有排队" : "当前没有未来安排"}</p>`;
   };
 
   const render = () => {
@@ -559,7 +559,7 @@
     const form = event.target.closest("[data-delete-server-form]");
     if (!form) return;
     const label = form.dataset.serverLabel || "该服务器";
-    const confirmed = window.confirm(`删除服务器 ${label}？这会移除本机监控登记和该服务器的当前 GPU/遥测记录，不会停止远端任务。`);
+    const confirmed = window.confirm(`移除服务器 ${label}？它将停止接收新分配，待当前资源和队列排空后退役；不会停止远端任务。`);
     if (!confirmed) event.preventDefault();
   });
 
@@ -592,8 +592,8 @@
   const setCoordinationCollapsed = (collapsed, { focus = false } = {}) => {
     dashboardLayout.classList.toggle("coordination-collapsed", collapsed);
     coordinationToggle.setAttribute("aria-expanded", String(!collapsed));
-    coordinationToggle.setAttribute("aria-label", collapsed ? "协作安排已收起" : "收起协作安排");
-    coordinationToggle.title = collapsed ? "协作安排已收起" : "收起协作安排";
+    coordinationToggle.setAttribute("aria-label", collapsed ? "项目与 Agent 已收起" : "收起项目与 Agent");
+    coordinationToggle.title = collapsed ? "项目与 Agent 已收起" : "收起项目与 Agent";
     coordinationToggle.innerHTML = `<i class="ph ${collapsed ? "ph-caret-left" : "ph-caret-right"}" aria-hidden="true"></i>`;
     coordinationReopen.hidden = !collapsed;
     coordinationReopen.setAttribute("aria-expanded", String(collapsed));
@@ -676,7 +676,7 @@
       ? `<strong>${escapeHTML(lease.actor_id)}</strong> · ${escapeHTML(lease.task_ref || lease.purpose || "未填写任务")}<br>${processes.length} 个计算进程 · 安全截止 ${formatDate(lease.expires_at, true)}`
       : processes.length
         ? `${processes.length} 个未登记进程 · ${escapeHTML(processes.map((item) => item.executable).join("、"))}`
-        : "暂无认领，也没有计算进程";
+        : "暂无资源分配，也没有计算进程";
   };
 
   const renderChart = async () => {

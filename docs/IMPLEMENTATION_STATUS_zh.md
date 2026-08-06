@@ -17,7 +17,7 @@
   `lease.resources[]` 返回的 endpoint、GPU、`cuda_visible_devices` 上运行或停止已获授权的
   workload；Broker 只协调分配与观测归属。外部 Slurm 是独立的
   `SchedulerTarget/SchedulerJob` adapter，由项目 owner 提交、查询和取消其作业。
-- endpoint 是本机共享服务器清单。`owner_project_id` 只用于可选归属展示，不参与权限判断；
+- endpoint 是本机服务器清单。`owner_project_id` 只用于可选归属展示，不参与权限判断；
   任一本机可写调用方都可添加、更新、维护、drain 和 retire endpoint。删除的第一步是
   `active → draining`：不再放置新任务，但不停止既有任务，也不删除遥测或审计；活跃 lease
   结束后第二次操作转为 `retired`。macOS App 的一次“移除并退役”会自动推进这两个受领域服务
@@ -25,7 +25,7 @@
   审计证据，但从日常服务器池、实时容量、异常统计和资源来源卡片中隐藏。
 - Windows 桌面源码构建入口已加入：PowerShell + PyInstaller 生成 `dist/windows/GPU Broker/GPU Broker.exe`，运行时写入 `%LOCALAPPDATA%\GPU Broker`，启动同一 loopback REST/Web UI，不复制调度、租约或审计规则；它仍不是已签名安装包。
 - 预设任务（workload profile）是可选的持久化资源合同：明确 `profile_id` 的 GUI/MCP 认领只传配置与任务，服务在立即或排队后分配时自动激活。没有 profile 时，一次性认领需要任意非空项目标识、任务、GPU 数量，以及需要的 CPU 核数、系统内存 MiB、单卡总显存/可用显存 MiB 等绝对值下限，任务名自动记录为用途；项目标识首次使用会自动登记为中性归属标签，不需要预创建、项目管理入口或服务器项目授权。申请不再要求预计占用时间，任务完成后释放租约；最大租约窗口是调度与未来预约共同遵守的硬边界。Agent 不得根据任务、目录或空闲容量自行挑选 profile，也不得推断项目、GPU 数量或 CPU/内存/显存需求。
-- Broker 提供面向 Agent 的共享协调看板：`gpu_coordination` 返回服务器、GPU、队列、
+- Broker 提供面向同一用户的项目与 Agent 协调看板：`gpu_coordination` 返回服务器、GPU、队列、
   空租约、受管与未归属进程和实际利用率。成功 lease 还带 endpoint/GPU 结构化资源与
   CPU、内存承诺；CUDA selector 只来自该返回值。`gpu_bind_observed_workload` 将已启动且
   已被 Collector 观测到的 lease 进程登记为受管，不启动或停止进程。

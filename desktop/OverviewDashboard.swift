@@ -164,7 +164,7 @@ struct FleetOverview: View {
                 }
 
                 if !snapshot.operationalEndpoints.isEmpty || hasActiveUsage {
-                    Label(snapshot.admissionBoundary, systemImage: "hand.raised.fill")
+                    Label("只协调资源，不执行任务", systemImage: "hand.raised.fill")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .fixedSize(horizontal: false, vertical: true)
@@ -174,7 +174,7 @@ struct FleetOverview: View {
             .padding(.bottom, 16)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .accessibilityLabel("资源总览")
+        .accessibilityLabel("总览")
     }
 
     private var overviewHeader: some View {
@@ -188,9 +188,9 @@ struct FleetOverview: View {
 
     private var overviewHeading: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("实时概览")
+            Text("我的计算资源")
                 .font(.system(size: 22, weight: .bold))
-            Text("CPU、内存与 GPU 的实时容量和可用状态")
+            Text("查看服务器容量，以及项目和 Agent 的资源状态")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(DesignTokens.mutedInk)
                 .lineLimit(1)
@@ -198,7 +198,7 @@ struct FleetOverview: View {
     }
 
     private var overviewCapacityBadge: some View {
-        Text("\(snapshot.operationalEndpoints.count) 台已登记 · \(onlineEndpointCount) 台在线")
+        Text("\(snapshot.operationalEndpoints.count) 台服务器 · \(onlineEndpointCount) 台在线")
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(DesignTokens.ink)
             .lineLimit(1)
@@ -1173,7 +1173,7 @@ private struct OverviewLeaseRow: View {
             Spacer(minLength: 8)
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 12) {
-                    LeaseFact(label: "操作者", value: lease.actorID, width: 170)
+                    LeaseFact(label: "记录来源", value: lease.actorID, width: 170)
                     LeaseFact(label: "GPU ID", value: gpuLabel, width: 112)
                         .help(lease.gpuIDs.joined(separator: "\n"))
                     LeaseFact(label: "GPU", value: "\(lease.gpuIDs.count) 块", width: 54)
@@ -1192,7 +1192,7 @@ private struct OverviewLeaseRow: View {
         .frame(minHeight: 44)
         .overviewSurface(radius: 9)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("资源使用 \(lease.projectID)")
+        .accessibilityLabel("资源分配 \(lease.projectID)")
         .accessibilityValue("\(lease.stateLabel)，\(lease.gpuIDs.count) 块 GPU")
     }
 }

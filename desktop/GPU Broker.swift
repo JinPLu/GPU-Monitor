@@ -577,7 +577,7 @@ private struct AppSidebar: View {
                         Text("GPU Broker")
                             .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(DesignTokens.ink)
-                        Text("查看和分配计算资源")
+                        Text("管理项目与 Agent 的资源")
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(DesignTokens.mutedInk)
                     }
@@ -589,23 +589,23 @@ private struct AppSidebar: View {
             .padding(.bottom, 25)
 
             if !compact {
-                Text("空间")
+                Text("我的资源")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DesignTokens.mutedInk)
                     .padding(.horizontal, 18)
                     .padding(.bottom, 8)
             }
 
-            SidebarSelection(title: "资源总览", systemImage: "house.fill", color: DesignTokens.interaction, selected: selectedSection == .overview, compact: compact) {
+            SidebarSelection(title: "总览", systemImage: "house.fill", color: DesignTokens.interaction, selected: selectedSection == .overview, compact: compact) {
                 navigate(.overview)
             }
             SidebarSelection(title: "服务器", systemImage: "server.rack", color: DesignTokens.interaction, selected: selectedSection == .serverPool, compact: compact) {
                 navigate(.serverPool)
             }
-            SidebarSelection(title: "资源使用", systemImage: "key.fill", color: DesignTokens.interaction, selected: selectedSection == .leases, compact: compact) {
+            SidebarSelection(title: "项目与 Agent", systemImage: "folder.fill", color: DesignTokens.interaction, selected: selectedSection == .leases, compact: compact) {
                 navigate(.leases)
             }
-            SidebarSelection(title: "设置", systemImage: "gearshape.fill", color: DesignTokens.interaction, selected: selectedSection == .settings, compact: compact) {
+            SidebarSelection(title: "本机设置", systemImage: "gearshape.fill", color: DesignTokens.interaction, selected: selectedSection == .settings, compact: compact) {
                 navigate(.settings)
             }
 
@@ -623,7 +623,7 @@ private struct AppSidebar: View {
                     }
                 }
                 if !compact {
-                    Text("不会启动或停止远端任务")
+                    Text("只协调资源，不执行任务")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .lineLimit(1)
@@ -814,10 +814,10 @@ private struct AppToolbar: View {
 
     private var title: String {
         switch selectedSection {
-        case .overview: return "资源总览"
+        case .overview: return "总览"
         case .serverPool: return "服务器"
-        case .leases: return "资源使用"
-        case .settings: return "设置"
+        case .leases: return "项目与 Agent"
+        case .settings: return "本机设置"
         }
     }
 }
@@ -942,26 +942,26 @@ private struct SettingsDashboard: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                HomeSectionTitle(title: "设置", subtitle: "显示、连接与安全说明")
+                HomeSectionTitle(title: "本机设置", subtitle: "操作记录与服务状态")
 
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("操作者")
+                    Text("操作记录")
                         .font(.system(size: 13, weight: .semibold))
                     HStack(alignment: .bottom, spacing: 12) {
                         VStack(alignment: .leading, spacing: 7) {
-                            Text("操作者标识")
+                            Text("本机操作标识")
                                 .fieldLabel()
                             TextField("human", text: $actorID)
                                 .textFieldStyle(.roundedBorder)
                                 .font(.system(size: 13, weight: .medium, design: .monospaced))
-                                .accessibilityLabel("操作者标识")
+                                .accessibilityLabel("本机操作标识")
                         }
                         Button("保存") { store.setActor(actorID) }
                             .buttonStyle(SecondaryActionButtonStyle())
                             .keyboardShortcut(.defaultAction)
-                            .accessibilityLabel("保存操作者标识")
+                            .accessibilityLabel("保存本机操作标识")
                     }
-                    Text("此名称用于区分本机操作记录，不会改变登录身份或远端权限。")
+                    Text("这个标识只用于本机审计，不是用户账号，也不会改变远端权限。")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                 }
@@ -981,7 +981,7 @@ private struct SettingsDashboard: View {
                 .background(DesignTokens.surface.opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
 
-                Label("GPU Broker 只记录资源归属，不会启动或停止服务器上的任务。", systemImage: "hand.raised.fill")
+                Label("单用户本机控制面；只协调资源，不执行任务。", systemImage: "hand.raised.fill")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
             }
@@ -1780,7 +1780,7 @@ private func localizedStateReason(_ reason: String) -> String {
         return "检测到未登记的计算进程，暂不能分配"
     }
     if reason == "exclusive lease active" {
-        return "资源已分配给其他使用者"
+        return "资源已分配给其他项目或 Agent"
     }
     if reason.hasPrefix("telemetry age "), reason.contains("exceeds stale threshold") {
         return "状态数据已过期"
@@ -1813,7 +1813,7 @@ private struct LeaseSummaryGroup: Identifiable {
 private func leaseSummaryGroups(gpus: [GPURecord]) -> [LeaseSummaryGroup] {
     var groups: [String: (owner: String, task: String, count: Int)] = [:]
     for gpu in gpus where isGPUClaimed(gpu) {
-        let owner = gpu.owner ?? "未知操作者"
+        let owner = gpu.owner ?? "未标注来源"
         let task = gpu.taskReference ?? "未标注任务"
         let key = "\(owner)|\(task)"
         if let existing = groups[key] {
@@ -1901,7 +1901,7 @@ private struct SpatialLeaseDesk: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("资源使用")
+                        Text("项目与 Agent")
                             .font(.system(size: 18, weight: .semibold))
                         Text("\(store.snapshot.leases.count) 个使用中")
                             .font(.system(size: 11, weight: .medium))
@@ -1914,7 +1914,7 @@ private struct SpatialLeaseDesk: View {
                 }
                 .padding(20)
 
-                Picker("资源使用状态", selection: $mode) {
+                Picker("项目与 Agent 资源状态", selection: $mode) {
                     Text("使用中 \(store.snapshot.leases.count)").tag(SpatialLeaseMode.active)
                     Text("等待 \(store.snapshot.requests.count)").tag(SpatialLeaseMode.queued)
                 }
@@ -2134,7 +2134,7 @@ private struct SpatialLeaseDetail: View {
                 }
 
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 18)], spacing: 18) {
-                    SpatialFact(label: "操作者", value: lease.actorID, icon: "person.crop.circle")
+                    SpatialFact(label: "记录来源", value: lease.actorID, icon: "person.crop.circle")
                     SpatialFact(label: "GPU", value: "\(lease.gpuIDs.count) 块", icon: "square.grid.3x3.fill")
                     SpatialFact(label: "到期", value: formattedTimestamp(lease.expiresAt), icon: "clock.fill")
                 }
@@ -2181,7 +2181,7 @@ private struct SpatialRequestDetail: View {
                     .foregroundStyle(DesignTokens.mutedInk)
                     .lineLimit(3)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 180, maximum: 260), spacing: 18)], spacing: 18) {
-                    SpatialFact(label: "操作者", value: request.actorID, icon: "person.crop.circle")
+                    SpatialFact(label: "记录来源", value: request.actorID, icon: "person.crop.circle")
                     SpatialFact(label: "需要", value: "\(request.gpuCount) 块 GPU", icon: "square.grid.3x3.fill")
                     SpatialFact(label: "提交时间", value: formattedTimestamp(request.createdAt), icon: "clock.fill")
                 }
@@ -3111,7 +3111,7 @@ private struct GPUDetailSheet: View {
             }
             if let owner = gpu.owner {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("当前资源使用")
+                    Text("当前资源归属")
                         .fieldLabel()
                     Text(owner)
                         .font(.system(size: 13, weight: .semibold, design: .monospaced))
@@ -3279,7 +3279,7 @@ private struct AddServerSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            SheetTitle(icon: "server.rack", title: "添加服务器", subtitle: "粘贴 SSH 指令，把机器加入本机资源池。")
+            SheetTitle(icon: "server.rack", title: "添加服务器", subtitle: "把直连计算服务器加入本机资源池。")
             VStack(alignment: .leading, spacing: 8) {
                 Text("SSH 指令")
                     .fieldLabel()
@@ -3293,7 +3293,7 @@ private struct AddServerSheet: View {
                 TextField("留空则由主机名自动生成", text: $endpointID)
                     .textFieldStyle(.roundedBorder)
             }
-            Text("连接成功后，这台机器可参与 GPU 分配。这里只读取远端状态，不会启动、停止或修改任务。")
+            Text("采集成功后，这台服务器可供你的项目和 Agent 申请。这里只读取状态，不执行任务。")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(DesignTokens.mutedInk)
                 .fixedSize(horizontal: false, vertical: true)
@@ -3360,7 +3360,7 @@ private struct ClaimSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            SheetTitle(icon: "checkmark.seal.fill", title: "申请 GPU", subtitle: "提交后会分配可用 GPU。如果需要排队，请等待分配完成后再启动任务。")
+            SheetTitle(icon: "checkmark.seal.fill", title: "申请 GPU", subtitle: "为项目或 Agent 申请 GPU；资源不足时会排队。")
             HStack(spacing: 14) {
                 LabeledField(label: "项目", placeholder: "project-a", text: $projectID)
                 LabeledField(label: "任务", placeholder: "training-042", text: $taskReference)
@@ -3506,9 +3506,9 @@ private struct ActorSettingsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            SheetTitle(icon: "person.crop.circle", title: "桌面设置", subtitle: "这个名称只用于记录本机操作，不代表身份认证或权限。")
+            SheetTitle(icon: "person.crop.circle", title: "本机设置", subtitle: "这个标识只用于本机审计，不是用户账号。")
             VStack(alignment: .leading, spacing: 8) {
-                Text("操作者标识")
+                Text("本机操作标识")
                     .fieldLabel()
                 TextField("human", text: $actorID)
                     .textFieldStyle(.roundedBorder)

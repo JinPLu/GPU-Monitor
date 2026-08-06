@@ -88,7 +88,7 @@ GPU_BROKER_URL = "http://127.0.0.1:8787"
 - Agent 对当前任务提供由自身基准或历史运行得出的、从小到大的候选资源合同，先调用 `resource_evaluate_plan`。Broker 只在相邻扩容同时节省至少 10% 剩余时间且至少 120 秒时选择更大合同；首个收益不足的候选会终止扩容。
 - CPU/内存-only 合同允许 `gpu_count=0`。已获配的主机容量通过 `resource_claim` 认领，完成后 `resource_release`；实际耗时用 `resource_record_actual` 追加记录。这些工具不会启动远端命令、绕过 owner、配额或新鲜 telemetry 校验。
 
-端点是本机共享服务器清单。端点返回可选的 `owner_project_id` 归属说明和 `lifecycle_state`，但归属不构成管理权限；任一本机可写调用方都可用 `gpu_add_server` 添加只读监测 endpoint。`gpu_delete_server` 的常规语义是将 `lifecycle_state` 转为 `draining`：不再接收新 placement，已有 workload 不会被停止，待关联租约和队列需求排空后再完成退役。
+端点是本机服务器清单。端点返回可选的 `owner_project_id` 归属说明和 `lifecycle_state`，但归属不构成管理权限；任一本机可写调用方都可用 `gpu_add_server` 添加只读监测 endpoint。`gpu_delete_server` 的常规语义是将 `lifecycle_state` 转为 `draining`：不再接收新 placement，已有 workload 不会被停止，待关联租约和队列需求排空后再完成退役。
 
 `gpu_request`、`gpu_request_status`、`gpu_cancel_request`、`gpu_activate_lease`、`gpu_release_lease` 与 `gpu_bind_workload` 是兼容性高级低层工具，不放在默认路径；新 Agent 优先采用上面的 claim / wait / execute / bind / release 流程。
 

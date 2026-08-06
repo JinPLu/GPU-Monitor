@@ -2,28 +2,28 @@
 {% block content %}
 <section class="page-heading">
   <div>
-    <p class="eyebrow">共享服务器池 · 实时状态 · 协作认领</p>
+    <p class="eyebrow">一个本机用户 · 多项目与 Agent</p>
     <h1>
       {% if page == 'overview' %}服务器总览
       {% elif page == 'gpus' %}GPU 实时状态
       {% elif page == 'gpu-detail' %}GPU 详情
-      {% elif page == 'requests' %}认领 GPU
-      {% elif page == 'leases' %}当前认领
+      {% elif page == 'requests' %}申请与分配
+      {% elif page == 'leases' %}资源分配
       {% elif page == 'reservations' %}安排使用时间
-      {% elif page == 'identities' %}身份与预设任务
+      {% elif page == 'identities' %}Agent 与预设
       {% elif page == 'maintenance' %}维护窗口
       {% elif page == 'alerts' %}告警
       {% elif page == 'audit' %}审计与历史
-      {% else %}设置与 Doctor{% endif %}
+      {% else %}本机设置{% endif %}
     </h1>
   </div>
-  <p class="muted">这里仅监控和协调归属，不会启动、停止或抢占远端任务。</p>
+  <p class="muted">这里只协调你的项目与 Agent 的资源，不执行远端任务。</p>
 </section>
 
 {% if page == 'overview' %}
 <section class="quick-actions" aria-label="常用操作">
   <a class="button-link" href="#add-server">添加服务器</a>
-  <a class="button-link quiet-link" href="/ui/requests#new-request">认领 GPU</a>
+  <a class="button-link quiet-link" href="/ui/requests#new-request">申请 GPU</a>
   <a class="button-link quiet-link" href="/ui/reservations">安排使用时间</a>
 </section>
 
@@ -75,7 +75,7 @@
 </section>
 
 <section class="list-section" aria-labelledby="active-claims-title">
-  <h2 id="active-claims-title">当前认领</h2>
+  <h2 id="active-claims-title">当前分配</h2>
   <div class="stacked-cards">
   {% for lease in payload.leases if lease.state in ['HELD', 'ACTIVE', 'ORPHANED_BUSY', 'CONFLICT'] %}
     <article class="card">
@@ -83,9 +83,9 @@
       <p>GPU：{% for gpu_id in lease.gpu_ids %}<code>{{ gpu_id }}</code>{% if not loop.last %}、{% endif %}{% endfor %}</p>
       <p class="muted">项目 {{ lease.project_id }} · 安全截止 {{ lease.expires_at }}</p>
     </article>
-  {% else %}<p class="empty">当前没有人或 Agent 认领 GPU。</p>{% endfor %}
+  {% else %}<p class="empty">当前没有项目或 Agent 使用 GPU。</p>{% endfor %}
   </div>
-  <p><a class="button-link quiet-link" href="/ui/requests">管理认领与队列</a></p>
+  <p><a class="button-link quiet-link" href="/ui/requests">管理申请与分配</a></p>
 </section>
 
 {% elif page == 'gpus' %}
@@ -125,22 +125,22 @@
 {% elif page == 'requests' %}
 {% if actor.role in ['allocator', 'operator', 'admin'] %}
 <section id="new-request" class="actions" aria-labelledby="request-title">
-  <h2 id="request-title">认领 GPU</h2>
-  <p>认领者：<strong>{{ actor.id }}</strong></p>
-  <p class="muted">可直接填写任意项目标识和任务；完成后释放租约，空闲资源会立即归到这个名称下，不足时自动进入共享队列。</p>
+  <h2 id="request-title">申请 GPU</h2>
+  <p>记录为：<strong>{{ actor.id }}</strong></p>
+  <p class="muted">为项目和任务申请 GPU。资源不足时进入队列，使用结束后归还。</p>
   {% if payload.claimable_workload_profiles %}
   <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
     <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ format_constraints(profile.constraints) }}</option>{% endfor %}</select></label>
     <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
-    <p class="field-help span-all">按配置认领会直接登记为使用中，但不会启动远端任务。</p>
+    <p class="field-help span-all">按预设申请会直接分配资源，但不会启动远端任务。</p>
     <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
-    <button type="submit">按配置认领</button>
+    <button type="submit">按预设申请</button>
   </form>
   {% else %}
-  <p class="field-help">还没有可用的预设任务；临时需求可直接使用下方一次性认领。</p>
+  <p class="field-help">还没有可用的预设任务；临时需求可直接使用下方一次性申请。</p>
   {% endif %}
   <details>
-    <summary>一次性认领（需明确资源）</summary>
+    <summary>一次性申请（需明确资源）</summary>
     <form method="post" action="/ui/action/quick-claim" class="stack form-grid quick-claim-form">
       <label>项目标识<input name="project_id" required placeholder="例如：storyboard"></label>
       <label>任务<input name="task_ref" required placeholder="例如：WAN 视频评测"></label>
@@ -151,16 +151,16 @@
       <label>单卡总显存 GiB<input name="min_total_vram_gib" type="number" min="1" placeholder="例如：80"></label>
       <label>单卡可用显存 GiB<input name="min_free_vram_gib" type="number" min="0" placeholder="例如：60"></label>
       <details class="span-all"><summary>高级：指定精确 GPU</summary><label>GPU（可多选）<select name="gpu_ids" multiple size="6">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label><p class="field-help">选择后以所选 GPU 数量为准。</p></details>
-      <p class="field-help span-all">CPU、内存和显存请填绝对需求；Broker 只按这些下限调度，认领成功同样不会启动远端任务。</p>
+      <p class="field-help span-all">CPU、内存和显存请填绝对需求；Broker 只按这些下限分配，成功后也不会启动远端任务。</p>
       <input type="hidden" name="placement" value="pack"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
-      <button type="submit">一次性认领</button>
+      <button type="submit">一次性申请</button>
     </form>
   </details>
 </section>
 {% endif %}
 
 <section class="list-section" aria-labelledby="queue-title">
-  <h2 id="queue-title">共享请求队列</h2>
+  <h2 id="queue-title">资源申请队列</h2>
   <div class="stacked-cards">
   {% for item in payload.requests %}
     <article class="card request-card state-{{ item.state|lower }}">
@@ -195,11 +195,11 @@
           <input type="hidden" name="lease_id" value="{{ lease.id }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes"><button type="submit">延长</button>
         </form>
         <form method="post" action="/ui/action/release-lease" class="inline-form">
-          <input type="hidden" name="lease_id" value="{{ lease.id }}"><input type="hidden" name="reason" value="released-from-gui"><input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm"><input type="checkbox" name="confirmed" value="yes" required> 我确认释放只撤销协调归属，不会停止远端进程</label><button type="submit" class="danger">释放认领</button>
+          <input type="hidden" name="lease_id" value="{{ lease.id }}"><input type="hidden" name="reason" value="released-from-gui"><input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm"><input type="checkbox" name="confirmed" value="yes" required> 我确认归还资源不会停止远端进程</label><button type="submit" class="danger">归还资源</button>
         </form>
       </div>
     </article>
-  {% else %}<p class="empty">当前没有 GPU 被认领。</p>{% endfor %}
+  {% else %}<p class="empty">当前没有已分配的 GPU。</p>{% endfor %}
   </div>
 </section>
 
@@ -253,7 +253,7 @@
 <section class="actions" aria-labelledby="reservation-title">
   <h2 id="reservation-title">安排未来使用时间</h2>
   <p>安排者：<strong>{{ actor.id }}</strong></p>
-  <p class="muted">选择具体 GPU 和时间；与已有认领或安排冲突时会直接提示。</p>
+  <p class="muted">选择具体 GPU 和时间；与已有分配或安排冲突时会直接提示。</p>
   <form method="post" action="/ui/action/reservation" class="stack form-grid">
     <label>项目标识<input name="project_id" required placeholder="例如：storyboard"></label>
     <label>时区<select name="timezone"><option value="Asia/Shanghai" selected>Asia/Shanghai</option><option value="UTC">UTC</option></select></label>
@@ -277,13 +277,14 @@
 </div></section>
 
 {% elif page == 'identities' %}
-<section class="list-section"><h2>预设任务</h2><p class="muted">一次性认领可直接填写任意项目标识，不需要先创建项目。预设任务仅用于反复执行时固定 GPU 数量、用途和可选服务器范围。</p><div class="stacked-cards">
-{% for profile in payload.workload_profiles %}<article class="card"><div class="card-title"><strong>{{ profile.display_name }}</strong><span class="badge">{{ '启用' if profile.enabled else '禁用' }}</span></div><p><code>{{ profile.id }}</code> · {{ profile.project_id }}</p><p>{{ format_constraints(profile.constraints) }}</p><p class="muted">用途：{{ profile.purpose }}</p></article>{% else %}<p class="empty">尚无预设任务；一次性认领不需要预设。</p>{% endfor %}
+<section class="list-section"><h2>预设任务</h2><p class="muted">一次性申请可直接填写项目标识。预设任务用于反复执行时固定 GPU 数量、用途和服务器范围。</p><div class="stacked-cards">
+{% for profile in payload.workload_profiles %}<article class="card"><div class="card-title"><strong>{{ profile.display_name }}</strong><span class="badge">{{ '启用' if profile.enabled else '禁用' }}</span></div><p><code>{{ profile.id }}</code> · {{ profile.project_id }}</p><p>{{ format_constraints(profile.constraints) }}</p><p class="muted">用途：{{ profile.purpose }}</p></article>{% else %}<p class="empty">尚无预设任务；一次性申请不需要预设。</p>{% endfor %}
 </div></section>
 
 {% if actor.is_admin %}
 <section class="actions" aria-labelledby="identity-admin-title">
-  <h2 id="identity-admin-title">身份与预设任务</h2>
+  <h2 id="identity-admin-title">Agent 与预设</h2>
+  <p class="muted">这些凭证用于本机操作记录和 Agent 接入，不是多用户账号。</p>
   <details>
     <summary>创建或更新预设任务</summary>
     <form method="post" action="/ui/action/workload-profile" class="stack form-grid">
@@ -295,23 +296,23 @@
       <label class="span-all">允许服务器（可多选，留空则由 Broker 在全部服务器中调度）<select name="endpoint_ids" multiple size="6">{% for endpoint in payload.endpoints %}<option value="{{ endpoint.id }}">{{ endpoint.id }} · {{ endpoint.host }}:{{ endpoint.port }}</option>{% endfor %}</select></label>
       <label class="span-all">固定用途<textarea name="purpose" rows="2" required placeholder="例如：WRBench 图像/视频生成基准评测"></textarea></label>
       <p class="field-help span-all">归属标识可任意填写，无需预先创建。CPU、内存和显存请填绝对资源需求；最大租约窗口是调度与未来预约共同遵守的硬边界。精确 GPU 固定选择仍应走一次性申请。</p>
-      <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认这是可由 Agent 按配置重复认领的资源合同。</label><button type="submit">保存预设任务</button>
+      <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认这是可由 Agent 按预设重复申请的资源合同。</label><button type="submit">保存预设任务</button>
     </form>
   </details>
   <details>
-    <summary>创建人类或 Agent 身份</summary>
+    <summary>创建本机操作或 Agent 凭证</summary>
     <form method="post" action="/ui/action/actor" class="stack form-grid">
-      <label>身份 ID<input name="id" required placeholder="agent-name"></label><label>显示名称<input name="display_name" required placeholder="Agent Name"></label>
+      <label>凭证 ID<input name="id" required placeholder="agent-name"></label><label>显示名称<input name="display_name" required placeholder="Agent Name"></label>
       <label>角色<select name="role"><option value="viewer">只读 viewer</option><option value="allocator" selected>申请 allocator</option><option value="operator">运维 operator</option><option value="admin">管理员 admin</option><option value="collector">采集 collector</option></select></label><label>Token 标签<input name="token_label" value="generated" required></label>
-      <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认 token 只会显示一次，并会安全保存。</label><button type="submit">创建身份并显示 token</button>
+      <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认 token 只会显示一次，并会安全保存。</label><button type="submit">创建凭证并显示 token</button>
     </form>
   </details>
 </section>
 
-<section class="list-section"><h2>已登记身份</h2><div class="stacked-cards">
+<section class="list-section"><h2>已登记凭证</h2><div class="stacked-cards">
 {% for item in payload.actors %}<article class="card"><div class="card-title"><strong>{{ item.display_name }}</strong><span class="badge">{{ item.role }}</span></div><p><code>{{ item.id }}</code></p>
   {% for token in item.tokens %}<div class="token-row">{{ token.label }} · {{ '已撤销' if token.revoked_at else '有效' }}{% if not token.revoked_at %}<form method="post" action="/ui/action/revoke-token" class="inline-form"><input type="hidden" name="token_id" value="{{ token.id }}"><input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm"><input type="checkbox" name="confirmed" value="yes" required> 确认撤销</label><button type="submit" class="danger">撤销</button></form>{% endif %}</div>{% endfor %}
-</article>{% else %}<p class="empty">尚无身份。</p>{% endfor %}
+</article>{% else %}<p class="empty">尚无凭证。</p>{% endfor %}
 </div></section>
 {% endif %}
 

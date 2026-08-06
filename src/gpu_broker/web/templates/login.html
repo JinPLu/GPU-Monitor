@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% block content %}
 <section class="login-panel" aria-labelledby="login-title">
-  <p class="eyebrow">本机、协作式 GPU 资源控制面</p>
-  <h1 id="login-title">登录 gpu-broker</h1>
-  <p>输入只保存在本地秘密管理中的 API token。服务器只保存 token hash；租约不代表训练或服务启动授权。</p>
+  <p class="eyebrow">一个本机用户 · 多项目与 Agent</p>
+  <h1 id="login-title">打开 GPU Broker</h1>
+  <p>输入保存在本机秘密管理中的 API token。服务器只保存 token hash；通过验证也不代表可以启动远端任务。</p>
   <form method="post" action="/ui/login" class="stack">
     <label>API token
       <input id="api-token" name="token" type="password" autocomplete="current-password" required autofocus>

@@ -19,7 +19,7 @@ final class FixtureModeUITests: XCTestCase {
     }
 
     func testFixtureModeLaunchesWithoutProductionDaemon() {
-        let overview = app.descendants(matching: .any)["资源总览"]
+        let overview = app.descendants(matching: .any)["总览"]
         XCTAssertTrue(overview.waitForExistence(timeout: 5), "Fixture launch must reach the native fleet overview")
 
         let refreshButton = app.buttons["刷新资源快照"]
