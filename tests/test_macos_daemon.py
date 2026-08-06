@@ -501,6 +501,8 @@ def test_product_copy_is_anchored_on_one_user_with_projects_and_agents() -> None
     ).read_text(encoding="utf-8")
 
     assert "一个本机用户，管理多台服务器、多个项目和多个 Agent" in readme
+    assert "| 你要做什么 | GPU Broker 做什么 |\n| --- | --- |" in readme
+    assert "| --- | --- | --- |" not in readme
     assert 'SidebarSelection(title: "项目与 Agent"' in window_source
     assert 'Text("项目与 Agent")' in usage_source
     assert "一个本机用户 · 同一份状态" in base_template
