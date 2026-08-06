@@ -16,11 +16,11 @@ struct FleetOverview: View {
     ])
 
     private var attentionEndpoints: [EndpointRecord] {
-        snapshot.endpoints.filter { ["ERROR", "STALE", "DRAINING", "RETIRED", "DISABLED"].contains($0.monitorStatus) }
+        snapshot.operationalEndpoints.filter { ["ERROR", "STALE", "DRAINING", "DISABLED"].contains($0.monitorStatus) }
     }
 
     private var attentionGPUs: [GPURecord] {
-        snapshot.gpus.filter { attentionStates.contains($0.state) }
+        snapshot.operationalGPUs.filter { attentionStates.contains($0.state) }
     }
 
     private var visibleAttentionEndpoints: [EndpointRecord] {
@@ -41,29 +41,54 @@ struct FleetOverview: View {
     }
 
     private var freshEndpointIDs: Set<String> {
-        Set(snapshot.endpoints.filter { $0.monitorStatus == "ONLINE" }.map(\.id))
+        Set(snapshot.operationalEndpoints.filter { $0.monitorStatus == "ONLINE" }.map(\.id))
     }
 
     private var freshGPUCount: Int {
-        snapshot.gpus.filter { freshEndpointIDs.contains($0.endpointID) }.count
+        snapshot.operationalGPUs.filter { freshEndpointIDs.contains($0.endpointID) }.count
     }
 
     private var allocatableGPUCount: Int {
-        snapshot.gpus.filter {
+        snapshot.operationalGPUs.filter {
             freshEndpointIDs.contains($0.endpointID) && $0.state == "AVAILABLE"
         }.count
     }
 
-    private var idleLeaseGPUCount: Int {
-        snapshot.gpus.filter { ["HELD", "LEASED_IDLE"].contains($0.state) }.count
+    private var runningTaskCount: Int {
+        let linkedLeaseIDs = Set(snapshot.resourceClaims.flatMap(\.nativeLeaseIDs))
+        let generic = snapshot.resourceClaims.filter {
+            $0.runtimeState == "RUNNING" || $0.state == "RUNNING"
+        }.count
+        let legacy = snapshot.leases.filter {
+            !linkedLeaseIDs.contains($0.id) && $0.runtimeState == "RUNNING"
+        }.count
+        return generic + legacy
     }
 
-    private var queuedRequestCount: Int {
-        snapshot.requests.filter { $0.state == "QUEUED" }.count
+    private var assignedWaitingCount: Int {
+        let linkedLeaseIDs = Set(snapshot.resourceClaims.flatMap(\.nativeLeaseIDs))
+        let generic = snapshot.resourceClaims.filter {
+            ["HELD", "ACTIVE"].contains($0.state) && $0.runtimeState != "RUNNING"
+        }.count
+        let legacy = snapshot.leases.filter {
+            !linkedLeaseIDs.contains($0.id) && $0.runtimeState != "RUNNING"
+        }.count
+        return generic + legacy
+    }
+
+    private var queuedCoordinationCount: Int {
+        let linkedRequestIDs = Set(snapshot.resourceClaims.flatMap(\.nativeRequestIDs))
+        let generic = snapshot.resourceClaims.filter {
+            ["BLOCKED", "QUEUED", "PENDING_APPROVAL", "REQUESTED"].contains($0.state)
+        }.count
+        let legacy = snapshot.requests.filter { !linkedRequestIDs.contains($0.id) }.count
+        return generic + legacy
     }
 
     private var monitoringProviders: [ResourceProviderRecord] {
-        snapshot.monitoringProviders
+        snapshot.monitoringProviders.filter {
+            !($0.providerType == "direct-gpu" && $0.total.gpuCount == 0 && $0.available.gpuCount == 0)
+        }
     }
 
     private var hostCapacityProviders: [ResourceProviderRecord] {
@@ -75,29 +100,75 @@ struct FleetOverview: View {
     }
 
     private var availableHostCPU: Int {
-        Int(hostCapacityProviders.reduce(0) { $0 + $1.available.cpuCores }.rounded())
+        Int(snapshot.operationalEndpoints.compactMap(\.availableCPUCores).reduce(0, +).rounded())
     }
 
     private var availableHostMemoryGiB: Int {
-        hostCapacityProviders.reduce(0) { $0 + $1.available.memoryMiB } / 1024
+        snapshot.operationalEndpoints
+            .filter { $0.monitorStatus == "ONLINE" }
+            .compactMap(\.memoryAvailableMiB)
+            .reduce(0, +) / 1024
+    }
+
+    private var totalHostCPU: Int {
+        snapshot.operationalEndpoints.compactMap(\.cpuCount).reduce(0, +)
+    }
+
+    private var totalHostMemoryGiB: Int {
+        snapshot.operationalEndpoints.compactMap(\.memoryTotalMiB).reduce(0, +) / 1024
+    }
+
+    private var onlineEndpointCount: Int {
+        snapshot.operationalEndpoints.filter { $0.monitorStatus == "ONLINE" }.count
+    }
+
+    private var hasCoordinationSignals: Bool {
+        assignedWaitingCount > 0 || queuedCoordinationCount > 0
+            || !attentionEndpoints.isEmpty || !attentionGPUs.isEmpty
+    }
+
+    private var hasPlanningHistory: Bool {
+        !snapshot.resourcePlanEvaluations.isEmpty
+            || !snapshot.resourceRunActuals.isEmpty
+            || !snapshot.resourceClaims.isEmpty
+    }
+
+    private var hasActiveUsage: Bool {
+        !snapshot.leases.isEmpty || !snapshot.requests.isEmpty || !snapshot.reservations.isEmpty
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
                 overviewHeader
-                summaryGrid
-                coordinationSignals
-                resourceProjectionSection
-                planningAuditSection
-                attentionSection
-                serverPool
-                leaseSection
+                if snapshot.operationalEndpoints.isEmpty {
+                    emptyFleetState
+                } else {
+                    summaryGrid
+                    serverPool
+                }
+                if !attentionEndpoints.isEmpty || !attentionGPUs.isEmpty {
+                    attentionSection
+                }
+                if hasCoordinationSignals {
+                    coordinationSignals
+                }
+                if !monitoringProviders.isEmpty {
+                    resourceProjectionSection
+                }
+                if hasPlanningHistory {
+                    planningAuditSection
+                }
+                if hasActiveUsage {
+                    leaseSection
+                }
 
-                Label(snapshot.admissionBoundary, systemImage: "hand.raised.fill")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(DesignTokens.mutedInk)
-                    .fixedSize(horizontal: false, vertical: true)
+                if !snapshot.operationalEndpoints.isEmpty || hasActiveUsage {
+                    Label(snapshot.admissionBoundary, systemImage: "hand.raised.fill")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.horizontal, 24)
             .padding(.bottom, 16)
@@ -107,78 +178,119 @@ struct FleetOverview: View {
     }
 
     private var overviewHeader: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        HStack(alignment: .bottom, spacing: 12) {
             overviewHeading
+            Spacer(minLength: 12)
             overviewCapacityBadge
         }
-        .font(.system(size: 11, weight: .semibold, design: .rounded))
-        .foregroundStyle(DesignTokens.mutedInk)
+        .padding(.top, 4)
     }
 
     private var overviewHeading: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("实时概览")
-                .font(.system(size: 16, weight: .semibold))
-            Text("查看已登记容量、最新在线状态与协调中的租约")
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 22, weight: .bold))
+            Text("CPU、内存与 GPU 的实时容量和可用状态")
+                .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(DesignTokens.mutedInk)
                 .lineLimit(1)
         }
     }
 
     private var overviewCapacityBadge: some View {
-        Text("\(snapshot.summary.totalServers) 台已登记 · \(snapshot.summary.onlineServers) 台在线")
+        Text("\(snapshot.operationalEndpoints.count) 台已登记 · \(onlineEndpointCount) 台在线")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(DesignTokens.ink)
             .lineLimit(1)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(.regularMaterial, in: Capsule())
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .background(DesignTokens.surface, in: Capsule())
+            .overlay(Capsule().stroke(DesignTokens.surfaceStroke, lineWidth: 1))
     }
 
     private var summaryGrid: some View {
-        LazyVGrid(columns: columns, spacing: 10) {
-            OverviewSummaryCard(title: "已登记 GPU", value: snapshot.summary.totalGPUs, icon: "square.grid.3x3.fill")
-            OverviewSummaryCard(title: "在线 / 最新 GPU", value: freshGPUCount, icon: "waveform.path.ecg")
-            OverviewSummaryCard(title: "当前可分配", value: allocatableGPUCount, icon: "checkmark.circle.fill")
-            OverviewSummaryCard(title: "可用 CPU", value: availableHostCPU, icon: "cpu")
-            OverviewSummaryCard(title: "可用内存 GB", value: availableHostMemoryGiB, icon: "memorychip")
-            OverviewSummaryCard(title: "调度目标", value: schedulerProviders.count, icon: "point.3.connected.trianglepath.dotted")
+        LazyVGrid(columns: summaryColumns, spacing: 12) {
+            OverviewSummaryCard(
+                title: "服务器",
+                value: "\(onlineEndpointCount) / \(snapshot.operationalEndpoints.count)",
+                detail: "在线 / 已登记",
+                icon: "server.rack",
+                color: DesignTokens.network
+            )
+            OverviewSummaryCard(
+                title: "CPU",
+                value: "\(availableHostCPU) / \(totalHostCPU)",
+                detail: "可用核 / 总核",
+                icon: "cpu",
+                color: DesignTokens.cpu
+            )
+            OverviewSummaryCard(
+                title: "内存",
+                value: "\(availableHostMemoryGiB) / \(totalHostMemoryGiB) GB",
+                detail: "可用 / 总容量",
+                icon: "memorychip",
+                color: DesignTokens.memory
+            )
+            OverviewSummaryCard(
+                title: "GPU",
+                value: "\(allocatableGPUCount) / \(snapshot.operationalGPUs.count)",
+                detail: "可分配 / 已登记",
+                icon: "square.stack.3d.up.fill",
+                color: DesignTokens.gpu
+            )
+            OverviewSummaryCard(
+                title: "运行中的任务",
+                value: "\(runningTaskCount)",
+                detail: "\(assignedWaitingCount) 个已分配任务等待运行",
+                icon: "key.fill",
+                color: DesignTokens.interaction
+            )
+            OverviewSummaryCard(
+                title: "需要关注",
+                value: "\(attentionEndpoints.count + attentionGPUs.count)",
+                detail: queuedCoordinationCount > 0
+                    ? "另有 \(queuedCoordinationCount) 个等待中的资源申请"
+                    : "没有等待中的资源申请",
+                icon: "exclamationmark.triangle.fill",
+                color: attentionEndpoints.isEmpty && attentionGPUs.isEmpty ? DesignTokens.success : DesignTokens.danger
+            )
         }
     }
 
     private var coordinationSignals: some View {
         LazyVGrid(columns: columns, spacing: 8) {
             CoordinationSignal(
-                title: "空闲租约",
-                value: "\(idleLeaseGPUCount) GPU",
-                detail: "已归属、未运行",
+                title: "已分配未运行",
+                value: "\(assignedWaitingCount)",
+                detail: "资源已分配，但尚未检测到任务",
                 icon: "pause.circle",
-                color: idleLeaseGPUCount > 0 ? DesignTokens.warning : DesignTokens.mutedInk
+                color: assignedWaitingCount > 0 ? DesignTokens.warning : DesignTokens.mutedInk
             )
             CoordinationSignal(
                 title: "排队请求",
-                value: "\(queuedRequestCount + snapshot.resourceClaims.filter { $0.state == "QUEUED" }.count)",
-                detail: "GPU 与通用资源请求",
+                value: "\(queuedCoordinationCount)",
+                detail: "等待分配的资源申请",
                 icon: "hourglass",
-                color: (queuedRequestCount > 0 || snapshot.resourceClaims.contains { $0.state == "QUEUED" }) ? DesignTokens.warning : DesignTokens.mutedInk
+                color: queuedCoordinationCount > 0 ? DesignTokens.warning : DesignTokens.mutedInk
             )
             CoordinationSignal(
-                title: "边际收益决策",
+                title: "方案比较",
                 value: "\(snapshot.resourcePlanEvaluations.count)",
-                detail: "扩容需 ≥10% 且 ≥2 分钟",
+                detail: "只推荐收益明确的资源方案",
                 icon: "chart.line.uptrend.xyaxis",
                 color: snapshot.resourcePlanEvaluations.isEmpty ? DesignTokens.mutedInk : DesignTokens.interaction
             )
             CoordinationSignal(
-                title: "运行实绩",
+                title: "任务记录",
                 value: "\(snapshot.resourceRunActuals.count)",
-                detail: "预测 vs 实际",
+                detail: "预计时间与实际时间",
                 icon: "checklist.checked",
                 color: snapshot.resourceRunActuals.isEmpty ? DesignTokens.mutedInk : DesignTokens.success
             )
             CoordinationSignal(
-                title: "状态例外",
+                title: "需要处理",
                 value: "\(attentionEndpoints.count + attentionGPUs.count)",
-                detail: "需要人工确认",
+                detail: "连接、数据或资源状态异常",
                 icon: "exclamationmark.triangle.fill",
                 color: (attentionEndpoints.isEmpty && attentionGPUs.isEmpty) ? DesignTokens.mutedInk : DesignTokens.danger
             )
@@ -188,13 +300,17 @@ struct FleetOverview: View {
     private var resourceProjectionSection: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("资源调度投影")
+                Text(monitoringProviders.allSatisfy { $0.providerType == "scheduler" }
+                    ? "外部计算平台"
+                    : "可用资源")
                     .font(.system(size: 13, weight: .semibold))
                 Text("\(monitoringProviders.count)")
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(DesignTokens.mutedInk)
                 Spacer()
-                Text("GPU、主机容量、外部调度分开显示")
+                Text(monitoringProviders.allSatisfy { $0.providerType == "scheduler" }
+                    ? "资源状态由外部调度系统确认"
+                    : "按服务器和资源来源查看")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
             }
@@ -209,25 +325,25 @@ struct FleetOverview: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("资源调度投影")
+        .accessibilityLabel("可用资源")
     }
 
     private var planningAuditSection: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("Agent 调度决策")
+                Text("资源方案")
                     .font(.system(size: 13, weight: .semibold))
                 Text("\(snapshot.resourcePlanEvaluations.count)")
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(DesignTokens.mutedInk)
                 Spacer()
-                Text("候选方案、选择/拒绝与预测-实际")
+                Text("查看资源选择和预计收益")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
             }
 
             if snapshot.resourcePlanEvaluations.isEmpty && snapshot.resourceRunActuals.isEmpty && snapshot.resourceClaims.isEmpty {
-                Label("等待 Agent 提交通用资源计划；旧快照保持兼容", systemImage: "clock")
+                Label("暂无资源方案", systemImage: "clock")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
                     .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
@@ -248,13 +364,13 @@ struct FleetOverview: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Agent 调度决策")
+        .accessibilityLabel("资源方案")
     }
 
     private var attentionSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("状态例外")
+                Text("需要处理")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 if !attentionEndpoints.isEmpty || !attentionGPUs.isEmpty {
@@ -265,7 +381,7 @@ struct FleetOverview: View {
             }
 
             if attentionEndpoints.isEmpty && attentionGPUs.isEmpty {
-                Label("所有端点均未报告过期或连接异常", systemImage: "checkmark.circle.fill")
+                Label("所有服务器状态正常", systemImage: "checkmark.circle.fill")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(DesignTokens.success)
                     .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
@@ -282,7 +398,7 @@ struct FleetOverview: View {
                             )
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("端点状态例外")
+                        .accessibilityLabel("服务器需要处理")
                         .accessibilityValue("\(endpoint.displayName)，\(endpoint.monitorLabel)")
                     }
                     ForEach(visibleAttentionGPUs) { gpu in
@@ -294,17 +410,17 @@ struct FleetOverview: View {
                             )
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("GPU 状态例外")
+                        .accessibilityLabel("GPU 需要处理")
                         .accessibilityValue("GPU \(gpu.index)，\(overviewGPUStateLabel(gpu.state))")
                     }
                 }
                 if hiddenAttentionCount > 0 {
                     Button(action: openServerPool) {
                         HStack(spacing: 8) {
-                            Label("另有 \(hiddenAttentionCount) 项状态例外", systemImage: "ellipsis.circle.fill")
+                            Label("另有 \(hiddenAttentionCount) 项需要处理", systemImage: "ellipsis.circle.fill")
                                 .font(.system(size: 10, weight: .semibold))
                             Spacer(minLength: 8)
-                            Text("在服务器池查看")
+                                Text("查看全部服务器")
                                 .font(.system(size: 10, weight: .semibold))
                             Image(systemName: "arrow.right")
                                 .font(.system(size: 9, weight: .semibold))
@@ -315,8 +431,8 @@ struct FleetOverview: View {
                         .overviewSurface(radius: 9)
                     }
                     .buttonStyle(.plain)
-                    .help("打开服务器池查看全部状态例外")
-                    .accessibilityLabel("另有 \(hiddenAttentionCount) 项状态例外，在服务器池查看全部")
+                    .help("打开服务器页面查看全部问题")
+                    .accessibilityLabel("另有 \(hiddenAttentionCount) 项需要处理，打开服务器页面查看")
                 }
             }
         }
@@ -325,9 +441,9 @@ struct FleetOverview: View {
     private var serverPool: some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("服务器池")
+                Text("服务器")
                     .font(.system(size: 13, weight: .semibold))
-                Text("\(snapshot.endpoints.count)")
+                Text("\(snapshot.operationalEndpoints.count)")
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(DesignTokens.mutedInk)
                 Spacer()
@@ -336,15 +452,8 @@ struct FleetOverview: View {
                     .foregroundStyle(DesignTokens.mutedInk)
             }
 
-            LazyVGrid(
-                columns: [
-                    GridItem(.flexible(minimum: 0), spacing: 10),
-                    GridItem(.flexible(minimum: 0), spacing: 10)
-                ],
-                alignment: .leading,
-                spacing: 10
-            ) {
-                ForEach(snapshot.endpoints) { endpoint in
+            LazyVGrid(columns: serverColumns, alignment: .leading, spacing: 12) {
+                ForEach(snapshot.operationalEndpoints) { endpoint in
                     OverviewServerCard(
                         endpoint: endpoint,
                         gpus: snapshot.gpus(for: endpoint),
@@ -356,10 +465,34 @@ struct FleetOverview: View {
         }
     }
 
+    private var emptyFleetState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "server.rack")
+                .font(.system(size: 25, weight: .semibold))
+                .foregroundStyle(DesignTokens.interaction)
+                .frame(width: 52, height: 52)
+                .background(DesignTokens.selection, in: Circle())
+            Text("还没有服务器")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(DesignTokens.ink)
+            Text("添加服务器后，这里会显示 CPU、内存、GPU 和正在使用的任务。")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .multilineTextAlignment(.center)
+            Button("前往服务器", action: openServerPool)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+        }
+        .frame(maxWidth: .infinity, minHeight: 190)
+        .overviewSurface(radius: 14)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("还没有服务器。前往服务器页面添加服务器。")
+    }
+
     private var leaseSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("当前租约")
+                Text("正在使用")
                     .font(.system(size: 13, weight: .semibold))
                 Text("\(snapshot.leases.count)")
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
@@ -372,7 +505,7 @@ struct FleetOverview: View {
 
             LazyVStack(spacing: 6) {
                 if snapshot.leases.isEmpty {
-                    Text("暂无活动租约")
+                    Text("当前没有正在使用的资源")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
@@ -397,6 +530,14 @@ struct FleetOverview: View {
         [GridItem(.adaptive(minimum: 180, maximum: 320), spacing: 10)]
     }
 
+    private var summaryColumns: [GridItem] {
+        Array(repeating: GridItem(.flexible(minimum: 0), spacing: 12), count: 3)
+    }
+
+    private var serverColumns: [GridItem] {
+        Array(repeating: GridItem(.flexible(minimum: 360), spacing: 12), count: 2)
+    }
+
     private func gpuLabel(for lease: LeaseRecord) -> String {
         let indexed = lease.gpuIDs.compactMap { gpuID in
             snapshot.gpus.first(where: { $0.id == gpuID }).map { "\($0.index)" }
@@ -408,40 +549,48 @@ struct FleetOverview: View {
     }
 
     private var snapshotAgeLabel: String {
-        guard let age = snapshot.dataAgeSeconds else { return "等待快照" }
-        if age < 5 { return "快照刚更新" }
-        return "快照 \(Int(age.rounded())) 秒前"
+        guard let age = snapshot.dataAgeSeconds else { return "等待数据" }
+        if age < 5 { return "刚刚更新" }
+        return "\(Int(age.rounded())) 秒前更新"
     }
 }
 
 private struct OverviewSummaryCard: View {
     let title: String
-    let value: Int
+    let value: String
+    let detail: String
     let icon: String
-    var isAttention = false
+    let color: Color
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 13) {
             Image(systemName: icon)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(isAttention ? DesignTokens.danger : DesignTokens.interaction)
-                .frame(width: 30, height: 30)
-                .background(
-                    (isAttention ? DesignTokens.danger : DesignTokens.interaction).opacity(0.11),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                )
-            VStack(alignment: .leading, spacing: 1) {
-                Text("\(value)")
-                    .font(.system(size: 19, weight: .semibold, design: .rounded))
+                .font(.system(size: 18, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(color)
+                .frame(width: 42, height: 42)
+                .background(color.opacity(0.14), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                Text(value)
+                    .font(.system(size: 19, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                Text(detail)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 12)
-        .frame(minHeight: 56)
-        .overviewSurface(radius: 11)
+        .padding(13)
+        .frame(minHeight: 78)
+        .overviewSurface(radius: 14)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue("\(value)，\(detail)")
     }
 }
 
@@ -529,16 +678,18 @@ private struct ResourceProjectionCard: View {
                         .foregroundStyle(DesignTokens.mutedInk)
                 }
                 Spacer(minLength: 4)
-                Text(provider.enabled ? "可观察" : "停用")
+                Text(provider.enabled ? provider.stateLabel : "已停用")
                     .font(.system(size: 9, weight: .semibold, design: .rounded))
                     .foregroundStyle(provider.enabled ? providerColor : DesignTokens.mutedInk)
             }
 
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 7) {
-                ResourceProjectionFact(title: "总容量", value: provider.total.compactLabel)
-                ResourceProjectionFact(title: "已承诺", value: provider.committed.compactLabel)
-                ResourceProjectionFact(title: "当前可认领", value: availableLabel)
-                ResourceProjectionFact(title: "单元", value: "\(unitCount)")
+            if !isWaitingForExternalSystem {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 7) {
+                    ResourceProjectionFact(title: "总容量", value: provider.total.compactLabel)
+                    ResourceProjectionFact(title: "已分配", value: provider.committed.compactLabel)
+                    ResourceProjectionFact(title: "当前可用", value: availableLabel)
+                    ResourceProjectionFact(title: "资源项", value: "\(unitCount)")
+                }
             }
 
             if let boundary = provider.trustBoundary {
@@ -552,11 +703,11 @@ private struct ResourceProjectionCard: View {
         .overviewSurface(radius: 10)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(provider.providerLabel) \(provider.displayName)")
-        .accessibilityValue("\(provider.stateLabel)，可认领 \(availableLabel)，已承诺 \(provider.committed.compactLabel)")
+        .accessibilityValue("\(provider.stateLabel)，当前可用 \(availableLabel)，已分配 \(provider.committed.compactLabel)")
     }
 
     private var providerColor: Color {
-        if provider.providerType == "scheduler", ["PENDING", "QUEUED", "SUBMITTED"].contains(provider.state) {
+        if isWaitingForExternalSystem {
             return DesignTokens.warning
         }
         switch provider.state {
@@ -568,10 +719,15 @@ private struct ResourceProjectionCard: View {
     }
 
     private var availableLabel: String {
-        if provider.providerType == "scheduler", ["PENDING", "QUEUED", "SUBMITTED"].contains(provider.state) {
-            return "等待调度确认"
+        if isWaitingForExternalSystem {
+            return "等待外部系统确认"
         }
         return provider.available.compactLabel
+    }
+
+    private var isWaitingForExternalSystem: Bool {
+        provider.providerType == "scheduler"
+            && ["PENDING", "QUEUED", "SUBMITTED"].contains(provider.state)
     }
 }
 
@@ -621,7 +777,7 @@ private struct ResourceClaimOverviewRow: View {
         .frame(minHeight: 44)
         .overviewSurface(radius: 9)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("资源认领 \(claim.projectID)")
+        .accessibilityLabel("资源申请 \(claim.projectID)")
         .accessibilityValue("\(claim.stateLabel)，\(claim.quantities.compactLabel)")
     }
 }
@@ -760,28 +916,37 @@ private struct OverviewServerCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 7, height: 7)
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(spacing: 11) {
+                Image(systemName: "server.rack")
+                    .font(.system(size: 15, weight: .semibold))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(statusColor)
+                    .frame(width: 38, height: 38)
+                    .background(statusColor.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 Button(action: open) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(endpoint.sshCommand)
-                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
                             .lineLimit(1)
                             .truncationMode(.middle)
                         Text(endpoint.monitorLabel)
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(DesignTokens.mutedInk)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(statusColor)
                     }
                 }
                 .buttonStyle(.plain)
 
                 Spacer(minLength: 4)
                 Text(capacityLabel)
-                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .foregroundStyle(endpoint.monitorStatus == "ONLINE" ? DesignTokens.mutedInk : DesignTokens.warning)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(gpus.isEmpty ? DesignTokens.cpu : DesignTokens.gpu)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(
+                        (gpus.isEmpty ? DesignTokens.cpu : DesignTokens.gpu).opacity(0.12),
+                        in: Capsule()
+                    )
 
                 Menu {
                     Button("复制 SSH 命令", systemImage: "doc.on.doc") {
@@ -799,68 +964,71 @@ private struct OverviewServerCard: View {
                 .help("查看或复制服务器信息")
             }
 
-            LazyVGrid(columns: metricColumns, spacing: 8) {
-                OverviewMetric(
-                    title: "CPU 负载",
-                    value: endpoint.cpuLoadFraction,
-                    detail: cpuDetail
+            HStack(alignment: .top, spacing: 9) {
+                HomeResourceMetric(
+                    icon: "cpu",
+                    title: "CPU",
+                    value: percent(endpoint.cpuLoadFraction),
+                    detail: cpuDetail,
+                    progress: endpoint.cpuLoadFraction,
+                    color: DesignTokens.cpu
                 )
-                OverviewMetric(
+                HomeResourceMetric(
+                    icon: "memorychip",
                     title: "内存",
-                    value: endpoint.memoryFraction,
-                    detail: memoryDetail
+                    value: percent(endpoint.memoryFraction),
+                    detail: memoryDetail,
+                    progress: endpoint.memoryFraction,
+                    color: DesignTokens.memory
                 )
-                OverviewMetric(
-                    title: "GPU 利用率",
-                    value: averageUtilization,
-                    detail: utilizationDetail
-                )
-                OverviewMetric(
-                    title: "显存",
-                    value: averageVRAM,
-                    detail: vramDetail
+                HomeResourceMetric(
+                    icon: "square.stack.3d.up.fill",
+                    title: "GPU",
+                    value: gpus.isEmpty ? "0 块" : "\(allocatableCount) / \(gpus.count)",
+                    detail: gpuCapacityDetail,
+                    progress: averageUtilization,
+                    color: DesignTokens.gpu
                 )
             }
 
             Divider().opacity(0.34)
 
             if sortedGPUs.isEmpty {
-                Text("等待 GPU 状态")
-                    .font(.system(size: 10, weight: .medium))
+                Label("CPU 计算节点 · 当前未检测到 GPU", systemImage: "cpu")
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
-                    .frame(maxWidth: .infinity, minHeight: 70)
+                    .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
             } else {
                 LazyVGrid(columns: gpuColumns, spacing: 7) {
                     ForEach(visibleGPUs) { gpu in
                         Button { selectGPU(gpu) } label: {
-                            OverviewGPUTile(gpu: gpu)
+                            HomeGPUChip(gpu: gpu)
                         }
                         .buttonStyle(.plain)
                     }
                     if hiddenGPUCount > 0 {
-                        Text("+\(hiddenGPUCount)")
-                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        Label("另有 \(hiddenGPUCount) 块", systemImage: "ellipsis.circle")
+                            .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(DesignTokens.mutedInk)
-                            .frame(maxWidth: .infinity, minHeight: 62)
+                            .frame(maxWidth: .infinity, minHeight: 44)
                             .background(DesignTokens.ink.opacity(0.05), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     }
                 }
             }
         }
-        .padding(12)
-        .overviewSurface(radius: 12)
-    }
-
-    private var metricColumns: [GridItem] {
-        [GridItem(.flexible(), spacing: 9), GridItem(.flexible(), spacing: 9)]
+        .padding(14)
+        .overviewSurface(radius: 15)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("服务器 \(endpoint.displayName)")
+        .accessibilityValue("\(endpoint.monitorLabel)，\(capacityLabel)，\(cpuDetail)，\(memoryDetail)")
     }
 
     private var gpuColumns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 6), count: 4)
+        [GridItem(.adaptive(minimum: 132, maximum: 210), spacing: 7)]
     }
 
     private var visibleGPUs: [GPURecord] {
-        Array(sortedGPUs.prefix(12))
+        Array(sortedGPUs.prefix(6))
     }
 
     private var hiddenGPUCount: Int {
@@ -887,87 +1055,99 @@ private struct OverviewServerCard: View {
         return "\(gibibytes(used)) / \(gibibytes(total)) GB"
     }
 
-    private var utilizationDetail: String {
+    private var gpuCapacityDetail: String {
         guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线，不显示旧遥测" }
-        guard !gpus.isEmpty else { return "等待 GPU 状态" }
-        return "\(gpus.count) 块 GPU 平均"
-    }
-
-    private var vramDetail: String {
-        guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线，不显示旧遥测" }
-        guard totalVRAMMiB > 0 else { return "等待 GPU 状态" }
-        return "\(gibibytes(usedVRAMMiB)) / \(gibibytes(totalVRAMMiB)) GB"
+        guard !gpus.isEmpty else { return "仅 CPU · 无 GPU" }
+        return "\(gibibytes(totalVRAMMiB)) GB 显存"
     }
 
     private var capacityLabel: String {
         guard endpoint.monitorStatus == "ONLINE" else { return "状态未在线" }
-        guard !gpus.isEmpty else { return "等待 GPU 状态" }
+        guard !gpus.isEmpty else { return "CPU 节点" }
         return "\(allocatableCount)/\(gpus.count) 可分配"
     }
 }
 
-private struct OverviewMetric: View {
+private struct HomeResourceMetric: View {
+    let icon: String
     let title: String
-    let value: Double?
+    let value: String
     let detail: String
+    let progress: Double?
+    let color: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 4) {
-                Text(title)
-                Spacer(minLength: 4)
-                Text(percent(value))
-                    .fontDesign(.rounded)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .semibold))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(color)
+                    .frame(width: 26, height: 26)
+                    .background(color.opacity(0.13), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                    Text(value)
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .lineLimit(1)
+                }
             }
-            .font(.system(size: 9, weight: .semibold))
 
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(DesignTokens.ink.opacity(0.09))
+                    Capsule().fill(DesignTokens.ink.opacity(0.08))
                     Capsule()
-                        .fill(DesignTokens.interaction)
-                        .frame(width: proxy.size.width * CGFloat(value ?? 0))
+                        .fill(color)
+                        .frame(width: proxy.size.width * CGFloat(progress ?? 0))
                 }
             }
-            .frame(height: 4)
+            .frame(height: 5)
 
             Text(detail)
-                .font(.system(size: 8, weight: .medium))
+                .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(DesignTokens.mutedInk)
                 .lineLimit(1)
         }
+        .padding(10)
+        .frame(maxWidth: .infinity, minHeight: 92, alignment: .topLeading)
+        .background(DesignTokens.glassSmoke, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue("\(value)，\(detail)")
     }
 }
 
-private struct OverviewGPUTile: View {
+private struct HomeGPUChip: View {
     let gpu: GPURecord
 
     var body: some View {
-        VStack(spacing: 4) {
-            ZStack {
-                Circle()
-                    .stroke(DesignTokens.ink.opacity(0.10), lineWidth: 4)
-                Circle()
-                    .trim(from: 0, to: gpu.memoryFraction)
-                    .stroke(DesignTokens.interaction, style: StrokeStyle(lineWidth: 4, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                Text("\(Int((gpu.memoryFraction * 100).rounded()))%")
-                    .font(.system(size: 8, weight: .semibold, design: .rounded))
+        HStack(spacing: 8) {
+            Image(systemName: overviewGPUStateIcon(gpu.state))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(DesignTokens.gpu)
+                .frame(width: 28, height: 28)
+                .background(DesignTokens.gpu.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("GPU \(gpu.index)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                Text(overviewGPUStateLabel(gpu.state))
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
             }
-            .frame(width: 36, height: 36)
-
-            Text("GPU \(gpu.index)")
-                .font(.system(size: 8, weight: .semibold, design: .rounded))
-            Text(gpu.memoryLabel)
-                .font(.system(size: 7, weight: .medium, design: .rounded))
+            Spacer(minLength: 2)
+            Text(gpu.vramLabel)
+                .font(.system(size: 9, weight: .semibold, design: .rounded))
                 .foregroundStyle(DesignTokens.mutedInk)
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
         }
-        .frame(maxWidth: .infinity, minHeight: 62)
+        .padding(.horizontal, 9)
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .background(DesignTokens.glassSmoke, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("GPU \(gpu.index)，显存占用 \(Int((gpu.memoryFraction * 100).rounded()))%，\(overviewGPUStateLabel(gpu.state))")
+        .accessibilityLabel("GPU \(gpu.index)，\(overviewGPUStateLabel(gpu.state))，显存 \(gpu.vramLabel)")
     }
 }
 
@@ -1012,7 +1192,7 @@ private struct OverviewLeaseRow: View {
         .frame(minHeight: 44)
         .overviewSurface(radius: 9)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("租约 \(lease.projectID)")
+        .accessibilityLabel("资源使用 \(lease.projectID)")
         .accessibilityValue("\(lease.stateLabel)，\(lease.gpuIDs.count) 块 GPU")
     }
 }
@@ -1072,12 +1252,10 @@ private struct LeaseFact: View {
 private extension View {
     func overviewSurface(radius: CGFloat) -> some View {
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
-        return background(.regularMaterial, in: shape)
-            .background(DesignTokens.surface.opacity(0.32), in: shape)
+        return background(DesignTokens.surface, in: shape)
             .overlay(
                 shape.stroke(DesignTokens.surfaceStroke, lineWidth: 0.8)
             )
-            .shadow(color: DesignTokens.surfaceShadow, radius: 8, x: 0, y: 2)
     }
 }
 
@@ -1111,7 +1289,7 @@ private func gibibytes(_ mebibytes: Int) -> Int {
 private func overviewGPUStateLabel(_ state: String) -> String {
     switch state {
     case "AVAILABLE": return "可用"
-    case "HELD", "LEASED_IDLE": return "已认领"
+    case "HELD", "LEASED_IDLE": return "已分配"
     case "RUNNING_MANAGED": return "运行中"
     case "BUSY_UNMANAGED": return "非托管占用"
     case "ORPHANED_BUSY": return "释放后仍占用"

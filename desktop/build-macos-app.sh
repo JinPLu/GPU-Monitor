@@ -47,7 +47,6 @@ fi
 mkdir -p "${macos_dir}" "${resources_dir}" "${runtime_dir}/configs"
 cp "${script_dir}/Info.plist" "${app_bundle}/Contents/Info.plist"
 cp "${script_dir}/assets/GPU Broker.icns" "${resources_dir}/GPU Broker.icns"
-cp "${script_dir}/assets/ai-compute-studio-v1.png" "${resources_dir}/ai-compute-studio-v1.png"
 cp "${project_root}/configs/inventory.yaml" "${runtime_dir}/configs/inventory.yaml"
 if [[ -d "${script_dir}/Fixtures" ]]; then
   mkdir -p "${resources_dir}/Fixtures"

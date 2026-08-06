@@ -115,9 +115,148 @@ final class BrokerStoreTests: XCTestCase {
         )
     }
 
+    func testURLSessionClientFetchesUnifiedStateRoute() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StateRouteURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = URLSessionBrokerSnapshotClient(
+            baseURL: URL(string: "http://broker.test/")!,
+            session: session
+        )
+        let fixtureData = try Data(contentsOf: Self.fixturesRoot.appendingPathComponent("1.json"))
+        StateRouteURLProtocol.responseData = fixtureData
+        defer { StateRouteURLProtocol.reset() }
+
+        let snapshot = try await client.snapshot(actorID: "tester")
+
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/state")
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.value(forHTTPHeaderField: "X-GPU-Broker-Actor"), "tester")
+        XCTAssertEqual(snapshot.snapshotRevision, 101)
+        XCTAssertEqual(snapshot.summary.totalGPUs, 1)
+    }
+
+    func testUnifiedStateEnvelopeParsesCurrentAndHistory() throws {
+        let history = [
+            "summary": ["total_gpus": 1],
+            "data_age_seconds": 8,
+            "freshness_seconds": 30
+        ] as [String: Any]
+        let snapshot = BrokerSnapshot(envelope: [
+            "schema_version": "v1",
+            "snapshot_revision": 150,
+            "server_time": "2026-08-06T08:00:00Z",
+            "data": [
+                "current": [
+                    "summary": ["total_gpus": 8],
+                    "endpoints": [],
+                    "gpus": [],
+                    "leases": [],
+                    "requests": [],
+                    "reservations": [],
+                    "data_age_seconds": 2,
+                    "freshness_seconds": 30,
+                    "admission_boundary": "test"
+                ],
+                "history": [
+                    "retired_endpoints": [],
+                    "resource_plan_evaluations": [],
+                    "resource_run_actuals": [
+                        [
+                            "id": "actual-history",
+                            "actor_id": "agent-a",
+                            "project_id": "project-a",
+                            "task_ref": "train",
+                            "quantities": ["gpu_count": 1],
+                            "actual_duration_seconds": 1760
+                        ]
+                    ],
+                    "summary_samples": [
+                        history
+                    ]
+                ]
+            ]
+        ])
+
+        XCTAssertEqual(snapshot.snapshotRevision, 150)
+        XCTAssertEqual(snapshot.summary.totalGPUs, 8)
+        XCTAssertEqual(snapshot.history.resourceRunActuals.count, 1)
+        XCTAssertEqual(snapshot.resourceRunActuals.first?.id, "actual-history")
+        XCTAssertEqual(snapshot.resourceRunActuals.first?.actualDurationSeconds, 1760)
+    }
+
+    func testMutationRevisionFloorRejectsRollbackSnapshotAndLaterCommitsRequiredRevision() async throws {
+        var beforeMutation = try Self.snapshot(named: "1")
+        beforeMutation.snapshotRevision = 101
+        var rollback = try Self.snapshot(named: "8")
+        rollback.snapshotRevision = 120
+        var afterMutation = try Self.snapshot(named: "8")
+        afterMutation.snapshotRevision = 150
+        let client = ScriptedClient(results: [
+            .success(beforeMutation),
+            .success(rollback),
+            .success(afterMutation)
+        ])
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+
+        store.connectForTesting(snapshotClient: client)
+        try await waitUntil { store.snapshot.snapshotRevision == 101 && !store.isRefreshing }
+
+        let mutationResponse = try JSONSerialization.data(withJSONObject: ["snapshot_revision": 150])
+        store.raiseMinimumRequiredSnapshotRevision(from: mutationResponse)
+        store.reload()
+        try await waitUntil { store.freshness == .stale && !store.isRefreshing }
+
+        XCTAssertEqual(store.snapshot.snapshotRevision, 101)
+        XCTAssertEqual(store.lastGoodSnapshot?.snapshotRevision, 101)
+        XCTAssertEqual(
+            store.errorMessage,
+            "无法更新资源：\(BrokerRefreshError.snapshotRevisionBehind(required: 150, received: 120).localizedDescription)"
+        )
+
+        store.reload()
+        try await waitUntil { store.snapshot.snapshotRevision == 150 && !store.isRefreshing }
+
+        XCTAssertEqual(store.freshness, .fresh)
+        XCTAssertNil(store.errorMessage)
+    }
+
+    func testOrdinaryRefreshRejectsRevisionRollbackAndPreservesLastGoodSnapshot() async throws {
+        var accepted = try Self.snapshot(named: "8")
+        accepted.snapshotRevision = 150
+        var rollback = try Self.snapshot(named: "1")
+        rollback.snapshotRevision = 120
+        let client = ScriptedClient(results: [.success(accepted), .success(rollback)])
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+
+        store.connectForTesting(snapshotClient: client)
+        try await waitUntil { store.snapshot.snapshotRevision == 150 && !store.isRefreshing }
+
+        store.reload()
+        try await waitUntil { store.freshness == .stale && !store.isRefreshing }
+
+        XCTAssertEqual(store.snapshot.snapshotRevision, 150)
+        XCTAssertEqual(store.lastGoodSnapshot?.snapshotRevision, 150)
+        XCTAssertEqual(
+            store.errorMessage,
+            "无法更新资源：\(BrokerRefreshError.snapshotRevisionBehind(required: 150, received: 120).localizedDescription)"
+        )
+    }
+
     func testEndpointRemovalRefreshDiscardsPreMutationResponseWithoutOverlapOrRollback() async throws {
         let beforeDeletion = try Self.snapshot(named: "1")
-        let afterDeletion = BrokerSnapshot.empty
+        let endpoint = try XCTUnwrap(beforeDeletion.endpoints.first)
+        let retiredEndpoint = try XCTUnwrap(EndpointRecord(raw: [
+            "id": endpoint.id,
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "ssh_user": endpoint.sshUser,
+            "enabled": false,
+            "lifecycle_state": "retired",
+            "monitor": ["status": "RETIRED"]
+        ]))
+        var afterDeletion = beforeDeletion
+        afterDeletion.snapshotRevision = (beforeDeletion.snapshotRevision ?? 0) + 1
+        afterDeletion.endpoints = [retiredEndpoint]
         let client = DelayedSequenceClient(
             snapshots: [beforeDeletion, afterDeletion],
             delaysNanoseconds: [80_000_000, 80_000_000]
@@ -127,9 +266,10 @@ final class BrokerStoreTests: XCTestCase {
 
         store.connectForTesting(snapshotClient: client)
         try await waitUntilAsync { await client.metrics().activeCalls == 1 }
-        let endpoint = try XCTUnwrap(beforeDeletion.endpoints.first)
-
-        store.confirmEndpointRemovalAfterMutation(endpoint) { success, message in
+        store.confirmEndpointRemovalAfterMutation(
+            endpoint,
+            expectedLifecycleState: "RETIRED"
+        ) { success, message in
             recorder.success = success
             recorder.message = message
         }
@@ -142,8 +282,41 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(metrics.callCount, 2)
         XCTAssertEqual(metrics.maxConcurrentCalls, 1)
         XCTAssertEqual(store.snapshot, afterDeletion)
+        XCTAssertTrue(store.snapshot.operationalEndpoints.isEmpty)
+        XCTAssertTrue(store.snapshot.operationalGPUs.isEmpty)
+        XCTAssertTrue(store.snapshot.monitoringProviders.isEmpty)
         XCTAssertEqual(recorder.success, true)
         XCTAssertNil(recorder.message)
+    }
+
+    func testEndpointLifecycleMutationStaysAvailableWhenTelemetryIsStale() async throws {
+        let client = ScriptedClient(results: [.success(try Self.snapshot(named: "stale"))])
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+
+        store.connectForTesting(
+            snapshotClient: client,
+            baseURL: URL(string: "http://127.0.0.1:8787/")
+        )
+
+        try await waitUntil { store.freshness == .stale && !store.isRefreshing }
+        XCTAssertFalse(store.allowsMutations)
+        XCTAssertTrue(store.allowsEndpointLifecycleMutations)
+    }
+
+    func testEndpointLifecycleResponseParsingNormalizesState() throws {
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "snapshot_revision": 250,
+            "data": ["endpoint": ["lifecycle_state": "draining"]]
+        ])
+
+        XCTAssertEqual(BrokerStore.endpointLifecycleState(from: payload), "DRAINING")
+        XCTAssertEqual(BrokerStore.snapshotRevision(from: payload), 250)
+        XCTAssertNil(BrokerStore.endpointLifecycleState(from: Data("{}".utf8)))
+
+        let errorPayload = try JSONSerialization.data(withJSONObject: [
+            "error": ["code": "endpoint_already_retired"]
+        ])
+        XCTAssertEqual(BrokerStore.apiErrorCode(from: errorPayload), "endpoint_already_retired")
     }
 
     func testStableSelectionFallsBackToFirstAvailableRecord() throws {
@@ -189,13 +362,48 @@ final class BrokerStoreTests: XCTestCase {
                         "quantities": ["node_count": 2, "scheduler_units": 2]
                     ]
                 ],
+                "scheduler_targets": [
+                    [
+                        "id": "hanhai22",
+                        "display_name": "Hanhai22",
+                        "kind": "external-scheduler",
+                        "adapter": "slurm",
+                        "enabled": true,
+                        "last_access": ["status": "access_required", "message": "VPN required"]
+                    ]
+                ],
+                "scheduler_jobs": [
+                    [
+                        "id": "job-1",
+                        "target_id": "hanhai22",
+                        "actor_id": "agent-a",
+                        "project_id": "project-a",
+                        "task_ref": "train",
+                        "state": "pending",
+                        "raw_state": "PENDING",
+                        "scheduler_job_id": "12345"
+                    ]
+                ],
+                "scheduler_transfers": [
+                    [
+                        "id": "transfer-1",
+                        "target_id": "hanhai22",
+                        "actor_id": "agent-a",
+                        "project_id": "project-a",
+                        "state": "completed",
+                        "remote_directory": "/scratch/project-a"
+                    ]
+                ],
                 "resource_claims": [
                     [
                         "id": "claim-1",
                         "actor_id": "agent-a",
                         "project_id": "project-a",
                         "task_ref": "train",
-                        "state": "QUEUED",
+                        "state": "active",
+                        "runtime_state": "RUNNING",
+                        "native_lease_ids": ["lease-1"],
+                        "native_request_ids": ["request-1"],
                         "provider_type": "host-capacity",
                         "quantities": ["cpu_cores": 4, "memory_mib": 8192]
                     ]
@@ -255,7 +463,18 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(scheduler.providerType, "scheduler")
         XCTAssertEqual(scheduler.trustBoundary, "等待外部调度器确认；不计入裸机可用容量")
         XCTAssertEqual(snapshot.allocatableUnits.first?.unitType, "scheduler-target")
+        XCTAssertEqual(snapshot.schedulerTargets.first?.id, "hanhai22")
+        XCTAssertEqual(snapshot.schedulerTargets.first?.accessStatus, "ACCESS_REQUIRED")
+        XCTAssertEqual(snapshot.schedulerJobs.first?.targetID, "hanhai22")
+        XCTAssertEqual(snapshot.schedulerJobs.first?.state, "PENDING")
+        XCTAssertEqual(snapshot.schedulerTransfers.first?.targetID, "hanhai22")
+        XCTAssertEqual(snapshot.schedulerTransfers.first?.state, "COMPLETED")
         XCTAssertEqual(snapshot.resourceClaims.first?.quantities.compactLabel, "4 CPU · 8 GB RAM")
+        XCTAssertEqual(snapshot.resourceClaims.first?.state, "ACTIVE")
+        XCTAssertEqual(snapshot.resourceClaims.first?.runtimeState, "RUNNING")
+        XCTAssertEqual(snapshot.resourceClaims.first?.stateLabel, "运行中")
+        XCTAssertEqual(snapshot.resourceClaims.first?.nativeLeaseIDs, ["lease-1"])
+        XCTAssertEqual(snapshot.resourceClaims.first?.nativeRequestIDs, ["request-1"])
         XCTAssertEqual(snapshot.resourcePlanEvaluations.first?.selectedCandidate?.candidateKey, "small")
         XCTAssertEqual(snapshot.resourceRunActuals.first?.actualDurationSeconds, 1760)
     }
@@ -429,5 +648,39 @@ private actor ScriptedClient: BrokerSnapshotClient {
     func snapshot(actorID: String) async throws -> BrokerSnapshot {
         let result = results.isEmpty ? .failure(BrokerRefreshError.invalidSnapshot) : results.removeFirst()
         return try result.get()
+    }
+}
+
+private final class StateRouteURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var responseData: Data?
+    nonisolated(unsafe) static var lastRequest: URLRequest?
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        Self.lastRequest = request
+        let data = Self.responseData ?? Data("{}".utf8)
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+
+    static func reset() {
+        responseData = nil
+        lastRequest = nil
     }
 }

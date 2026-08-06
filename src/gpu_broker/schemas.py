@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -13,6 +13,18 @@ DEFAULT_LEASE_WINDOW_SECONDS = 8 * 60 * 60
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class ControlPlaneSnapshotData(StrictModel):
+    current: dict[str, Any]
+    history: dict[str, Any]
+
+
+class ControlPlaneSnapshot(StrictModel):
+    schema_version: str
+    snapshot_revision: int
+    server_time: str | None
+    data: ControlPlaneSnapshotData
 
 
 class ResourceConstraints(StrictModel):

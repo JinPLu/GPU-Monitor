@@ -4,4 +4,5 @@
 
 图标以项目已内置的 [Phosphor Icons](https://phosphoricons.com/) `graphics-card` 字形为主体；构图遵循 Apple App Icon 指南：保持主图形居中、减少细节，并把边缘裁切交给系统处理。
 
-`ai-compute-studio-v1.png` 是桌面资源总览使用的氛围背景，用于 Apple Home 式半透明空间感。它是产品展示资产，不包含真实服务器、地址、账号或 telemetry。
+`ai-compute-studio-v1.png` 是早期桌面氛围背景的设计源文件，不包含真实服务器、地址、账号或
+telemetry。低合成模式不再加载或打包它，避免全窗口实时模糊与混合增加 WindowServer 开销。

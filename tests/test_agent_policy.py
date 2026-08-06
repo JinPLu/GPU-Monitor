@@ -144,7 +144,7 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
         "gpu_release",
         "advanced compatibility tools",
         "idempotency_key",
-        "endpoints belong to projects",
+            "endpoints are shared loopback inventory",
         "draining",
     ):
         assert runtime_contract in mcp_instructions

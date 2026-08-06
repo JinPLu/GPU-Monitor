@@ -15,6 +15,7 @@ from gpu_broker.api import create_app
 from gpu_broker.cli import app as cli_app
 from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
 from gpu_broker.mcp_server import mcp
+from gpu_broker.models import Endpoint
 from gpu_broker.schemas import EndpointUpsert, RequestCreate
 from tests.helpers import observation, process_for_gpu
 
@@ -134,6 +135,51 @@ def test_snapshot_api_uses_latest_complete_gpu_set(tmp_path: Path, inventory) ->
     ]
     assert data["summary"]["total_gpus"] == 2
     assert data["endpoints"][0]["monitor"]["gpu_count"] == 2
+
+
+def test_control_plane_state_api_exposes_current_and_history_contract(
+    tmp_path: Path, inventory
+) -> None:
+    inventory_path = tmp_path / "state-contract.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'state-contract.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    app.state.service.ingest_observation(observation(count=1))
+    client = TestClient(app)
+
+    response = client.get("/api/v1/state", headers={"X-GPU-Broker-Actor": "test-agent"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == "v1"
+    assert isinstance(payload["snapshot_revision"], int)
+    assert payload["server_time"]
+    assert set(payload["data"]) == {"current", "history"}
+    current = payload["data"]["current"]
+    history = payload["data"]["history"]
+    assert {
+        "summary",
+        "endpoints",
+        "gpus",
+        "leases",
+        "requests",
+        "reservations",
+        "resource_providers",
+        "scheduler_targets",
+        "scheduler_jobs",
+        "workload_profiles",
+    }.issubset(current)
+    assert {
+        "retired_endpoints",
+        "resource_plan_evaluations",
+        "resource_run_actuals",
+    }.issubset(history)
+    assert current["gpus"][0]["state"] == "AVAILABLE"
 
 
 def test_lease_api_suppresses_executable_resources_when_claimed_gpu_absent(
@@ -540,6 +586,11 @@ def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> 
         )
     )
     client = TestClient(app)
+    with app.state.service.database.session() as session:
+        endpoint = session.get(Endpoint, "endpoint-b")
+        assert endpoint is not None
+        endpoint.owner_project_id = None
+        session.commit()
 
     missing_key = client.delete(
         "/api/v1/endpoints/endpoint-b",
@@ -708,6 +759,7 @@ def test_mcp_exposes_required_tools() -> None:
     by_name = {tool.name: tool for tool in tools}
     names = set(by_name)
     assert {
+        "control_plane_state",
         "gpu_status",
         "gpu_coordination",
         "gpu_list",
@@ -764,9 +816,28 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
     calls = []
 
     class FakeClient:
-        def get(self, path, *, params=None):  # type: ignore[no-untyped-def]
-            calls.append(("GET", path, params))
-            return {"schema_version": "v1", "data": {}}
+        def control_plane_state(self):  # type: ignore[no-untyped-def]
+            calls.append(("STATE", "/api/v1/state"))
+            return {
+                "schema_version": "v1",
+                "snapshot_revision": 1,
+                "server_time": "2026-08-06T00:00:00Z",
+                "data": {
+                    "current": {
+                        "coordination": {},
+                    },
+                    "history": {},
+                },
+            }
+
+        def coordination(self):  # type: ignore[no-untyped-def]
+            state = self.control_plane_state()
+            return {
+                "schema_version": state["schema_version"],
+                "snapshot_revision": state["snapshot_revision"],
+                "server_time": state["server_time"],
+                "data": state["data"]["current"]["coordination"],
+            }
 
         def post(self, path, body=None, *, idempotency_key):  # type: ignore[no-untyped-def]
             calls.append(("POST", path, body, idempotency_key))
@@ -774,8 +845,13 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
 
     monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
 
-    assert mcp_server.gpu_coordination() == {"schema_version": "v1", "data": {}}
-    assert calls == [("GET", "/api/v1/coordination", None)]
+    assert mcp_server.gpu_coordination() == {
+        "schema_version": "v1",
+        "snapshot_revision": 1,
+        "server_time": "2026-08-06T00:00:00Z",
+        "data": {},
+    }
+    assert calls == [("STATE", "/api/v1/state")]
 
     calls.clear()
     assert mcp_server.gpu_claim("agent", "project", "task", 1)["request"] == {}
@@ -1107,6 +1183,45 @@ def test_cli_help_is_available() -> None:
     result = CliRunner().invoke(cli_app, ["--help"])
     assert result.exit_code == 0
     assert "status" in result.stdout
+
+
+def test_cli_state_uses_canonical_client_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class FakeClient:
+        def control_plane_state(
+            self,
+            *,
+            minimum_snapshot_revision=None,
+            timeout_seconds=0,
+            poll_interval_seconds=0.25,
+        ):  # type: ignore[no-untyped-def]
+            calls.append((minimum_snapshot_revision, timeout_seconds, poll_interval_seconds))
+            return {
+                "schema_version": "v1",
+                "snapshot_revision": 12,
+                "server_time": "2026-08-06T00:00:00Z",
+                "data": {"current": {"gpus": []}, "history": {}},
+            }
+
+    monkeypatch.setattr(cli_module, "_client", lambda url, actor: FakeClient())
+
+    result = CliRunner().invoke(
+        cli_app,
+        [
+            "state",
+            "--minimum-snapshot-revision",
+            "12",
+            "--timeout-seconds",
+            "2",
+            "--poll-interval-seconds",
+            "0.5",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"snapshot_revision": 12' in result.stdout
+    assert calls == [(12, 2.0, 0.5)]
 
 
 def test_cli_resource_evaluate_uses_client_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

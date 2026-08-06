@@ -1,0 +1,414 @@
+{
+  "schema_version": "v1",
+  "snapshot_revision": 207,
+  "server_time": "2026-08-06T09:00:00Z",
+  "data": {
+    "current": {
+      "summary": {
+        "online_servers": 2,
+        "total_servers": 2,
+        "total_gpus": 2,
+        "available_gpus": 1,
+        "busy_gpus": 1,
+        "claimed_gpus": 1,
+        "abnormal_gpus": 0
+      },
+      "endpoints": [
+        {
+          "id": "cpu-node-01",
+          "host": "10.20.0.11",
+          "port": 22,
+          "ssh_user": "compute",
+          "enabled": true,
+          "lifecycle_state": "active",
+          "labels": {
+            "fixture": "true",
+            "resource_kind": "cpu-only"
+          },
+          "monitor": {
+            "status": "ONLINE",
+            "last_success_at": "2026-08-06T08:59:58Z",
+            "last_attempt_at": "2026-08-06T08:59:58Z"
+          },
+          "host_telemetry": {
+            "cpu_count": 32,
+            "load_1m": 7.5,
+            "memory_total_mib": 131072,
+            "memory_available_mib": 98304
+          }
+        },
+        {
+          "id": "gpu-node-01",
+          "host": "10.20.0.21",
+          "port": 2222,
+          "ssh_user": "gpu",
+          "enabled": true,
+          "lifecycle_state": "active",
+          "labels": {
+            "fixture": "true",
+            "resource_kind": "gpu"
+          },
+          "monitor": {
+            "status": "ONLINE",
+            "last_success_at": "2026-08-06T08:59:57Z",
+            "last_attempt_at": "2026-08-06T08:59:57Z"
+          },
+          "host_telemetry": {
+            "cpu_count": 64,
+            "load_1m": 18.0,
+            "memory_total_mib": 262144,
+            "memory_available_mib": 163840
+          }
+        }
+      ],
+      "gpus": [
+        {
+          "id": "gpu-node-01:GPU-FIXTURE-0",
+          "endpoint_id": "gpu-node-01",
+          "gpu_uuid": "GPU-FIXTURE-0",
+          "gpu_index": 0,
+          "name": "NVIDIA A100-SXM4-80GB",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "RUNNING_MANAGED",
+          "lease": {
+            "id": "lease-vision-train",
+            "actor_id": "agent-trainer",
+            "project_id": "vision-lab",
+            "task_ref": "train-resnet"
+          },
+          "processes": [],
+          "telemetry": {
+            "memory_used_mib": 32768,
+            "gpu_utilization_pct": 67,
+            "temperature_c": 61
+          }
+        },
+        {
+          "id": "gpu-node-01:GPU-FIXTURE-1",
+          "endpoint_id": "gpu-node-01",
+          "gpu_uuid": "GPU-FIXTURE-1",
+          "gpu_index": 1,
+          "name": "NVIDIA A100-SXM4-80GB",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "AVAILABLE",
+          "processes": [],
+          "telemetry": {
+            "memory_used_mib": 4096,
+            "gpu_utilization_pct": 4,
+            "temperature_c": 34
+          }
+        }
+      ],
+      "leases": [
+        {
+          "id": "lease-vision-train",
+          "request_id": "request-vision-train",
+          "actor_id": "agent-trainer",
+          "project_id": "vision-lab",
+          "state": "ACTIVE",
+          "runtime_state": "RUNNING",
+          "gpu_ids": [
+            "gpu-node-01:GPU-FIXTURE-0"
+          ],
+          "issued_at": "2026-08-06T08:30:00Z",
+          "expires_at": "2026-08-06T12:30:00Z",
+          "task_ref": "train-resnet",
+          "purpose": "训练图像分类模型"
+        }
+      ],
+      "requests": [
+        {
+          "id": "request-robotics-gpu",
+          "actor_id": "agent-sim",
+          "project_id": "robotics",
+          "task_ref": "render-simulation",
+          "purpose": "为仿真结果生成可视化",
+          "state": "QUEUED",
+          "blocked_reason": "等待一块可用 GPU",
+          "constraints": {
+            "gpu_count": 1
+          },
+          "created_at": "2026-08-06T08:50:00Z"
+        }
+      ],
+      "reservations": [],
+      "resource_providers": [
+        {
+          "id": "host-capacity:cpu-node-01",
+          "provider_type": "host-capacity",
+          "display_name": "CPU 计算节点",
+          "endpoint_id": "cpu-node-01",
+          "state": "ONLINE",
+          "enabled": true,
+          "total": {
+            "cpu_cores": 32,
+            "memory_mib": 131072,
+            "gpu_count": 0
+          },
+          "committed": {
+            "cpu_cores": 12,
+            "memory_mib": 32768,
+            "gpu_count": 0
+          },
+          "available": {
+            "cpu_cores": 24.5,
+            "memory_mib": 98304,
+            "gpu_count": 0
+          },
+          "updated_at": "2026-08-06T08:59:58Z"
+        },
+        {
+          "id": "direct-gpu:gpu-node-01",
+          "provider_type": "direct-gpu",
+          "display_name": "A100 计算节点",
+          "endpoint_id": "gpu-node-01",
+          "state": "ONLINE",
+          "enabled": true,
+          "total": {
+            "cpu_cores": 64,
+            "memory_mib": 262144,
+            "gpu_count": 2
+          },
+          "committed": {
+            "cpu_cores": 16,
+            "memory_mib": 65536,
+            "gpu_count": 1
+          },
+          "available": {
+            "cpu_cores": 46,
+            "memory_mib": 163840,
+            "gpu_count": 1
+          },
+          "updated_at": "2026-08-06T08:59:57Z"
+        },
+        {
+          "id": "scheduler:research-cluster",
+          "provider_type": "scheduler",
+          "display_name": "研究计算平台",
+          "scheduler_target_id": "research-cluster",
+          "state": "PENDING",
+          "enabled": true,
+          "total": {
+            "cpu_cores": 128,
+            "memory_mib": 524288,
+            "gpu_count": 4,
+            "node_count": 2
+          },
+          "committed": {
+            "cpu_cores": 0,
+            "memory_mib": 0,
+            "gpu_count": 0
+          },
+          "available": {
+            "cpu_cores": 0,
+            "memory_mib": 0,
+            "gpu_count": 0
+          },
+          "updated_at": "2026-08-06T08:58:00Z"
+        }
+      ],
+      "allocatable_units": [],
+      "resource_claims": [
+        {
+          "id": "claim-vision-prep",
+          "actor_id": "agent-trainer",
+          "project_id": "vision-lab",
+          "task_ref": "prepare-dataset",
+          "purpose": "准备训练数据",
+          "state": "active",
+          "runtime_state": "ASSIGNED",
+          "provider_type": "host-capacity",
+          "quantities": {
+            "cpu_cores": 12,
+            "memory_mib": 32768,
+            "gpu_count": 0
+          },
+          "created_at": "2026-08-06T08:15:00Z"
+        },
+        {
+          "id": "claim-vision-train",
+          "actor_id": "agent-trainer",
+          "project_id": "vision-lab",
+          "task_ref": "train-resnet",
+          "purpose": "训练图像分类模型",
+          "state": "active",
+          "runtime_state": "RUNNING",
+          "native_lease_ids": [
+            "lease-vision-train"
+          ],
+          "native_request_ids": [
+            "request-vision-train"
+          ],
+          "provider_type": "direct-gpu",
+          "quantities": {
+            "cpu_cores": 16,
+            "memory_mib": 65536,
+            "gpu_count": 1
+          },
+          "created_at": "2026-08-06T08:30:00Z"
+        },
+        {
+          "id": "claim-vision-eval",
+          "actor_id": "agent-eval",
+          "project_id": "vision-lab",
+          "task_ref": "eval-model",
+          "purpose": "评估最新模型",
+          "state": "blocked",
+          "runtime_state": "REQUESTED",
+          "provider_type": "direct-gpu",
+          "quantities": {
+            "cpu_cores": 8,
+            "memory_mib": 16384,
+            "gpu_count": 1
+          },
+          "created_at": "2026-08-06T08:50:00Z"
+        },
+        {
+          "id": "claim-robotics-sim",
+          "actor_id": "agent-sim",
+          "project_id": "robotics",
+          "task_ref": "simulate-policy",
+          "purpose": "运行策略仿真",
+          "state": "active",
+          "runtime_state": "ASSIGNED",
+          "provider_type": "host-capacity",
+          "quantities": {
+            "cpu_cores": 20,
+            "memory_mib": 49152,
+            "gpu_count": 0
+          },
+          "created_at": "2026-08-06T08:40:00Z"
+        },
+        {
+          "id": "claim-robotics-shared-task-name",
+          "actor_id": "agent-sim",
+          "project_id": "robotics",
+          "task_ref": "train-resnet",
+          "purpose": "验证同名任务按项目分别展示",
+          "state": "blocked",
+          "runtime_state": "REQUESTED",
+          "provider_type": "host-capacity",
+          "quantities": {
+            "cpu_cores": 4,
+            "memory_mib": 8192,
+            "gpu_count": 0
+          },
+          "created_at": "2026-08-06T08:42:00Z"
+        }
+      ],
+      "data_age_seconds": 2,
+      "freshness_seconds": 30,
+      "admission_boundary": "只记录资源归属，不会启动或停止服务器上的任务。",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
+    },
+    "history": {
+      "resource_plan_evaluations": [
+        {
+          "id": "plan-vision-eval",
+          "claim_id": "claim-vision-eval",
+          "actor_id": "agent-eval",
+          "project_id": "vision-lab",
+          "task_ref": "eval-model",
+          "selected_candidate_key": "direct-gpu:gpu-node-01",
+          "minimum_saved_seconds": 120,
+          "minimum_saved_ratio": 0.1,
+          "created_at": "2026-08-06T08:50:00Z",
+          "candidates": [
+            {
+              "candidate_key": "direct-gpu:gpu-node-01",
+              "provider_type": "direct-gpu",
+              "quantities": {
+                "cpu_cores": 8,
+                "memory_mib": 16384,
+                "gpu_count": 1
+              },
+              "predicted_runtime_seconds": 1800,
+              "predicted_saved_seconds": 420,
+              "predicted_saved_ratio": 0.19,
+              "selected": true
+            }
+          ]
+        },
+        {
+          "id": "plan-robotics-sim",
+          "claim_id": "claim-robotics-sim",
+          "actor_id": "agent-sim",
+          "project_id": "robotics",
+          "task_ref": "simulate-policy",
+          "selected_candidate_key": "host-capacity:cpu-node-01",
+          "minimum_saved_seconds": 120,
+          "minimum_saved_ratio": 0.1,
+          "created_at": "2026-08-06T08:40:00Z",
+          "candidates": [
+            {
+              "candidate_key": "host-capacity:cpu-node-01",
+              "provider_type": "host-capacity",
+              "quantities": {
+                "cpu_cores": 20,
+                "memory_mib": 49152,
+                "gpu_count": 0
+              },
+              "predicted_runtime_seconds": 2400,
+              "predicted_saved_seconds": 360,
+              "predicted_saved_ratio": 0.13,
+              "selected": true
+            }
+          ]
+        }
+      ],
+      "resource_run_actuals": [
+        {
+          "id": "actual-vision-baseline",
+          "evaluation_id": "plan-vision-baseline",
+          "claim_id": "claim-vision-baseline",
+          "actor_id": "agent-trainer",
+          "project_id": "vision-lab",
+          "task_ref": "baseline-train",
+          "provider_type": "direct-gpu",
+          "quantities": {
+            "cpu_cores": 12,
+            "memory_mib": 49152,
+            "gpu_count": 1
+          },
+          "predicted_duration_seconds": 3600,
+          "actual_duration_seconds": 3420,
+          "created_at": "2026-08-06T07:30:00Z"
+        },
+        {
+          "id": "actual-robotics-replay",
+          "evaluation_id": "plan-robotics-replay",
+          "claim_id": "claim-robotics-replay",
+          "actor_id": "agent-sim",
+          "project_id": "robotics",
+          "task_ref": "replay-dataset",
+          "provider_type": "host-capacity",
+          "quantities": {
+            "cpu_cores": 8,
+            "memory_mib": 24576,
+            "gpu_count": 0
+          },
+          "predicted_duration_seconds": 1800,
+          "actual_duration_seconds": 1920,
+          "created_at": "2026-08-06T07:45:00Z"
+        }
+      ],
+      "retired_endpoints": []
+    }
+  }
+}

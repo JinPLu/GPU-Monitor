@@ -12,4 +12,5 @@ API_CAPABILITIES = (
     "server_deletion",
     "external_slurm_scheduler",
     "general_resource_scheduler",
+    "control_plane_state",
 )

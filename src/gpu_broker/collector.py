@@ -38,9 +38,15 @@ GPU_SECTION = "__GPU_BROKER_GPU__"
 PROCESS_SECTION = "__GPU_BROKER_PROCESSES__"
 IDENTITY_SECTION = "__GPU_BROKER_IDENTITY__"
 HOST_RESOURCES_SECTION = "__GPU_BROKER_HOST_RESOURCES__"
+GPU_UNAVAILABLE = "__GPU_BROKER_GPU_UNAVAILABLE__"
 COMBINED_QUERY = (
-    f"set -e; printf '{GPU_SECTION}\\n'; {GPU_QUERY}; "
-    f"printf '{PROCESS_SECTION}\\n'; {PROCESS_QUERY}; "
+    f"set -e; printf '{GPU_SECTION}\\n'; "
+    f"if command -v nvidia-smi >/dev/null 2>&1; then "
+    f"{GPU_QUERY} 2>/dev/null || printf '{GPU_UNAVAILABLE}\\n'; "
+    f"else printf '{GPU_UNAVAILABLE}\\n'; fi; "
+    f"printf '{PROCESS_SECTION}\\n'; "
+    f"if command -v nvidia-smi >/dev/null 2>&1; then "
+    f"{PROCESS_QUERY} 2>/dev/null || true; fi; "
     f"printf '{IDENTITY_SECTION}\\n'; {IDENTITY_QUERY}; "
     f"printf '{HOST_RESOURCES_SECTION}\\n'; {HOST_RESOURCES_QUERY}"
 )
@@ -256,8 +262,9 @@ class SSHCollector:
         gpu_raw, process_raw, identity_raw, host_raw = parse_combined_probe(
             await self._run(endpoint, COMBINED_QUERY)
         )
-        gpus = parse_gpu_csv(gpu_raw)
-        apps = parse_process_csv(process_raw)
+        gpu_probe_available = GPU_UNAVAILABLE not in gpu_raw.splitlines()
+        gpus = parse_gpu_csv(gpu_raw) if gpu_probe_available else []
+        apps = parse_process_csv(process_raw) if gpu_probe_available else []
         _hostname, boot_id = parse_identity(identity_raw)
         cpu_count, load_1m, memory_total_mib, memory_available_mib = parse_host_resources(host_raw)
         pids = sorted({app.pid for app in apps})
@@ -293,6 +300,9 @@ class SSHCollector:
             },
             gpus=gpus,
             processes=processes,
+            # A missing host-side NVIDIA runtime must not prevent CPU and memory
+            # monitoring, but it also must not mark previously known GPUs absent.
+            observation_complete=gpu_probe_available,
         )
 
     async def collect_once(

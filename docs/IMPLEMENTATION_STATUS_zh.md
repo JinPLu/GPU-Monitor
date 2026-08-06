@@ -1,6 +1,6 @@
 # gpu-broker 实施状态
 
-更新时间：2026-08-04（Asia/Shanghai）
+更新时间：2026-08-06（Asia/Shanghai）
 
 ## 当前状态
 
@@ -17,10 +17,12 @@
   `lease.resources[]` 返回的 endpoint、GPU、`cuda_visible_devices` 上运行或停止已获授权的
   workload；Broker 只协调分配与观测归属。外部 Slurm 是独立的
   `SchedulerTarget/SchedulerJob` adapter，由项目 owner 提交、查询和取消其作业。
-- endpoint 是项目资源。新 endpoint 必须声明 `owner_project_id`；项目 Agent 可自行添加、
-  更新、维护、drain 和 retire 自己的 endpoint，无需管理员角色。删除的第一步是
+- endpoint 是本机共享服务器清单。`owner_project_id` 只用于可选归属展示，不参与权限判断；
+  任一本机可写调用方都可添加、更新、维护、drain 和 retire endpoint。删除的第一步是
   `active → draining`：不再放置新任务，但不停止既有任务，也不删除遥测或审计；活跃 lease
-  结束后第二次操作转为 `retired`。
+  结束后第二次操作转为 `retired`。macOS App 的一次“移除并退役”会自动推进这两个受领域服务
+  保护的阶段；全局 GPU telemetry 过期不再阻止本地 endpoint 生命周期操作。退役记录继续保留
+  审计证据，但从日常服务器池、实时容量、异常统计和资源来源卡片中隐藏。
 - Windows 桌面源码构建入口已加入：PowerShell + PyInstaller 生成 `dist/windows/GPU Broker/GPU Broker.exe`，运行时写入 `%LOCALAPPDATA%\GPU Broker`，启动同一 loopback REST/Web UI，不复制调度、租约或审计规则；它仍不是已签名安装包。
 - 预设任务（workload profile）是可选的持久化资源合同：明确 `profile_id` 的 GUI/MCP 认领只传配置与任务，服务在立即或排队后分配时自动激活。没有 profile 时，一次性认领需要任意非空项目标识、任务、GPU 数量，以及需要的 CPU 核数、系统内存 MiB、单卡总显存/可用显存 MiB 等绝对值下限，任务名自动记录为用途；项目标识首次使用会自动登记为中性归属标签，不需要预创建、项目管理入口或服务器项目授权。申请不再要求预计占用时间，任务完成后释放租约；最大租约窗口是调度与未来预约共同遵守的硬边界。Agent 不得根据任务、目录或空闲容量自行挑选 profile，也不得推断项目、GPU 数量或 CPU/内存/显存需求。
 - Broker 提供面向 Agent 的共享协调看板：`gpu_coordination` 返回服务器、GPU、队列、
@@ -29,6 +31,16 @@
   已被 Collector 观测到的 lease 进程登记为受管，不启动或停止进程。
 - macOS 桌面总览是人类的实时观察面：区分已登记、在线/新鲜和可分配容量，并显示空租约、
   队列与 stale 信号；不再把人工操作当作资源调度的必经步骤。
+- macOS“资源使用”页按项目、Agent、任务三种稳定维度展示资源归属。当前状态严格区分“已分配”
+  （活动 claim/lease 且未观察到托管进程）、“运行中”（关联 GPU 已观察到 `RUNNING_MANAGED`）和
+  “申请中”（`blocked/QUEUED/PENDING_APPROVAL`），每种状态同时展示 CPU、系统内存与 GPU 数量。
+  “运行中”的数量是对应资源分配量，不是瞬时 CPU/内存消耗；服务器 CPU 负载与物理内存用量只
+  属于遥测，不会冒充项目用量。通用 claim 通过 allocation 的 `native_lease_id` 逐条关联旧 lease，
+  再由 lease 关联 request；只有明确对应的旧记录才去重，其他迁移期记录仍会保留。
+- macOS 桌面默认使用低合成路径：主窗口为 opaque，并按用户偏好固定使用浅色静态背景；
+  侧栏、工具栏和总览卡片不再使用大面积 material、实时背景模糊或阴影。该修复针对 GUI 可见时
+  `WindowServer` CPU 显著升高、关闭 GUI 后下降而 headless daemon 保持低占用的现场证据；小面积
+  按钮材质仍保留，后台采集与 REST 快照合同未改变。
 - macOS App 已把 Python 后端、数据库迁移和空 inventory 冻结进 `Contents/Resources/BrokerRuntime`。
   目标 Mac 不需要额外安装 Python、`uv` 或 `gpu-broker` CLI；构建机仍需 Python 3.12 与 `uv`，
   PyInstaller 只作为构建期工具解析。独立验证会从 `/tmp` 冷启动内置后端、执行新库迁移、读取
@@ -36,6 +48,10 @@
   元数据污染的 `~/Applications/GPU Broker.app`，`dist/GPU Broker.app` 保持为项目入口链接。
 - Collector 同时展示每台服务器的 CPU 核数、1 分钟负载及系统内存可用量/总量；调度会将
   lease 的 CPU/内存需求持久化为 endpoint commitment，并按剩余量及显存下限筛选候选资源。
+- 固定 SSH 探针把 NVIDIA 查询改为可选段。远端没有主机侧 `nvidia-smi` 或驱动不可用时，
+  CPU、负载和内存仍能完成采集，服务器保持在线并作为 CPU 计算节点显示；该次 GPU 观察标记为
+  不完整，因此不会把历史 GPU 误判为全部消失。GPU 仍需在 Broker 能执行固定只读探针的运行环境
+  中可见，任意容器命令或运行时切换仍未开放。
 - Collector 成功完成一次 endpoint 全量观测后，Broker 会把该 endpoint 未再次出现的历史 GPU
   标记为 absent，而不是删除遥测、审计或 lease。snapshot/API 的活跃 GPU 列表、总数和分配候选
   只使用最新完整集合；缺失 GPU 的 lease 引用保留为 fail-closed 诊断信号。采集失败、超时、
@@ -51,7 +67,11 @@
 
 ## 验证快照
 
-- 当前 macOS 桌面已完成 1440×820 与 1024×640 两种窗口尺寸的实机截图复查，并通过原生构建；删除能力探测、旧服务禁用移除提示、REST-only 删除、租约状态页、资源约束表单、绝对资源指标和新文本口径均保留。Windows launcher 的路径和默认 inventory 初始化有单元测试覆盖；Windows `.exe` 仍需在 Windows 上运行 `desktop\build-windows-app.ps1` 产出。
+- 当前 macOS 桌面已完成低合成模式下 1024×640、1280×800 与 1440×820 三种窗口尺寸的离线
+  fixture 截图复查，并通过原生构建与签名；删除能力探测、旧服务禁用移除提示、REST-only 删除、
+  租约状态页、资源约束表单、绝对资源指标和新文本口径均保留。Windows launcher 的路径和默认
+  inventory 初始化有单元测试覆盖；Windows `.exe` 仍需在 Windows 上运行
+  `desktop\build-windows-app.ps1` 产出。
 - 两次人工只读 shadow 和一次 5 分钟轻量化冒烟已完成；非托管进程与失效 endpoint 均正确闭锁。
 - 上述结果是 2026-07-19 的历史证据，不代表当前 GPU 可用性。详细记录见 [归档](archive/IMPLEMENTATION_EVIDENCE_2026-07-19.md)。
 - 2026-08-01 在临时数据库与 fake observation 路径上新增 GPU presence 回归：连续完整观测的
@@ -74,9 +94,32 @@
   次级按钮改为 native material 叠加轻量中性色，而不是玫瑰色或蓝黑色实体面板。空间背景保留
   冷日光与暖灯光的真实色差，并降低全窗遮罩，使内容层更接近 Apple Home 的通透层级。自定义
   action button style 同步读取原生 `isEnabled`，只读夹具中的主按钮不会再以可操作的高亮色呈现。
-- 原生 core build、应用打包、159 个 Python 测试、Ruff、证据门禁正负控均通过。当前机器只有
-  CommandLineTools、缺少完整 Xcode/XCTest，因此 Swift XCTest、XCUI 与 VoiceOver 自动化仍是
-  环境 gate；benchmark 会对此明确失败，不会把 0 测试或 skipped run 报为成功。
+- 2026-08-05 根据用户侧 visible/closed 对照采样，确认持续掉帧来自桌面窗口合成而非 GPU/SSH
+  Collector。主窗口切换为 opaque，移除全窗背景图片的实时 blur/blend，并将侧栏、工具栏、
+  总览卡片和大卡片阴影改为不透明表面；新增源码回归守卫，防止大面积 material 路径被重新引入。
+- 2026-08-06 总览与服务器页改为浅色 Apple Home 风格：使用系统字体、SF Symbols、中性资源图标
+  与唯一的 macOS control accent，只有健康、等待、危险使用 green/orange/red 语义状态色。每台
+  服务器始终显示 CPU 核数与负载、内存用量/总量、GPU 数量与显存；零 GPU 服务器明确标为
+  “CPU 节点”和“当前未检测到 GPU”。资源使用页新增项目、Agent、任务三维归属视图和已分配、
+  运行中、申请中三段 CPU/内存/GPU 汇总；投影直接从已提交 snapshot 计算，不持久缓存旧
+  projection，选择使用稳定 ID 保留。
+  界面文案按用户任务重写，一级页面不再使用“端点、调度投影、信任边界”等实现术语。新增
+  mixed-resources 与 resource-ownership 离线夹具，覆盖 CPU-only、GPU 服务器、两个项目、三个
+  Agent 和多项任务，并在 1024×640、1280×800、1440×820 三种窗口尺寸截图复查。
+- 2026-08-06 `/api/v1/snapshot` 在同一 revision 中补齐 resource providers、allocatable units、
+  claims、allocations、plan evaluations 与 run actuals，桌面不再依赖只存在于 fixture 的字段。
+  Swift 读取时统一规范化状态大小写，并把运行态限定为托管 GPU 进程证据；同名任务按
+  `(project_id, task_ref)` 分组，避免跨项目合并。总览和资源使用页均按 claim/lease 的明确关联
+  逐条去重，顶部总计与分组使用同一套规则。
+- 2026-08-06 Python CLI 与 MCP 的常规读路径切换为 canonical `/api/v1/state`
+  envelope 投影；新增 `gpu-broker state` 与 MCP `control_plane_state`，支持等待最低
+  `snapshot_revision` 并拒绝 revision 回退。旧读工具名保留兼容，但不再作为碎片化
+  operational REST 读入口；history、doctor、scheduler access/status 等诊断读路径仍保留专用接口。
+  后端 canonical route、单 revision 状态组装、mutation revision floor 与跨端消费合同已经并入。
+- 本轮统一状态路径已通过 233 个 Python 测试、全仓 Ruff、Swift core build、macOS 应用打包、
+  standalone app 验证、fixture 合同校验与 `git diff --check`。当前机器只有 CommandLineTools、
+  缺少完整 Xcode/XCTest，因此 Swift XCTest、XCUI 与 VoiceOver 自动化仍是环境 gate；benchmark
+  会对此明确失败，不会把 0 测试或 skipped run 报为成功。
 
 ## 未完成 gate
 

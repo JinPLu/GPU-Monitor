@@ -9,6 +9,7 @@ import pytest
 
 from gpu_broker.collector import (
     COMBINED_QUERY,
+    GPU_UNAVAILABLE,
     SSHCollector,
     parse_gpu_csv,
     parse_host_resources,
@@ -50,6 +51,40 @@ def test_fake_collector_never_needs_a_shell(service, inventory) -> None:
     assert snapshot["endpoints"][0]["host_telemetry"]["memory_available_mib"] == 196608
     # endpoint-b is intentionally a fake failure; no network access happened.
     assert result["endpoint-b"]["error"] == "AssertionError"
+
+
+def test_collector_keeps_cpu_only_endpoint_online_without_nvidia_runtime(
+    service, inventory
+) -> None:
+    async def fake_runner(endpoint, command):  # type: ignore[no-untyped-def]
+        assert endpoint.id == "endpoint-a"
+        assert command == COMBINED_QUERY
+        return (
+            "__GPU_BROKER_GPU__\n"
+            f"{GPU_UNAVAILABLE}\n"
+            "__GPU_BROKER_PROCESSES__\n"
+            "__GPU_BROKER_IDENTITY__\n"
+            "cpu-host\ncpu-boot\n"
+            "__GPU_BROKER_HOST_RESOURCES__\n"
+            "32\n131072 98304\n2.5\n"
+        )
+
+    collector = SSHCollector(inventory, runner=fake_runner)
+    observation = asyncio.run(collector.observe_endpoint(inventory.endpoints[0]))
+
+    assert observation.gpus == []
+    assert observation.processes == []
+    assert observation.observation_complete is False
+    assert observation.host.cpu_count == 32
+    assert observation.host.memory_available_mib == 98304
+
+    result = service.ingest_observation(observation)
+    assert result["gpu_count"] == 0
+    snapshot = service.snapshot(service.local_actor("human"))["data"]
+    endpoint = next(value for value in snapshot["endpoints"] if value["id"] == "endpoint-a")
+    assert endpoint["monitor"]["status"] == "ONLINE"
+    assert endpoint["host_telemetry"]["cpu_count"] == 32
+    assert endpoint["host_telemetry"]["memory_available_mib"] == 98304
 
 
 def test_importer_keeps_same_ip_different_ports_distinct(tmp_path: Path) -> None:

@@ -1,0 +1,130 @@
+{
+  "schema_version": "v1",
+  "snapshot_revision": 206,
+  "server_time": "2026-08-06T08:00:00Z",
+  "data": {
+    "current": {
+      "summary": {
+        "online_servers": 2,
+        "total_servers": 2,
+        "total_gpus": 2,
+        "available_gpus": 1,
+        "busy_gpus": 1,
+        "claimed_gpus": 0,
+        "abnormal_gpus": 0
+      },
+      "endpoints": [
+        {
+          "id": "cpu-node-01",
+          "host": "10.20.0.11",
+          "port": 22,
+          "ssh_user": "compute",
+          "enabled": true,
+          "lifecycle_state": "active",
+          "labels": {
+            "fixture": "true",
+            "resource_kind": "cpu-only"
+          },
+          "monitor": {
+            "status": "ONLINE",
+            "last_success_at": "2026-08-06T07:59:58Z",
+            "last_attempt_at": "2026-08-06T07:59:58Z"
+          },
+          "host_telemetry": {
+            "cpu_count": 32,
+            "load_1m": 7.5,
+            "memory_total_mib": 131072,
+            "memory_available_mib": 98304
+          }
+        },
+        {
+          "id": "gpu-node-01",
+          "host": "10.20.0.21",
+          "port": 2222,
+          "ssh_user": "gpu",
+          "enabled": true,
+          "lifecycle_state": "active",
+          "labels": {
+            "fixture": "true",
+            "resource_kind": "gpu"
+          },
+          "monitor": {
+            "status": "ONLINE",
+            "last_success_at": "2026-08-06T07:59:57Z",
+            "last_attempt_at": "2026-08-06T07:59:57Z"
+          },
+          "host_telemetry": {
+            "cpu_count": 64,
+            "load_1m": 18.0,
+            "memory_total_mib": 262144,
+            "memory_available_mib": 163840
+          }
+        }
+      ],
+      "gpus": [
+        {
+          "id": "gpu-node-01:GPU-FIXTURE-0",
+          "endpoint_id": "gpu-node-01",
+          "gpu_uuid": "GPU-FIXTURE-0",
+          "gpu_index": 0,
+          "name": "NVIDIA A100-SXM4-80GB",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "AVAILABLE",
+          "processes": [],
+          "telemetry": {
+            "memory_used_mib": 4096,
+            "gpu_utilization_pct": 4,
+            "temperature_c": 34
+          }
+        },
+        {
+          "id": "gpu-node-01:GPU-FIXTURE-1",
+          "endpoint_id": "gpu-node-01",
+          "gpu_uuid": "GPU-FIXTURE-1",
+          "gpu_index": 1,
+          "name": "NVIDIA A100-SXM4-80GB",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "BUSY_UNMANAGED",
+          "state_reason": "检测到未纳管计算进程",
+          "processes": [],
+          "telemetry": {
+            "memory_used_mib": 32768,
+            "gpu_utilization_pct": 67,
+            "temperature_c": 61
+          }
+        }
+      ],
+      "leases": [],
+      "requests": [],
+      "reservations": [],
+      "data_age_seconds": 2,
+      "freshness_seconds": 30,
+      "admission_boundary": "只协调资源归属，不授权启动或停止远端工作负载。",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "resource_providers": [],
+      "allocatable_units": [],
+      "resource_claims": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
+    },
+    "history": {
+      "retired_endpoints": [],
+      "resource_plan_evaluations": [],
+      "resource_run_actuals": []
+    }
+  }
+}

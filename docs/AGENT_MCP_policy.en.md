@@ -10,9 +10,11 @@ questions and never infer missing inputs.
 
 For bare-metal work, use `gpu_claim_profile` or `gpu_claim` → project execution
 on `lease.resources[]` → `gpu_bind_observed_workload` → `gpu_release`.
-`gpu_coordination` is optional context for ordinary pre-approved profile claims
-or explicit-contract claims. A queued/null result cannot be executed; poll the
-existing request with `gpu_wait_for_claim` until a `HELD` or `ACTIVE` lease,
+Routine read tools project from canonical `/api/v1/state`; use
+`control_plane_state` when the full envelope or a minimum `snapshot_revision` is
+needed. `gpu_coordination` is optional context for ordinary pre-approved profile
+claims or explicit-contract claims. A queued/null result cannot be executed; poll
+the existing request with `gpu_wait_for_claim` until a `HELD` or `ACTIVE` lease,
 terminal state, or timeout. When Broker returns a lease, use only its structured
 `lease.resources[]` for placement. Each resource supplies `endpoint` (`id`,
 `host`, `port`, `ssh_user`), `gpus` (`id`, `gpu_uuid`, `gpu_index`),
@@ -20,9 +22,9 @@ terminal state, or timeout. When Broker returns a lease, use only its structured
 observed attribution; the Agent may use its project's normal execution path to
 start or stop the authorized workload on those resources. Bind it after startup
 and release it when done. Supply a caller-stable `idempotency_key` for a retried
-mutation. Endpoints are project-owned
-(`owner_project_id`) and their lifecycle can move to `draining`; draining blocks
-new placement and never stops an existing workload.
+mutation. Endpoints are shared loopback inventory; `owner_project_id` is optional
+attribution rather than a management permission. Their lifecycle can move to
+`draining`; draining blocks new placement and never stops an existing workload.
 
 The low-level request, activate, release-lease, and bind-workload tools remain
 advanced compatibility tools. Prefer the claim / wait / execute / bind /

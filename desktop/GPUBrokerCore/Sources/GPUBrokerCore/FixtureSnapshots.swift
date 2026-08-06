@@ -60,7 +60,9 @@ public enum FixtureSnapshots {
         guard
             let object = try? JSONSerialization.jsonObject(with: data),
             let envelope = object as? [String: Any],
-            envelope["data"] is [String: Any]
+            let stateData = envelope["data"] as? [String: Any],
+            stateData["current"] is [String: Any],
+            stateData["history"] is [String: Any]
         else {
             throw FixtureSnapshotError.invalid(url)
         }

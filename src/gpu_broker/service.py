@@ -95,6 +95,8 @@ from gpu_broker.planner import ResourcePlanCandidate, select_smallest_useful_pla
 
 ACTIVE_LEASE_STATES = {"HELD", "ACTIVE", "ORPHANED_BUSY", "CONFLICT"}
 TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
+TERMINAL_SCHEDULER_JOB_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}
+TERMINAL_SCHEDULER_TRANSFER_STATES = {"COMPLETED", "FAILED", "DEFERRED"}
 TELEMETRY_HISTORY_INTERVAL_SECONDS = 60
 TELEMETRY_HISTORY_RETENTION_SECONDS = 24 * 60 * 60
 # The collector derives a process start time from `ps etimes`, which has
@@ -104,10 +106,11 @@ TELEMETRY_HISTORY_RETENTION_SECONDS = 24 * 60 * 60
 # collection and lose its workload attribution.
 PROCESS_START_TIME_JITTER_SECONDS = 2
 MUTATING_ROLES = {"allocator", "operator", "admin"}
+RESOURCE_SNAPSHOT_HISTORY_LIMIT = 50
 # Routine coordination is cooperative, not an administrative workflow.
-# Endpoint ownership and actor/request ownership remain the scope boundaries;
-# an external project agent must not need a separately granted "operator"
-# role merely to reserve capacity, drain its endpoint, or record maintenance.
+# Endpoint inventory is shared on loopback; owner_project_id is attribution,
+# not an endpoint-management permission boundary. Lease/request ownership still
+# prevents one actor from changing another actor's active resource contract.
 OPERATOR_ROLES = MUTATING_ROLES
 ADMIN_ROLES = {"admin"}
 ENDPOINT_LIFECYCLE_STATES = {"active", "draining", "retired"}
@@ -509,17 +512,18 @@ class BrokerService:
         return lease.actor_id == actor.id
 
     @staticmethod
-    def _can_manage_endpoint(actor: ActorContext, endpoint: Endpoint) -> bool:
-        return actor.is_admin or (
-            endpoint.owner_project_id is not None and endpoint.owner_project_id in actor.project_ids
-        )
+    def _can_manage_endpoint(actor: ActorContext, _endpoint: Endpoint) -> bool:
+        # Endpoint inventory is a shared loopback control-plane resource.  The
+        # actor label records who made the change for audit, but endpoint
+        # lifecycle operations are intentionally not project-permission gated.
+        return actor.role in MUTATING_ROLES
 
     @classmethod
     def _require_endpoint_manager(cls, actor: ActorContext, endpoint: Endpoint) -> None:
         if not cls._can_manage_endpoint(actor, endpoint):
             raise BrokerError(
                 "endpoint_forbidden",
-                "only a member of the endpoint owner project may manage this endpoint",
+                "this actor cannot manage server inventory",
                 status_code=403,
             )
 
@@ -575,7 +579,14 @@ class BrokerService:
                 IdempotencyRecord.key == key,
             )
         )
-        return json_load(prior.response_json) if prior is not None else None
+        return self._with_committed_revision(json_load(prior.response_json)) if prior is not None else None
+
+    @staticmethod
+    def _with_committed_revision(response: dict[str, Any]) -> dict[str, Any]:
+        revision = response.get("snapshot_revision")
+        if revision is not None:
+            response.setdefault("committed", {"snapshot_revision": revision})
+        return response
 
     def _remember_idempotency(
         self,
@@ -587,6 +598,7 @@ class BrokerService:
         response: dict[str, Any],
         now: datetime,
     ) -> None:
+        self._with_committed_revision(response)
         session.add(
             IdempotencyRecord(
                 actor_id=actor.id,
@@ -1321,6 +1333,7 @@ class BrokerService:
         endpoint_id: str | None = None,
         state: str | None = None,
         only_available: bool = False,
+        include_retired: bool = False,
     ) -> dict[str, Any]:
         def operation(session: Session) -> dict[str, Any]:
             now = utcnow()
@@ -1335,7 +1348,8 @@ class BrokerService:
             visible_endpoints = [
                 endpoint
                 for endpoint in endpoints
-                if endpoint_id is None or endpoint.id == endpoint_id
+                if (include_retired or endpoint.lifecycle_state != "retired")
+                and (endpoint_id is None or endpoint.id == endpoint_id)
             ]
             visible_ids = {endpoint.id for endpoint in visible_endpoints}
             host_telemetry_by_endpoint = (
@@ -1624,6 +1638,16 @@ class BrokerService:
                 }
                 gpu_payloads.append(payload)
 
+            running_lease_ids = {
+                item["lease"]["id"]
+                for item in gpu_payloads
+                if item["state"] == "RUNNING_MANAGED" and item["lease"] is not None
+            }
+            for lease_id, payload in lease_payloads.items():
+                payload["runtime_state"] = (
+                    "RUNNING" if lease_id in running_lease_ids else "ASSIGNED"
+                )
+
             all_gpu_payloads = gpu_payloads
             counts = defaultdict(int)
             for gpu in all_gpu_payloads:
@@ -1712,28 +1736,581 @@ class BrokerService:
                 ]
 
             visible_gpu_ids = {gpu.id for gpu in endpoint_gpus}
+
+            # The desktop consumes one revision-consistent snapshot.  Include the
+            # generic CPU/memory resource records here instead of making the GUI
+            # stitch together several REST reads from different revisions.
+            providers = [
+                provider
+                for provider in session.scalars(
+                    select(ResourceProvider).order_by(ResourceProvider.id)
+                ).all()
+                if provider.endpoint_id is None or provider.endpoint_id in visible_ids
+            ]
+            provider_ids = {provider.id for provider in providers}
+            units = (
+                session.scalars(
+                    select(AllocatableUnit)
+                    .where(AllocatableUnit.provider_id.in_(provider_ids))
+                    .order_by(AllocatableUnit.id)
+                ).all()
+                if provider_ids
+                else []
+            )
+            unit_by_id = {unit.id: unit for unit in units}
+            units_by_provider: dict[str, list[AllocatableUnit]] = defaultdict(list)
+            for unit in units:
+                units_by_provider[unit.provider_id].append(unit)
+
+            resource_claim_query = select(ResourceClaimModel).where(
+                ResourceClaimModel.state.in_(("active", "blocked"))
+            )
+            if not actor.is_admin:
+                resource_claim_query = resource_claim_query.where(
+                    or_(
+                        ResourceClaimModel.actor_id == actor.id,
+                        ResourceClaimModel.project_id.in_(actor.project_ids),
+                    )
+                )
+            visible_resource_claims = session.scalars(
+                resource_claim_query.order_by(ResourceClaimModel.created_at.desc())
+            ).all()
+            visible_resource_claim_ids = {claim.id for claim in visible_resource_claims}
+            all_resource_allocations = (
+                session.scalars(
+                    select(ResourceAllocation)
+                    .order_by(ResourceAllocation.created_at.desc(), ResourceAllocation.id.desc())
+                ).all()
+            )
+            allocations_by_claim: dict[str, list[ResourceAllocation]] = defaultdict(list)
+            active_allocations_by_provider: dict[str, list[ResourceAllocation]] = defaultdict(
+                list
+            )
+            for allocation in all_resource_allocations:
+                if allocation.claim_id in visible_resource_claim_ids:
+                    allocations_by_claim[allocation.claim_id].append(allocation)
+                unit = unit_by_id.get(allocation.unit_id)
+                if allocation.state == "active" and unit is not None:
+                    active_allocations_by_provider[unit.provider_id].append(allocation)
+
+            def summed_quantities(values: Iterable[dict[str, Any]]) -> dict[str, Any]:
+                total = {
+                    "cpu_cores": 0.0,
+                    "memory_mib": 0,
+                    "gpu_count": 0,
+                    "nodes": 0,
+                    "scheduler_units": 0,
+                }
+                for value in values:
+                    total["cpu_cores"] += float(value.get("cpu_cores") or 0.0)
+                    total["memory_mib"] += int(value.get("memory_mib") or 0)
+                    total["gpu_count"] += int(value.get("gpu_count") or 0)
+                    total["nodes"] += int(value.get("nodes") or value.get("node_count") or 0)
+                    total["scheduler_units"] += int(value.get("scheduler_units") or 0)
+                total["cpu_cores"] = round(total["cpu_cores"], 1)
+                return total
+
+            endpoint_payload_by_id = {item["id"]: item for item in endpoint_payloads}
+            direct_commitments_by_endpoint = self._endpoint_commitment_usage(session)
+            resource_provider_payloads: list[dict[str, Any]] = []
+            for provider in providers:
+                payload = self._provider_dict(provider)
+                provider_units = units_by_provider.get(provider.id, [])
+                total = summed_quantities(
+                    {
+                        "cpu_cores": unit.total_cpu_cores,
+                        "memory_mib": unit.total_memory_mib,
+                        "gpu_count": unit.total_gpu_count,
+                    }
+                    for unit in provider_units
+                    if unit.enabled
+                )
+                committed = summed_quantities(
+                    json_load(allocation.quantities_json)
+                    for allocation in active_allocations_by_provider.get(provider.id, [])
+                )
+                available = {
+                    "cpu_cores": max(0.0, total["cpu_cores"] - committed["cpu_cores"]),
+                    "memory_mib": max(0, total["memory_mib"] - committed["memory_mib"]),
+                    "gpu_count": max(0, total["gpu_count"] - committed["gpu_count"]),
+                    "nodes": max(0, total["nodes"] - committed["nodes"]),
+                    "scheduler_units": max(
+                        0, total["scheduler_units"] - committed["scheduler_units"]
+                    ),
+                }
+                endpoint = endpoint_payload_by_id.get(provider.endpoint_id or "")
+                telemetry = host_telemetry_by_endpoint.get(provider.endpoint_id or "")
+                if provider.provider_type == "host-capacity" and endpoint is not None:
+                    direct_cpu, direct_memory = direct_commitments_by_endpoint.get(
+                        provider.endpoint_id or "", (0.0, 0)
+                    )
+                    total.update(
+                        cpu_cores=float(telemetry.cpu_count if telemetry else 0.0),
+                        memory_mib=int(telemetry.memory_total_mib if telemetry else 0),
+                    )
+                    committed.update(
+                        cpu_cores=round(committed["cpu_cores"] + direct_cpu, 1),
+                        memory_mib=committed["memory_mib"] + direct_memory,
+                    )
+                    available.update(
+                        cpu_cores=round(
+                            max(
+                                0.0,
+                                (telemetry.cpu_count - telemetry.load_1m if telemetry else 0.0)
+                                - committed["cpu_cores"],
+                            ),
+                            1,
+                        ),
+                        memory_mib=max(
+                            0,
+                            (telemetry.memory_available_mib if telemetry else 0)
+                            - committed["memory_mib"],
+                        ),
+                    )
+                    payload["state"] = endpoint["monitor"]["status"]
+                    payload["observed_at"] = _iso(telemetry.observed_at) if telemetry else None
+                elif endpoint is not None:
+                    payload["state"] = endpoint["monitor"]["status"]
+                else:
+                    payload["state"] = "PENDING" if provider.enabled else "DISABLED"
+                payload.update(total=total, committed=committed, available=available)
+                resource_provider_payloads.append(payload)
+
+            host_capacity_payloads: list[dict[str, Any]] = []
+            host_provider_by_endpoint = {
+                provider.endpoint_id: provider
+                for provider in providers
+                if provider.provider_type == "host-capacity" and provider.endpoint_id is not None
+            }
+            for endpoint in visible_endpoints:
+                telemetry = host_telemetry_by_endpoint.get(endpoint.id)
+                endpoint_payload = endpoint_payload_by_id[endpoint.id]
+                monitor_status = endpoint_payload["monitor"]["status"]
+                observed_at = _as_utc(telemetry.observed_at) if telemetry is not None else None
+                telemetry_stale = (
+                    telemetry is None
+                    or observed_at is None
+                    or now - observed_at
+                    > timedelta(seconds=self.inventory.collector.stale_after_seconds)
+                )
+                provider = host_provider_by_endpoint.get(endpoint.id)
+                unit = next(
+                    (
+                        candidate
+                        for candidate in units_by_provider.get(provider.id, [])
+                        if candidate.unit_type == "host"
+                    ),
+                    None,
+                ) if provider is not None else None
+                direct_cpu, direct_memory = direct_commitments_by_endpoint.get(
+                    endpoint.id, (0.0, 0)
+                )
+                generic = summed_quantities(
+                    json_load(allocation.quantities_json)
+                    for allocation in active_allocations_by_provider.get(
+                        provider.id if provider is not None else "", []
+                    )
+                )
+                generic_cpu = generic["cpu_cores"]
+                generic_memory = generic["memory_mib"]
+                if telemetry is None:
+                    available_cpu = None
+                    available_memory = None
+                else:
+                    available_cpu = max(
+                        0.0,
+                        telemetry.cpu_count
+                        - telemetry.load_1m
+                        - direct_cpu
+                        - generic_cpu,
+                    )
+                    available_memory = max(
+                        0,
+                        telemetry.memory_available_mib
+                        - direct_memory
+                        - generic_memory,
+                    )
+                monitor_reason = {
+                    "DRAINING": "endpoint is draining and blocks new claims",
+                    "DISABLED": "endpoint is disabled",
+                    "PENDING": "no successful collector observation",
+                    "STALE": "collector success is stale",
+                }.get(monitor_status)
+                if monitor_status == "ERROR":
+                    monitor_reason = (
+                        endpoint_payload["monitor"].get("last_error")
+                        or "collector has no successful observation"
+                    )
+                admission_state = "available"
+                admission_reason = None
+                if monitor_status != "ONLINE":
+                    admission_state = "blocked"
+                    admission_reason = monitor_reason or monitor_status.lower()
+                elif telemetry_stale:
+                    admission_state = "blocked"
+                    admission_reason = "host telemetry is stale"
+                elif available_cpu == 0 and available_memory == 0:
+                    admission_state = "blocked"
+                    admission_reason = "no uncommitted CPU or memory capacity"
+                host_capacity_payloads.append(
+                    {
+                        "provider": self._provider_dict(provider)
+                        if provider is not None
+                        else None,
+                        "unit": self._allocatable_unit_dict(unit) if unit is not None else None,
+                        "endpoint": self._endpoint_dict(endpoint),
+                        "monitor_status": monitor_status,
+                        "admission_state": admission_state,
+                        "admission_reason": admission_reason,
+                        "telemetry": self._host_telemetry_dict(telemetry),
+                        "capacity": {
+                            "total_cpu_cores": telemetry.cpu_count if telemetry else None,
+                            "observed_available_cpu_cores": round(
+                                max(0.0, telemetry.cpu_count - telemetry.load_1m), 1
+                            )
+                            if telemetry
+                            else None,
+                            "available_cpu_cores": round(available_cpu, 1)
+                            if available_cpu is not None
+                            else None,
+                            "total_memory_mib": telemetry.memory_total_mib if telemetry else None,
+                            "observed_available_memory_mib": telemetry.memory_available_mib
+                            if telemetry
+                            else None,
+                            "available_memory_mib": available_memory,
+                            "committed_cpu_cores": round(direct_cpu + generic_cpu, 1),
+                            "committed_memory_mib": direct_memory + generic_memory,
+                            "direct_lease_cpu_cores": round(direct_cpu, 1),
+                            "direct_lease_memory_mib": direct_memory,
+                            "generic_claim_cpu_cores": round(generic_cpu, 1),
+                            "generic_claim_memory_mib": generic_memory,
+                        },
+                    }
+                )
+
+            resource_claim_payloads: list[dict[str, Any]] = []
+            for claim in visible_resource_claims:
+                claim_allocations = allocations_by_claim.get(claim.id, [])
+                active_claim_allocations = [
+                    allocation
+                    for allocation in claim_allocations
+                    if allocation.state == "active"
+                ]
+                native_lease_ids = sorted(
+                    {
+                        allocation.native_lease_id
+                        for allocation in claim_allocations
+                        if allocation.native_lease_id is not None
+                    }
+                )
+                native_request_ids = sorted(
+                    {
+                        lease_by_id[lease_id].request_id
+                        for lease_id in native_lease_ids
+                        if lease_id in lease_by_id
+                    }
+                )
+                allocation_quantities = summed_quantities(
+                    json_load(allocation.quantities_json)
+                    for allocation in active_claim_allocations
+                )
+                payload = self._resource_claim_dict(claim)
+                payload.update(
+                    quantities=(
+                        allocation_quantities
+                        if active_claim_allocations
+                        else json_load(claim.requested_quantities_json)
+                    ),
+                    native_lease_ids=native_lease_ids,
+                    native_request_ids=native_request_ids,
+                    runtime_state=(
+                        "RUNNING"
+                        if running_lease_ids.intersection(native_lease_ids)
+                        else "ASSIGNED"
+                        if claim.state == "active"
+                        else "REQUESTED"
+                        if claim.state == "blocked"
+                        else claim.state.upper()
+                    ),
+                    allocations=[
+                        self._resource_allocation_dict(
+                            allocation,
+                            unit=unit_by_id.get(allocation.unit_id),
+                        )
+                        for allocation in claim_allocations
+                    ],
+                )
+                resource_claim_payloads.append(payload)
+
+            evaluation_query = select(ResourcePlanEvaluation)
+            if not actor.is_admin:
+                evaluation_query = evaluation_query.where(
+                    or_(
+                        ResourcePlanEvaluation.actor_id == actor.id,
+                        ResourcePlanEvaluation.project_id.in_(actor.project_ids),
+                    )
+                )
+            evaluations = session.scalars(
+                evaluation_query.order_by(ResourcePlanEvaluation.created_at.desc()).limit(
+                    RESOURCE_SNAPSHOT_HISTORY_LIMIT
+                )
+            ).all()
+            candidates_by_evaluation: dict[str, list[ResourcePlanCandidateModel]] = defaultdict(
+                list
+            )
+            if evaluations:
+                for candidate in session.scalars(
+                    select(ResourcePlanCandidateModel)
+                    .where(
+                        ResourcePlanCandidateModel.evaluation_id.in_(
+                            [evaluation.id for evaluation in evaluations]
+                        )
+                    )
+                    .order_by(
+                        ResourcePlanCandidateModel.evaluation_id,
+                        ResourcePlanCandidateModel.id,
+                    )
+                ).all():
+                    candidates_by_evaluation[candidate.evaluation_id].append(candidate)
+            actual_query = select(ResourceRunActual)
+            if not actor.is_admin:
+                actual_query = actual_query.where(
+                    or_(
+                        ResourceRunActual.actor_id == actor.id,
+                        ResourceRunActual.project_id.in_(actor.project_ids),
+                    )
+                )
+            actuals = session.scalars(
+                actual_query.order_by(ResourceRunActual.created_at.desc()).limit(
+                    RESOURCE_SNAPSHOT_HISTORY_LIMIT
+                )
+            ).all()
+
+            retired_endpoint_payloads = [
+                self._endpoint_dict(endpoint)
+                for endpoint in endpoints
+                if endpoint.lifecycle_state == "retired"
+                and (endpoint_id is None or endpoint.id == endpoint_id)
+            ]
+            maintenance_payloads = [
+                self._maintenance_dict(window)
+                for window in session.scalars(
+                    select(MaintenanceWindow)
+                    .where(
+                        MaintenanceWindow.state == "ACTIVE",
+                        MaintenanceWindow.end_at > now,
+                    )
+                    .order_by(MaintenanceWindow.start_at, MaintenanceWindow.id)
+                ).all()
+            ]
+            alert_payloads = [
+                self._alert_dict(alert)
+                for alert in session.scalars(
+                    select(Alert)
+                    .where(Alert.active.is_(True))
+                    .order_by(Alert.severity, Alert.last_seen_at.desc(), Alert.id)
+                ).all()
+            ]
+            scheduler_target_payloads = [
+                self._scheduler_target_dict(target)
+                for target in session.scalars(
+                    select(SchedulerTarget)
+                    .where(SchedulerTarget.enabled.is_(True))
+                    .order_by(SchedulerTarget.id)
+                ).all()
+            ]
+            scheduler_jobs = [
+                job
+                for job in session.scalars(
+                    select(SchedulerJob)
+                    .where(SchedulerJob.state.not_in(TERMINAL_SCHEDULER_JOB_STATES))
+                    .order_by(SchedulerJob.created_at.desc())
+                ).all()
+                if self._scheduler_job_visible(actor, job)
+            ]
+            job_events_by_id: dict[str, list[SchedulerJobEvent]] = defaultdict(list)
+            if scheduler_jobs:
+                for event in session.scalars(
+                    select(SchedulerJobEvent)
+                    .where(SchedulerJobEvent.job_id.in_([job.id for job in scheduler_jobs]))
+                    .order_by(SchedulerJobEvent.job_id, SchedulerJobEvent.id)
+                ).all():
+                    job_events_by_id[event.job_id].append(event)
+            scheduler_transfer_payloads = [
+                self._scheduler_transfer_dict(transfer)
+                for transfer in session.scalars(
+                    select(SchedulerTransfer)
+                    .where(SchedulerTransfer.state.not_in(TERMINAL_SCHEDULER_TRANSFER_STATES))
+                    .order_by(SchedulerTransfer.created_at.desc())
+                ).all()
+                if self._scheduler_transfer_visible(actor, transfer)
+            ]
+            profiles = session.scalars(
+                select(WorkloadProfile)
+                .where(WorkloadProfile.enabled.is_(True))
+                .order_by(WorkloadProfile.project_id, WorkloadProfile.id)
+            ).all()
+            grants_by_profile_id: dict[str, list[str]] = defaultdict(list)
+            if profiles:
+                for grant in session.scalars(
+                    select(WorkloadProfileGrant)
+                    .where(WorkloadProfileGrant.profile_id.in_([profile.id for profile in profiles]))
+                    .order_by(WorkloadProfileGrant.profile_id, WorkloadProfileGrant.project_id)
+                ).all():
+                    grants_by_profile_id[grant.profile_id].append(grant.project_id)
+            workload_profile_payloads = []
+            for profile in profiles:
+                grants = grants_by_profile_id[profile.id]
+                if actor.is_admin:
+                    profile_visible = True
+                else:
+                    profile_visible = any(
+                        profile.project_id == project_id
+                        or profile.grant_all_projects
+                        or project_id in grants
+                        for project_id in actor.project_ids
+                    )
+                if profile_visible:
+                    workload_profile_payloads.append(self._workload_profile_dict(profile, grants))
+
+            visible_lease_payloads = [
+                lease_payloads[lease.id]
+                for lease in visible_leases
+                if any(
+                    resource.active and resource.gpu_id in visible_gpu_ids
+                    for resource in resources_by_lease[lease.id]
+                )
+            ]
+            queued_request_payloads = [
+                self._request_dict(request) for request in queued_requests
+            ]
+            resource_actual_payloads = [self._resource_actual_dict(actual) for actual in actuals]
+            resource_usage_revision = stable_hash(
+                {
+                    "claims": resource_claim_payloads,
+                    "leases": visible_lease_payloads,
+                    "requests": queued_request_payloads,
+                    "actuals": resource_actual_payloads,
+                }
+            )
+
             data = {
                 "summary": summary,
                 "data_age_seconds": round(max(ages), 1) if ages else None,
                 "endpoints": endpoint_payloads,
                 "gpus": gpu_payloads,
                 "absent_gpu_ids": absent_gpu_ids,
-                "leases": [
-                    lease_payloads[lease.id]
-                    for lease in visible_leases
-                    if any(
-                        resource.active and resource.gpu_id in visible_gpu_ids
-                        for resource in resources_by_lease[lease.id]
-                    )
-                ],
-                "requests": [self._request_dict(request) for request in queued_requests],
+                "leases": visible_lease_payloads,
+                "requests": queued_request_payloads,
                 "reservations": [self._reservation_dict(item) for item in visible_reservations],
+                "maintenance": maintenance_payloads,
+                "alerts": alert_payloads,
+                "resource_providers": resource_provider_payloads,
+                "allocatable_units": [
+                    {
+                        **self._allocatable_unit_dict(unit),
+                        "quantities": {
+                            "cpu_cores": unit.total_cpu_cores or 0.0,
+                            "memory_mib": unit.total_memory_mib or 0,
+                            "gpu_count": unit.total_gpu_count,
+                        },
+                    }
+                    for unit in units
+                ],
+                "host_capacity": host_capacity_payloads,
+                "resource_claims": resource_claim_payloads,
+                "scheduler_targets": scheduler_target_payloads,
+                "scheduler_jobs": [
+                    self._scheduler_job_dict(job, job_events_by_id[job.id])
+                    for job in scheduler_jobs
+                ],
+                "scheduler_transfers": scheduler_transfer_payloads,
+                "workload_profiles": workload_profile_payloads,
+                "resource_plan_evaluations": [
+                    self._resource_plan_evaluation_dict(
+                        evaluation,
+                        candidates_by_evaluation[evaluation.id],
+                    )
+                    for evaluation in evaluations
+                ],
+                "resource_run_actuals": resource_actual_payloads,
+                "retired_endpoints": retired_endpoint_payloads,
+                "resource_usage_revision": resource_usage_revision,
                 "freshness_seconds": self.inventory.collector.stale_after_seconds,
-                "admission_boundary": "A lease coordinates GPUs only; it does not authorize workload launch.",
+                "admission_boundary": "GPU Broker 只记录资源分配，不会在服务器上启动或停止任务。",
             }
             return self.envelope(session, data)
 
         return self._read(operation)
+
+    def control_plane_state(self, actor: ActorContext) -> dict[str, Any]:
+        snapshot = self.snapshot(actor)
+        data = snapshot["data"]
+        current_keys = (
+            "summary",
+            "data_age_seconds",
+            "freshness_seconds",
+            "endpoints",
+            "gpus",
+            "absent_gpu_ids",
+            "leases",
+            "requests",
+            "reservations",
+            "maintenance",
+            "alerts",
+            "resource_providers",
+            "allocatable_units",
+            "host_capacity",
+            "resource_claims",
+            "scheduler_targets",
+            "scheduler_jobs",
+            "scheduler_transfers",
+            "workload_profiles",
+            "admission_boundary",
+        )
+        history_keys = (
+            "retired_endpoints",
+            "resource_plan_evaluations",
+            "resource_run_actuals",
+        )
+        current = {key: data[key] for key in current_keys}
+        if not actor.is_admin:
+            def visible_project_item(item: dict[str, Any]) -> bool:
+                return item.get("actor_id") == actor.id or item.get("project_id") in actor.project_ids
+
+            current["leases"] = [
+                lease for lease in current["leases"] if visible_project_item(lease)
+            ]
+            current["requests"] = [
+                request for request in current["requests"] if visible_project_item(request)
+            ]
+            current["reservations"] = [
+                reservation
+                for reservation in current["reservations"]
+                if visible_project_item(reservation)
+            ]
+            visible_lease_ids = {lease["id"] for lease in current["leases"]}
+            current["gpus"] = [
+                {
+                    **gpu,
+                    "lease": (
+                        gpu["lease"]
+                        if gpu.get("lease") is None
+                        or gpu["lease"]["id"] in visible_lease_ids
+                        else None
+                    ),
+                }
+                for gpu in current["gpus"]
+            ]
+        return {
+            "schema_version": snapshot["schema_version"],
+            "snapshot_revision": snapshot["snapshot_revision"],
+            "server_time": snapshot["server_time"],
+            "data": {
+                "current": current,
+                "history": {key: data[key] for key in history_keys},
+            },
+        }
 
     def coordination(self, actor: ActorContext) -> dict[str, Any]:
         """Return an agent-readable shared coordination board from one broker snapshot.
@@ -2661,7 +3238,7 @@ class BrokerService:
         return self._write(operation)
 
     def list_endpoints(self, actor: ActorContext) -> dict[str, Any]:
-        snapshot = self.snapshot(actor)
+        snapshot = self.snapshot(actor, include_retired=True)
         return {**snapshot, "data": snapshot["data"]["endpoints"]}
 
     def list_gpus(
@@ -2679,6 +3256,7 @@ class BrokerService:
             endpoint_id=endpoint_id,
             only_available=only_available,
             compact=compact,
+            include_retired=True,
         )
         values = snapshot["data"]["gpus"]
         return {**snapshot, "data": values}
@@ -6534,18 +7112,6 @@ class BrokerService:
                     status_code=409,
                 )
             if endpoint is None:
-                if endpoint_data.owner_project_id is None:
-                    raise BrokerError(
-                        "endpoint_owner_required",
-                        "new endpoints must declare owner_project_id",
-                        status_code=422,
-                    )
-                if not actor.is_admin and endpoint_data.owner_project_id not in actor.project_ids:
-                    raise BrokerError(
-                        "endpoint_forbidden",
-                        "only a member of owner_project_id may create its endpoint",
-                        status_code=403,
-                    )
                 lifecycle_state = endpoint_data.lifecycle_state or "active"
                 if lifecycle_state != "active":
                     raise BrokerError(
@@ -6571,17 +7137,6 @@ class BrokerService:
                 )
                 session.add(endpoint)
             else:
-                if endpoint.owner_project_id is None:
-                    if (
-                        endpoint_data.owner_project_id is None
-                        or endpoint_data.owner_project_id not in actor.project_ids
-                    ):
-                        raise BrokerError(
-                            "endpoint_owner_required",
-                            "a legacy endpoint must be adopted by its owning project",
-                            status_code=422,
-                        )
-                    endpoint.owner_project_id = endpoint_data.owner_project_id
                 self._require_endpoint_manager(actor, endpoint)
                 if (endpoint.host, endpoint.port) != (endpoint_data.host, endpoint_data.port):
                     raise BrokerError(
@@ -6589,15 +7144,8 @@ class BrokerService:
                         "existing endpoint id cannot change host:port; create a new endpoint id",
                         status_code=409,
                     )
-                if (
-                    endpoint_data.owner_project_id is not None
-                    and endpoint_data.owner_project_id != endpoint.owner_project_id
-                ):
-                    raise BrokerError(
-                        "endpoint_owner_immutable",
-                        "endpoint ownership is immutable; retire it and create a new endpoint id",
-                        status_code=409,
-                    )
+                if endpoint_data.owner_project_id is not None:
+                    endpoint.owner_project_id = endpoint_data.owner_project_id
                 requested_lifecycle = endpoint_data.lifecycle_state
                 if requested_lifecycle is None and endpoint_data.enabled is False:
                     requested_lifecycle = "draining"

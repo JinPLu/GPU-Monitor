@@ -64,6 +64,8 @@ gpu-broker daemon status
 
 后台服务是唯一的 REST/状态 owner。MCP 会在首次调用前自动确保它就绪，
 GUI 只是客户端；关闭 GUI 不会停止调度控制面。
+CLI 和 MCP 的常规读路径使用统一的 `/api/v1/state` 控制面状态；旧的
+`status`、`gpu list`、`request queue` 等命令只是从同一 revision 投影。
 
 更新源码后要同时更新全局命令并重装 LaunchAgent；`daemon install` 会用新
 启动参数重启已安装服务：
@@ -112,6 +114,7 @@ macOS 系统库。为避免同步盘给 App 注入会破坏严格签名复验的
 常用命令：
 
 ```bash
+gpu-broker state
 gpu-broker status
 gpu-broker gpu list
 gpu-broker request queue
@@ -125,11 +128,11 @@ gpu-broker lease release --help
 
 粘贴内容只用于解析地址，不会作为 shell 命令执行。管道、跳板、密钥参数和额外 shell 片段会被拒绝。
 
-endpoint 属于项目，而不是全局管理员资产；返回体以 `owner_project_id` 与
-`lifecycle_state` 表达归属和生命周期。项目 owner 可从 Dashboard、REST、CLI
-或 MCP 将误登记或已退役的 endpoint 标记为 draining。draining 后不再接收新
+endpoint 是本机共享服务器清单；`owner_project_id` 只作为可选归属说明，不参与添加、
+编辑、维护或删除权限判断。任一本机可写调用方都可从 Dashboard、REST、CLI 或 MCP
+将误登记或已退役的 endpoint 标记为 draining。draining 后不再接收新
 placement，也不会停止已有远端任务；关联的活跃租约和排队需求排空后，Broker 才
-完成移除。
+完成移除。退役记录只留在历史与审计接口，不再进入资源总览、容量或异常统计。
 
 > [!CAUTION]
 > 瀚海22一类 Slurm 集群不是普通 SSH 裸机。登录节点不代表计算节点或可用

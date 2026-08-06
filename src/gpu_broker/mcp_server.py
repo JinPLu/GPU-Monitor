@@ -47,8 +47,9 @@ MCP_INSTRUCTIONS = (
     "Provide an idempotency_key for a mutation when retrying it, and reuse that same caller-chosen key. "
     "The low-level request, activate, release-lease, and bind-workload tools remain advanced "
     "compatibility tools; prefer the normal path. "
-    "Endpoints belong to projects. Their owner may add them and retire them into draining; retirement "
-    "prevents new placement and never stops an existing workload. "
+    "Endpoints are shared loopback inventory; project ownership is optional attribution. Authorized "
+    "actors may add them or retire them into draining; retirement prevents new placement and never "
+    "stops an existing workload. "
     "External Slurm clusters such as Hanhai22 are SchedulerTargets, never raw SSH endpoints. Use "
     "gpu_scheduler_targets and gpu_scheduler_access_status to discover a target, then use owner-scoped "
     "submit, status, and cancel operations. "
@@ -153,6 +154,22 @@ def _matching_lease(payload: dict[str, Any], request_id: str) -> dict[str, Any] 
 
 
 @mcp.tool()
+def control_plane_state(
+    agent_name: str | None = None,
+    minimum_snapshot_revision: int | None = None,
+    timeout_seconds: float = 0,
+    poll_interval_seconds: float = 0.25,
+) -> dict[str, Any]:
+    """Return the canonical broker state envelope from one control-plane revision."""
+
+    return _client(agent_name).control_plane_state(
+        minimum_snapshot_revision=minimum_snapshot_revision,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+@mcp.tool()
 def gpu_status(
     compact: bool = True,
     server_id: str | None = None,
@@ -166,7 +183,7 @@ def gpu_status(
         params["endpoint_id"] = server_id
     if state:
         params["state"] = state
-    return _client().get("/api/v1/snapshot", params=params)
+    return _client().snapshot(**params)
 
 
 @mcp.tool()
@@ -178,7 +195,7 @@ def gpu_coordination() -> dict[str, Any]:
     such as an idle lease or unbound compute process. It is read-only.
     """
 
-    return _client().get("/api/v1/coordination")
+    return _client().coordination()
 
 
 @mcp.tool()
@@ -195,25 +212,26 @@ def gpu_list(
         params["state"] = state
     if server_id:
         params["endpoint_id"] = server_id
-    return _client().get("/api/v1/gpus", params=params)
+    return _client().gpus(
+        state=state,
+        endpoint_id=server_id,
+        only_available=only_available,
+        compact=compact,
+    )
 
 
 @mcp.tool()
 def gpu_who(project_id: str | None = None) -> dict[str, Any]:
     """List project-visible leases and workload bindings; returns no SSH or task secrets."""
 
-    result = _client().get("/api/v1/leases")
-    if project_id:
-        result["data"] = [lease for lease in result["data"] if lease["project_id"] == project_id]
-    return result
+    return _client().leases(project_id=project_id)
 
 
 @mcp.tool()
 def gpu_list_profiles(project_id: str | None = None) -> dict[str, Any]:
     """List project-visible workload profiles approved for routine GPU claims."""
 
-    params = {"project_id": project_id} if project_id else None
-    return _client().get("/api/v1/workload-profiles", params=params)
+    return _client().workload_profiles(project_id=project_id)
 
 
 @mcp.tool()
@@ -224,7 +242,7 @@ def gpu_scheduler_targets() -> dict[str, Any]:
     hints are metadata; Slurm remains the resource allocator.
     """
 
-    return _client().get("/api/v1/scheduler-targets")
+    return _client().scheduler_targets()
 
 
 @mcp.tool()
@@ -241,10 +259,7 @@ def gpu_scheduler_access_status(target_id: str) -> dict[str, Any]:
 def gpu_scheduler_profiles(project_id: str) -> dict[str, Any]:
     """List enabled Slurm profiles explicitly granted to a project."""
 
-    result = _client().get(
-        "/api/v1/workload-profiles",
-        params={"project_id": project_id},
-    )
+    result = _client().workload_profiles(project_id=project_id)
     result["data"] = [
         profile
         for profile in result.get("data", [])
@@ -320,8 +335,7 @@ def gpu_scheduler_job_status(
     client = _client(agent_name)
     if job_id:
         return client.get(f"/api/v1/scheduler-jobs/{job_id}")
-    params = {"project_id": project_id} if project_id else None
-    return client.get("/api/v1/scheduler-jobs", params=params)
+    return client.scheduler_jobs(project_id=project_id)
 
 
 @mcp.tool()
@@ -390,10 +404,10 @@ def gpu_scheduler_transfer_status(
     """Compatibility helper for the deferred staged-upload API."""
 
     client = _client(agent_name)
-    if transfer_id:
-        return client.get(f"/api/v1/scheduler-transfers/{transfer_id}")
-    params = {"project_id": project_id} if project_id else None
-    return client.get("/api/v1/scheduler-transfers", params=params)
+    return client.scheduler_transfers(
+        transfer_id=transfer_id,
+        project_id=project_id,
+    )
 
 
 @mcp.tool()
@@ -412,10 +426,7 @@ def gpu_request(request: dict[str, Any], idempotency_key: str | None = None) -> 
 def gpu_request_status(request_id: str | None = None) -> dict[str, Any]:
     """List visible requests or return one request by id."""
 
-    result = _client().get("/api/v1/requests")
-    if request_id:
-        result["data"] = [item for item in result["data"] if item["id"] == request_id]
-    return result
+    return _client().requests(request_id=request_id)
 
 
 @mcp.tool()
@@ -447,8 +458,20 @@ def gpu_wait_for_claim(
 
     while True:
         polls += 1
-        requests_payload = client.get("/api/v1/requests")
-        leases_payload = client.get("/api/v1/leases")
+        state_payload = client.control_plane_state()
+        current = state_payload["data"]["current"]
+        requests_payload = {
+            "schema_version": state_payload.get("schema_version", "v1"),
+            "snapshot_revision": state_payload["snapshot_revision"],
+            "server_time": state_payload.get("server_time"),
+            "data": current.get("requests", []),
+        }
+        leases_payload = {
+            "schema_version": state_payload.get("schema_version", "v1"),
+            "snapshot_revision": state_payload["snapshot_revision"],
+            "server_time": state_payload.get("server_time"),
+            "data": current.get("leases", []),
+        }
         request = _matching_request(requests_payload, request_id)
         lease = _matching_lease(leases_payload, request_id)
         elapsed_seconds = round(time.monotonic() - started_at, 3)
@@ -456,6 +479,8 @@ def gpu_wait_for_claim(
         if request is None:
             return {
                 "schema_version": requests_payload.get("schema_version", "v1"),
+                "snapshot_revision": requests_payload["snapshot_revision"],
+                "server_time": requests_payload.get("server_time"),
                 "state": "not_found",
                 "request": None,
                 "lease": lease,
@@ -465,6 +490,8 @@ def gpu_wait_for_claim(
         if lease is not None and lease.get("state") in PLACED_LEASE_STATES:
             return {
                 "schema_version": requests_payload.get("schema_version", "v1"),
+                "snapshot_revision": requests_payload["snapshot_revision"],
+                "server_time": requests_payload.get("server_time"),
                 "state": "allocated",
                 "request": request,
                 "lease": lease,
@@ -476,6 +503,8 @@ def gpu_wait_for_claim(
         ):
             return {
                 "schema_version": requests_payload.get("schema_version", "v1"),
+                "snapshot_revision": requests_payload["snapshot_revision"],
+                "server_time": requests_payload.get("server_time"),
                 "state": "terminal",
                 "request": request,
                 "lease": lease,
@@ -487,6 +516,8 @@ def gpu_wait_for_claim(
         if remaining_seconds <= 0:
             return {
                 "schema_version": requests_payload.get("schema_version", "v1"),
+                "snapshot_revision": requests_payload["snapshot_revision"],
+                "server_time": requests_payload.get("server_time"),
                 "state": "timeout",
                 "request": request,
                 "lease": lease,
@@ -575,7 +606,7 @@ def gpu_bind_observed_workload(
 def gpu_list_reservations() -> dict[str, Any]:
     """List visible future GPU reservations."""
 
-    return _client().get("/api/v1/reservations")
+    return _client().reservations()
 
 
 @mcp.tool()
@@ -820,7 +851,7 @@ def gpu_add_server(
     server_id: str | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Add a project-owned endpoint to read-only monitoring."""
+    """Add a shared endpoint with project attribution to read-only monitoring."""
 
     if not project_id.strip():
         raise ValueError("project_id must not be empty")

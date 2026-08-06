@@ -172,7 +172,7 @@ public struct ResourceProviderRecord: Identifiable, Equatable, Sendable {
         displayName = raw.string("display_name") ?? raw.string("name") ?? id
         endpointID = raw.string("endpoint_id")
         schedulerTargetID = raw.string("scheduler_target_id")
-        state = raw.string("state") ?? raw.string("lifecycle_state") ?? "UNKNOWN"
+        state = (raw.string("state") ?? raw.string("lifecycle_state") ?? "UNKNOWN").uppercased()
         enabled = raw.bool("enabled", default: true)
         total = ResourceQuantityRecord(raw: raw["total"] as? [String: Any] ?? raw["capacity"] as? [String: Any] ?? [:])
         committed = ResourceQuantityRecord(raw: raw["committed"] as? [String: Any] ?? raw["commitment"] as? [String: Any] ?? [:])
@@ -214,17 +214,17 @@ public struct ResourceProviderRecord: Identifiable, Equatable, Sendable {
 
     public var providerLabel: String {
         switch providerType {
-        case "direct-gpu": return "直连 GPU"
-        case "host-capacity": return "主机 CPU/内存"
-        case "scheduler": return "外部调度器"
+        case "direct-gpu": return "GPU"
+        case "host-capacity": return "CPU 与内存"
+        case "scheduler": return "外部计算平台"
         default: return providerType
         }
     }
 
     public var stateLabel: String {
         switch state {
-        case "ONLINE", "READY", "AVAILABLE": return "可调度"
-        case "PENDING", "QUEUED", "SUBMITTED": return "等待确认"
+        case "ONLINE", "READY", "AVAILABLE": return "可用"
+        case "PENDING", "QUEUED", "SUBMITTED": return "等待外部系统确认"
         case "ALLOCATED", "LEASED", "RUNNING": return "已分配"
         case "STALE": return "状态过期"
         case "ERROR", "CONFLICT": return "需要处理"
@@ -237,11 +237,11 @@ public struct ResourceProviderRecord: Identifiable, Equatable, Sendable {
 
     public var trustBoundary: String? {
         if providerType == "scheduler", ["PENDING", "QUEUED", "SUBMITTED"].contains(state) {
-            return "等待外部调度器确认；不计入裸机可用容量"
+            return "外部系统尚未确认，因此暂不计入可用资源。"
         }
-        if !enabled { return "已停用；不可认领" }
+        if !enabled { return "此资源已停用，暂时不能申请。" }
         if ["STALE", "ERROR", "CONFLICT", "DISABLED", "DRAINING", "RETIRED"].contains(state) {
-            return "状态不可信或不可接收新认领"
+            return "数据已过期或资源不可用，暂时不能申请。"
         }
         return nil
     }
@@ -271,12 +271,94 @@ public struct AllocatableUnitRecord: Identifiable, Equatable, Sendable {
         endpointID = raw.string("endpoint_id")
         gpuID = raw.string("gpu_id")
         schedulerTargetID = raw.string("scheduler_target_id")
-        state = raw.string("state") ?? "UNKNOWN"
+        state = (raw.string("state") ?? "UNKNOWN").uppercased()
         quantities = ResourceQuantityRecord(raw: raw["quantities"] as? [String: Any] ?? raw)
         committed = ResourceQuantityRecord(raw: raw["committed"] as? [String: Any] ?? raw["commitment"] as? [String: Any] ?? [:])
         ownerProjectID = raw.string("owner_project_id") ?? raw.string("project_id")
         actorID = raw.string("actor_id")
         nativeSchedulerJobID = raw.string("native_scheduler_job_id") ?? raw.string("scheduler_job_id")
+    }
+}
+
+public struct SchedulerTargetRecord: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let displayName: String
+    public let kind: String
+    public let adapter: String
+    public let enabled: Bool
+    public let accessStatus: String
+    public let accessMessage: String?
+
+    public init?(raw: [String: Any]) {
+        guard let id = raw.string("id") else { return nil }
+        self.id = id
+        displayName = raw.string("display_name") ?? raw.string("name") ?? id
+        kind = raw.string("kind") ?? "external-scheduler"
+        adapter = raw.string("adapter") ?? ""
+        enabled = raw.bool("enabled", default: true)
+        let access = raw["last_access"] as? [String: Any] ?? [:]
+        accessStatus = (access.string("status") ?? "unknown").uppercased()
+        accessMessage = access.string("message")
+    }
+}
+
+public struct SchedulerJobRecord: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let targetID: String
+    public let actorID: String
+    public let projectID: String
+    public let taskReference: String
+    public let state: String
+    public let rawState: String?
+    public let schedulerJobID: String?
+
+    public init?(raw: [String: Any]) {
+        guard
+            let id = raw.string("id"),
+            let targetID = raw.string("target_id"),
+            let actorID = raw.string("actor_id"),
+            let projectID = raw.string("project_id")
+        else {
+            return nil
+        }
+        self.id = id
+        self.targetID = targetID
+        self.actorID = actorID
+        self.projectID = projectID
+        taskReference = raw.string("task_ref") ?? raw.string("task_reference") ?? ""
+        state = (raw.string("state") ?? "UNKNOWN").uppercased()
+        rawState = raw.string("raw_state")
+        schedulerJobID = raw.string("scheduler_job_id")
+    }
+}
+
+public struct SchedulerTransferRecord: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let targetID: String
+    public let actorID: String
+    public let projectID: String
+    public let state: String
+    public let remoteDirectory: String?
+    public let remoteStagedPath: String?
+    public let errorMessage: String?
+
+    public init?(raw: [String: Any]) {
+        guard
+            let id = raw.string("id"),
+            let targetID = raw.string("target_id"),
+            let actorID = raw.string("actor_id"),
+            let projectID = raw.string("project_id")
+        else {
+            return nil
+        }
+        self.id = id
+        self.targetID = targetID
+        self.actorID = actorID
+        self.projectID = projectID
+        state = (raw.string("state") ?? "UNKNOWN").uppercased()
+        remoteDirectory = raw.string("remote_directory")
+        remoteStagedPath = raw.string("remote_staged_path")
+        errorMessage = raw.string("error_message")
     }
 }
 
@@ -307,7 +389,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         self.sshUser = sshUser
         self.sshAlias = raw.string("ssh_alias")
         self.enabled = raw.bool("enabled", default: true)
-        self.lifecycleState = raw.string("lifecycle_state")
+        self.lifecycleState = raw.string("lifecycle_state")?.uppercased()
         let monitor = raw["monitor"] as? [String: Any] ?? [:]
         self.monitorStatus = monitor.string("status") ?? "PENDING"
         self.monitorError = monitor.string("last_error")
@@ -327,6 +409,10 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
 
     public var displayName: String {
         sshAlias ?? "\(sshUser)@\(host):\(port)"
+    }
+
+    public var isRetired: Bool {
+        lifecycleState == "RETIRED" || monitorStatus == "RETIRED"
     }
 
     public var monitorLabel: String {
@@ -461,6 +547,22 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct BrokerStateHistory: Equatable, Sendable {
+    public let retiredEndpoints: [EndpointRecord]
+    public let resourcePlanEvaluations: [ResourcePlanEvaluationRecord]
+    public let resourceRunActuals: [ResourceRunActualRecord]
+
+    public static let empty = BrokerStateHistory(raw: [:])
+
+    public init(raw: [String: Any]) {
+        retiredEndpoints = (raw["retired_endpoints"] as? [[String: Any]] ?? []).compactMap(EndpointRecord.init)
+        resourcePlanEvaluations = (raw["resource_plan_evaluations"] as? [[String: Any]] ?? [])
+            .compactMap(ResourcePlanEvaluationRecord.init)
+        resourceRunActuals = (raw["resource_run_actuals"] as? [[String: Any]] ?? [])
+            .compactMap(ResourceRunActualRecord.init)
+    }
+}
+
 public struct BrokerSnapshot: Equatable, Sendable {
     public var schemaVersion: String?
     public var snapshotRevision: Int?
@@ -473,9 +575,13 @@ public struct BrokerSnapshot: Equatable, Sendable {
     public var reservations: [ReservationRecord]
     public var resourceProviders: [ResourceProviderRecord]
     public var allocatableUnits: [AllocatableUnitRecord]
+    public var schedulerTargets: [SchedulerTargetRecord]
+    public var schedulerJobs: [SchedulerJobRecord]
+    public var schedulerTransfers: [SchedulerTransferRecord]
     public var resourceClaims: [ResourceClaimRecord]
     public var resourcePlanEvaluations: [ResourcePlanEvaluationRecord]
     public var resourceRunActuals: [ResourceRunActualRecord]
+    public var history: BrokerStateHistory
     public var dataAgeSeconds: Double?
     public var freshnessSeconds: Double?
     public var admissionBoundary: String
@@ -492,21 +598,38 @@ public struct BrokerSnapshot: Equatable, Sendable {
         reservations: [],
         resourceProviders: [],
         allocatableUnits: [],
+        schedulerTargets: [],
+        schedulerJobs: [],
+        schedulerTransfers: [],
         resourceClaims: [],
         resourcePlanEvaluations: [],
         resourceRunActuals: [],
+        history: .empty,
         dataAgeSeconds: nil,
         freshnessSeconds: nil,
-        admissionBoundary: "这里只负责分配 GPU，不代表可以启动或停止远端任务。"
+        admissionBoundary: "GPU Broker 只记录资源归属，不会启动或停止服务器上的任务。"
     )
 
+    public var operationalEndpoints: [EndpointRecord] {
+        endpoints.filter { !$0.isRetired }
+    }
+
+    public var operationalGPUs: [GPURecord] {
+        let endpointIDs = Set(operationalEndpoints.map(\.id))
+        return gpus.filter { endpointIDs.contains($0.endpointID) }
+    }
+
     public init(envelope: [String: Any]) {
-        let payload = envelope["data"] as? [String: Any] ?? envelope
+        let stateData = envelope["data"] as? [String: Any]
+        let payload = stateData?["current"] as? [String: Any]
+            ?? stateData
+            ?? envelope
         self.init(
             payload: payload,
             schemaVersion: envelope.string("schema_version"),
             snapshotRevision: envelope.optionalInt("snapshot_revision"),
-            serverTime: envelope.string("server_time")
+            serverTime: envelope.string("server_time"),
+            history: BrokerStateHistory(raw: stateData?["history"] as? [String: Any] ?? [:])
         )
     }
 
@@ -514,26 +637,45 @@ public struct BrokerSnapshot: Equatable, Sendable {
         payload: [String: Any],
         schemaVersion: String? = nil,
         snapshotRevision: Int? = nil,
-        serverTime: String? = nil
+        serverTime: String? = nil,
+        history: BrokerStateHistory = .empty
     ) {
         self.schemaVersion = schemaVersion
         self.snapshotRevision = snapshotRevision
         self.serverTime = serverTime
+        self.history = history
         summary = ResourceSummary(raw: payload["summary"] as? [String: Any] ?? [:])
         endpoints = (payload["endpoints"] as? [[String: Any]] ?? []).compactMap(EndpointRecord.init)
         gpus = (payload["gpus"] as? [[String: Any]] ?? []).compactMap(GPURecord.init)
-        let endpointAttention = endpoints.filter { ["ERROR", "STALE", "DRAINING", "RETIRED"].contains($0.monitorStatus) }.count
-        let gpuAttentionStates = Set(["BUSY_UNMANAGED", "UNKNOWN_RECOVERING", "UNKNOWN_STALE", "UNHEALTHY", "CONFLICT", "ORPHANED_BUSY", "DRAINING", "RETIRED"])
-        let gpuAttention = gpus.filter { gpuAttentionStates.contains($0.state) }.count
+        let operationalEndpointIDs = Set(endpoints.filter { !$0.isRetired }.map(\.id))
+        let endpointAttention = endpoints.filter {
+            !$0.isRetired && ["ERROR", "STALE", "DRAINING"].contains($0.monitorStatus)
+        }.count
+        let gpuAttentionStates = Set(["BUSY_UNMANAGED", "UNKNOWN_RECOVERING", "UNKNOWN_STALE", "UNHEALTHY", "CONFLICT", "ORPHANED_BUSY", "DRAINING"])
+        let gpuAttention = gpus.filter {
+            operationalEndpointIDs.contains($0.endpointID) && gpuAttentionStates.contains($0.state)
+        }.count
         summary.attentionResources = max(summary.attentionResources, endpointAttention + gpuAttention)
         leases = (payload["leases"] as? [[String: Any]] ?? []).compactMap(LeaseRecord.init)
         requests = (payload["requests"] as? [[String: Any]] ?? []).compactMap(AllocationRequestRecord.init)
         reservations = (payload["reservations"] as? [[String: Any]] ?? []).compactMap(ReservationRecord.init)
         resourceProviders = (payload["resource_providers"] as? [[String: Any]] ?? []).compactMap(ResourceProviderRecord.init)
         allocatableUnits = (payload["allocatable_units"] as? [[String: Any]] ?? []).compactMap(AllocatableUnitRecord.init)
+        schedulerTargets = (payload["scheduler_targets"] as? [[String: Any]] ?? []).compactMap(SchedulerTargetRecord.init)
+        schedulerJobs = (payload["scheduler_jobs"] as? [[String: Any]] ?? []).compactMap(SchedulerJobRecord.init)
+        schedulerTransfers = (payload["scheduler_transfers"] as? [[String: Any]] ?? [])
+            .compactMap(SchedulerTransferRecord.init)
         resourceClaims = (payload["resource_claims"] as? [[String: Any]] ?? []).compactMap(ResourceClaimRecord.init)
-        resourcePlanEvaluations = (payload["resource_plan_evaluations"] as? [[String: Any]] ?? []).compactMap(ResourcePlanEvaluationRecord.init)
-        resourceRunActuals = (payload["resource_run_actuals"] as? [[String: Any]] ?? []).compactMap(ResourceRunActualRecord.init)
+        let currentResourcePlanEvaluations = (payload["resource_plan_evaluations"] as? [[String: Any]] ?? [])
+            .compactMap(ResourcePlanEvaluationRecord.init)
+        resourcePlanEvaluations = currentResourcePlanEvaluations.isEmpty
+            ? history.resourcePlanEvaluations
+            : currentResourcePlanEvaluations
+        let currentResourceRunActuals = (payload["resource_run_actuals"] as? [[String: Any]] ?? [])
+            .compactMap(ResourceRunActualRecord.init)
+        resourceRunActuals = currentResourceRunActuals.isEmpty
+            ? history.resourceRunActuals
+            : currentResourceRunActuals
         dataAgeSeconds = payload.optionalDouble("data_age_seconds")
         freshnessSeconds = payload.optionalDouble("freshness_seconds")
         admissionBoundary = payload.string("admission_boundary") ?? BrokerSnapshot.empty.admissionBoundary
@@ -551,9 +693,13 @@ public struct BrokerSnapshot: Equatable, Sendable {
         reservations: [ReservationRecord] = [],
         resourceProviders: [ResourceProviderRecord] = [],
         allocatableUnits: [AllocatableUnitRecord] = [],
+        schedulerTargets: [SchedulerTargetRecord] = [],
+        schedulerJobs: [SchedulerJobRecord] = [],
+        schedulerTransfers: [SchedulerTransferRecord] = [],
         resourceClaims: [ResourceClaimRecord] = [],
         resourcePlanEvaluations: [ResourcePlanEvaluationRecord] = [],
         resourceRunActuals: [ResourceRunActualRecord] = [],
+        history: BrokerStateHistory = .empty,
         dataAgeSeconds: Double?,
         freshnessSeconds: Double? = nil,
         admissionBoundary: String
@@ -569,20 +715,31 @@ public struct BrokerSnapshot: Equatable, Sendable {
         self.reservations = reservations
         self.resourceProviders = resourceProviders
         self.allocatableUnits = allocatableUnits
+        self.schedulerTargets = schedulerTargets
+        self.schedulerJobs = schedulerJobs
+        self.schedulerTransfers = schedulerTransfers
         self.resourceClaims = resourceClaims
         self.resourcePlanEvaluations = resourcePlanEvaluations
         self.resourceRunActuals = resourceRunActuals
+        self.history = history
         self.dataAgeSeconds = dataAgeSeconds
         self.freshnessSeconds = freshnessSeconds
         self.admissionBoundary = admissionBoundary
     }
 
     public var monitoringProviders: [ResourceProviderRecord] {
-        if !resourceProviders.isEmpty {
-            return resourceProviders
+        let operationalEndpointIDs = Set(operationalEndpoints.map(\.id))
+        var providers = resourceProviders.filter {
+            $0.endpointID == nil || operationalEndpointIDs.contains($0.endpointID ?? "")
         }
-        var providers: [ResourceProviderRecord] = endpoints.map { endpoint in
+        let explicitKeys = Set(providers.map {
+            "\($0.providerType):\($0.endpointID ?? $0.schedulerTargetID ?? $0.id)"
+        })
+        providers.append(contentsOf: operationalEndpoints.compactMap { endpoint in
+            let key = "direct-gpu:\(endpoint.id)"
+            guard !explicitKeys.contains(key) else { return nil }
             let endpointGPUs = gpus(for: endpoint)
+            guard !endpointGPUs.isEmpty else { return nil }
             let availableGPUs = endpoint.monitorStatus == "ONLINE"
                 ? endpointGPUs.filter { $0.state == "AVAILABLE" }.count
                 : 0
@@ -598,8 +755,10 @@ public struct BrokerSnapshot: Equatable, Sendable {
                 available: ResourceQuantityRecord(gpuCount: availableGPUs),
                 updatedAt: endpoint.monitorLastSuccessAt
             )
-        }
-        providers.append(contentsOf: endpoints.compactMap { endpoint in
+        })
+        providers.append(contentsOf: operationalEndpoints.compactMap { endpoint in
+            let key = "host-capacity:\(endpoint.id)"
+            guard !explicitKeys.contains(key) else { return nil }
             guard endpoint.cpuCount != nil || endpoint.memoryTotalMiB != nil else { return nil }
             return ResourceProviderRecord(
                 id: "host-capacity:\(endpoint.id)",
@@ -627,8 +786,20 @@ public struct BrokerSnapshot: Equatable, Sendable {
         gpus.filter { $0.endpointID == endpoint.id }
     }
 
+    public func endpoint(id: String) -> EndpointRecord? {
+        endpoints.first { $0.id == id }
+    }
+
+    public func gpu(id: String) -> GPURecord? {
+        gpus.first { $0.id == id }
+    }
+
     public func stableEndpointSelection(currentID: String) -> String {
         endpoints.contains { $0.id == currentID } ? currentID : (endpoints.first?.id ?? "")
+    }
+
+    public func stableGPUSelection(currentID: String) -> String {
+        gpus.contains { $0.id == currentID } ? currentID : (gpus.first?.id ?? "")
     }
 
     public func stableLeaseSelection(currentID: String) -> String {
@@ -647,8 +818,11 @@ public struct ResourceClaimRecord: Identifiable, Equatable, Sendable {
     public let taskReference: String
     public let purpose: String?
     public let state: String
+    public let runtimeState: String
     public let providerType: String?
     public let quantities: ResourceQuantityRecord
+    public let nativeLeaseIDs: [String]
+    public let nativeRequestIDs: [String]
     public let createdAt: String?
 
     public init?(raw: [String: Any]) {
@@ -664,21 +838,26 @@ public struct ResourceClaimRecord: Identifiable, Equatable, Sendable {
         self.projectID = projectID
         self.taskReference = raw.string("task_ref") ?? raw.string("task_reference") ?? ""
         self.purpose = raw.string("purpose")
-        self.state = raw.string("state") ?? "UNKNOWN"
+        self.state = (raw.string("state") ?? "UNKNOWN").uppercased()
+        self.runtimeState = (raw.string("runtime_state") ?? self.state).uppercased()
         self.providerType = raw.string("provider_type")
         self.quantities = ResourceQuantityRecord(
             raw: raw["quantities"] as? [String: Any]
                 ?? raw["requested_quantities"] as? [String: Any]
                 ?? [:]
         )
+        self.nativeLeaseIDs = raw["native_lease_ids"] as? [String] ?? []
+        self.nativeRequestIDs = raw["native_request_ids"] as? [String] ?? []
         self.createdAt = raw.string("created_at")
     }
 
     public var stateLabel: String {
+        if runtimeState == "RUNNING" { return "运行中" }
         switch state {
         case "QUEUED": return "排队中"
         case "PENDING_APPROVAL": return "等待批准"
-        case "HELD", "ACTIVE": return "已认领"
+        case "BLOCKED": return "等待资源"
+        case "HELD", "ACTIVE": return "已分配"
         case "RUNNING": return "运行中"
         case "REJECTED": return "已拒绝"
         case "RELEASED": return "已释放"
@@ -714,7 +893,10 @@ public struct ResourcePlanEvaluationRecord: Identifiable, Equatable, Sendable {
         self.taskReference = raw.string("task_ref") ?? raw.string("task_reference") ?? ""
         self.selectedCandidateKey = raw.string("selected_candidate_key")
         self.minimumSavedSeconds = raw.optionalInt("minimum_saved_seconds") ?? raw.optionalInt("min_saved_seconds")
-        self.minimumSavedRatio = raw.optionalDouble("minimum_saved_ratio") ?? raw.optionalDouble("min_saved_ratio")
+            ?? raw.optionalInt("marginal_min_saved_seconds")
+        self.minimumSavedRatio = raw.optionalDouble("minimum_saved_ratio")
+            ?? raw.optionalDouble("min_saved_ratio")
+            ?? raw.optionalDouble("marginal_min_saved_ratio")
         self.createdAt = raw.string("created_at")
         self.candidates = (raw["candidates"] as? [[String: Any]] ?? []).compactMap(ResourcePlanCandidateRecord.init)
     }
@@ -771,7 +953,7 @@ public struct ResourceRunActualRecord: Identifiable, Equatable, Sendable {
 
     public init?(raw: [String: Any]) {
         guard
-            let id = raw.string("id"),
+            let id = raw.string("id") ?? raw.optionalInt("id").map(String.init),
             let actorID = raw.string("actor_id"),
             let projectID = raw.string("project_id")
         else {
@@ -831,6 +1013,7 @@ public struct LeaseRecord: Identifiable, Equatable, Sendable {
     public let actorID: String
     public let projectID: String
     public let state: String
+    public let runtimeState: String
     public let gpuIDs: [String]
     public let issuedAt: String?
     public let expiresAt: String?
@@ -845,7 +1028,8 @@ public struct LeaseRecord: Identifiable, Equatable, Sendable {
         self.requestID = raw.string("request_id")
         self.actorID = actorID
         self.projectID = projectID
-        self.state = raw.string("state") ?? "UNKNOWN"
+        self.state = (raw.string("state") ?? "UNKNOWN").uppercased()
+        self.runtimeState = (raw.string("runtime_state") ?? "ASSIGNED").uppercased()
         self.gpuIDs = raw["gpu_ids"] as? [String] ?? []
         self.issuedAt = raw.string("issued_at")
         self.expiresAt = raw.string("expires_at")

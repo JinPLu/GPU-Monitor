@@ -48,9 +48,8 @@ class Endpoint(Base):
     storage_group: Mapped[str | None] = mapped_column(String(120))
     expected_gpu_count: Mapped[int | None] = mapped_column(Integer)
     expected_gpu_total_vram_mib: Mapped[int | None] = mapped_column(Integer)
-    # The owning project controls endpoint lifecycle metadata.  This stays
-    # nullable only so pre-owner databases can be migrated without guessing a
-    # project; new self-service endpoints always supply an owner.
+    # Optional project attribution for reporting. Endpoint lifecycle operations
+    # are shared loopback inventory actions and are not permission-gated by it.
     owner_project_id: Mapped[str | None] = mapped_column(
         ForeignKey("projects.id", ondelete="RESTRICT"), index=True
     )

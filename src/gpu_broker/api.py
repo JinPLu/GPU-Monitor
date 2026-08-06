@@ -36,6 +36,7 @@ from gpu_broker.importer import ParsedSSHCommand, parse_ssh_command
 from gpu_broker.schemas import (
     ActorCreate,
     AlertAcknowledge,
+    ControlPlaneSnapshot,
     EndpointEnabled,
     EndpointUpsert,
     LeaseBind,
@@ -313,6 +314,10 @@ def create_app(settings: Settings) -> FastAPI:
             state=state,
             only_available=only_available,
         )
+
+    @app.get("/api/v1/state", response_model=ControlPlaneSnapshot)
+    def control_plane_state(actor: ApiActor) -> dict[str, Any]:
+        return service.control_plane_state(actor)
 
     @app.get("/api/v1/endpoints")
     def endpoints(actor: ApiActor) -> dict[str, Any]:

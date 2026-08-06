@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import plistlib
 import sqlite3
 import stat
@@ -386,3 +387,125 @@ def test_macos_gui_no_longer_owns_or_terminates_server_process() -> None:
         "startServer(executable:",
     ):
         assert forbidden not in source
+
+
+def test_macos_gui_defaults_to_low_composition_surfaces() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    window_source = (project_root / "desktop" / "GPU Broker.swift").read_text(
+        encoding="utf-8"
+    )
+    support_source = (project_root / "desktop" / "AppSupport.swift").read_text(
+        encoding="utf-8"
+    )
+    overview_source = (
+        project_root / "desktop" / "OverviewDashboard.swift"
+    ).read_text(encoding="utf-8")
+
+    launch_body = window_source.split(
+        "func applicationDidFinishLaunching", maxsplit=1
+    )[1].split("func applicationShouldTerminate", maxsplit=1)[0]
+    assert "createdWindow.backgroundColor = .windowBackgroundColor" in launch_body
+    assert "createdWindow.isOpaque = true" in launch_body
+    assert "createdWindow.appearance = NSAppearance(named: .aqua)" in launch_body
+
+    ambient_body = support_source.split("struct AmbientBackground", maxsplit=1)[
+        1
+    ].split("struct SoftButtonStyle", maxsplit=1)[0]
+    for forbidden in ("Image(", ".blur(", ".blendMode(", ".regularMaterial"):
+        assert forbidden not in ambient_body
+    assert "DesignTokens.ambientSmoke" in ambient_body
+
+    sidebar_body = window_source.split("private struct AppSidebar", maxsplit=1)[
+        1
+    ].split("private struct SidebarSelection", maxsplit=1)[0]
+    toolbar_body = window_source.split("private struct AppToolbar", maxsplit=1)[
+        1
+    ].split("private struct FreshnessBadge", maxsplit=1)[0]
+    assert ".regularMaterial" not in sidebar_body
+    assert ".regularMaterial" not in toolbar_body
+    assert ".background(DesignTokens.surface)" in sidebar_body
+    assert ".background(DesignTokens.surface)" in toolbar_body
+    assert "GPU_BROKER_DESKTOP_VIEWPORT" in window_source
+    assert "GPU_BROKER_DESKTOP_SCREENSHOT" in window_source
+    assert "GPU_BROKER_DESKTOP_EXIT_AFTER_SCREENSHOT" in window_source
+    assert "GPU_BROKER_DESKTOP_SECTION" in window_source
+    assert "CPU 计算节点 · 当前未检测到 GPU" in overview_source
+    assert "static let interaction = Color(nsColor: .controlAccentColor)" in support_source
+    assert "static let cpu = mutedInk" in support_source
+    assert "static let memory = mutedInk" in support_source
+    assert "static let gpu = mutedInk" in support_source
+    assert "static let network = mutedInk" in support_source
+    for forbidden_accent in (".systemTeal", ".systemIndigo", ".systemBlue"):
+        assert forbidden_accent not in support_source
+
+    surface_body = overview_source.split(
+        "func overviewSurface(radius:", maxsplit=1
+    )[1].split("private func percent", maxsplit=1)[0]
+    assert ".regularMaterial" not in surface_body
+    assert ".shadow(" not in surface_body
+    assert "background(DesignTokens.surface, in: shape)" in surface_body
+
+
+def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry_claims() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    usage_source = (
+        project_root / "desktop" / "ResourceUsageDashboard.swift"
+    ).read_text(encoding="utf-8")
+    window_source = (project_root / "desktop" / "GPU Broker.swift").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ResourceUsageDashboard(store: store)" in window_source
+    assert 'case "resource-usage", "leases": .leases' in window_source
+    for scope in ("case project", "case agent", "case task"):
+        assert scope in usage_source
+    for status_label in ('label: "已分配"', 'label: "运行中"', 'label: "申请中"'):
+        assert status_label in usage_source
+    assert 'snapshot.resourceClaims.filter {' in usage_source
+    assert '$0.runtimeState == "RUNNING" || $0.state == "RUNNING"' in usage_source
+    assert '["BLOCKED", "QUEUED", "PENDING_APPROVAL", "REQUESTED"]' in usage_source
+    assert "Set(snapshot.resourceClaims.flatMap(\\.nativeLeaseIDs))" in usage_source
+    assert "Set(snapshot.resourceClaims.flatMap(\\.nativeRequestIDs))" in usage_source
+    assert 'key = "\\(projectID)\\u{1F}\\(taskReference)"' in usage_source
+    assert "if snapshot.resourceClaims.isEmpty" not in usage_source
+    assert "claims.isEmpty ? requests : []" not in usage_source
+    assert "endpoint.cpuLoadFraction" not in usage_source
+    assert "endpoint.memoryFraction" not in usage_source
+    assert ".onChange(of: store.snapshot.snapshotRevision)" in usage_source
+    assert "groupsByScope = [scope: makeResourceUsageGroups" in usage_source
+    assert "ResourceUsageScope.allCases.map" not in usage_source
+    assert "GPU_BROKER_DESKTOP_USAGE_SCOPE" in usage_source
+    for resource_label in ('label: "CPU"', 'label: "内存"', 'label: "GPU"'):
+        assert resource_label in usage_source
+
+
+def test_resource_ownership_fixture_covers_all_resource_usage_dimensions() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    fixture = json.loads(
+        (project_root / "desktop" / "fixtures" / "resource-ownership.json").read_text(
+            encoding="utf-8"
+        )
+    )["data"]["current"]
+    claims = fixture["resource_claims"]
+
+    assert {claim["project_id"] for claim in claims} == {"vision-lab", "robotics"}
+    assert len({claim["actor_id"] for claim in claims}) >= 3
+    assert len({claim["task_ref"] for claim in claims}) >= 4
+    assert {claim["state"].upper() for claim in claims} >= {"ACTIVE", "BLOCKED"}
+    assert {claim["runtime_state"] for claim in claims} >= {
+        "ASSIGNED",
+        "RUNNING",
+        "REQUESTED",
+    }
+    for claim in claims:
+        assert set(claim["quantities"]) >= {"cpu_cores", "memory_mib", "gpu_count"}
+    linked_claim = next(claim for claim in claims if claim["id"] == "claim-vision-train")
+    assert linked_claim["native_lease_ids"] == ["lease-vision-train"]
+    assert linked_claim["native_request_ids"] == ["request-vision-train"]
+    shared_task_projects = {
+        claim["project_id"] for claim in claims if claim["task_ref"] == "train-resnet"
+    }
+    assert shared_task_projects == {"vision-lab", "robotics"}
+    assert fixture["requests"][0]["id"] == "request-robotics-gpu"
+    assert any(endpoint["id"] == "cpu-node-01" for endpoint in fixture["endpoints"])
+    assert any(provider["provider_type"] == "scheduler" for provider in fixture["resource_providers"])

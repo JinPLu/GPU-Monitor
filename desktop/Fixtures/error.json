@@ -3,72 +3,89 @@
   "snapshot_revision": 202,
   "server_time": "2026-08-01T00:00:00Z",
   "data": {
-    "summary": {
-      "online_servers": 0,
-      "total_servers": 1,
-      "total_gpus": 1,
-      "available_gpus": 0,
-      "busy_gpus": 0,
-      "claimed_gpus": 0,
-      "abnormal_gpus": 1
-    },
-    "endpoints": [
-      {
-        "id": "fixture-error",
-        "host": "127.0.0.1",
-        "port": 2231,
-        "ssh_user": "gpu",
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "storage_group": "fixture",
-        "expected_gpu_count": 1,
-        "expected_gpu_total_vram_mib": 81920,
-        "owner_project_id": null,
-        "lifecycle_state": "active",
-        "enabled": true,
-        "monitor": {
-          "status": "ERROR",
-          "last_error": "operation timed out"
-        },
-        "host_telemetry": {
-          "cpu_count": 64,
-          "load_1m": 7.0,
-          "memory_total_mib": 262144,
-          "memory_available_mib": 188743
+    "current": {
+      "summary": {
+        "online_servers": 0,
+        "total_servers": 1,
+        "total_gpus": 1,
+        "available_gpus": 0,
+        "busy_gpus": 0,
+        "claimed_gpus": 0,
+        "abnormal_gpus": 1
+      },
+      "endpoints": [
+        {
+          "id": "fixture-error",
+          "host": "127.0.0.1",
+          "port": 2231,
+          "ssh_user": "gpu",
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "storage_group": "fixture",
+          "expected_gpu_count": 1,
+          "expected_gpu_total_vram_mib": 81920,
+          "owner_project_id": null,
+          "lifecycle_state": "active",
+          "enabled": true,
+          "monitor": {
+            "status": "ERROR",
+            "last_error": "operation timed out"
+          },
+          "host_telemetry": {
+            "cpu_count": 64,
+            "load_1m": 7.0,
+            "memory_total_mib": 262144,
+            "memory_available_mib": 188743
+          }
         }
-      }
-    ],
-    "gpus": [
-      {
-        "id": "fixture-error:GPU-fixture-error-00-UUID",
-        "endpoint_id": "fixture-error",
-        "gpu_uuid": "GPU-fixture-error-00-UUID",
-        "gpu_index": 0,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "UNKNOWN_RECOVERING",
-        "telemetry": {
-          "memory_used_mib": 1024,
-          "gpu_utilization_pct": 4,
-          "temperature_c": 34
-        },
-        "processes": [],
-        "state_reason": "no fresh telemetry after service start"
-      }
-    ],
-    "leases": [],
-    "requests": [],
-    "data_age_seconds": null,
-    "reservations": [],
-    "freshness_seconds": 30,
-    "admission_boundary": "Fixture: allocation only."
+      ],
+      "gpus": [
+        {
+          "id": "fixture-error:GPU-fixture-error-00-UUID",
+          "endpoint_id": "fixture-error",
+          "gpu_uuid": "GPU-fixture-error-00-UUID",
+          "gpu_index": 0,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "UNKNOWN_RECOVERING",
+          "telemetry": {
+            "memory_used_mib": 1024,
+            "gpu_utilization_pct": 4,
+            "temperature_c": 34
+          },
+          "processes": [],
+          "state_reason": "no fresh telemetry after service start"
+        }
+      ],
+      "leases": [],
+      "requests": [],
+      "data_age_seconds": null,
+      "reservations": [],
+      "freshness_seconds": 30,
+      "admission_boundary": "Fixture: allocation only.",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "resource_providers": [],
+      "allocatable_units": [],
+      "resource_claims": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
+    },
+    "history": {
+      "retired_endpoints": [],
+      "resource_plan_evaluations": [],
+      "resource_run_actuals": []
+    }
   }
 }

@@ -13,6 +13,7 @@ public enum BrokerRefreshError: LocalizedError, Equatable, Sendable {
     case timeout
     case invalidSnapshot
     case serviceRejected(Int)
+    case snapshotRevisionBehind(required: Int, received: Int?)
 
     public var errorDescription: String? {
         switch self {
@@ -24,6 +25,9 @@ public enum BrokerRefreshError: LocalizedError, Equatable, Sendable {
             return "本机服务返回了无法读取的资源快照。"
         case .serviceRejected(let status):
             return "本机服务拒绝了资源刷新（HTTP \(status)）。"
+        case .snapshotRevisionBehind(let required, let received):
+            let receivedLabel = received.map(String.init) ?? "未知"
+            return "本机服务返回了旧资源快照（\(receivedLabel)，需要至少 \(required)）。请稍后刷新。"
         }
     }
 }
@@ -42,7 +46,7 @@ public final class URLSessionBrokerSnapshotClient: BrokerSnapshotClient {
     }
 
     public func snapshot(actorID: String) async throws -> BrokerSnapshot {
-        var request = URLRequest(url: baseURL.appendingPathComponent("api/v1/snapshot"))
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/v1/state"))
         request.timeoutInterval = 6
         request.setValue(actorID, forHTTPHeaderField: "X-GPU-Broker-Actor")
         let (data, response) = try await session.data(for: request)
@@ -55,7 +59,9 @@ public final class URLSessionBrokerSnapshotClient: BrokerSnapshotClient {
         guard
             let object = try? JSONSerialization.jsonObject(with: data),
             let envelope = object as? [String: Any],
-            envelope["data"] is [String: Any]
+            let stateData = envelope["data"] as? [String: Any],
+            stateData["current"] is [String: Any],
+            stateData["history"] is [String: Any]
         else {
             throw BrokerRefreshError.invalidSnapshot
         }
@@ -66,7 +72,9 @@ public final class URLSessionBrokerSnapshotClient: BrokerSnapshotClient {
 @MainActor
 public final class BrokerStore: ObservableObject {
     private struct PendingEndpointRemoval {
-        let endpoint: EndpointRecord
+        let endpointID: String
+        let endpointDisplayName: String
+        let expectedLifecycleState: String
         let completion: @MainActor @Sendable (Bool, String?) -> Void
     }
 
@@ -91,6 +99,7 @@ public final class BrokerStore: ObservableObject {
     private var refreshGeneration: UInt64 = 0
     private var discardedRefreshGeneration: UInt64?
     private var pendingEndpointRemovals: [PendingEndpointRemoval] = []
+    private var minimumRequiredSnapshotRevision: Int?
     private let refreshTimeoutSeconds: TimeInterval
     private let refreshIntervalSeconds: TimeInterval
     private let dateProvider: () -> Date
@@ -120,6 +129,10 @@ public final class BrokerStore: ObservableObject {
         baseURL != nil && isConnected && freshness == .fresh
     }
 
+    public var allowsEndpointLifecycleMutations: Bool {
+        baseURL != nil && isConnected
+    }
+
     public var canRefresh: Bool {
         snapshotClient != nil
     }
@@ -134,6 +147,13 @@ public final class BrokerStore: ObservableObject {
         return "资源数据已过期或尚未就绪，不能执行资源变更。请先刷新到最新状态。"
     }
 
+    public var endpointLifecycleMutationUnavailableReason: String {
+        if baseURL == nil {
+            return "当前为只读测试夹具或尚未连接本机服务，不能移除服务器。"
+        }
+        return "本机服务连接已中断，暂时不能移除服务器。请先刷新重试。"
+    }
+
     public func connect(to baseURL: URL, serviceInfo: ServiceInfo) {
         self.baseURL = baseURL
         configureSnapshotClient(
@@ -146,9 +166,10 @@ public final class BrokerStore: ObservableObject {
     public func connectForTesting(
         snapshotClient: BrokerSnapshotClient,
         serviceInfo: ServiceInfo = .fixture,
+        baseURL: URL? = nil,
         startPeriodicRefresh: Bool = false
     ) {
-        baseURL = nil
+        self.baseURL = baseURL
         configureSnapshotClient(
             snapshotClient,
             serviceInfo: serviceInfo,
@@ -275,8 +296,8 @@ public final class BrokerStore: ObservableObject {
     }
 
     public func deleteEndpoint(_ endpoint: EndpointRecord, completion: @escaping @MainActor @Sendable (Bool, String?) -> Void) {
-        guard allowsMutations else {
-            let message = mutationUnavailableMessage
+        guard allowsEndpointLifecycleMutations else {
+            let message = endpointLifecycleMutationUnavailableReason
             errorMessage = message
             completion(false, message)
             return
@@ -287,17 +308,26 @@ public final class BrokerStore: ObservableObject {
             completion(false, message)
             return
         }
+        deletingEndpointIDs.insert(endpoint.id)
+        advanceEndpointLifecycle(endpoint, drainWasAccepted: false, completion: completion)
+    }
+
+    private func advanceEndpointLifecycle(
+        _ endpoint: EndpointRecord,
+        drainWasAccepted: Bool,
+        completion: @escaping @MainActor @Sendable (Bool, String?) -> Void
+    ) {
         guard let url = baseURL?
             .appendingPathComponent("api/v1/endpoints")
             .appendingPathComponent(endpoint.id)
         else {
+            deletingEndpointIDs.remove(endpoint.id)
             let message = "本机服务尚未连接。"
             errorMessage = message
             completion(false, message)
             return
         }
 
-        deletingEndpointIDs.insert(endpoint.id)
         var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         request.timeoutInterval = 10
@@ -322,18 +352,89 @@ public final class BrokerStore: ObservableObject {
                     return
                 }
                 guard (200..<300).contains(response.statusCode) else {
+                    if let code = Self.apiErrorCode(from: data), [
+                        "endpoint_already_retired",
+                        "endpoint_not_found"
+                    ].contains(code) {
+                        self.confirmEndpointRemovalAfterMutation(
+                            endpoint,
+                            expectedLifecycleState: "RETIRED"
+                        ) { success, message in
+                            self.deletingEndpointIDs.remove(endpoint.id)
+                            completion(success, message)
+                        }
+                        return
+                    }
                     self.deletingEndpointIDs.remove(endpoint.id)
-                    let message = "移除失败：\(self.apiErrorMessage(from: data) ?? "服务拒绝了此操作。")"
+                    let reason = self.apiErrorMessage(from: data) ?? "服务拒绝了此操作。"
+                    let message = drainWasAccepted
+                        ? "服务器已进入排空，但尚未完成退役：\(reason)"
+                        : "移除失败：\(reason)"
+                    if drainWasAccepted {
+                        self.notice = "\(endpoint.displayName) 已停止接收新分配。"
+                        self.requestRefresh()
+                    }
                     self.errorMessage = message
                     completion(false, message)
                     return
                 }
-                self.confirmEndpointRemovalAfterMutation(endpoint) { success, message in
+                guard let lifecycleState = Self.endpointLifecycleState(from: data) else {
+                    self.deletingEndpointIDs.remove(endpoint.id)
+                    let message = "移除失败：本机服务返回了无法识别的服务器状态。"
+                    self.errorMessage = message
+                    completion(false, message)
+                    return
+                }
+                if lifecycleState == "DRAINING", !drainWasAccepted {
+                    self.raiseMinimumRequiredSnapshotRevision(from: data)
+                    self.advanceEndpointLifecycle(
+                        endpoint,
+                        drainWasAccepted: true,
+                        completion: completion
+                    )
+                    return
+                }
+                guard lifecycleState == "RETIRED" else {
+                    self.deletingEndpointIDs.remove(endpoint.id)
+                    let message = "移除失败：服务器停留在 \(lifecycleState) 状态。"
+                    self.errorMessage = message
+                    completion(false, message)
+                    return
+                }
+                self.raiseMinimumRequiredSnapshotRevision(from: data)
+                self.confirmEndpointRemovalAfterMutation(
+                    endpoint,
+                    expectedLifecycleState: lifecycleState
+                ) { success, message in
                     self.deletingEndpointIDs.remove(endpoint.id)
                     completion(success, message)
                 }
             }
         }.resume()
+    }
+
+    static func endpointLifecycleState(from data: Data?) -> String? {
+        guard
+            let data,
+            let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let endpoint = ((payload["data"] as? [String: Any])?["endpoint"] as? [String: Any])
+                ?? (payload["endpoint"] as? [String: Any]),
+            let lifecycleState = endpoint["lifecycle_state"] as? String
+        else {
+            return nil
+        }
+        return lifecycleState.uppercased()
+    }
+
+    static func apiErrorCode(from data: Data?) -> String? {
+        guard
+            let data,
+            let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let error = payload["error"] as? [String: Any]
+        else {
+            return nil
+        }
+        return error["code"] as? String
     }
 
     public func releaseLease(_ lease: LeaseRecord, completion: @escaping @MainActor @Sendable (Bool, String?) -> Void) {
@@ -389,6 +490,7 @@ public final class BrokerStore: ObservableObject {
                     completion(false, message)
                     return
                 }
+                self.raiseMinimumRequiredSnapshotRevision(from: data)
                 self.notice = "已释放租约 \(lease.id)。"
                 self.errorMessage = nil
                 self.reload()
@@ -490,20 +592,35 @@ public final class BrokerStore: ObservableObject {
         if shouldDiscard {
             discardedRefreshGeneration = nil
         } else {
+            let resolvedResult: Result<BrokerSnapshot, Error>
             switch result {
             case .success(let snapshot):
-                self.snapshot = snapshot
-                self.lastGoodSnapshot = snapshot
-                self.freshness = Self.freshness(for: snapshot)
-                self.isConnected = true
-                self.lastUpdated = dateProvider()
-                self.errorMessage = nil
+                if let revisionError = snapshotRevisionFloorError(for: snapshot) {
+                    self.isConnected = false
+                    self.freshness = lastGoodSnapshot == nil ? .failed : .stale
+                    self.errorMessage = "无法更新资源：\(revisionError.localizedDescription)"
+                    resolvedResult = .failure(revisionError)
+                } else {
+                    self.snapshot = snapshot
+                    self.lastGoodSnapshot = snapshot
+                    self.freshness = Self.freshness(for: snapshot)
+                    self.isConnected = true
+                    self.lastUpdated = dateProvider()
+                    self.errorMessage = nil
+                    if let requiredRevision = minimumRequiredSnapshotRevision,
+                       let snapshotRevision = snapshot.snapshotRevision,
+                       snapshotRevision >= requiredRevision {
+                        minimumRequiredSnapshotRevision = nil
+                    }
+                    resolvedResult = .success(snapshot)
+                }
             case .failure(let error):
                 self.isConnected = false
                 self.freshness = lastGoodSnapshot == nil ? .failed : .stale
                 self.errorMessage = "无法更新资源：\(error.localizedDescription)"
+                resolvedResult = .failure(error)
             }
-            resolvePendingEndpointRemovals(with: result)
+            resolvePendingEndpointRemovals(with: resolvedResult)
         }
         if pendingRefresh {
             pendingRefresh = false
@@ -616,9 +733,34 @@ public final class BrokerStore: ObservableObject {
                     return
                 }
                 let payload = self.apiPayload(from: data)
+                self.raiseMinimumRequiredSnapshotRevision(from: data)
                 completion(payload, nil)
             }
         }.resume()
+    }
+
+    func raiseMinimumRequiredSnapshotRevision(from data: Data?) {
+        guard let revision = Self.snapshotRevision(from: data) else { return }
+        if let minimumRequiredSnapshotRevision {
+            self.minimumRequiredSnapshotRevision = max(minimumRequiredSnapshotRevision, revision)
+        } else {
+            minimumRequiredSnapshotRevision = revision
+        }
+        if activeRefreshTask != nil {
+            discardedRefreshGeneration = refreshGeneration
+            pendingRefresh = true
+        }
+    }
+
+    private func snapshotRevisionFloorError(for snapshot: BrokerSnapshot) -> BrokerRefreshError? {
+        let required = max(
+            minimumRequiredSnapshotRevision ?? 0,
+            lastGoodSnapshot?.snapshotRevision ?? 0
+        )
+        guard let received = snapshot.snapshotRevision, received >= required else {
+            return .snapshotRevisionBehind(required: required, received: snapshot.snapshotRevision)
+        }
+        return nil
     }
 
     private func apiPayload(from data: Data?) -> [String: Any]? {
@@ -630,6 +772,17 @@ public final class BrokerStore: ObservableObject {
             return nil
         }
         return payload["data"] as? [String: Any] ?? payload
+    }
+
+    static func snapshotRevision(from data: Data?) -> Int? {
+        guard
+            let data,
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let payload = object as? [String: Any]
+        else {
+            return nil
+        }
+        return payload.optionalInt("snapshot_revision")
     }
 
     private func apiErrorMessage(from data: Data?) -> String? {
@@ -662,6 +815,8 @@ public final class BrokerStore: ObservableObject {
         switch code {
         case "endpoint_has_active_leases":
             return "这台服务器仍有正在使用的租约，请先到“租约”归还 GPU。"
+        case "endpoint_has_queued_requests":
+            return "仍有排队或待批准请求指定了这台服务器，请先取消或调整请求。"
         case "endpoint_has_lease_history":
             return "这台服务器已有租约历史，需要保留登记记录，不能直接删除。"
         case "endpoint_referenced_by_requests":
@@ -687,6 +842,7 @@ public final class BrokerStore: ObservableObject {
 
     func confirmEndpointRemovalAfterMutation(
         _ endpoint: EndpointRecord,
+        expectedLifecycleState: String,
         completion: @escaping @MainActor @Sendable (Bool, String?) -> Void
     ) {
         guard snapshotClient != nil else {
@@ -695,7 +851,14 @@ public final class BrokerStore: ObservableObject {
             completion(false, message)
             return
         }
-        pendingEndpointRemovals.append(PendingEndpointRemoval(endpoint: endpoint, completion: completion))
+            pendingEndpointRemovals.append(
+                PendingEndpointRemoval(
+                    endpointID: endpoint.id,
+                    endpointDisplayName: endpoint.displayName,
+                    expectedLifecycleState: expectedLifecycleState.uppercased(),
+                    completion: completion
+                )
+            )
         if activeRefreshTask != nil {
             discardedRefreshGeneration = refreshGeneration
             pendingRefresh = true
@@ -711,12 +874,18 @@ public final class BrokerStore: ObservableObject {
         switch result {
         case .success(let nextSnapshot):
             for confirmation in confirmations {
-                if nextSnapshot.endpoints.contains(where: { $0.id == confirmation.endpoint.id }) {
+                let nextEndpoint = nextSnapshot.endpoints.first {
+                    $0.id == confirmation.endpointID
+                }
+                let reachedExpectedState = nextEndpoint == nil
+                    || nextEndpoint?.lifecycleState == confirmation.expectedLifecycleState
+                    || nextEndpoint?.monitorStatus == confirmation.expectedLifecycleState
+                if !reachedExpectedState {
                     let message = "本机服务尚未确认移除。请刷新状态后再查看。"
                     errorMessage = message
                     confirmation.completion(false, message)
                 } else {
-                    notice = "已移除 \(confirmation.endpoint.displayName)。"
+                    notice = "已从服务器池移除 \(confirmation.endpointDisplayName)；审计历史仍保留。"
                     errorMessage = nil
                     confirmation.completion(true, nil)
                 }

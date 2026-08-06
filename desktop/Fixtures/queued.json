@@ -3,98 +3,115 @@
   "snapshot_revision": 205,
   "server_time": "2026-08-01T00:00:00Z",
   "data": {
-    "summary": {
-      "online_servers": 1,
-      "total_servers": 1,
-      "total_gpus": 1,
-      "available_gpus": 0,
-      "busy_gpus": 1,
-      "claimed_gpus": 0,
-      "abnormal_gpus": 0
-    },
-    "endpoints": [
-      {
-        "id": "fixture-queued",
-        "host": "127.0.0.1",
-        "port": 2236,
-        "ssh_user": "gpu",
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "storage_group": "fixture",
-        "expected_gpu_count": 1,
-        "expected_gpu_total_vram_mib": 81920,
-        "owner_project_id": null,
-        "lifecycle_state": "active",
-        "enabled": true,
-        "monitor": {
-          "status": "ONLINE"
-        },
-        "host_telemetry": {
-          "cpu_count": 64,
-          "load_1m": 7.0,
-          "memory_total_mib": 262144,
-          "memory_available_mib": 188743
+    "current": {
+      "summary": {
+        "online_servers": 1,
+        "total_servers": 1,
+        "total_gpus": 1,
+        "available_gpus": 0,
+        "busy_gpus": 1,
+        "claimed_gpus": 0,
+        "abnormal_gpus": 0
+      },
+      "endpoints": [
+        {
+          "id": "fixture-queued",
+          "host": "127.0.0.1",
+          "port": 2236,
+          "ssh_user": "gpu",
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "storage_group": "fixture",
+          "expected_gpu_count": 1,
+          "expected_gpu_total_vram_mib": 81920,
+          "owner_project_id": null,
+          "lifecycle_state": "active",
+          "enabled": true,
+          "monitor": {
+            "status": "ONLINE"
+          },
+          "host_telemetry": {
+            "cpu_count": 64,
+            "load_1m": 7.0,
+            "memory_total_mib": 262144,
+            "memory_available_mib": 188743
+          }
         }
-      }
-    ],
-    "gpus": [
-      {
-        "id": "fixture-queued:GPU-fixture-queued-00-UUID",
-        "endpoint_id": "fixture-queued",
-        "gpu_uuid": "GPU-fixture-queued-00-UUID",
-        "gpu_index": 0,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "OK",
-        "enabled": true,
-        "state": "RESERVED",
-        "telemetry": {
-          "memory_used_mib": 1024,
-          "gpu_utilization_pct": 4,
-          "temperature_c": 34
-        },
-        "processes": [],
-        "state_reason": "reservation reservation-fixture-queued is active"
-      }
-    ],
-    "leases": [],
-    "requests": [
-      {
-        "id": "request-fixture-queued",
-        "actor_id": "fixture",
-        "project_id": "fixture-project",
-        "task_ref": "queued",
-        "purpose": "fixture",
-        "state": "QUEUED",
-        "constraints": {
-          "gpu_count": 2
-        },
-        "blocked_reason": "reservation reservation-fixture-queued is active",
-        "created_at": "2026-08-01T00:30:00Z"
-      }
-    ],
-    "reservations": [
-      {
-        "id": "reservation-fixture-queued",
-        "project_id": "fixture-project",
-        "actor_id": "fixture",
-        "gpu_ids": [
-          "fixture-queued:GPU-fixture-queued-00-UUID"
-        ],
-        "starts_at": "2026-08-01T00:00:00Z",
-        "ends_at": "2026-08-01T04:00:00Z",
-        "state": "ACTIVE",
-        "purpose": "reserved fixture"
-      }
-    ],
-    "data_age_seconds": 5,
-    "freshness_seconds": 30,
-    "admission_boundary": "Fixture: allocation only."
+      ],
+      "gpus": [
+        {
+          "id": "fixture-queued:GPU-fixture-queued-00-UUID",
+          "endpoint_id": "fixture-queued",
+          "gpu_uuid": "GPU-fixture-queued-00-UUID",
+          "gpu_index": 0,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "RESERVED",
+          "telemetry": {
+            "memory_used_mib": 1024,
+            "gpu_utilization_pct": 4,
+            "temperature_c": 34
+          },
+          "processes": [],
+          "state_reason": "reservation reservation-fixture-queued is active"
+        }
+      ],
+      "leases": [],
+      "requests": [
+        {
+          "id": "request-fixture-queued",
+          "actor_id": "fixture",
+          "project_id": "fixture-project",
+          "task_ref": "queued",
+          "purpose": "fixture",
+          "state": "QUEUED",
+          "constraints": {
+            "gpu_count": 2
+          },
+          "blocked_reason": "reservation reservation-fixture-queued is active",
+          "created_at": "2026-08-01T00:30:00Z"
+        }
+      ],
+      "reservations": [
+        {
+          "id": "reservation-fixture-queued",
+          "project_id": "fixture-project",
+          "actor_id": "fixture",
+          "gpu_ids": [
+            "fixture-queued:GPU-fixture-queued-00-UUID"
+          ],
+          "starts_at": "2026-08-01T00:00:00Z",
+          "ends_at": "2026-08-01T04:00:00Z",
+          "state": "ACTIVE",
+          "purpose": "reserved fixture"
+        }
+      ],
+      "data_age_seconds": 5,
+      "freshness_seconds": 30,
+      "admission_boundary": "Fixture: allocation only.",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "resource_providers": [],
+      "allocatable_units": [],
+      "resource_claims": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
+    },
+    "history": {
+      "retired_endpoints": [],
+      "resource_plan_evaluations": [],
+      "resource_run_actuals": []
+    }
   }
 }

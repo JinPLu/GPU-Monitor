@@ -3,520 +3,537 @@
   "snapshot_revision": 204,
   "server_time": "2026-08-01T00:00:00Z",
   "data": {
-    "summary": {
-      "online_servers": 0,
-      "total_servers": 4,
-      "total_gpus": 15,
-      "available_gpus": 1,
-      "busy_gpus": 4,
-      "claimed_gpus": 5,
-      "abnormal_gpus": 9
+    "current": {
+      "summary": {
+        "online_servers": 0,
+        "total_servers": 4,
+        "total_gpus": 15,
+        "available_gpus": 1,
+        "busy_gpus": 4,
+        "claimed_gpus": 5,
+        "abnormal_gpus": 9
+      },
+      "endpoints": [
+        {
+          "id": "fixture-maintenance",
+          "host": "127.0.0.1",
+          "port": 2233,
+          "ssh_user": "gpu",
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "storage_group": "fixture",
+          "expected_gpu_count": 7,
+          "expected_gpu_total_vram_mib": 573440,
+          "owner_project_id": null,
+          "lifecycle_state": "active",
+          "enabled": false,
+          "monitor": {
+            "status": "DISABLED"
+          },
+          "host_telemetry": {
+            "cpu_count": 32,
+            "load_1m": 7.0,
+            "memory_total_mib": 131072,
+            "memory_available_mib": 94371
+          }
+        },
+        {
+          "id": "fixture-pending",
+          "host": "127.0.0.1",
+          "port": 2234,
+          "ssh_user": "gpu",
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "storage_group": "fixture",
+          "expected_gpu_count": 5,
+          "expected_gpu_total_vram_mib": 409600,
+          "owner_project_id": null,
+          "lifecycle_state": "active",
+          "enabled": true,
+          "monitor": {
+            "status": "PENDING"
+          },
+          "host_telemetry": {
+            "cpu_count": 32,
+            "load_1m": 7.0,
+            "memory_total_mib": 131072,
+            "memory_available_mib": 94371
+          }
+        },
+        {
+          "id": "fixture-draining",
+          "host": "127.0.0.1",
+          "port": 2235,
+          "ssh_user": "gpu",
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "storage_group": "fixture",
+          "expected_gpu_count": 2,
+          "expected_gpu_total_vram_mib": 163840,
+          "owner_project_id": null,
+          "lifecycle_state": "draining",
+          "enabled": true,
+          "monitor": {
+            "status": "DRAINING"
+          },
+          "host_telemetry": {
+            "cpu_count": 32,
+            "load_1m": 7.0,
+            "memory_total_mib": 131072,
+            "memory_available_mib": 94371
+          }
+        },
+        {
+          "id": "fixture-retired",
+          "host": "127.0.0.1",
+          "port": 2236,
+          "ssh_user": "gpu",
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "storage_group": "fixture",
+          "expected_gpu_count": 1,
+          "expected_gpu_total_vram_mib": 81920,
+          "owner_project_id": null,
+          "lifecycle_state": "retired",
+          "enabled": true,
+          "monitor": {
+            "status": "RETIRED"
+          },
+          "host_telemetry": {
+            "cpu_count": 32,
+            "load_1m": 7.0,
+            "memory_total_mib": 131072,
+            "memory_available_mib": 94371
+          }
+        }
+      ],
+      "gpus": [
+        {
+          "id": "fixture-maintenance:GPU-fixture-maintenance-00-AVAILABLE",
+          "endpoint_id": "fixture-maintenance",
+          "gpu_uuid": "GPU-fixture-maintenance-00-AVAILABLE",
+          "gpu_index": 0,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "AVAILABLE",
+          "telemetry": {
+            "memory_used_mib": 2048,
+            "gpu_utilization_pct": 6,
+            "temperature_c": 35
+          },
+          "processes": []
+        },
+        {
+          "id": "fixture-maintenance:GPU-fixture-maintenance-01-HELD",
+          "endpoint_id": "fixture-maintenance",
+          "gpu_uuid": "GPU-fixture-maintenance-01-HELD",
+          "gpu_index": 1,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "HELD",
+          "telemetry": {
+            "memory_used_mib": 2560,
+            "gpu_utilization_pct": 11,
+            "temperature_c": 36
+          },
+          "processes": [],
+          "state_reason": "exclusive lease active",
+          "lease": {
+            "actor_id": "fixture",
+            "task_ref": "held"
+          }
+        },
+        {
+          "id": "fixture-maintenance:GPU-fixture-maintenance-02-LEASED_IDLE",
+          "endpoint_id": "fixture-maintenance",
+          "gpu_uuid": "GPU-fixture-maintenance-02-LEASED_IDLE",
+          "gpu_index": 2,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "LEASED_IDLE",
+          "telemetry": {
+            "memory_used_mib": 3072,
+            "gpu_utilization_pct": 16,
+            "temperature_c": 37
+          },
+          "processes": [],
+          "state_reason": "exclusive lease active",
+          "lease": {
+            "actor_id": "fixture",
+            "task_ref": "idle"
+          }
+        },
+        {
+          "id": "fixture-maintenance:GPU-fixture-maintenance-03-RUNNING_MANAGED",
+          "endpoint_id": "fixture-maintenance",
+          "gpu_uuid": "GPU-fixture-maintenance-03-RUNNING_MANAGED",
+          "gpu_index": 3,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "RUNNING_MANAGED",
+          "telemetry": {
+            "memory_used_mib": 3584,
+            "gpu_utilization_pct": 21,
+            "temperature_c": 38
+          },
+          "processes": [
+            {
+              "pid": 4401,
+              "name": "python",
+              "owner": "fixture"
+            }
+          ],
+          "state_reason": "bound workload process observed",
+          "lease": {
+            "actor_id": "fixture",
+            "task_ref": "managed"
+          }
+        },
+        {
+          "id": "fixture-maintenance:GPU-fixture-maintenance-04-BUSY_UNMANAGED",
+          "endpoint_id": "fixture-maintenance",
+          "gpu_uuid": "GPU-fixture-maintenance-04-BUSY_UNMANAGED",
+          "gpu_index": 4,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "BUSY_UNMANAGED",
+          "telemetry": {
+            "memory_used_mib": 4096,
+            "gpu_utilization_pct": 26,
+            "temperature_c": 39
+          },
+          "processes": [
+            {
+              "pid": 4402,
+              "name": "python",
+              "owner": "unknown"
+            }
+          ],
+          "state_reason": "compute process observed; admission blocked"
+        },
+        {
+          "id": "fixture-maintenance:GPU-fixture-maintenance-05-RESERVED",
+          "endpoint_id": "fixture-maintenance",
+          "gpu_uuid": "GPU-fixture-maintenance-05-RESERVED",
+          "gpu_index": 5,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "OK",
+          "enabled": true,
+          "state": "RESERVED",
+          "telemetry": {
+            "memory_used_mib": 4608,
+            "gpu_utilization_pct": 31,
+            "temperature_c": 40
+          },
+          "processes": [],
+          "state_reason": "reservation fixture-state is active"
+        },
+        {
+          "id": "fixture-maintenance:GPU-fixture-maintenance-06-MAINTENANCE",
+          "endpoint_id": "fixture-maintenance",
+          "gpu_uuid": "GPU-fixture-maintenance-06-MAINTENANCE",
+          "gpu_index": 6,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "MAINTENANCE",
+          "telemetry": {
+            "memory_used_mib": 5120,
+            "gpu_utilization_pct": 36,
+            "temperature_c": 41
+          },
+          "processes": [],
+          "state_reason": "maintenance window"
+        },
+        {
+          "id": "fixture-pending:GPU-fixture-pending-00-UNKNOWN_RECOVERING",
+          "endpoint_id": "fixture-pending",
+          "gpu_uuid": "GPU-fixture-pending-00-UNKNOWN_RECOVERING",
+          "gpu_index": 0,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "UNKNOWN_RECOVERING",
+          "telemetry": {
+            "memory_used_mib": 2048,
+            "gpu_utilization_pct": 6,
+            "temperature_c": 35
+          },
+          "processes": [],
+          "state_reason": "no fresh telemetry after service start"
+        },
+        {
+          "id": "fixture-pending:GPU-fixture-pending-01-UNKNOWN_STALE",
+          "endpoint_id": "fixture-pending",
+          "gpu_uuid": "GPU-fixture-pending-01-UNKNOWN_STALE",
+          "gpu_index": 1,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "UNKNOWN_STALE",
+          "telemetry": {
+            "memory_used_mib": 2560,
+            "gpu_utilization_pct": 11,
+            "temperature_c": 36
+          },
+          "processes": [],
+          "state_reason": "telemetry age 94 exceeds stale threshold"
+        },
+        {
+          "id": "fixture-pending:GPU-fixture-pending-02-UNHEALTHY",
+          "endpoint_id": "fixture-pending",
+          "gpu_uuid": "GPU-fixture-pending-02-UNHEALTHY",
+          "gpu_index": 2,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "UNHEALTHY",
+          "telemetry": {
+            "memory_used_mib": 3072,
+            "gpu_utilization_pct": 16,
+            "temperature_c": 37
+          },
+          "processes": [],
+          "state_reason": "health probe failed"
+        },
+        {
+          "id": "fixture-pending:GPU-fixture-pending-03-CONFLICT",
+          "endpoint_id": "fixture-pending",
+          "gpu_uuid": "GPU-fixture-pending-03-CONFLICT",
+          "gpu_index": 3,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "CONFLICT",
+          "telemetry": {
+            "memory_used_mib": 3584,
+            "gpu_utilization_pct": 21,
+            "temperature_c": 38
+          },
+          "processes": [
+            {
+              "pid": 4403,
+              "name": "python",
+              "owner": "other"
+            }
+          ],
+          "state_reason": "lease/process attribution conflict",
+          "lease": {
+            "actor_id": "fixture",
+            "task_ref": "conflict"
+          }
+        },
+        {
+          "id": "fixture-pending:GPU-fixture-pending-04-ORPHANED_BUSY",
+          "endpoint_id": "fixture-pending",
+          "gpu_uuid": "GPU-fixture-pending-04-ORPHANED_BUSY",
+          "gpu_index": 4,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "ORPHANED_BUSY",
+          "telemetry": {
+            "memory_used_mib": 4096,
+            "gpu_utilization_pct": 26,
+            "temperature_c": 39
+          },
+          "processes": [
+            {
+              "pid": 4404,
+              "name": "python",
+              "owner": "fixture"
+            }
+          ],
+          "state_reason": "lease expired while a compute process remains"
+        },
+        {
+          "id": "fixture-draining:GPU-fixture-draining-00-DISABLED",
+          "endpoint_id": "fixture-draining",
+          "gpu_uuid": "GPU-fixture-draining-00-DISABLED",
+          "gpu_index": 0,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": false,
+          "state": "DISABLED",
+          "telemetry": {
+            "memory_used_mib": 2048,
+            "gpu_utilization_pct": 6,
+            "temperature_c": 35
+          },
+          "processes": [],
+          "state_reason": "endpoint or GPU is disabled"
+        },
+        {
+          "id": "fixture-draining:GPU-fixture-draining-01-DRAINING",
+          "endpoint_id": "fixture-draining",
+          "gpu_uuid": "GPU-fixture-draining-01-DRAINING",
+          "gpu_index": 1,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "DRAINING",
+          "telemetry": {
+            "memory_used_mib": 2560,
+            "gpu_utilization_pct": 11,
+            "temperature_c": 36
+          },
+          "processes": [],
+          "state_reason": "endpoint draining"
+        },
+        {
+          "id": "fixture-retired:GPU-fixture-retired-00-RETIRED",
+          "endpoint_id": "fixture-retired",
+          "gpu_uuid": "GPU-fixture-retired-00-RETIRED",
+          "gpu_index": 0,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": false,
+          "state": "RETIRED",
+          "telemetry": {
+            "memory_used_mib": 2048,
+            "gpu_utilization_pct": 6,
+            "temperature_c": 35
+          },
+          "processes": [],
+          "state_reason": "endpoint retired"
+        }
+      ],
+      "leases": [
+        {
+          "id": "lease-maintenance-held",
+          "actor_id": "fixture",
+          "project_id": "fixture-project",
+          "state": "HELD",
+          "gpu_ids": [
+            "fixture-maintenance:GPU-fixture-maintenance-01-HELD",
+            "fixture-maintenance:GPU-fixture-maintenance-02-LEASED_IDLE",
+            "fixture-maintenance:GPU-fixture-maintenance-03-RUNNING_MANAGED"
+          ],
+          "task_ref": "state-matrix",
+          "purpose": "fixture"
+        }
+      ],
+      "requests": [],
+      "reservations": [
+        {
+          "id": "reservation-fixture-state",
+          "project_id": "fixture-project",
+          "actor_id": "fixture",
+          "gpu_ids": [
+            "fixture-maintenance:GPU-fixture-maintenance-05-RESERVED"
+          ],
+          "starts_at": "2026-08-01T00:00:00Z",
+          "ends_at": "2026-08-01T05:00:00Z",
+          "state": "ACTIVE",
+          "purpose": "state matrix"
+        }
+      ],
+      "data_age_seconds": 6,
+      "freshness_seconds": 30,
+      "admission_boundary": "Fixture: allocation only.",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "resource_providers": [],
+      "allocatable_units": [],
+      "resource_claims": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
     },
-    "endpoints": [
-      {
-        "id": "fixture-maintenance",
-        "host": "127.0.0.1",
-        "port": 2233,
-        "ssh_user": "gpu",
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "storage_group": "fixture",
-        "expected_gpu_count": 7,
-        "expected_gpu_total_vram_mib": 573440,
-        "owner_project_id": null,
-        "lifecycle_state": "active",
-        "enabled": false,
-        "monitor": {
-          "status": "DISABLED"
-        },
-        "host_telemetry": {
-          "cpu_count": 32,
-          "load_1m": 7.0,
-          "memory_total_mib": 131072,
-          "memory_available_mib": 94371
-        }
-      },
-      {
-        "id": "fixture-pending",
-        "host": "127.0.0.1",
-        "port": 2234,
-        "ssh_user": "gpu",
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "storage_group": "fixture",
-        "expected_gpu_count": 5,
-        "expected_gpu_total_vram_mib": 409600,
-        "owner_project_id": null,
-        "lifecycle_state": "active",
-        "enabled": true,
-        "monitor": {
-          "status": "PENDING"
-        },
-        "host_telemetry": {
-          "cpu_count": 32,
-          "load_1m": 7.0,
-          "memory_total_mib": 131072,
-          "memory_available_mib": 94371
-        }
-      },
-      {
-        "id": "fixture-draining",
-        "host": "127.0.0.1",
-        "port": 2235,
-        "ssh_user": "gpu",
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "storage_group": "fixture",
-        "expected_gpu_count": 2,
-        "expected_gpu_total_vram_mib": 163840,
-        "owner_project_id": null,
-        "lifecycle_state": "draining",
-        "enabled": true,
-        "monitor": {
-          "status": "DRAINING"
-        },
-        "host_telemetry": {
-          "cpu_count": 32,
-          "load_1m": 7.0,
-          "memory_total_mib": 131072,
-          "memory_available_mib": 94371
-        }
-      },
-      {
-        "id": "fixture-retired",
-        "host": "127.0.0.1",
-        "port": 2236,
-        "ssh_user": "gpu",
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "storage_group": "fixture",
-        "expected_gpu_count": 1,
-        "expected_gpu_total_vram_mib": 81920,
-        "owner_project_id": null,
-        "lifecycle_state": "retired",
-        "enabled": true,
-        "monitor": {
-          "status": "RETIRED"
-        },
-        "host_telemetry": {
-          "cpu_count": 32,
-          "load_1m": 7.0,
-          "memory_total_mib": 131072,
-          "memory_available_mib": 94371
-        }
-      }
-    ],
-    "gpus": [
-      {
-        "id": "fixture-maintenance:GPU-fixture-maintenance-00-AVAILABLE",
-        "endpoint_id": "fixture-maintenance",
-        "gpu_uuid": "GPU-fixture-maintenance-00-AVAILABLE",
-        "gpu_index": 0,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "OK",
-        "enabled": true,
-        "state": "AVAILABLE",
-        "telemetry": {
-          "memory_used_mib": 2048,
-          "gpu_utilization_pct": 6,
-          "temperature_c": 35
-        },
-        "processes": []
-      },
-      {
-        "id": "fixture-maintenance:GPU-fixture-maintenance-01-HELD",
-        "endpoint_id": "fixture-maintenance",
-        "gpu_uuid": "GPU-fixture-maintenance-01-HELD",
-        "gpu_index": 1,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "OK",
-        "enabled": true,
-        "state": "HELD",
-        "telemetry": {
-          "memory_used_mib": 2560,
-          "gpu_utilization_pct": 11,
-          "temperature_c": 36
-        },
-        "processes": [],
-        "state_reason": "exclusive lease active",
-        "lease": {
-          "actor_id": "fixture",
-          "task_ref": "held"
-        }
-      },
-      {
-        "id": "fixture-maintenance:GPU-fixture-maintenance-02-LEASED_IDLE",
-        "endpoint_id": "fixture-maintenance",
-        "gpu_uuid": "GPU-fixture-maintenance-02-LEASED_IDLE",
-        "gpu_index": 2,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "OK",
-        "enabled": true,
-        "state": "LEASED_IDLE",
-        "telemetry": {
-          "memory_used_mib": 3072,
-          "gpu_utilization_pct": 16,
-          "temperature_c": 37
-        },
-        "processes": [],
-        "state_reason": "exclusive lease active",
-        "lease": {
-          "actor_id": "fixture",
-          "task_ref": "idle"
-        }
-      },
-      {
-        "id": "fixture-maintenance:GPU-fixture-maintenance-03-RUNNING_MANAGED",
-        "endpoint_id": "fixture-maintenance",
-        "gpu_uuid": "GPU-fixture-maintenance-03-RUNNING_MANAGED",
-        "gpu_index": 3,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "OK",
-        "enabled": true,
-        "state": "RUNNING_MANAGED",
-        "telemetry": {
-          "memory_used_mib": 3584,
-          "gpu_utilization_pct": 21,
-          "temperature_c": 38
-        },
-        "processes": [
-          {
-            "pid": 4401,
-            "name": "python",
-            "owner": "fixture"
-          }
-        ],
-        "state_reason": "bound workload process observed",
-        "lease": {
-          "actor_id": "fixture",
-          "task_ref": "managed"
-        }
-      },
-      {
-        "id": "fixture-maintenance:GPU-fixture-maintenance-04-BUSY_UNMANAGED",
-        "endpoint_id": "fixture-maintenance",
-        "gpu_uuid": "GPU-fixture-maintenance-04-BUSY_UNMANAGED",
-        "gpu_index": 4,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "BUSY_UNMANAGED",
-        "telemetry": {
-          "memory_used_mib": 4096,
-          "gpu_utilization_pct": 26,
-          "temperature_c": 39
-        },
-        "processes": [
-          {
-            "pid": 4402,
-            "name": "python",
-            "owner": "unknown"
-          }
-        ],
-        "state_reason": "compute process observed; admission blocked"
-      },
-      {
-        "id": "fixture-maintenance:GPU-fixture-maintenance-05-RESERVED",
-        "endpoint_id": "fixture-maintenance",
-        "gpu_uuid": "GPU-fixture-maintenance-05-RESERVED",
-        "gpu_index": 5,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "OK",
-        "enabled": true,
-        "state": "RESERVED",
-        "telemetry": {
-          "memory_used_mib": 4608,
-          "gpu_utilization_pct": 31,
-          "temperature_c": 40
-        },
-        "processes": [],
-        "state_reason": "reservation fixture-state is active"
-      },
-      {
-        "id": "fixture-maintenance:GPU-fixture-maintenance-06-MAINTENANCE",
-        "endpoint_id": "fixture-maintenance",
-        "gpu_uuid": "GPU-fixture-maintenance-06-MAINTENANCE",
-        "gpu_index": 6,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "MAINTENANCE",
-        "telemetry": {
-          "memory_used_mib": 5120,
-          "gpu_utilization_pct": 36,
-          "temperature_c": 41
-        },
-        "processes": [],
-        "state_reason": "maintenance window"
-      },
-      {
-        "id": "fixture-pending:GPU-fixture-pending-00-UNKNOWN_RECOVERING",
-        "endpoint_id": "fixture-pending",
-        "gpu_uuid": "GPU-fixture-pending-00-UNKNOWN_RECOVERING",
-        "gpu_index": 0,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "UNKNOWN_RECOVERING",
-        "telemetry": {
-          "memory_used_mib": 2048,
-          "gpu_utilization_pct": 6,
-          "temperature_c": 35
-        },
-        "processes": [],
-        "state_reason": "no fresh telemetry after service start"
-      },
-      {
-        "id": "fixture-pending:GPU-fixture-pending-01-UNKNOWN_STALE",
-        "endpoint_id": "fixture-pending",
-        "gpu_uuid": "GPU-fixture-pending-01-UNKNOWN_STALE",
-        "gpu_index": 1,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "UNKNOWN_STALE",
-        "telemetry": {
-          "memory_used_mib": 2560,
-          "gpu_utilization_pct": 11,
-          "temperature_c": 36
-        },
-        "processes": [],
-        "state_reason": "telemetry age 94 exceeds stale threshold"
-      },
-      {
-        "id": "fixture-pending:GPU-fixture-pending-02-UNHEALTHY",
-        "endpoint_id": "fixture-pending",
-        "gpu_uuid": "GPU-fixture-pending-02-UNHEALTHY",
-        "gpu_index": 2,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "UNHEALTHY",
-        "telemetry": {
-          "memory_used_mib": 3072,
-          "gpu_utilization_pct": 16,
-          "temperature_c": 37
-        },
-        "processes": [],
-        "state_reason": "health probe failed"
-      },
-      {
-        "id": "fixture-pending:GPU-fixture-pending-03-CONFLICT",
-        "endpoint_id": "fixture-pending",
-        "gpu_uuid": "GPU-fixture-pending-03-CONFLICT",
-        "gpu_index": 3,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "CONFLICT",
-        "telemetry": {
-          "memory_used_mib": 3584,
-          "gpu_utilization_pct": 21,
-          "temperature_c": 38
-        },
-        "processes": [
-          {
-            "pid": 4403,
-            "name": "python",
-            "owner": "other"
-          }
-        ],
-        "state_reason": "lease/process attribution conflict",
-        "lease": {
-          "actor_id": "fixture",
-          "task_ref": "conflict"
-        }
-      },
-      {
-        "id": "fixture-pending:GPU-fixture-pending-04-ORPHANED_BUSY",
-        "endpoint_id": "fixture-pending",
-        "gpu_uuid": "GPU-fixture-pending-04-ORPHANED_BUSY",
-        "gpu_index": 4,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "ORPHANED_BUSY",
-        "telemetry": {
-          "memory_used_mib": 4096,
-          "gpu_utilization_pct": 26,
-          "temperature_c": 39
-        },
-        "processes": [
-          {
-            "pid": 4404,
-            "name": "python",
-            "owner": "fixture"
-          }
-        ],
-        "state_reason": "lease expired while a compute process remains"
-      },
-      {
-        "id": "fixture-draining:GPU-fixture-draining-00-DISABLED",
-        "endpoint_id": "fixture-draining",
-        "gpu_uuid": "GPU-fixture-draining-00-DISABLED",
-        "gpu_index": 0,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": false,
-        "state": "DISABLED",
-        "telemetry": {
-          "memory_used_mib": 2048,
-          "gpu_utilization_pct": 6,
-          "temperature_c": 35
-        },
-        "processes": [],
-        "state_reason": "endpoint or GPU is disabled"
-      },
-      {
-        "id": "fixture-draining:GPU-fixture-draining-01-DRAINING",
-        "endpoint_id": "fixture-draining",
-        "gpu_uuid": "GPU-fixture-draining-01-DRAINING",
-        "gpu_index": 1,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "DRAINING",
-        "telemetry": {
-          "memory_used_mib": 2560,
-          "gpu_utilization_pct": 11,
-          "temperature_c": 36
-        },
-        "processes": [],
-        "state_reason": "endpoint draining"
-      },
-      {
-        "id": "fixture-retired:GPU-fixture-retired-00-RETIRED",
-        "endpoint_id": "fixture-retired",
-        "gpu_uuid": "GPU-fixture-retired-00-RETIRED",
-        "gpu_index": 0,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": false,
-        "state": "RETIRED",
-        "telemetry": {
-          "memory_used_mib": 2048,
-          "gpu_utilization_pct": 6,
-          "temperature_c": 35
-        },
-        "processes": [],
-        "state_reason": "endpoint retired"
-      }
-    ],
-    "leases": [
-      {
-        "id": "lease-maintenance-held",
-        "actor_id": "fixture",
-        "project_id": "fixture-project",
-        "state": "HELD",
-        "gpu_ids": [
-          "fixture-maintenance:GPU-fixture-maintenance-01-HELD",
-          "fixture-maintenance:GPU-fixture-maintenance-02-LEASED_IDLE",
-          "fixture-maintenance:GPU-fixture-maintenance-03-RUNNING_MANAGED"
-        ],
-        "task_ref": "state-matrix",
-        "purpose": "fixture"
-      }
-    ],
-    "requests": [],
-    "reservations": [
-      {
-        "id": "reservation-fixture-state",
-        "project_id": "fixture-project",
-        "actor_id": "fixture",
-        "gpu_ids": [
-          "fixture-maintenance:GPU-fixture-maintenance-05-RESERVED"
-        ],
-        "starts_at": "2026-08-01T00:00:00Z",
-        "ends_at": "2026-08-01T05:00:00Z",
-        "state": "ACTIVE",
-        "purpose": "state matrix"
-      }
-    ],
-    "data_age_seconds": 6,
-    "freshness_seconds": 30,
-    "admission_boundary": "Fixture: allocation only."
+    "history": {
+      "retired_endpoints": [],
+      "resource_plan_evaluations": [],
+      "resource_run_actuals": []
+    }
   }
 }

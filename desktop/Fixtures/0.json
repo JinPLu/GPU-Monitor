@@ -3,22 +3,39 @@
   "snapshot_revision": 100,
   "server_time": "2026-08-01T00:00:00Z",
   "data": {
-    "summary": {
-      "online_servers": 0,
-      "total_servers": 0,
-      "total_gpus": 0,
-      "available_gpus": 0,
-      "busy_gpus": 0,
-      "claimed_gpus": 0,
-      "abnormal_gpus": 0
+    "current": {
+      "summary": {
+        "online_servers": 0,
+        "total_servers": 0,
+        "total_gpus": 0,
+        "available_gpus": 0,
+        "busy_gpus": 0,
+        "claimed_gpus": 0,
+        "abnormal_gpus": 0
+      },
+      "endpoints": [],
+      "gpus": [],
+      "leases": [],
+      "requests": [],
+      "data_age_seconds": 1,
+      "reservations": [],
+      "freshness_seconds": 30,
+      "admission_boundary": "Fixture: allocation only.",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "resource_providers": [],
+      "allocatable_units": [],
+      "resource_claims": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
     },
-    "endpoints": [],
-    "gpus": [],
-    "leases": [],
-    "requests": [],
-    "data_age_seconds": 1,
-    "reservations": [],
-    "freshness_seconds": 30,
-    "admission_boundary": "Fixture: allocation only."
+    "history": {
+      "retired_endpoints": [],
+      "resource_plan_evaluations": [],
+      "resource_run_actuals": []
+    }
   }
 }

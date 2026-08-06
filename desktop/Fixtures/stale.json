@@ -3,71 +3,88 @@
   "snapshot_revision": 201,
   "server_time": "2026-08-01T00:00:00Z",
   "data": {
-    "summary": {
-      "online_servers": 0,
-      "total_servers": 1,
-      "total_gpus": 1,
-      "available_gpus": 0,
-      "busy_gpus": 0,
-      "claimed_gpus": 0,
-      "abnormal_gpus": 1
-    },
-    "endpoints": [
-      {
-        "id": "fixture-stale",
-        "host": "127.0.0.1",
-        "port": 2230,
-        "ssh_user": "gpu",
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "storage_group": "fixture",
-        "expected_gpu_count": 1,
-        "expected_gpu_total_vram_mib": 81920,
-        "owner_project_id": null,
-        "lifecycle_state": "active",
-        "enabled": true,
-        "monitor": {
-          "status": "STALE"
-        },
-        "host_telemetry": {
-          "cpu_count": 64,
-          "load_1m": 7.0,
-          "memory_total_mib": 262144,
-          "memory_available_mib": 188743
+    "current": {
+      "summary": {
+        "online_servers": 0,
+        "total_servers": 1,
+        "total_gpus": 1,
+        "available_gpus": 0,
+        "busy_gpus": 0,
+        "claimed_gpus": 0,
+        "abnormal_gpus": 1
+      },
+      "endpoints": [
+        {
+          "id": "fixture-stale",
+          "host": "127.0.0.1",
+          "port": 2230,
+          "ssh_user": "gpu",
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "storage_group": "fixture",
+          "expected_gpu_count": 1,
+          "expected_gpu_total_vram_mib": 81920,
+          "owner_project_id": null,
+          "lifecycle_state": "active",
+          "enabled": true,
+          "monitor": {
+            "status": "STALE"
+          },
+          "host_telemetry": {
+            "cpu_count": 64,
+            "load_1m": 7.0,
+            "memory_total_mib": 262144,
+            "memory_available_mib": 188743
+          }
         }
-      }
-    ],
-    "gpus": [
-      {
-        "id": "fixture-stale:GPU-fixture-stale-00-UUID",
-        "endpoint_id": "fixture-stale",
-        "gpu_uuid": "GPU-fixture-stale-00-UUID",
-        "gpu_index": 0,
-        "name": "Fixture GPU",
-        "total_vram_mib": 81920,
-        "labels": {
-          "fixture": "true",
-          "surface": "desktop-ui"
-        },
-        "health": "ATTENTION",
-        "enabled": true,
-        "state": "UNKNOWN_STALE",
-        "telemetry": {
-          "memory_used_mib": 1024,
-          "gpu_utilization_pct": 4,
-          "temperature_c": 34
-        },
-        "processes": [],
-        "state_reason": "telemetry age 94 exceeds stale threshold"
-      }
-    ],
-    "leases": [],
-    "requests": [],
-    "data_age_seconds": 94,
-    "freshness_seconds": 30,
-    "reservations": [],
-    "admission_boundary": "Fixture: allocation only."
+      ],
+      "gpus": [
+        {
+          "id": "fixture-stale:GPU-fixture-stale-00-UUID",
+          "endpoint_id": "fixture-stale",
+          "gpu_uuid": "GPU-fixture-stale-00-UUID",
+          "gpu_index": 0,
+          "name": "Fixture GPU",
+          "total_vram_mib": 81920,
+          "labels": {
+            "fixture": "true",
+            "surface": "desktop-ui"
+          },
+          "health": "ATTENTION",
+          "enabled": true,
+          "state": "UNKNOWN_STALE",
+          "telemetry": {
+            "memory_used_mib": 1024,
+            "gpu_utilization_pct": 4,
+            "temperature_c": 34
+          },
+          "processes": [],
+          "state_reason": "telemetry age 94 exceeds stale threshold"
+        }
+      ],
+      "leases": [],
+      "requests": [],
+      "data_age_seconds": 94,
+      "freshness_seconds": 30,
+      "reservations": [],
+      "admission_boundary": "Fixture: allocation only.",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "resource_providers": [],
+      "allocatable_units": [],
+      "resource_claims": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
+    },
+    "history": {
+      "retired_endpoints": [],
+      "resource_plan_evaluations": [],
+      "resource_run_actuals": []
+    }
   }
 }

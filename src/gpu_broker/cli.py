@@ -278,7 +278,39 @@ def status(
     url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None,
     actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None,
 ) -> None:
-    _print(_call(lambda: _client(url, actor).get("/api/v1/snapshot")), as_json)
+    _print(_call(lambda: _client(url, actor).snapshot()), as_json)
+
+
+@app.command("state")
+def state(
+    minimum_snapshot_revision: Annotated[
+        int | None,
+        typer.Option("--minimum-snapshot-revision", min=0, help="Wait for at least this revision."),
+    ] = None,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option("--timeout-seconds", min=0, max=300),
+    ] = 0,
+    poll_interval_seconds: Annotated[
+        float,
+        typer.Option("--poll-interval-seconds", min=0.05, max=10),
+    ] = 0.25,
+    as_json: Annotated[bool, typer.Option("--json", help="Machine-readable JSON")] = True,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    """Return the canonical control-plane state envelope."""
+
+    _print(
+        _call(
+            lambda: _client(url, actor).control_plane_state(
+                minimum_snapshot_revision=minimum_snapshot_revision,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        ),
+        as_json,
+    )
 
 
 @endpoint_app.command("list")
@@ -287,7 +319,7 @@ def endpoint_list(
     url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None,
     actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None,
 ) -> None:
-    _print(_call(lambda: _client(url, actor).get("/api/v1/endpoints")), as_json)
+    _print(_call(lambda: _client(url, actor).endpoints()), as_json)
 
 
 @endpoint_app.command("delete")
@@ -317,7 +349,7 @@ def gpu_list(
     url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None,
     actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None,
 ) -> None:
-    _print(_call(lambda: _client(url, actor).get("/api/v1/gpus", params={"state": state} if state else None)), as_json)
+    _print(_call(lambda: _client(url, actor).gpus(state=state)), as_json)
 
 
 @app.command("who")
@@ -327,9 +359,7 @@ def who(
     url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None,
     actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None,
 ) -> None:
-    response = _call(lambda: _client(url, actor).get("/api/v1/leases"))
-    if project:
-        response["data"] = [lease for lease in response["data"] if lease["project_id"] == project]
+    response = _call(lambda: _client(url, actor).leases(project_id=project))
     _print(response, as_json)
 
 
@@ -369,8 +399,7 @@ def request_queue(
     url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None,
     actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None,
 ) -> None:
-    response = _call(lambda: _client(url, actor).get("/api/v1/requests"))
-    response["data"] = [item for item in response["data"] if item["state"] in {"QUEUED", "PENDING_APPROVAL"}]
+    response = _call(lambda: _client(url, actor).requests(queued_only=True))
     _print(response, as_json)
 
 
@@ -406,7 +435,7 @@ def lease_bind(lease_id: str, run_id: Annotated[str, typer.Option("--run-id")], 
 
 @reservation_app.command("list")
 def reservation_list(as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None) -> None:
-    _print(_call(lambda: _client(url, actor).get("/api/v1/reservations")), as_json)
+    _print(_call(lambda: _client(url, actor).reservations()), as_json)
 
 
 @reservation_app.command("create")

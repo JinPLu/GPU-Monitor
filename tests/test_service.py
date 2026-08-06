@@ -34,7 +34,7 @@ from gpu_broker.schemas import (
     WorkloadProfileClaim,
     WorkloadProfileUpsert,
 )
-from gpu_broker.service import ACTIVE_LEASE_STATES, BrokerError, BrokerService
+from gpu_broker.service import ACTIVE_LEASE_STATES, ActorContext, BrokerError, BrokerService
 from gpu_broker.timeutil import utcnow
 from tests.helpers import observation, process_for_gpu
 
@@ -591,6 +591,13 @@ def test_endpoint_delete_drains_then_retires_without_erasing_monitoring_state(se
     assert any(gpu["endpoint_id"] == "endpoint-a" for gpu in service.list_gpus(admin)["data"])
     assert any(event["action"] == "endpoint.draining" for event in service.list_events(admin)["data"])
     assert any(event["action"] == "endpoint.retired" for event in service.list_events(admin)["data"])
+    snapshot = service.snapshot(admin)["data"]
+    assert all(endpoint["id"] != "endpoint-a" for endpoint in snapshot["endpoints"])
+    assert all(gpu["endpoint_id"] != "endpoint-a" for gpu in snapshot["gpus"])
+    assert all(
+        provider["endpoint_id"] != "endpoint-a"
+        for provider in snapshot["resource_providers"]
+    )
 
     def deleted_rows(session):  # type: ignore[no-untyped-def]
         return (
@@ -611,6 +618,38 @@ def test_endpoint_delete_drains_then_retires_without_erasing_monitoring_state(se
     assert len(gpus) == 2
     assert len(provider_states) == 1
     assert len(alerts) == 1
+
+
+def test_endpoint_inventory_mutations_do_not_require_project_membership(service, admin) -> None:
+    desktop_actor = ActorContext(
+        id=admin.id,
+        role="allocator",
+        project_ids=frozenset(),
+    )
+    created = service.upsert_endpoint(
+        desktop_actor,
+        EndpointUpsert(
+            id="desktop-ownerless",
+            host="127.0.0.1",
+            port=2298,
+            ssh_user="gpu",
+        ),
+        idempotency_key="desktop-ownerless-create",
+    )
+
+    assert created["endpoint"]["owner_project_id"] is None
+    drained = service.delete_endpoint(
+        desktop_actor,
+        "endpoint-a",
+        idempotency_key="desktop-delete-without-project",
+    )
+    assert drained["endpoint"]["lifecycle_state"] == "draining"
+    retired = service.delete_endpoint(
+        desktop_actor,
+        "endpoint-a",
+        idempotency_key="desktop-retire-without-project",
+    )
+    assert retired["endpoint"]["lifecycle_state"] == "retired"
 
 
 def test_endpoint_delete_waits_for_active_lease_then_retires_with_history(service, admin) -> None:

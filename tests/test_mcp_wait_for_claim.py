@@ -17,19 +17,27 @@ class FakeClient:
     ) -> None:
         self.requests_by_poll = requests_by_poll
         self.leases_by_poll = leases_by_poll
-        self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.calls: list[tuple[str, dict[str, Any]]] = []
         self.poll_index = -1
 
-    def get(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        self.calls.append(("GET", path, params))
-        if path == "/api/v1/requests":
-            self.poll_index += 1
-            index = min(self.poll_index, len(self.requests_by_poll) - 1)
-            return {"schema_version": "v1", "data": self.requests_by_poll[index]}
-        if path == "/api/v1/leases":
-            index = min(max(self.poll_index, 0), len(self.leases_by_poll) - 1)
-            return {"schema_version": "v1", "data": self.leases_by_poll[index]}
-        raise AssertionError(f"unexpected path: {path}")
+    def control_plane_state(self) -> dict[str, Any]:
+        self.poll_index += 1
+        request_index = min(self.poll_index, len(self.requests_by_poll) - 1)
+        lease_index = min(self.poll_index, len(self.leases_by_poll) - 1)
+        payload = {
+            "schema_version": "v1",
+            "snapshot_revision": self.poll_index + 1,
+            "server_time": "2026-08-06T00:00:00Z",
+            "data": {
+                "current": {
+                    "requests": self.requests_by_poll[request_index],
+                    "leases": self.leases_by_poll[lease_index],
+                },
+                "history": {},
+            },
+        }
+        self.calls.append(("STATE", payload))
+        return payload
 
 
 def _request(state: str = "QUEUED") -> dict[str, Any]:
@@ -71,16 +79,12 @@ def test_wait_for_claim_returns_held_or_active_matching_lease(
     )
 
     assert result["state"] == "allocated"
+    assert result["snapshot_revision"] == 2
     assert result["request"]["state"] == "LEASED"
     assert result["lease"]["state"] == "HELD"
     assert result["polls"] == 2
     assert sleeps == [pytest.approx(0.1)]
-    assert client.calls == [
-        ("GET", "/api/v1/requests", None),
-        ("GET", "/api/v1/leases", None),
-        ("GET", "/api/v1/requests", None),
-        ("GET", "/api/v1/leases", None),
-    ]
+    assert [call[0] for call in client.calls] == ["STATE", "STATE"]
 
 
 def test_wait_for_claim_returns_terminal_request_without_writes(
@@ -92,12 +96,10 @@ def test_wait_for_claim_returns_terminal_request_without_writes(
     result = mcp_server.gpu_wait_for_claim("agent-a", "req-1")
 
     assert result["state"] == "terminal"
+    assert result["snapshot_revision"] == 1
     assert result["request"]["state"] == "CANCELLED"
     assert result["lease"] is None
-    assert client.calls == [
-        ("GET", "/api/v1/requests", None),
-        ("GET", "/api/v1/leases", None),
-    ]
+    assert [call[0] for call in client.calls] == ["STATE"]
 
 
 def test_wait_for_claim_timeout_keeps_last_request_and_lease(
@@ -109,13 +111,11 @@ def test_wait_for_claim_timeout_keeps_last_request_and_lease(
     result = mcp_server.gpu_wait_for_claim("agent-a", "req-1", timeout_seconds=0)
 
     assert result["state"] == "timeout"
+    assert result["snapshot_revision"] == 1
     assert result["request"]["state"] == "QUEUED"
     assert result["lease"] is None
     assert result["polls"] == 1
-    assert client.calls == [
-        ("GET", "/api/v1/requests", None),
-        ("GET", "/api/v1/leases", None),
-    ]
+    assert [call[0] for call in client.calls] == ["STATE"]
 
 
 @pytest.mark.parametrize(
