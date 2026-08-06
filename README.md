@@ -1,182 +1,150 @@
 <p align="center">
-  <img src="desktop/assets/GPU%20Broker%20Icon.png" width="96" alt="GPU Broker icon">
+  <img src="desktop/assets/GPU%20Broker%20Icon.png" width="92" alt="GPU Broker icon">
 </p>
 
 <h1 align="center">GPU Broker</h1>
 
-<p align="center">给共享 GPU 准备的本机协调台：看清资源、认领租约、排队等待、用完释放。</p>
+<p align="center"><strong>让人、App 与 Agent 在同一个本机控制面上协调共享 GPU。</strong></p>
 
 <p align="center">
-  <a href="docs/AGENT_MCP_zh.md">MCP 安装</a> ·
-  <a href="docs/HANHAI22_SLURM_zh.md">瀚海22 / Slurm</a> ·
-  <a href="docs/DESIGN_SYSTEM.md">桌面设计</a> ·
-  <a href="docs/IMPLEMENTATION_STATUS_zh.md">当前状态</a> ·
-  <a href="CONTRIBUTING.md">参与贡献</a> ·
-  <a href="LICENSE">MIT License</a>
+  统一状态 · 队列与租约 · 只读采集 · 可审计归属
 </p>
 
 <p align="center">
+  <a href="#-一分钟开始">一分钟开始</a> ·
+  <a href="#-选择入口">选择入口</a> ·
+  <a href="#-一条公共数据路径">数据路径</a> ·
+  <a href="#-agent--mcp">Agent / MCP</a> ·
+  <a href="#-安全边界">安全边界</a> ·
+  <a href="#-文档">文档</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/JinPLu/GPU-Monitor/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/release-v1.0.0-0F766E" alt="GPU Broker v1.0.0"></a>
   <img src="https://img.shields.io/badge/Python-3.12%2B-2563EB?logo=python&logoColor=white" alt="Python 3.12+">
-  <img src="https://img.shields.io/badge/Desktop-macOS%20%7C%20Windows-334155" alt="macOS and Windows desktop">
-  <img src="https://img.shields.io/badge/REST%20%2F%20CLI%20%2F%20MCP-loopback-0F766E" alt="REST CLI MCP loopback">
-  <img src="https://img.shields.io/badge/Remote%20control-never-C2410C" alt="Does not control remote workloads">
+  <img src="https://img.shields.io/badge/macOS-14%2B-111827?logo=apple&logoColor=white" alt="macOS 14+">
+  <img src="https://img.shields.io/badge/Windows-source%20build-2563EB?logo=windows&logoColor=white" alt="Windows source build">
+  <img src="https://img.shields.io/badge/network-loopback%20only-C2410C" alt="Loopback only">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-334155" alt="MIT License"></a>
 </p>
+
+GPU Broker 把 GPU/CPU 观测、资源合同、队列、租约和审计收进一个本机服务。
+桌面 App、CLI 和 MCP 读取同一份带 `snapshot_revision` 的状态，
+不再各自拼接服务器、任务和资源数据。
+
+> [!TIP]
+> 不需要先理解调度模型。人类打开 App 或 Web 控制台，脚本使用 CLI / REST，
+> Agent 注册 MCP；它们最终都进入同一个 `BrokerService`。
 
 > [!IMPORTANT]
-> GPU Broker 负责“谁占用哪块 GPU”、分配与只读探测，不能被直连 SSH 或本地
-> inventory 旁路。租约本身不执行命令；任务已获授权后，Agent 可通过项目自己的
-> 执行路径在 `lease.resources[]` 指定的资源上启动或停止 workload。每个 resource
-> 都给出 endpoint、GPU、`cuda_visible_devices` 和 commitment，Agent 不自行推断。
+> GPU Broker 协调“谁使用哪些资源”，但不启动、停止或授权远端 workload。
+> 获得租约后，项目只能使用 `lease.resources[]` 返回的实际落点执行已获授权的任务。
 
-## 能帮你做什么
+## 🚀 一分钟开始
 
-GPU Broker 把人类、脚本和 Agent 放到同一个本机资源看板上。大家看到同一份状态，走同一套队列和租约规则，最后用可审计的记录收尾。
-
-- 看清服务器、GPU、显存、利用率、CPU 和内存状态。
-- 认领空闲 GPU；忙时进入队列，由 Broker 统一排队和选址。
-- 为项目添加 endpoint，或将不再使用的 endpoint 退役并排空。
-- 让 Dashboard、CLI、REST 和 MCP 共享同一个服务层，不复制调度逻辑。
-- 用固定只读 SSH 探针采集状态，不读取私钥、环境变量或任务内容。
-
-简单查看和手动认领用 Dashboard；自动化和 Agent 协作走 CLI、REST 或 MCP。
-
-## 快速开始
-
-准备条件：Python 3.12+ 和 [uv](https://docs.astral.sh/uv/)。
+推荐在 macOS 上安装用户级后台服务。准备 [Python 3.12+](https://www.python.org/)
+和 [uv](https://docs.astral.sh/uv/)：
 
 ```bash
-uv sync --extra dev --reinstall-package gpu-broker
-uv run --reinstall-package gpu-broker gpu-broker init
-uv run --reinstall-package gpu-broker gpu-broker serve
-```
-
-服务默认只监听 <http://127.0.0.1:8787/>。
-
-macOS 日常使用推荐安装用户级后台服务。首次安装会把仓库中的 inventory
-和现有 SQLite 状态迁移到 `~/Library/Application Support/GPU Broker/`；
-仓库原文件保留，不会删除：
-
-```bash
+git clone https://github.com/JinPLu/GPU-Monitor.git
+cd GPU-Monitor
 uv tool install --force .
 gpu-broker daemon install --source-root "$PWD"
 gpu-broker daemon status
+open http://127.0.0.1:8787/
 ```
 
-后台服务是唯一的 REST/状态 owner。MCP 会在首次调用前自动确保它就绪，
-GUI 只是客户端；关闭 GUI 不会停止调度控制面。
-CLI 和 MCP 的常规读路径使用统一的 `/api/v1/state` 控制面状态；旧的
-`status`、`gpu list`、`request queue` 等命令只是从同一 revision 投影。
-
-更新源码后要同时更新全局命令并重装 LaunchAgent；`daemon install` 会用新
-启动参数重启已安装服务：
-
-```bash
-uv tool install --force .
-gpu-broker daemon install --source-root "$PWD"
-```
-
-### macOS 桌面版
-
-```bash
-zsh desktop/build-macos-app.sh
-zsh desktop/verify-macos-app.sh
-open "dist/GPU Broker.app"
-```
-
-构建机需要 Python 3.12 和 `uv`；脚本会在构建环境中临时解析 PyInstaller。生成的
-`GPU Broker.app` 已内置后端、迁移和空 inventory，目标 Mac 不需要另装 Python、
-`uv` 或 `gpu-broker` CLI。验证脚本会从 `/tmp` 启动内置后端，并检查前端只链接
-macOS 系统库。为避免同步盘给 App 注入会破坏严格签名复验的 Finder 元数据，正式
-产物安装在 `~/Applications/GPU Broker.app`，项目内的 `dist/GPU Broker.app` 是该
-产物的入口链接；可用 `GPU_BROKER_USER_APPLICATIONS_DIR` 覆盖安装目录。
-
-### Windows 桌面版
-
-在 Windows PowerShell 中运行：
-
-```powershell
-.\desktop\build-windows-app.ps1
-.\dist\windows\GPU Broker\GPU Broker.exe
-```
-
-桌面版都是源码构建产物，不是经 Developer ID 公证的安装包；macOS 产物使用 ad-hoc
-签名。Windows 首次运行会在 `%LOCALAPPDATA%\GPU Broker\` 写入默认 inventory 和 SQLite state；路径和端口可用 `GPU_BROKER_DATA_DIR`、`GPU_BROKER_INVENTORY`、`GPU_BROKER_DATABASE_URL`、`GPU_BROKER_BIND_PORT` 覆盖。
-
-## 直接使用
-
-| 你想做的事 | 入口 |
-| --- | --- |
-| 查看资源、管理项目 endpoint、认领或退役 endpoint | Dashboard |
-| 写脚本、备份、迁移、一次性采集 | CLI |
-| 接入本机工具或内部页面 | REST |
-| 让 Agent 查询、认领、绑定观测、释放租约 | MCP |
-
-常用命令：
+确认统一状态路径可用：
 
 ```bash
 gpu-broker state
-gpu-broker status
-gpu-broker gpu list
-gpu-broker request queue
-gpu-broker endpoint delete <endpoint_id>
-gpu-broker lease release --help
 ```
 
-## 服务器管理
+后台服务是唯一的状态 owner。关闭 Web 页面或桌面 App 不会停止控制面；MCP 在首次
+调用前会检查并确保这个服务就绪。
 
-在 Dashboard 里粘贴一行或多行 `ssh [-p PORT] USER@HOST`。GPU Broker 会逐行预览，只登记合法且不重复的地址。
+## 🧭 选择入口
 
-粘贴内容只用于解析地址，不会作为 shell 命令执行。管道、跳板、密钥参数和额外 shell 片段会被拒绝。
+| 你要完成的事 | 使用 | 最短入口 |
+| --- | --- | --- |
+| 🖥️ 查看资源、添加或退役服务器、人工认领 | 桌面 App / Web 控制台 | <http://127.0.0.1:8787/> |
+| ⌨️ 查询状态、备份、迁移、一次性采集 | CLI | `gpu-broker --help` |
+| 🤖 让 Agent 认领、等待、绑定并释放资源 | MCP | [安装与 Agent 合同](docs/AGENT_MCP_zh.md) |
+| 🔌 接入本机脚本或内部工具 | REST | `GET /api/v1/state` |
+| 🧮 提交外部 Slurm 作业 | Scheduler adapter | [瀚海22 / Slurm 指南](docs/HANHAI22_SLURM_zh.md) |
 
-endpoint 是本机共享服务器清单；`owner_project_id` 只作为可选归属说明，不参与添加、
-编辑、维护或删除权限判断。任一本机可写调用方都可从 Dashboard、REST、CLI 或 MCP
-将误登记或已退役的 endpoint 标记为 draining。draining 后不再接收新
-placement，也不会停止已有远端任务；关联的活跃租约和排队需求排空后，Broker 才
-完成移除。退役记录只留在历史与审计接口，不再进入资源总览、容量或异常统计。
+添加服务器时粘贴 `ssh [-p PORT] USER@HOST`。输入只用于解析地址；管道、跳板、
+密钥参数和额外 shell 片段会被拒绝。
 
-> [!CAUTION]
-> 瀚海22一类 Slurm 集群不是普通 SSH 裸机。登录节点不代表计算节点或可用
-> GPU，不应直接加入当前服务器池；实际资源必须由 Slurm 分配。Broker 使用独立
-> `SchedulerTarget/SchedulerJob` adapter 发现、提交和跟踪，详见
-> [瀚海22外部 Slurm 调度指南](docs/HANHAI22_SLURM_zh.md)。
+## 🔄 一条公共数据路径
 
-## Agent / MCP
+```mermaid
+flowchart LR
+    APP["🖥️ App"] --> REST["🔌 Loopback REST"]
+    CLI["⌨️ CLI"] --> REST
+    MCP["🤖 MCP"] --> REST
+    REST --> SERVICE["🧠 BrokerService"]
+    SERVICE <--> DB["🗄️ SQLite"]
+    HOSTS["🖧 GPU / CPU endpoints"] -->|"固定只读探针"| COLLECTOR["📡 Collector"]
+    COLLECTOR --> SERVICE
+    SERVICE --> STATE["📦 Canonical state<br/>snapshot_revision"]
+    STATE --> APP
+    STATE --> CLI
+    STATE --> MCP
+```
 
-完成一次 macOS daemon 安装后，为目标 Agent 注册同一个 `gpu-broker-mcp`。
-Agent 不依赖 GUI：MCP 首次调用会检查并启动用户级后台服务。日常流程很短：
+- `service.py` 是调度、队列、租约、状态和审计规则的唯一 owner。
+- App、CLI 与 MCP 的常规读操作都从 `GET /api/v1/state` 的同一 revision 投影。
+- CLI 与 MCP 不直连 SQLite 或 SSH；Collector 只执行固定的只读探针。
+- App 写操作完成后，以 mutation 返回的 revision 为下限读取下一份权威快照，
+  避免一个页面更新而另一个页面继续显示旧数据。
+
+服务器移除也走同一状态机：`active → draining → retired`。进入 `draining` 后不再
+接收新任务，但不会停止已有 workload；关联租约和队列排空后才完成退役。App 的各页面
+按稳定 ID 从下一份 canonical state 协调，因此服务器列表、总览和资源归属会一起更新。
+
+## 🤖 Agent / MCP
+
+完成 daemon 安装后，为 Codex 注册同一个本机 MCP server：
+
+```bash
+codex mcp add gpu-broker \
+  --env GPU_BROKER_URL=http://127.0.0.1:8787 \
+  -- gpu-broker-mcp
+python3 scripts/install_agent_policy.py codex --install
+```
 
 ```text
-profile/显式合同 claim -> 必要时等待 -> 读取 lease.resources[] -> 项目执行 workload -> 绑定观测 -> 释放
+claim → queued 时 wait → 读取 lease.resources[] → 项目执行 workload → bind → release
 ```
 
-预设任务使用 `profile_id` 和任务名。临时任务需要项目标识、任务名、GPU 数量，并按绝对值给出需要的 CPU 核数、系统内存和显存下限。资源合同已在当前任务、已接受计划或同一持续任务的历史认领中明确后，Agent 应主动 claim、排队等待并复用合同，不应反复询问能否使用 MCP，也不必为了普通预批准 profile 或显式合同 claim 先读协调看板。queued/null 结果不能执行；可用 `gpu_wait_for_claim` 继续读取已有 request/lease，直到返回 `HELD` 或 `ACTIVE` lease、终止状态或超时。成功 lease 的实际落点只取自 `lease.resources[]`，其中含 endpoint、GPU、`cuda_visible_devices` 和 commitment。随后 Agent 可用项目既有执行路径运行或停止已获授权的 workload；Broker 不会替它启动或停止。启动后调用 `gpu_bind_observed_workload`，完成或启动失败后调用 `gpu_release`。对会重试的写操作复用调用方稳定的 `idempotency_key`。
+Agent 使用预设的 `profile_id`，或显式提供 `project_id`、任务名、`gpu_count` 和所需
+CPU / 内存 / 显存下限。queued / null 不能执行；placement 只取自
+`lease.resources[]`，不能根据 inventory、空闲容量或任务名推断。
 
-低层 request、activate、release-lease 和 bind-workload MCP 工具是高级兼容接口；新 Agent 优先走 claim / wait / execute / bind / release 路径。
+Claude Code、Cursor、工具白名单和完整运行合同见
+[Agent / MCP 全局安装](docs/AGENT_MCP_zh.md)。MCP 只调用 REST，不建立第二份数据库，
+也不会在服务不可用时回退到 SSH、inventory 或 `nvidia-smi`。
 
-外部 Slurm 项目先调用 `gpu_scheduler_targets` 和
-`gpu_scheduler_access_status`。这是独立的 SchedulerTarget adapter：项目 owner
-可提交、查询和取消自己的 Slurm 作业；不用也不能把登录节点当裸机 GPU endpoint。
-Slurm 作业与裸机 lease 分开记录，`PENDING` 不表示已经获得 GPU，状态与
-`AllocTRES` 才是分配事实。当前不公开 staged upload。
+> [!CAUTION]
+> 瀚海22一类 Slurm 集群是 `SchedulerTarget`，不是普通 endpoint。登录节点不能证明
+> GPU 已分配；发现、提交、查询和取消必须走独立 scheduler adapter。
 
-完整安装和全局规则见：
+## 🛡️ 安全边界
 
-- [安装与客户端适配](docs/AGENT_MCP_zh.md)
-- [英文全局路由与安全规则](docs/AGENT_MCP_policy.en.md)
+| ✅ GPU Broker 负责 | ⛔ GPU Broker 不负责 |
+| --- | --- |
+| 本机资源观测、队列、租约和审计 | 启动、停止、抢占或授权远端 workload |
+| 固定、只读的 SSH telemetry 探针 | 任意 shell、私钥读取或远端生命周期控制 |
+| 基于新鲜 telemetry 的 fail-closed 分配 | 把静态 inventory 当作 GPU 可用证明 |
+| GPU UUID 与 endpoint `id` 的稳定身份 | 合并同 IP 的不同端口或猜测 placement |
+| loopback 上的本机协作 | 未经安全评审的非 loopback 暴露 |
+| 独立的外部 Slurm adapter | 把 Slurm 登录节点登记为裸机 GPU endpoint |
 
-## 权限与安全边界
+telemetry 过期、采集异常、非托管进程、维护或资源冲突都会拒绝分配。本地 actor
+只是审计标签，不是认证凭据；当前服务不要直接暴露到网络。
 
-- 默认只绑定 loopback；不要直接暴露到网络。
-- 裸机 lease 协调归属，不执行远端运行时；项目自己的执行路径在获得 lease 后
-  使用 `lease.resources[]`。外部 Slurm adapter 是独立的项目 owner submit/status/cancel 接口。
-- inventory 只是静态资产清单，不能证明 GPU 当前可用。
-- GPU UUID 和 endpoint `id` 是身份边界；同 IP 不同端口不合并。
-- telemetry 过期、采集异常、非托管进程、维护或冲突都会拒绝分配。
-- 本地 actor 是审计标签，不是认证凭据。
-- 自动启停、抢占、dstack、交互式 Slurm、下载/同步和非 loopback 部署不在
-  当前开放边界内。
-
-## 开发与验证
+## 🧑‍💻 开发与验证
 
 ```bash
 uv sync --extra dev --reinstall-package gpu-broker
@@ -184,19 +152,25 @@ uv run --reinstall-package gpu-broker pytest
 uv run --reinstall-package gpu-broker ruff check .
 ```
 
-改桌面壳或打包路径时，在对应平台运行构建脚本：macOS 用 `zsh desktop/build-macos-app.sh`，Windows 用 `.\desktop\build-windows-app.ps1`。
+源码位于 `src/gpu_broker/`，桌面壳位于 `desktop/`，测试位于 `tests/`。
+测试使用临时数据库和 fake provider，不连接真实 GPU 或 SSH endpoint。
 
-源码主要在 `src/gpu_broker/`，桌面壳和资源在 `desktop/`，测试在 `tests/`，规则与状态文档在 `docs/`。不要提交 `dist/`、`build/`、`state/`、`.venv/`、`.codegraph/`、真实 inventory、私钥、`.env`、本地数据库或临时 QA 截图。
+桌面源码构建：macOS 运行 `zsh desktop/build-macos-app.sh`，Windows PowerShell 运行
+`.\desktop\build-windows-app.ps1`。macOS 产物使用 ad-hoc 签名，Windows 产物未签名；
+当前没有经过平台公证的安装包。
 
-## 更多资料
+## 📚 文档
 
-- [贡献指南](CONTRIBUTING.md)
-- [安全边界与报告](SECURITY.md)
-- [瀚海22外部 Slurm 调度指南](docs/HANHAI22_SLURM_zh.md)
-- [桌面设计系统](docs/DESIGN_SYSTEM.md)
-- [实施状态与未完成 gate](docs/IMPLEMENTATION_STATUS_zh.md)
-- [历史验证归档](docs/archive/IMPLEMENTATION_EVIDENCE_2026-07-19.md)
+| 文档 | 内容 |
+| --- | --- |
+| 🤖 [Agent / MCP 安装](docs/AGENT_MCP_zh.md) | 客户端注册、资源合同与工具路径 |
+| 🧮 [瀚海22 / Slurm](docs/HANHAI22_SLURM_zh.md) | 外部 scheduler 的独立边界 |
+| ✅ [实施状态](docs/IMPLEMENTATION_STATUS_zh.md) | 当前交付、验证证据与未完成 gate |
+| 🎨 [桌面设计系统](docs/DESIGN_SYSTEM.md) | macOS 信息架构与视觉约束 |
+| 🧑‍💻 [参与贡献](CONTRIBUTING.md) | 开发约定与验证命令 |
+| 🔐 [安全说明](SECURITY.md) | loopback、凭据与漏洞报告边界 |
+| 📦 [v1.0.0 Release](https://github.com/JinPLu/GPU-Monitor/releases/tag/v1.0.0) | 首个稳定版本 |
 
-## License
+## 📄 License
 
 [MIT](LICENSE)
