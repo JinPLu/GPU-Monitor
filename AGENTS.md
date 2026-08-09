@@ -1,4 +1,4 @@
-# gpu-broker
+# ServerPilot (`gpu-broker` package)
 
 - 本机 loopback GPU 协作控制面；GUI、CLI、MCP 共用 REST/领域逻辑。租约只协调归属，不授权启动或停止工作负载。
 - `README.md` 是用户入口；当前交付与 gate 只写 `docs/IMPLEMENTATION_STATUS_zh.md`；全局 MCP 安装见 `docs/AGENT_MCP_zh.md`，外部 Agent 的运行契约以 MCP instructions 为准。

@@ -1,0 +1,20 @@
+---
+description: ServerPilot MCP usage — server-compute coordination and human-supervised Agent scheduling
+alwaysApply: true
+---
+<!-- GPU_BROKER_START -->
+## ServerPilot
+
+This project has a ServerPilot MCP server (`gpu_*` tools) configured when the local broker is reachable at `http://127.0.0.1:8787`. Server instructions and tool schemas remain authoritative.
+
+Use this guidance only where the local `serverpilot` MCP, or its compatible
+`gpu-broker` name, is callable.
+
+- Treat coordination as routine once the task carries a `profile_id`, or a complete explicit `project_id` / resource contract. Reuse it; never infer missing quantities from a title, directory, inventory, or apparent idleness.
+- Use bare metal as `claim → wait → execute → bind → release`: call `gpu_claim_profile` or `gpu_claim`, then `gpu_wait_for_claim` for the same queued request. A queued or null lease is not permission to run. Use only returned `lease.resources[]` for host, GPU, CUDA selector, and commitment; bind observed work after startup and release it after completion or failed start.
+- `gpu_coordination`, `gpu_status`, and `resource_monitor` describe current truth; they do not license an Agent to compute placement. Treat ServerPilot's availability projection as authoritative and fail closed for stale, unknown, unmanaged, conflicting, or maintained resources.
+- For CPU/memory-only or mixed work, submit explicit candidates to `resource_evaluate_plan`, then use `resource_claim` / `resource_record_actual` / `resource_release`. A zero-GPU contract is valid when no GPU is required.
+- Reuse a caller-stable `idempotency_key` for mutation retries. `owner_project_id` is reporting attribution, not server-administration permission. Agents do not add, drain, retire, or reconfigure endpoints without current explicit human authorization.
+- Hanhai22 and other Slurm clusters are SchedulerTargets, never raw SSH endpoints. `PENDING` is not a bare-metal lease; Slurm status and `AllocTRES` establish allocation. One-off submission needs the exact approved resource/script contract and `approval_ref`; cancellation needs separate current user authority. `access_required` means ask the user to connect the approved VPN; do not automate it.
+- Report claim/request or scheduler-job ID, final state, and blocked reason so humans can supervise in ServerPilot. Do not bypass allocation or freshness through SSH, SQLite, inventory, remote probes, or `nvidia-smi`.
+<!-- GPU_BROKER_END -->

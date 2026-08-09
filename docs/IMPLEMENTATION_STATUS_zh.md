@@ -1,4 +1,4 @@
-# gpu-broker 实施状态
+# ServerPilot 实施状态
 
 更新时间：2026-08-10（Asia/Shanghai）
 
@@ -69,7 +69,7 @@
   `WindowServer` CPU 显著升高、关闭 GUI 后下降而 headless daemon 保持低占用的现场证据；小面积
   按钮材质仍保留，后台采集与 REST 快照合同未改变。
 - macOS App 已把 Python 后端、数据库迁移和空 inventory 冻结进 `Contents/Resources/BrokerRuntime`。
-  目标 Mac 不需要额外安装 Python、`uv` 或 `gpu-broker` CLI；构建机仍需 Python 3.12 与 `uv`，
+  目标 Mac 不需要额外安装 Python、`uv` 或 `serverpilot` CLI；构建机仍需 Python 3.12 与 `uv`，
   PyInstaller 只作为构建期工具解析。独立验证会从 `/tmp` 冷启动内置后端、执行新库迁移、读取
   snapshot，并确认 Swift 前端没有非系统动态库依赖。正式产物安装在不受项目同步盘 Finder
   元数据污染的 `~/Applications/ServerPilot.app`，`dist/ServerPilot.app` 保持为项目入口链接。
@@ -85,7 +85,7 @@
   只使用最新完整集合；缺失 GPU 的 lease 引用保留为 fail-closed 诊断信号。采集失败、超时、
   malformed 或显式非完整观测不会改变既有 presence；晚到且 `observed_at` 早于当前 endpoint
   最新观测时间的结果会被兼容地忽略，不更新 provider、presence、进程或队列。
-- 外部 Agent 的完整运行契约由 `gpu-broker` MCP instructions 和工具 schema 提供：任务已
+- 外部 Agent 的完整运行契约由 ServerPilot MCP instructions 和工具 schema 提供：任务已
   给出 profile 或项目资源合同时，Agent 主动 claim、等待队列、按 lease 执行、绑定并释放；
   不能从 inventory、空闲容量或任务名猜合同，也不能旁路 Broker。
 - 已实现独立外部 Slurm adapter：`SchedulerTarget` 全局发现、`SchedulerJob` 与追加式状态

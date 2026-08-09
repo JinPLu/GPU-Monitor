@@ -4,7 +4,7 @@
 
 ## Agent 警告
 
-本文中的 `hh22`、`ssh`、`sbatch`、`srun`、`scancel` 示例仅供人类诊断、核查或 Broker 尚未覆盖操作时参考。Agent 处理瀚海22或其他外部 Slurm 集群必须通过 `SchedulerTarget` 和 `gpu-broker` MCP 的 scheduler 工具；不得把这些手工命令当成 MCP 不可用时的 fallback，也不得把登录节点按项目本地 SSH endpoint 规则登记或认领 GPU。若 MCP 或 scheduler 工具不可用，Agent 应报告不可用并停止到需要人工处理的位置。
+本文中的 `hh22`、`ssh`、`sbatch`、`srun`、`scancel` 示例仅供人类诊断、核查或 ServerPilot 尚未覆盖操作时参考。Agent 处理瀚海22或其他外部 Slurm 集群必须通过 `SchedulerTarget` 和 ServerPilot MCP 的 scheduler 工具；不得把这些手工命令当成 MCP 不可用时的 fallback，也不得把登录节点按项目本地 SSH endpoint 规则登记或认领 GPU。若 MCP 或 scheduler 工具不可用，Agent 应报告不可用并停止到需要人工处理的位置。
 
 ## 定位
 

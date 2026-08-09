@@ -98,9 +98,10 @@ def test_cursor_print_is_paste_ready(
 def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_questions() -> None:
     adapter = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
     for boundary in (
-        "use the local gpu-broker mcp proactively",
+        "use the local serverpilot mcp",
+        "compatible gpu-broker mcp name",
         "server instructions",
-        "tool schemas are authoritative",
+        "tool schemas and serverpilot's server instructions remain authoritative",
         "routine owner-scoped claim",
         "profile_id",
         "project_id",
@@ -109,7 +110,7 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
         "gpu_claim",
         "gpu_wait_for_claim",
         "never infer missing inputs",
-        "queued/null",
+        "queued or null",
         "held",
         "active",
         "lease.resources[]",
@@ -121,6 +122,9 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
         "idempotency_key",
         "owner_project_id",
         "draining",
+        "resource_evaluate_plan",
+        "resource_record_actual",
+        "humans supervise",
         "ssh",
         "sqlite",
         "inventory",
@@ -150,7 +154,7 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
         assert runtime_contract in mcp_instructions
     assert "gpu_grant_server_project" not in adapter
     assert "gpu_grant_server_project" not in mcp.instructions
-    assert "approval_ref" not in adapter
+    assert "approval_ref" in adapter
     assert "approval_ref" not in mcp_instructions
 
 
@@ -159,13 +163,15 @@ def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
     for boundary in (
         "schedulertargets",
         "never raw ssh endpoints",
-        "distinct scheduler adapter",
-        "owner-controlled submit, status, and cancel",
+        "gpu_scheduler_targets",
+        "gpu_scheduler_access_status",
+        "current-task approval_ref",
+        "cancellation is a separate, explicit user-authorized action",
         "slurm pending",
         "alloctres",
         "access_required",
-        "do not automate vpn",
-        "do not bypass broker allocation",
+        "never automate vpn access",
+        "stop rather than bypassing serverpilot",
         "sqlite",
         "inventory",
         "remote probes",
@@ -184,7 +190,7 @@ def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
         "broker does not launch or stop",
     ):
         assert runtime_detail in mcp_instructions
-    assert "approval_ref" not in global_policy
+    assert "approval_ref" in global_policy
     assert "approval_ref" not in mcp_instructions
     assert "gpu_scheduler_upload" not in global_policy
     assert "gpu_scheduler_upload" not in mcp_instructions
