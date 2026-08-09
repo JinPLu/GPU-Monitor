@@ -1,6 +1,6 @@
 # Adapter 能力与边界
 
-GPU Broker 用 adapter 接入不同的观测和调度实现，但 adapter 不是第二个控制面。
+ServerPilot 用 adapter 接入不同的观测和调度实现，但 adapter 不是第二个控制面。
 资源身份、容量、认领、队列、租约、审计和准入判断始终由 `BrokerService` 持有。
 
 ## 当前注册能力

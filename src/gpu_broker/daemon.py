@@ -1,4 +1,4 @@
-"""macOS user-daemon lifecycle for the loopback GPU Broker control plane."""
+"""macOS user-daemon lifecycle for the loopback ServerPilot control plane."""
 
 from __future__ import annotations
 
@@ -96,6 +96,8 @@ def resolve_daemon_config(
     host, port, base_url = _loopback_url(
         environment.get("GPU_BROKER_URL", "http://127.0.0.1:8787")
     )
+    # Keep the durable pre-rebrand location so updating the product name never
+    # creates an empty control plane or strands an existing daemon's state.
     data_dir = (home / "Library/Application Support/GPU Broker").resolve()
     database_path = data_dir / "state/gpu-broker.sqlite3"
     inventory_path = data_dir / "inventory.yaml"
@@ -172,7 +174,7 @@ def probe_live(config: DaemonConfig) -> dict[str, Any] | None:
         or EXPECTED_CAPABILITY not in capabilities
     ):
         raise DaemonError(
-            f"{config.base_url} is occupied by an incompatible GPU Broker service"
+            f"{config.base_url} is occupied by an incompatible ServerPilot service"
         )
     return payload
 
@@ -189,7 +191,7 @@ def probe_ready(config: DaemonConfig) -> dict[str, Any] | None:
         or payload.get("daemon_instance_id") != daemon_instance_id(config)
     ):
         raise DaemonError(
-            f"{config.base_url} is not the installed GPU Broker macOS daemon"
+            f"{config.base_url} is not the installed ServerPilot macOS daemon"
         )
     return payload
 
@@ -242,7 +244,7 @@ def _publish_inventory(source: Path, destination: Path) -> bool:
         try:
             load_inventory(temporary)
         except ConfigurationError as exc:
-            raise DaemonError(f"source GPU Broker inventory is invalid: {exc}") from exc
+            raise DaemonError(f"source ServerPilot inventory is invalid: {exc}") from exc
         try:
             os.link(temporary, destination)
         except FileExistsError:
@@ -265,7 +267,7 @@ def _copy_sqlite(source: Path, destination: Path) -> bool:
     with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as source_db:
         integrity = source_db.execute("PRAGMA integrity_check").fetchone()
         if integrity is None or integrity[0] != "ok":
-            raise DaemonError("source GPU Broker database failed integrity_check")
+            raise DaemonError("source ServerPilot database failed integrity_check")
         try:
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent,
@@ -279,7 +281,7 @@ def _copy_sqlite(source: Path, destination: Path) -> bool:
             with sqlite3.connect(f"file:{temporary}?mode=ro", uri=True) as copied_db:
                 copied_integrity = copied_db.execute("PRAGMA integrity_check").fetchone()
             if copied_integrity is None or copied_integrity[0] != "ok":
-                raise DaemonError("migrated GPU Broker database failed integrity_check")
+                raise DaemonError("migrated ServerPilot database failed integrity_check")
             try:
                 os.link(temporary, destination)
             except FileExistsError:
@@ -511,7 +513,7 @@ class MacOSDaemonManager:
         if last_error is not None:
             raise last_error
         raise DaemonError(
-            f"GPU Broker daemon did not become ready at {self.config.base_url}"
+            f"ServerPilot daemon did not become ready at {self.config.base_url}"
         )
 
     def stop(self) -> None:

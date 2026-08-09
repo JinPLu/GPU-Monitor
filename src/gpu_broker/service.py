@@ -2352,7 +2352,7 @@ class BrokerService:
                 "retired_endpoints": retired_endpoint_payloads,
                 "resource_usage_revision": resource_usage_revision,
                 "freshness_seconds": self.inventory.collector.stale_after_seconds,
-                "admission_boundary": "GPU Broker 只记录资源分配，不会在服务器上启动或停止任务。",
+                "admission_boundary": "ServerPilot 只记录资源分配，不会在服务器上启动或停止任务。",
             }
             return self.envelope(session, data)
 

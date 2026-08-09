@@ -1,6 +1,6 @@
 # Security
 
-GPU Broker is intentionally a local pilot:
+ServerPilot is intentionally a local pilot:
 
 - The service binds to loopback by default and has no login layer.
 - The actor header is an audit label, not authentication.

@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gpu-broker"
-version = "1.1.0"
-description = "Single-user GPU/CPU coordination across servers, projects, and agents."
+version = "1.2.0"
+description = "ServerPilot: agent-coordinated server compute scheduling with human supervision."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Jinpeng Lu" }]
-keywords = ["gpu", "gpu-scheduling", "mcp", "resource-coordination"]
+keywords = ["server-scheduling", "compute-coordination", "gpu", "mcp", "agent"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -36,8 +36,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/JinPLu/GPU-Monitor"
-Issues = "https://github.com/JinPLu/GPU-Monitor/issues"
+Repository = "https://github.com/JinPLu/ServerPilot"
+Issues = "https://github.com/JinPLu/ServerPilot/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -49,6 +49,8 @@ dev = [
 [project.scripts]
 gpu-broker = "gpu_broker.cli:app"
 gpu-broker-mcp = "gpu_broker.mcp_server:main"
+serverpilot = "gpu_broker.cli:app"
+serverpilot-mcp = "gpu_broker.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

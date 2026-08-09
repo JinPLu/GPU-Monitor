@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render or install the shared GPU Broker policy for supported agent hosts.
+"""Render or install the shared ServerPilot policy for supported agent hosts.
 
 Codex and Claude Code own global Markdown files. Cursor owns User Rules in its
 settings UI, so this tool prints the Cursor block instead of editing a guessed
@@ -43,14 +43,14 @@ def merge(existing: str, block: str) -> str:
     start_count = existing.count(start)
     end_count = existing.count(end)
     if start_count != end_count:
-        raise ValueError("existing GPU Broker policy markers are incomplete")
+        raise ValueError("existing ServerPilot policy markers are incomplete")
     if start_count > 1:
-        raise ValueError("existing GPU Broker policy markers are duplicated")
+        raise ValueError("existing ServerPilot policy markers are duplicated")
     if start_count == 1:
         begin = existing.find(start)
         finish = existing.find(end)
         if finish < begin:
-            raise ValueError("existing GPU Broker policy markers are malformed")
+            raise ValueError("existing ServerPilot policy markers are malformed")
         finish += len(end)
         return existing[:begin].rstrip() + "\n\n" + block.rstrip() + "\n" + existing[finish:].lstrip()
     if not existing.strip():

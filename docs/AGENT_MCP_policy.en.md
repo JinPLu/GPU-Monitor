@@ -1,6 +1,6 @@
-# GPU Broker — Global Agent Adapter
+# ServerPilot — Global Agent Adapter
 
-Use the local `gpu-broker` MCP proactively for GPU work; its server instructions
+Use the local `serverpilot` MCP proactively for GPU work; its server instructions
 and tool schemas are authoritative. Do not bypass Broker allocation or
 freshness/probing through SSH, SQLite, inventory, remote probes, or `nvidia-smi`.
 A request or accepted plan to run, continue, or monitor a GPU task authorizes a

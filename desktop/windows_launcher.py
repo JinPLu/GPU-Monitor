@@ -1,4 +1,4 @@
-"""Windows desktop launcher for the bundled GPU Broker web console.
+"""Windows desktop launcher for the bundled ServerPilot web console.
 
 The launcher owns only local process lifecycle. Scheduling, leases, audit and
 inventory validation stay in the shared FastAPI/BrokerService path.
@@ -25,7 +25,8 @@ from gpu_broker.api import create_app
 from gpu_broker.config import Settings
 
 
-APP_NAME = "GPU Broker"
+APP_NAME = "ServerPilot"
+LEGACY_DATA_DIRECTORY_NAME = "GPU Broker"
 DEFAULT_PORT = 8787
 READY_TIMEOUT_SECONDS = 30.0
 DEFAULT_INVENTORY = """schema_version: 1
@@ -64,7 +65,7 @@ def default_data_dir(environment: Mapping[str, str] | None = None) -> Path:
         return Path(configured).expanduser()
     local_app_data = environment.get("LOCALAPPDATA")
     if local_app_data:
-        return Path(local_app_data) / APP_NAME
+        return Path(local_app_data) / LEGACY_DATA_DIRECTORY_NAME
     return Path.home() / ".gpu-broker"
 
 
@@ -139,7 +140,7 @@ def choose_port(preferred: int) -> tuple[int, bool]:
     for candidate in range(preferred + 1, min(preferred + 50, 65535) + 1):
         if not port_accepts_connections(candidate):
             return candidate, False
-    raise LauncherError("找不到可用的本机端口来启动 GPU Broker。")
+    raise LauncherError("找不到可用的本机端口来启动 ServerPilot。")
 
 
 def wait_until_ready(port: int, timeout_seconds: float = READY_TIMEOUT_SECONDS) -> bool:
@@ -211,7 +212,7 @@ def run_status_window(base_url: str, paths: RuntimePaths, server: BrokerServer |
     root.geometry("430x220")
     root.minsize(390, 210)
 
-    icon = resource_path("desktop", "assets", "GPU Broker Icon.png")
+    icon = resource_path("desktop", "assets", "ServerPilot Icon.png")
     if icon.is_file():
         try:
             image = tk.PhotoImage(file=str(icon))
@@ -284,7 +285,7 @@ def launch() -> int:
         server.start()
         if not wait_until_ready(paths.port):
             server.stop()
-            raise LauncherError("本机 GPU Broker 服务未能在规定时间内启动。请检查数据目录和 inventory。")
+            raise LauncherError("本机 ServerPilot 服务未能在规定时间内启动。请检查数据目录和 inventory。")
 
     base_url = f"http://127.0.0.1:{paths.port}/"
     webbrowser.open(base_url)
@@ -296,7 +297,7 @@ def main() -> int:
     try:
         return launch()
     except Exception as exc:
-        show_error("无法启动 GPU Broker", str(exc))
+        show_error("无法启动 ServerPilot", str(exc))
         return 1
 
 

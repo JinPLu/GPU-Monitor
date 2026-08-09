@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
   {% if csrf %}<meta name="csrf-token" content="{{ csrf }}">{% endif %}
-  <title>GPU Broker</title>
+  <title>ServerPilot</title>
   <link rel="stylesheet" href="/static/vendor/phosphor/style.css?v=2.1.2">
   <link rel="stylesheet" href="/static/app.css?v=20260720-home-clarity">
 </head>
@@ -15,9 +15,9 @@
   </div>
   <div class="app-shell{% if not actor %} signed-out{% endif %}">
     {% if actor %}
-    <aside class="sidebar" id="app-sidebar" aria-label="GPU Broker 导航">
-      <a class="brand" href="/" aria-label="GPU Broker 总览">
-        <span class="brand-mark" aria-hidden="true"><i class="ph ph-graphics-card"></i></span><span>GPU Broker</span>
+    <aside class="sidebar" id="app-sidebar" aria-label="ServerPilot 导航">
+      <a class="brand" href="/" aria-label="ServerPilot 总览">
+        <span class="brand-mark" aria-hidden="true"><i class="ph ph-graphics-card"></i></span><span>ServerPilot</span>
       </a>
       <nav class="sidebar-nav" aria-label="主要导航">
         <p class="nav-label">我的资源</p>

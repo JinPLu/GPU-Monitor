@@ -5,23 +5,23 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleDisplayName</key>
-    <string>GPU Broker</string>
+    <string>ServerPilot</string>
     <key>CFBundleExecutable</key>
-    <string>GPU Broker</string>
+    <string>ServerPilot</string>
     <key>CFBundleIdentifier</key>
     <string>local.gpu-broker.desktop</string>
     <key>CFBundleIconFile</key>
-    <string>GPU Broker</string>
+    <string>ServerPilot</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>GPU Broker</string>
+    <string>ServerPilot</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>

@@ -13,9 +13,9 @@ private enum DesktopError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .projectRootMissing:
-            return "应用内置运行资源不完整。请重新安装 GPU Broker.app，或为开发构建设置 GPU_BROKER_ROOT。"
+            return "应用内置运行资源不完整。请重新安装 ServerPilot.app，或为开发构建设置 GPU_BROKER_ROOT。"
         case .brokerExecutableMissing:
-            return "应用内置后台服务不完整。请重新安装 GPU Broker.app，或为开发构建设置 GPU_BROKER_CLI。"
+            return "应用内置后台服务不完整。请重新安装 ServerPilot.app，或为开发构建设置 GPU_BROKER_CLI。"
         case .commandFailed(let details):
             return details
         }
@@ -71,7 +71,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             backing: .buffered,
             defer: false
         )
-        createdWindow.title = "GPU Broker"
+        createdWindow.title = "ServerPilot"
         createdWindow.titleVisibility = .hidden
         createdWindow.titlebarAppearsTransparent = true
         createdWindow.toolbarStyle = .unifiedCompact
@@ -109,7 +109,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "退出 GPU Broker", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "退出 ServerPilot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
 
         let editMenuItem = NSMenuItem()
@@ -187,7 +187,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
                         self.connectOrStartServer(attempt: attempt + 1)
                     }
                 } else {
-                    self.showFatalError("本机 GPU Broker 服务未能在规定时间内启动。请检查项目依赖和 state 目录。")
+                    self.showFatalError("本机 ServerPilot 服务未能在规定时间内启动。请检查项目依赖和 state 目录。")
                 }
             }
         }
@@ -211,11 +211,11 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
                 let payload = object as? [String: Any],
                 let info = ServiceInfo(health: payload)
             else {
-                completion(.incompatible("127.0.0.1:\(port) 上有服务响应，但它不是当前 GPU Broker 服务。桌面应用不会关闭或替换这个外部服务。"))
+                completion(.incompatible("127.0.0.1:\(port) 上有服务响应，但它不是当前 ServerPilot 服务。桌面应用不会关闭或替换这个外部服务。"))
                 return
             }
             guard info.schemaVersion == "v1", info.capabilities.contains("instant_claims") else {
-                completion(.incompatible("127.0.0.1:\(port) 上的 GPU Broker 版本不兼容。请先退出旧服务，再重新打开桌面应用。"))
+                completion(.incompatible("127.0.0.1:\(port) 上的 ServerPilot 版本不兼容。请先退出旧服务，再重新打开桌面应用。"))
                 return
             }
             completion(.compatible(info))
@@ -402,7 +402,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
     private func showFatalError(_ message: String) {
         let alert = NSAlert()
         alert.alertStyle = .critical
-        alert.messageText = "无法启动 GPU Broker"
+        alert.messageText = "无法启动 ServerPilot"
         alert.informativeText = message
         alert.addButton(withTitle: "退出")
         alert.runModal()
@@ -600,7 +600,7 @@ private struct AppSidebar: View {
                 .frame(width: 36, height: 36)
                 if !compact {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("GPU Broker")
+                        Text("ServerPilot")
                             .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(DesignTokens.ink)
                         Text("管理项目与 Agent 的资源")
@@ -3593,7 +3593,7 @@ private struct LeaseStatusSection: View {
                 }
             }
 
-            Label("GPU Broker 只管理资源归属，不会操作远端任务", systemImage: "hand.raised.fill")
+            Label("ServerPilot 只管理资源归属，不会操作远端任务", systemImage: "hand.raised.fill")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(DesignTokens.mutedInk)
                 .padding(.top, 2)

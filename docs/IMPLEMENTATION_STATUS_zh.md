@@ -7,7 +7,7 @@
 - 本机功能版已交付：GUI、CLI 和 MCP 共用 REST 领域逻辑，可查看、认领、排队、预约和释放 GPU。
 - 通用资源控制面已追加支持 direct GPU、主机 CPU/内存和 SchedulerTarget 三类资源：CPU-only 合同不再因缺少 GPU 阻塞；主机认领以新鲜 telemetry 的可用 CPU/内存扣除既有承诺后 fail-closed 分配。Agent 以从小到大的显式候选预测认领资源，只有扩容同时节省至少 10% 剩余时间和 120 秒才扩大合同。候选、选择/拒绝原因与实际耗时均写入审计；REST、CLI、MCP 和 macOS 总览展示同一监控投影。GPU 旧接口、租约和 Slurm 作业语义保持兼容；Scheduler 的 PENDING 容量不作为裸机可用资源显示。
 - macOS 控制面改由用户级 headless LaunchAgent 长期持有，唯一数据目录是
-  `~/Library/Application Support/GPU Broker/`。MCP 首次 REST 调用会执行
+  `~/Library/Application Support/GPU Broker/`（品牌升级前的兼容数据目录）。MCP 首次 REST 调用会执行
   带 daemon identity 的 health/ready 检查并在单进程锁内自动 ensure；迁移先在
   同目录临时文件中校验，再以 no-clobber 原子发布。GUI 仅作为客户端，启动时先
   ensure，退出时不再终止后端。onefile PyInstaller bootloader 的直接服务子进程也会被
@@ -50,7 +50,7 @@
   结束后第二次操作转为 `retired`。macOS App 的一次“移除并退役”会自动推进这两个受领域服务
   保护的阶段；全局 GPU telemetry 过期不再阻止本地 endpoint 生命周期操作。退役记录继续保留
   审计证据，但从日常服务器池、实时容量、异常统计和资源来源卡片中隐藏。
-- Windows 桌面源码构建入口已加入：PowerShell + PyInstaller 生成 `dist/windows/GPU Broker/GPU Broker.exe`，运行时写入 `%LOCALAPPDATA%\GPU Broker`，启动同一 loopback REST/Web UI，不复制调度、租约或审计规则；它仍不是已签名安装包。
+- Windows 桌面源码构建入口已加入：PowerShell + PyInstaller 生成 `dist/windows/ServerPilot/ServerPilot.exe`，运行时继续使用 `%LOCALAPPDATA%\GPU Broker` 兼容数据目录，启动同一 loopback REST/Web UI，不复制调度、租约或审计规则；它仍不是已签名安装包。
 - 预设任务（workload profile）是可选的持久化资源合同：明确 `profile_id` 的 GUI/MCP 认领只传配置与任务，服务在立即或排队后分配时自动激活。没有 profile 时，一次性认领需要任意非空项目标识、任务、GPU 数量，以及需要的 CPU 核数、系统内存 MiB、单卡总显存/可用显存 MiB 等绝对值下限，任务名自动记录为用途；项目标识首次使用会自动登记为中性归属标签，不需要预创建、项目管理入口或服务器项目授权。申请不再要求预计占用时间，任务完成后释放租约；最大租约窗口是调度与未来预约共同遵守的硬边界。Agent 不得根据任务、目录或空闲容量自行挑选 profile，也不得推断项目、GPU 数量或 CPU/内存/显存需求。
 - Broker 提供面向同一用户的项目与 Agent 协调看板：`gpu_coordination` 返回服务器、GPU、队列、
   空租约、受管与未归属进程和实际利用率。成功 lease 还带 endpoint/GPU 结构化资源与
@@ -72,7 +72,7 @@
   目标 Mac 不需要额外安装 Python、`uv` 或 `gpu-broker` CLI；构建机仍需 Python 3.12 与 `uv`，
   PyInstaller 只作为构建期工具解析。独立验证会从 `/tmp` 冷启动内置后端、执行新库迁移、读取
   snapshot，并确认 Swift 前端没有非系统动态库依赖。正式产物安装在不受项目同步盘 Finder
-  元数据污染的 `~/Applications/GPU Broker.app`，`dist/GPU Broker.app` 保持为项目入口链接。
+  元数据污染的 `~/Applications/ServerPilot.app`，`dist/ServerPilot.app` 保持为项目入口链接。
 - Collector 同时展示每台服务器的 CPU 核数、1 分钟负载及系统内存可用量/总量；调度会将
   lease 的 CPU/内存需求持久化为 endpoint commitment，并按剩余量及显存下限筛选候选资源。
 - 固定 SSH 探针把 NVIDIA 查询改为可选段。远端没有主机侧 `nvidia-smi`、驱动不可用，或

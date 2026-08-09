@@ -14,8 +14,8 @@ coverage.xml
 build/
 .build/
 dist/
-/GPU Broker.app
-/GPU Broker *.app
+/ServerPilot.app
+/ServerPilot *.app
 *.egg-info/
 *.pem
 *.key

@@ -58,7 +58,7 @@
 
 <section id="add-server" class="actions" aria-labelledby="add-server-title">
   <h2 id="add-server-title">添加服务器监控</h2>
-  <p class="muted">填写能从本机 SSH 连接的地址。GPU Broker 会定时只读运行固定的 nvidia-smi 查询，不执行任务命令。</p>
+  <p class="muted">填写能从本机 SSH 连接的地址。ServerPilot 会定时只读运行固定的 nvidia-smi 查询，不执行任务命令。</p>
   <form method="post" action="/ui/action/endpoint" class="stack form-grid">
     <label>服务器名称（可留空）<input name="id" placeholder="例如：training-a"></label>
     <label>主机或 SSH 地址<input name="host" required placeholder="10.0.0.1 或 gpu-host"></label>

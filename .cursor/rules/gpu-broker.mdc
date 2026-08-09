@@ -1,11 +1,11 @@
 ---
-description: GPU Broker MCP usage — coordination policy for GPU-dependent work
+description: ServerPilot MCP usage — coordination policy for GPU-dependent work
 alwaysApply: true
 ---
 <!-- GPU_BROKER_START -->
-## GPU Broker
+## ServerPilot
 
-This project has a GPU Broker MCP server (`gpu_*` tools) configured when the local broker is reachable at `http://127.0.0.1:8787`. Server instructions and tool schemas remain authoritative.
+This project has a ServerPilot MCP server (`gpu_*` tools) configured when the local broker is reachable at `http://127.0.0.1:8787`. Server instructions and tool schemas remain authoritative.
 
 Use this guidance only where the local `gpu-broker` MCP is callable.
 

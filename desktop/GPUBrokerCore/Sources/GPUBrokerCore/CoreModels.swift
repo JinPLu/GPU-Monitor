@@ -756,7 +756,7 @@ public struct BrokerSnapshot: Equatable, Sendable {
         history: .empty,
         dataAgeSeconds: nil,
         freshnessSeconds: nil,
-        admissionBoundary: "GPU Broker 只协调资源，不执行服务器上的任务。"
+        admissionBoundary: "ServerPilot 只协调资源，不执行服务器上的任务。"
     )
 
     public var operationalEndpoints: [EndpointRecord] {

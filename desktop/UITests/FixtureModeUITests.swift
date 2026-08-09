@@ -31,7 +31,7 @@ final class FixtureModeUITests: XCTestCase {
         XCTAssertTrue(fixtureNotice.waitForExistence(timeout: 2), "The app must identify deterministic fixture mode")
 
         let startupFailure = app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS %@", "无法启动 GPU Broker")
+            NSPredicate(format: "label CONTAINS %@", "无法启动 ServerPilot")
         ).firstMatch
         XCTAssertFalse(
             startupFailure.exists,

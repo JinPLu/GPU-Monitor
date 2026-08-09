@@ -443,7 +443,7 @@ public final class BrokerStore: ObservableObject {
             return
         }
         guard supportsEndpointDeletion else {
-            let message = "当前本机服务不支持移除服务器。请重启或升级 GPU Broker 服务后再试。"
+            let message = "当前本机服务不支持移除服务器。请重启或升级 ServerPilot 服务后再试。"
             errorMessage = message
             completion(false, message)
             return

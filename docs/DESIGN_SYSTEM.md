@@ -1,4 +1,4 @@
-# GPU Broker — Native macOS Material Design System
+# ServerPilot — Native macOS Material Design System
 
 ## Product context
 
@@ -73,7 +73,7 @@ Use dynamic system colors for text, interaction, and semantic states so vibrancy
 ├──────────────┬───────────────────────────────────────────────────────────┤
 │ frosted      │ unified warm gray smoke-brown field with soft texture     │
 │ sidebar      │                                                           │
-│ GPU Broker   │ 总览 [summary] [attention] [freshness]                   │
+│ ServerPilot   │ 总览 [summary] [attention] [freshness]                   │
 │ 总览          │ 服务器 [server collection] → [server detail]             │
 │ 服务器        │ 项目与 Agent [allocation collection] → [detail]          │
 │ 项目与 Agent  │                                                           │
@@ -136,7 +136,7 @@ The target native shell is a SwiftUI/AppKit split view with `NSVisualEffectView`
 
 ## Beszel reference boundary
 
-GPU Broker may borrow Beszel's system-first information architecture, dense sortable tables, field visibility controls, compact endpoint information bar, on-demand history, request-generation protection, ownership markers, and its visible-only chart discipline. Native trend charts use timestamped samples, explicit gaps, no decorative animation, and a bounded selected-sample inspector; hidden details do not fetch or redraw histories. It must not import Beszel's React/PocketBase runtime, authentication and registration model, target/claim/reaper control plane, browser storage, or arbitrary command adapters. The Broker REST API remains the presentation boundary and `service.py` remains the allocation truth.
+ServerPilot may borrow Beszel's system-first information architecture, dense sortable tables, field visibility controls, compact endpoint information bar, on-demand history, request-generation protection, ownership markers, and its visible-only chart discipline. Native trend charts use timestamped samples, explicit gaps, no decorative animation, and a bounded selected-sample inspector; hidden details do not fetch or redraw histories. It must not import Beszel's React/PocketBase runtime, authentication and registration model, target/claim/reaper control plane, browser storage, or arbitrary command adapters. The Broker REST API remains the presentation boundary and `service.py` remains the allocation truth.
 
 The first native delivery presents current truth: resources, endpoint/GPU detail, attention, leases, requests, reservations, and current ownership arrangements. Time-series telemetry is an additive, capability-gated surface. A queue entry without a concrete GPU allocation belongs on an unassigned lane; it must never be drawn as historical ownership of a GPU.
 

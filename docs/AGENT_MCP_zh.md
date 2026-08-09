@@ -1,6 +1,6 @@
 # Agent / MCP 全局安装
 
-MCP 的完整运行契约由 `gpu-broker` server instructions 和工具 schema 提供；英文全局适配块见 [`AGENT_MCP_policy.en.md`](AGENT_MCP_policy.en.md)，保留“GPU 相关任务可主动调度 Broker、复用已批准资源合同、排队继续等待、禁止旁路和禁止推断缺失输入”的跨客户端规则。本文件只保留安装、注册和日常输入。
+MCP 的完整运行契约由 ServerPilot server instructions 和工具 schema 提供；英文全局适配块见 [`AGENT_MCP_policy.en.md`](AGENT_MCP_policy.en.md)，保留“GPU 相关任务可主动调度 Broker、复用已批准资源合同、排队继续等待、禁止旁路和禁止推断缺失输入”的跨客户端规则。本文件只保留安装、注册和日常输入。
 
 ## 一次性安装
 
@@ -8,11 +8,12 @@ MCP 的完整运行契约由 `gpu-broker` server instructions 和工具 schema �
 
 ```bash
 uv tool install --force .
-gpu-broker daemon install --source-root "$PWD"
-gpu-broker daemon status
+serverpilot daemon install --source-root "$PWD"
+serverpilot daemon status
 ```
 
-macOS 后台服务使用 `~/Library/Application Support/GPU Broker/` 作为唯一数据目录。
+为保证升级不丢失已有 inventory、租约和历史数据，ServerPilot 继续使用兼容数据目录
+`~/Library/Application Support/GPU Broker/`；这是内部路径，不影响 App 显示名。
 首次安装会在目标不存在时迁移仓库里的 `configs/inventory.yaml` 和
 `state/gpu-broker.sqlite3`，并保留原文件作为回滚源。源码更新后重新执行
 以下两条命令；第二条会更新并重启 LaunchAgent，不能只依赖一次健康检查完成
@@ -20,17 +21,17 @@ macOS 后台服务使用 `~/Library/Application Support/GPU Broker/` 作为唯�
 
 ```bash
 uv tool install --force .
-gpu-broker daemon install --source-root "$PWD"
+serverpilot daemon install --source-root "$PWD"
 ```
 
 常用生命周期命令：
 
 ```bash
-gpu-broker daemon ensure
-gpu-broker daemon status --json
-gpu-broker daemon stop
-gpu-broker daemon start
-gpu-broker daemon uninstall  # 只移除 LaunchAgent，保留数据
+serverpilot daemon ensure
+serverpilot daemon status --json
+serverpilot daemon stop
+serverpilot daemon start
+serverpilot daemon uninstall  # 只移除 LaunchAgent，保留数据
 ```
 
 ## 注册 MCP
@@ -39,15 +40,15 @@ gpu-broker daemon uninstall  # 只移除 LaunchAgent，保留数据
 
 | 客户端 | MCP 注册 | 全局规则 |
 | --- | --- | --- |
-| Codex | `codex mcp add gpu-broker --env GPU_BROKER_URL=http://127.0.0.1:8787 -- gpu-broker-mcp` | `python3 scripts/install_agent_policy.py codex --install` |
-| Claude Code | `claude mcp add --scope user gpu-broker --env GPU_BROKER_URL=http://127.0.0.1:8787 -- gpu-broker-mcp` | `python3 scripts/install_agent_policy.py claude --install` |
-| Cursor | 在 `~/.cursor/mcp.json` 配置 `gpu-broker` | `python3 scripts/install_agent_policy.py cursor --print` 后粘贴到 User Rules |
+| Codex | `codex mcp add serverpilot --env GPU_BROKER_URL=http://127.0.0.1:8787 -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py codex --install` |
+| Claude Code | `claude mcp add --scope user serverpilot --env GPU_BROKER_URL=http://127.0.0.1:8787 -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py claude --install` |
+| Cursor | 在 `~/.cursor/mcp.json` 配置 `serverpilot` | `python3 scripts/install_agent_policy.py cursor --print` 后粘贴到 User Rules |
 
 Codex 推荐只启用日常工具，并让下面的 owner-scoped 工具不再逐次等待人工确认；不要把全局工具权限改成全放行。资源合同和项目归属仍由 MCP instructions、工具 schema 与当前任务决定。
 
 ```toml
-[mcp_servers.gpu-broker]
-command = "gpu-broker-mcp"
+[mcp_servers.serverpilot]
+command = "serverpilot-mcp"
 enabled_tools = [
   "control_plane_state",
   "gpu_coordination", "gpu_status", "gpu_list", "gpu_who", "gpu_list_profiles",
@@ -61,11 +62,11 @@ enabled_tools = [
   "resource_evaluate_plan", "resource_claim", "resource_release", "resource_record_actual",
 ]
 
-[mcp_servers.gpu-broker.env]
+[mcp_servers.serverpilot.env]
 GPU_BROKER_URL = "http://127.0.0.1:8787"
 ```
 
-`gpu-broker-mcp` 仍然只通过 REST 调用调度服务；它不会直连 SQLite 或 SSH。
+`serverpilot-mcp` 仍然只通过 REST 调用调度服务；它不会直连 SQLite 或 SSH。
 常规只读工具从 canonical `/api/v1/state` 的同一 revision 投影；
 `control_plane_state` 可直接读取完整状态 envelope（含 `snapshot_revision`、
 `data.current` 与 `data.history`），需要等待后端达到指定 revision 时传入
@@ -97,8 +98,8 @@ Cursor MCP 示例：
 ```json
 {
   "mcpServers": {
-    "gpu-broker": {
-      "command": "gpu-broker-mcp",
+    "serverpilot": {
+      "command": "serverpilot-mcp",
       "env": {"GPU_BROKER_URL": "http://127.0.0.1:8787"}
     }
   }
@@ -122,7 +123,7 @@ Agent 不需要复制本仓库工作流，也不需要在其他项目写 GPU 说
 
 ## 其他项目
 
-不要把本仓库的瀚海22、Slurm、SSH 或 GPU Broker 细则复制到每个项目的 `AGENTS.md`。其他项目只需要完成两件全局配置：注册 `gpu-broker` MCP，并安装本仓库维护的全局 Agent policy block，例如 Codex 使用：
+不要把本仓库的瀚海22、Slurm、SSH 或 ServerPilot 细则复制到每个项目的 `AGENTS.md`。其他项目只需要完成两件全局配置：注册 `serverpilot` MCP，并安装本仓库维护的全局 Agent policy block，例如 Codex 使用：
 
 ```bash
 python3 scripts/install_agent_policy.py codex --install
@@ -131,7 +132,7 @@ python3 scripts/install_agent_policy.py codex --install
 项目本地说明只记录该项目自己的资源合同，例如固定 `profile_id`，或一次性任务需要的 `project_id`、`gpu_count`、CPU / 内存 / 显存下限和任务名。若某项目已有旧的“瀚海22 直接 `hh22` / `ssh` / `sbatch`”Agent 规则，应删除具体登录节点、端口、脚本和手工 fallback，替换为短指针：
 
 ```text
-GPU 和瀚海22任务使用全局 gpu-broker MCP policy。瀚海22是 SchedulerTarget；
+GPU 和瀚海22任务使用全局 ServerPilot MCP policy。瀚海22是 SchedulerTarget；
 Agent 调用 gpu_scheduler_targets / gpu_scheduler_access_status 和项目 owner 的
 scheduler 工具，不回退到项目本地 SSH 规则。
 ```
@@ -163,8 +164,8 @@ Slurm `PENDING` 不创建裸机 lease；只有 Slurm 状态和 AllocTRES 能证�
 ## 验证
 
 ```bash
-gpu-broker-mcp --help
-codex mcp get gpu-broker --json
+serverpilot-mcp --help
+codex mcp get serverpilot --json
 python3 scripts/install_agent_policy.py all --print
 ```
 

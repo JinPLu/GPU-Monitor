@@ -3,16 +3,18 @@ set -euo pipefail
 
 script_dir=${0:A:h}
 project_root=${script_dir:h}
-dist_app_entry="${project_root}/dist/GPU Broker.app"
+dist_app_entry="${project_root}/dist/ServerPilot.app"
 user_applications_dir="${GPU_BROKER_USER_APPLICATIONS_DIR:-${HOME}/Applications}"
-final_app_bundle="${user_applications_dir}/GPU Broker.app"
+final_app_bundle="${user_applications_dir}/ServerPilot.app"
 staging_root="$(mktemp -d /tmp/gpu-broker-macos-app.XXXXXX)"
 trap 'rm -rf "${staging_root}"' EXIT
-app_bundle="${staging_root}/GPU Broker.app"
+app_bundle="${staging_root}/ServerPilot.app"
 macos_dir="${app_bundle}/Contents/MacOS"
 resources_dir="${app_bundle}/Contents/Resources"
 runtime_dir="${resources_dir}/BrokerRuntime"
-root_app_entry="${project_root}/GPU Broker.app"
+root_app_entry="${project_root}/ServerPilot.app"
+legacy_root_app_entry="${project_root}/GPU Broker.app"
+legacy_user_app_bundle="${user_applications_dir}/GPU Broker.app"
 core_dir="${script_dir}/GPUBrokerCore"
 core_sources=("${core_dir}/Sources/GPUBrokerCore"/*.swift(N))
 swift_sources=("${core_sources[@]}" "${script_dir}"/*.swift(N))
@@ -46,7 +48,7 @@ fi
 
 mkdir -p "${macos_dir}" "${resources_dir}" "${runtime_dir}/configs"
 cp "${script_dir}/Info.plist" "${app_bundle}/Contents/Info.plist"
-cp "${script_dir}/assets/GPU Broker.icns" "${resources_dir}/GPU Broker.icns"
+cp "${script_dir}/assets/ServerPilot.icns" "${resources_dir}/ServerPilot.icns"
 cp "${project_root}/configs/inventory.yaml" "${runtime_dir}/configs/inventory.yaml"
 if [[ -d "${script_dir}/Fixtures" ]]; then
   mkdir -p "${resources_dir}/Fixtures"
@@ -77,13 +79,19 @@ xcrun --sdk macosx swiftc \
   -framework AppKit \
   -framework SwiftUI \
   "${swift_sources[@]}" \
-  -o "${macos_dir}/GPU Broker"
+  -o "${macos_dir}/ServerPilot"
 xattr -cr "${app_bundle}"
 xattr -d com.apple.FinderInfo "${app_bundle}" 2>/dev/null || true
 xattr -d 'com.apple.fileprovider.fpfs#P' "${app_bundle}" 2>/dev/null || true
 codesign --force --deep --sign - "${app_bundle}"
 codesign --verify --deep --strict "${app_bundle}"
 mkdir -p "${project_root}/dist" "${user_applications_dir}"
+if [[ ! -e "${final_app_bundle}" && -d "${legacy_user_app_bundle}" ]]; then
+  legacy_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${legacy_user_app_bundle}/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ "${legacy_bundle_id}" == "local.gpu-broker.desktop" ]]; then
+    mv "${legacy_user_app_bundle}" "${final_app_bundle}"
+  fi
+fi
 if [[ -e "${final_app_bundle}" || -L "${final_app_bundle}" ]]; then
   existing_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${final_app_bundle}/Contents/Info.plist" 2>/dev/null || true)"
   if [[ "${existing_bundle_id}" != "local.gpu-broker.desktop" ]]; then
@@ -118,13 +126,11 @@ elif [[ -e "${root_app_entry}" ]]; then
   exit 1
 fi
 
-ln -s "dist/GPU Broker.app" "${root_app_entry}"
+ln -s "dist/ServerPilot.app" "${root_app_entry}"
 
-for legacy_app in "${project_root}"/GPU\ Broker\ <->.app(N); do
-  if [[ -L "${legacy_app}" && "$(readlink "${legacy_app}")" == "dist/GPU Broker.app" ]]; then
-    unlink "${legacy_app}"
-  fi
-done
+if [[ -L "${legacy_root_app_entry}" && "$(readlink "${legacy_root_app_entry}")" == "dist/GPU Broker.app" ]]; then
+  unlink "${legacy_root_app_entry}"
+fi
 
 echo "Built ${final_app_bundle}"
 echo "Dist entry ${dist_app_entry}"

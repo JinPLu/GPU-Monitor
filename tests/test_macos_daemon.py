@@ -421,7 +421,7 @@ def test_mcp_ensures_daemon_before_constructing_rest_client(
 
 def test_macos_gui_no_longer_owns_or_terminates_server_process() -> None:
     source = (
-        Path(__file__).resolve().parents[1] / "desktop" / "GPU Broker.swift"
+        Path(__file__).resolve().parents[1] / "desktop" / "ServerPilot.swift"
     ).read_text(encoding="utf-8")
 
     assert '"daemon", "ensure", "--source-root"' in source
@@ -441,7 +441,7 @@ def test_macos_gui_no_longer_owns_or_terminates_server_process() -> None:
 
 def test_macos_gui_defaults_to_low_composition_surfaces() -> None:
     project_root = Path(__file__).resolve().parents[1]
-    window_source = (project_root / "desktop" / "GPU Broker.swift").read_text(
+    window_source = (project_root / "desktop" / "ServerPilot.swift").read_text(
         encoding="utf-8"
     )
     support_source = (project_root / "desktop" / "AppSupport.swift").read_text(
@@ -501,7 +501,7 @@ def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry
     usage_source = (
         project_root / "desktop" / "ResourceUsageDashboard.swift"
     ).read_text(encoding="utf-8")
-    window_source = (project_root / "desktop" / "GPU Broker.swift").read_text(
+    window_source = (project_root / "desktop" / "ServerPilot.swift").read_text(
         encoding="utf-8"
     )
 
@@ -532,7 +532,7 @@ def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry
 def test_product_copy_is_anchored_on_one_user_with_projects_and_agents() -> None:
     project_root = Path(__file__).resolve().parents[1]
     readme = (project_root / "README.md").read_text(encoding="utf-8")
-    window_source = (project_root / "desktop" / "GPU Broker.swift").read_text(
+    window_source = (project_root / "desktop" / "ServerPilot.swift").read_text(
         encoding="utf-8"
     )
     usage_source = (
@@ -551,7 +551,7 @@ def test_product_copy_is_anchored_on_one_user_with_projects_and_agents() -> None
     ).read_text(encoding="utf-8")
 
     assert "一个本机用户，管理多台服务器、多个项目和多个 Agent" in readme
-    assert "| 你要做什么 | GPU Broker 做什么 |\n| --- | --- |" in readme
+    assert "| 你要做什么 | ServerPilot 做什么 |\n| --- | --- |" in readme
     assert "| --- | --- | --- |" not in readme
     assert 'SidebarSelection(title: "项目与 Agent"' in window_source
     assert 'Text("项目与 Agent")' in usage_source

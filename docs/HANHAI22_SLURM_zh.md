@@ -1,4 +1,4 @@
-# 瀚海22：GPU Broker 外部 Slurm（CPU / GPU）调度使用指南
+# 瀚海22：ServerPilot 外部 Slurm（CPU / GPU）调度使用指南
 
 更新时间：2026-07-31（Asia/Shanghai）
 
@@ -8,12 +8,12 @@
 
 ## 定位
 
-瀚海22不是一台可以长期独占、由 GPU Broker 直接分配单卡的 SSH 裸机，
+瀚海22不是一台可以长期独占、由 ServerPilot 直接分配单卡的 SSH 裸机，
 而是一个由 Slurm 统一分配计算节点和 GPU 的外部集群：
 
 ```text
 用户 / Agent
-    -> GPU Broker：记录任务意图、资源合同和协调边界
+    -> ServerPilot：记录任务意图、资源合同和协调边界
     -> USTC SCC VPN：提供校外网络入口
     -> SSH 登录节点：编辑、编译、传输、提交和管理作业
     -> Slurm：排队并授予 CPU / GPU 资源
@@ -37,7 +37,7 @@
 | 资源申请 | 项目 Profile 用 `gpu_scheduler_submit_profile`；带明确资源合同的一次性脚本用 `gpu_scheduler_submit_once` |
 | 状态与取消 | `gpu_scheduler_job_status` / `gpu_scheduler_cancel` |
 | 数据上传 | 当前不公开；由项目自己既有的数据路径处理 |
-| GPU Broker | 保存授权、请求摘要、Job ID、状态事件和审计；不替代 Slurm 分配 |
+| ServerPilot | 保存授权、请求摘要、Job ID、状态事件和审计；不替代 Slurm 分配 |
 | 作业归属 | 以 Slurm Job ID、account、partition、QoS 和 AllocTRES 为准 |
 
 持续边界：
@@ -247,7 +247,7 @@ scancel <JOB_ID>
 - 最终状态、退出码和日志路径
 
 adapter 会把这组记录写入 `SchedulerJob` 及其追加式状态事件；它们不是裸机
-GPU Broker lease。Slurm `PENDING` 时绝不会生成“已获配 GPU”的假 lease。
+ServerPilot lease。Slurm `PENDING` 时绝不会生成“已获配 GPU”的假 lease。
 
 ## “常驻服务器”的边界
 
@@ -368,7 +368,7 @@ scontrol show job <JOB_ID>
 
 ## 已实现的 Slurm adapter 契约
 
-GPU Broker 使用独立 Slurm adapter，不复用裸机 endpoint / Collector 语义：
+ServerPilot 使用独立 Slurm adapter，不复用裸机 endpoint / Collector 语义：
 
 1. 以 `cluster_id + partition + qos` 标识调度域，不能以登录节点 IP 代表 GPU。
 2. 请求由 Broker 生成或校验 Slurm 资源合同，再提交到 Slurm。

@@ -140,7 +140,7 @@ def create_app(settings: Settings) -> FastAPI:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-    app = FastAPI(title="gpu-broker", version=__version__, lifespan=lifespan)
+    app = FastAPI(title="ServerPilot", version=__version__, lifespan=lifespan)
     app.state.service = service
     app.state.settings = settings
     limiter = RateLimiter(settings.rate_limit_per_minute)

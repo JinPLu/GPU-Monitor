@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = Split-Path -Parent $scriptDir
-$specPath = Join-Path $scriptDir "windows\GPUBrokerWindows.spec"
+$specPath = Join-Path $scriptDir "windows\ServerPilotWindows.spec"
 $outputRoot = Join-Path $projectRoot "dist\windows"
 $workPath = Join-Path $projectRoot "build\windows"
 
@@ -30,7 +30,7 @@ uv run --with pyinstaller pyinstaller `
     --workpath $workPath `
     $specPath
 
-$appPath = Join-Path $outputRoot "GPU Broker\GPU Broker.exe"
+$appPath = Join-Path $outputRoot "ServerPilot\ServerPilot.exe"
 if (-not (Test-Path $appPath)) {
     throw "Build finished but $appPath was not created."
 }

@@ -3,8 +3,8 @@ set -euo pipefail
 
 script_dir=${0:A:h}
 project_root=${script_dir:h}
-app_bundle="${1:-${project_root}/dist/GPU Broker.app}"
-frontend="${app_bundle}/Contents/MacOS/GPU Broker"
+app_bundle="${1:-${project_root}/dist/ServerPilot.app}"
+frontend="${app_bundle}/Contents/MacOS/ServerPilot"
 runtime_root="${app_bundle}/Contents/Resources/BrokerRuntime"
 backend="${runtime_root}/gpu-broker"
 inventory="${runtime_root}/configs/inventory.yaml"

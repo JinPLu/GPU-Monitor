@@ -17,7 +17,7 @@
 
 - Python 3.12；依赖改动同步 `uv.lock`。持久化或公共行为改动同步 migration、文档和测试。
 - 运行最贴近改动面的测试与 Ruff；除非用户明确要求只读 shadow 采集，否则不得连接真实 GPU。
-- 修改桌面壳或打包路径时运行 `zsh desktop/build-macos-app.sh`；`dist/GPU Broker.app` 只作为构建产物。
+- 修改桌面壳或打包路径时运行 `zsh desktop/build-macos-app.sh`；`dist/ServerPilot.app` 只作为构建产物。
 
 <!-- TEAMWORK_PROJECT_START -->
 ## Teamwork Project Instructions
