@@ -161,7 +161,7 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
 def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
     global_policy = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
     for boundary in (
-        "schedulertargets",
+        "external slurm clusters",
         "never raw ssh endpoints",
         "gpu_scheduler_targets",
         "gpu_scheduler_access_status",
@@ -176,8 +176,13 @@ def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
         "inventory",
         "remote probes",
         "nvidia-smi",
+        "sealed transport",
+        "read-only inspection profile",
+        "executable path, argv, shell fragment, ssh option",
     ):
         assert boundary in global_policy
+    for site_specific_identifier in ("hanhai", "瀚海", "hh22"):
+        assert site_specific_identifier not in global_policy
 
     mcp_instructions = _plain_policy_text(mcp.instructions).lower()
     for runtime_detail in (

@@ -254,6 +254,7 @@ class BrokerService:
                     port=configured_endpoint.port,
                     ssh_user=configured_endpoint.ssh_user,
                     ssh_alias=configured_endpoint.ssh_alias,
+                    observation_profile=configured_endpoint.observation_profile,
                     labels_json=json_dump(configured_endpoint.labels),
                     storage_group=configured_endpoint.storage_group,
                     expected_gpu_count=configured_endpoint.expected_gpu_count,
@@ -281,6 +282,7 @@ class BrokerService:
                     )
                 endpoint.ssh_user = configured_endpoint.ssh_user
                 endpoint.ssh_alias = configured_endpoint.ssh_alias
+                endpoint.observation_profile = configured_endpoint.observation_profile
                 endpoint.labels_json = json_dump(configured_endpoint.labels)
                 endpoint.storage_group = configured_endpoint.storage_group
                 endpoint.expected_gpu_count = configured_endpoint.expected_gpu_count
@@ -348,6 +350,7 @@ class BrokerService:
                         port=endpoint.port,
                         ssh_user=endpoint.ssh_user,
                         ssh_alias=endpoint.ssh_alias,
+                        observation_profile=endpoint.observation_profile,
                         labels=json_load(endpoint.labels_json),
                         storage_group=endpoint.storage_group,
                         expected_gpu_count=endpoint.expected_gpu_count,
@@ -618,6 +621,7 @@ class BrokerService:
             "port": endpoint.port,
             "ssh_user": endpoint.ssh_user,
             "ssh_alias": endpoint.ssh_alias,
+            "observation_profile": endpoint.observation_profile,
             "labels": json_load(endpoint.labels_json),
             "storage_group": endpoint.storage_group,
             "expected_gpu_count": endpoint.expected_gpu_count,
@@ -675,15 +679,19 @@ class BrokerService:
     @staticmethod
     def _scheduler_target_dict(target: SchedulerTarget) -> dict[str, Any]:
         connection = json_load(target.connection_json)
-        command_prefix = (
-            connection.get("command_prefix", []) if isinstance(connection, dict) else []
+        transport_profile = (
+            connection.get("transport_profile") if isinstance(connection, dict) else None
+        )
+        inspection_profile = (
+            connection.get("inspection_profile") if isinstance(connection, dict) else None
         )
         return {
             "id": target.id,
             "display_name": target.display_name,
             "kind": "external-scheduler",
             "adapter": target.adapter,
-            "command_helper": command_prefix[0] if command_prefix else None,
+            "transport_profile": transport_profile,
+            "inspection_profile": inspection_profile,
             "credential_refs": json_load(target.credential_refs_json),
             "capabilities": json_load(target.capabilities_json),
             "access_hint": target.access_hint,
@@ -6289,7 +6297,8 @@ class BrokerService:
             target = session.get(SchedulerTarget, target_data.id)
             before = self._scheduler_target_dict(target) if target else None
             connection = {
-                "command_prefix": target_data.command_prefix,
+                "transport_profile": target_data.transport_profile,
+                "inspection_profile": target_data.inspection_profile,
                 "upload": (
                     target_data.upload.model_dump(mode="json")
                     if target_data.upload is not None
@@ -7486,6 +7495,7 @@ class BrokerService:
                     port=endpoint_data.port,
                     ssh_user=endpoint_data.ssh_user,
                     ssh_alias=endpoint_data.ssh_alias,
+                    observation_profile=endpoint_data.observation_profile,
                     labels_json=json_dump(endpoint_data.labels),
                     storage_group=endpoint_data.storage_group,
                     expected_gpu_count=endpoint_data.expected_gpu_count,
@@ -7528,6 +7538,7 @@ class BrokerService:
                     endpoint.lifecycle_state = requested_lifecycle
                 endpoint.ssh_user = endpoint_data.ssh_user
                 endpoint.ssh_alias = endpoint_data.ssh_alias
+                endpoint.observation_profile = endpoint_data.observation_profile
                 endpoint.labels_json = json_dump(endpoint_data.labels)
                 endpoint.storage_group = endpoint_data.storage_group
                 endpoint.expected_gpu_count = endpoint_data.expected_gpu_count

@@ -44,6 +44,9 @@ class Endpoint(Base):
     port: Mapped[int] = mapped_column(Integer, nullable=False)
     ssh_user: Mapped[str] = mapped_column(String(64), nullable=False)
     ssh_alias: Mapped[str | None] = mapped_column(String(120))
+    observation_profile: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="linux-nvidia"
+    )
     labels_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     storage_group: Mapped[str | None] = mapped_column(String(120))
     expected_gpu_count: Mapped[int | None] = mapped_column(Integer)

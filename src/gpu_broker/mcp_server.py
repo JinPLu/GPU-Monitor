@@ -50,7 +50,7 @@ MCP_INSTRUCTIONS = (
     "Endpoints are shared loopback inventory; project ownership is optional attribution. Authorized "
     "actors may add them or retire them into draining; retirement prevents new placement and never "
     "stops an existing workload. "
-    "External Slurm clusters such as Hanhai22 are SchedulerTargets, never raw SSH endpoints. Use "
+    "External Slurm clusters are SchedulerTargets, never raw SSH endpoints. Use "
     "gpu_scheduler_targets and gpu_scheduler_access_status to discover a target, then use owner-scoped "
     "submit, status, and cancel operations. "
     "A Slurm PENDING job is not a bare-metal lease; scheduler status and AllocTRES establish its allocation. "
@@ -236,7 +236,7 @@ def gpu_list_profiles(project_id: str | None = None) -> dict[str, Any]:
 
 @mcp.tool()
 def gpu_scheduler_targets() -> dict[str, Any]:
-    """List globally registered external schedulers such as Hanhai22.
+    """List globally registered external scheduler targets.
 
     Scheduler targets are not raw GPU servers. Their login helpers and access
     hints are metadata; Slurm remains the resource allocator.

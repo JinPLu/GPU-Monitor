@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/JinPLu/ServerPilot/releases/tag/v1.2.0"><img src="https://img.shields.io/badge/release-v1.2.0-0F766E" alt="ServerPilot v1.2.0"></a>
+  <a href="https://github.com/JinPLu/ServerPilot/releases/tag/v1.3.0"><img src="https://img.shields.io/badge/release-v1.3.0-0F766E" alt="ServerPilot v1.3.0"></a>
   <img src="https://img.shields.io/badge/Python-3.12%2B-2563EB?logo=python&logoColor=white" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/macOS-14%2B-111827?logo=apple&logoColor=white" alt="macOS 14+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-334155" alt="MIT License"></a>
@@ -24,6 +24,8 @@
 ServerPilot 把直连服务器和外部集群的 GPU / CPU 汇总到一个本机控制面。你可以
 查看资源，为项目、Agent 和任务申请资源，并在资源不足时排队。App、CLI 和 MCP
 始终读取同一份状态。
+
+一个本机用户，管理多台服务器、多个项目和多个 Agent；资源申请由 Broker 协调，利用率与归属由人持续监督。
 
 ## 🎯 四件事
 
@@ -114,13 +116,13 @@ GPU / CPU 服务器 ── 固定只读 Collector ──────────
 > `lease.resources[]` 返回的位置运行已获授权的任务。
 
 > [!CAUTION]
-> Slurm 登录节点不是普通 GPU 服务器，也不能证明 GPU 已分配。瀚海22必须使用
-> `SchedulerTarget` 和 scheduler 工具，详见 [Slurm 指南](docs/HANHAI22_SLURM_zh.md)。
+> Slurm 登录节点不是普通 GPU 服务器，也不能证明 GPU 已分配。任何外部调度集群都使用
+> `SchedulerTarget` 和 scheduler 工具；读取差异通过受限 profile 配置，而不是按集群名称写规则。
 
 ## 📚 文档
 
 - 🤖 [Agent / MCP 安装与资源合同](docs/AGENT_MCP_zh.md)
-- 🧮 [瀚海22 / Slurm 调度](docs/HANHAI22_SLURM_zh.md)
+- 🧮 [外部 Slurm 调度与连接 profile](docs/ADAPTERS_zh.md)
 - ✅ [当前实现与验证状态](docs/IMPLEMENTATION_STATUS_zh.md)
 - 🎨 [桌面设计系统](docs/DESIGN_SYSTEM.md)
 - 🔌 [Adapter 能力与边界](docs/ADAPTERS_zh.md)

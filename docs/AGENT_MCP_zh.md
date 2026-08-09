@@ -137,30 +137,29 @@ Agent 不需要复制本仓库工作流，也不需要在其他项目写 GPU 说
 
 ## 其他项目
 
-不要把本仓库的瀚海22、Slurm、SSH 或 ServerPilot 细则复制到每个项目的 `AGENTS.md`。其他项目只需要完成两件全局配置：注册 `serverpilot` MCP，并安装本仓库维护的全局 Agent policy block，例如 Codex 使用：
+不要把本仓库的具体集群、Slurm、SSH 或 ServerPilot 细则复制到每个项目的 `AGENTS.md`。其他项目只需要完成两件全局配置：注册 `serverpilot` MCP，并安装本仓库维护的全局 Agent policy block，例如 Codex 使用：
 
 ```bash
 python3 scripts/install_agent_policy.py codex --install
 ```
 
-项目本地说明只记录该项目自己的资源合同，例如固定 `profile_id`，或一次性任务需要的 `project_id`、`gpu_count`、CPU / 内存 / 显存下限和任务名。若某项目已有旧的“瀚海22 直接 `hh22` / `ssh` / `sbatch`”Agent 规则，应删除具体登录节点、端口、脚本和手工 fallback，替换为短指针：
+项目本地说明只记录该项目自己的资源合同，例如固定 `profile_id`，或一次性任务需要的 `project_id`、`gpu_count`、CPU / 内存 / 显存下限和任务名。若某项目已有旧的“直接 `ssh` / `sbatch`”Agent 规则，应删除具体登录节点、端口、脚本和手工 fallback，替换为短指针：
 
 ```text
-GPU 和瀚海22任务使用全局 ServerPilot MCP policy。瀚海22是 SchedulerTarget；
-Agent 调用 gpu_scheduler_targets / gpu_scheduler_access_status 和项目 owner 的
+GPU 和外部调度任务使用全局 ServerPilot MCP policy。外部集群是 SchedulerTarget；
+Agent 调用 gpu_scheduler_targets / gpu_scheduler_access_status，并对发现的 target_id 使用项目 owner 的
 scheduler 工具，不回退到项目本地 SSH 规则。
 ```
 
 ## 外部调度型服务器
 
-瀚海22一类 Slurm 集群不是当前 Broker 的普通 SSH endpoint。目标任务明确使用
-瀚海22时，Agent 应转入[瀚海22外部 Slurm 调度指南](HANHAI22_SLURM_zh.md)的
-专用 scheduler 流程：
+任何 Slurm 集群都不是当前 Broker 的普通 SSH endpoint。目标任务明确使用外部 scheduler 时，
+Agent 走同一条通用 scheduler 流程：
 
 - 不把登录节点登记为普通 GPU 服务器。
-- 不调用当前裸机 `gpu_claim` 表示已经获得瀚海22 GPU。
-- 先调用 `gpu_scheduler_targets`，再调用
-  `gpu_scheduler_access_status("hanhai22")`；不得从项目本地 IP/端口规则猜入口。
+- 不调用当前裸机 `gpu_claim` 表示已经获得外部集群 GPU。
+- 先调用 `gpu_scheduler_targets`，从返回的 target ID 选择目标后再调用
+  `gpu_scheduler_access_status(target_id)`；不得从项目本地 IP/端口规则猜入口。
 - Profile 任务调用 `gpu_scheduler_submit_profile`；项目 owner 的一次性脚本调用
   `gpu_scheduler_submit_once`，并提供脚本与资源合同。
 - 用 `gpu_scheduler_job_status` 读取 Job ID、状态和 AllocTRES；不调用
@@ -174,6 +173,11 @@ Slurm `PENDING` 不创建裸机 lease；只有 Slurm 状态和 AllocTRES 能证�
 已经打开、尚未热加载专用 scheduler 工具的旧任务，可从
 `gpu_coordination.data.scheduler_targets[*].last_access` 读取最近一次接入观测；
 不得因此回退到项目本地 SSH 规则。
+
+服务器由人类在连接时配置：普通 endpoint 选择封闭的 `observation_profile`，外部
+SchedulerTarget 选择封闭的 `transport_profile` 与 `inspection_profile`。这些字段只选择代码注册的
+固定读取能力，不能承载命令、argv、shell、私钥、SSH option 或 secret；Agent 不选择、不修改
+profile，也不按任何服务器名称编写分支。
 
 ## 验证
 

@@ -90,8 +90,8 @@
   不能从 inventory、空闲容量或任务名猜合同，也不能旁路 Broker。
 - 已实现独立外部 Slurm adapter：`SchedulerTarget` 全局发现、`SchedulerJob` 与追加式状态
   事件持久化，MCP 提供目标/接入查询、Profile 或带资源合同的一次性提交、状态刷新与 owner
-  cancel。瀚海22不会注册为普通 endpoint；脚本默认只保存摘要，VPN 只检测不自动操作，
-  Slurm `PENDING` 不创建裸机 lease。staged upload 暂不公开。
+  cancel。外部集群不会注册为普通 endpoint；连接时只选择封闭 transport 与 inspection profile，
+  脚本默认只保存摘要，VPN 只检测不自动操作，Slurm `PENDING` 不创建裸机 lease。staged upload 暂不公开。
 
 ## 验证快照
 

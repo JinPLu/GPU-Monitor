@@ -52,12 +52,18 @@ never stops an existing workload.
 
 ## External schedulers
 
-Hanhai22 and every other Slurm cluster are `SchedulerTarget`s, never raw SSH
-endpoints. Discover the target with `gpu_scheduler_targets`, check it with
+External Slurm clusters are `SchedulerTarget`s, never raw SSH endpoints.
+Discover the target with `gpu_scheduler_targets`, check the selected target with
 `gpu_scheduler_access_status`, and use the scheduler tools. A Slurm `PENDING`
 job is not a bare-metal lease; scheduler state and `AllocTRES` establish the
 allocation. `access_required` means ask the user to connect the approved VPN;
 never automate VPN access or fall back to SSH.
+
+Connection metadata can select only a sealed transport and read-only inspection
+profile. It cannot contain an executable path, argv, shell fragment, SSH option,
+secret, or arbitrary probe. An endpoint likewise selects a sealed observation
+profile. Agents do not select or alter either profile; a human administrator
+configures them when connecting a server.
 
 `gpu_scheduler_submit_profile` follows the approved profile. A one-off submit
 requires the exact script/resource contract and a current-task `approval_ref`.

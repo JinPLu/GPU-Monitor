@@ -1,8 +1,8 @@
 """Bounded Slurm command adapter for external scheduler targets.
 
-The adapter receives a fixed local command prefix (for example the user-owned
-``hh22`` authentication helper) and appends one shell-quoted remote command.
-It never accepts raw SSH options or a free-form remote command from MCP.
+Each target selects a sealed transport and a sealed, read-only inspection
+profile.  The local deployment resolves the transport helper; target data never
+contains an executable, argv, SSH option, or secret.
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from types import MappingProxyType
+from typing import Any, Callable, Literal, Mapping, Protocol
 
 from gpu_broker.adapters import AdapterCommandError, SlurmCommandSchedulerAdapter, scheduler_adapter
 
@@ -32,205 +33,38 @@ TERMINAL_SLURM_STATES = {
     "TIMEOUT",
 }
 
-SCHEDULER_INSPECTION_SCRIPT = r"""
-set -uo pipefail
+_SCHEDULER_BASIC_INSPECTION_SCRIPT = r"""
+set -eu
 
 printf 'GB|identity|%s|%s|%s|%s\n' \
-  "$(hostname -f 2>/dev/null || hostname)" \
-  "$(id -un)" \
-  "$HOME" \
-  "$PWD"
-
-emit_path() {
-  label=$1
-  candidate=$2
-  if [ -e "$candidate" ]; then
-    kind=other
-    [ -d "$candidate" ] && kind=directory
-    writable=false
-    [ -w "$candidate" ] && writable=true
-    printf 'GB|path|%s|%s|%s|%s\n' \
-      "$label" "$candidate" "$kind" "$writable"
-  fi
-}
-
-emit_path home "$HOME"
-emit_path home-root /home
-emit_path software /opt
-emit_path scratch /scratch
-emit_path data /data
-emit_path public /public
-
+  "$(hostname -f 2>/dev/null || hostname)" "$(id -un)" "$HOME" "$PWD"
+if [ -e "$HOME" ]; then
+  writable=false
+  [ -w "$HOME" ] && writable=true
+  printf 'GB|path|home|%s|directory|%s\n' "$HOME" "$writable"
+fi
 df -Pk "$HOME" | awk \
   'NR == 2 { printf "GB|filesystem|%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6 }'
-
 if command -v quota >/dev/null 2>&1; then
-  (quota -s 2>&1 || true) \
-    | sed -e 's/|/ /g' -e 's/^/GB|quota|/' \
-    | head -n 20
+  (quota -s 2>&1 || true) | sed -e 's/|/ /g' -e 's/^/GB|quota|/' | head -n 20
 fi
+""".strip()
 
-clean_probe_output() {
-  LC_ALL=C sed -E $'s/\x1B\[[0-9;?]*[ -\/]*[@-~]//g' \
-    | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
-}
-
-emit_qos_probe_failure() {
-  probe=$1
-  probe_output=$2
-  cleaned=$(printf '%s' "$probe_output" | clean_probe_output)
-  lowered=$(printf '%s' "$cleaned" | LC_ALL=C tr '[:upper:]' '[:lower:]')
-  case "$lowered" in
-    *'permission denied'*|*'access denied'*|*'not authorized'*|*'not permitted'*)
-      probe_status=denied
-      ;;
-    *'command not found'*|*'unknown field'*|*'invalid field'*|*'not found'*)
-      probe_status=unsupported
-      ;;
-    *) probe_status=unavailable ;;
-  esac
-  probe_lines=$(printf '%s' "$cleaned" | awk 'NR { lines=NR } END { print lines + 0 }')
-  probe_bytes=$(printf '%s' "$cleaned" | LC_ALL=C wc -c | tr -d '[:space:]')
-  probe_digest=$(printf '%s' "$cleaned" | LC_ALL=C cksum | awk '{ print $1 }')
-  printf 'GB|qos-probe|%s|%s|%s|%s|cksum:%s\n' \
-    "$probe" "$probe_status" "$probe_lines" "$probe_bytes" "$probe_digest"
-}
-
-if [ "${SBATCH_QOS+x}" = x ]; then
-  sbatch_qos_present=true
-  if [ -n "$SBATCH_QOS" ]; then sbatch_qos_nonempty=true; else sbatch_qos_nonempty=false; fi
-  sbatch_qos_bytes=$(printf '%s' "$SBATCH_QOS" | LC_ALL=C wc -c | tr -d '[:space:]')
-  sbatch_qos_digest=cksum:$(printf '%s' "$SBATCH_QOS" | LC_ALL=C cksum | awk '{ print $1 }')
-else
-  sbatch_qos_present=false
-  sbatch_qos_nonempty=false
-  sbatch_qos_bytes=0
-  sbatch_qos_digest=none
-fi
-printf 'GB|sbatch-env|SBATCH_QOS|%s|%s|%s|%s\n' \
-  "$sbatch_qos_present" "$sbatch_qos_nonempty" \
-  "$sbatch_qos_bytes" "$sbatch_qos_digest"
-
-partition_qos_output=$(scontrol show partition CPU-64C256GB -o 2>&1)
-partition_qos_status=$?
-if [ "$partition_qos_status" -eq 0 ] && [ -n "$partition_qos_output" ]; then
-  printf '%s\n' "$partition_qos_output" | clean_probe_output | awk '
-    {
-      for (i=1; i<=NF; i++) {
-        split($i, pair, "=")
-        key=toupper(pair[1])
-        value=substr($i, length(pair[1]) + 2)
-        if (key == "PARTITIONNAME") partition=value
-        else if (key == "ALLOWQOS") allow_qos=value
-        else if (key == "QOS") qos=value
-        else if (key == "DEFAULTQOS") default_qos=value
-      }
-    }
-    function safe(value) {
-      if (value == "") return "(none)"
-      if (value !~ /^[[:alnum:]_.,:+\/()=-]+$/) return "(redacted)"
-      return value
-    }
-    END {
-      printf "GB|qos-probe|partition|available|%s|%s|%s|%s\n", \
-        safe(partition), safe(allow_qos), safe(qos), safe(default_qos)
-    }
-  '
-else
-  emit_qos_probe_failure partition "$partition_qos_output"
-fi
-
-current_user=$(id -un)
-association_qos_output=$(sacctmgr -n -P show assoc where user="$current_user" \
-  format=Account,User,Partition,QOS,DefaultQOS 2>&1)
-association_qos_status=$?
-if [ "$association_qos_status" -eq 0 ]; then
-  printf '%s\n' "$association_qos_output" | clean_probe_output | awk \
-    -F '|' -v current_user="$current_user" '
-    function safe(value) {
-      if (value == "") return "(none)"
-      if (value !~ /^[[:alnum:]_.,:+\/()=-]+$/) return "(redacted)"
-      return value
-    }
-    $2 == current_user && count < 64 {
-      printf "GB|association-qos|%s|%s|%s|%s\n", \
-        safe($1), safe($3), safe($4), safe($5)
-      count++
-    }
-    END { printf "GB|qos-probe|association|available|%d\n", count + 0 }
-  '
-else
-  emit_qos_probe_failure association "$association_qos_output"
-fi
-
-aliyunpan_count=0
-aliyunpan_seen=
-
-emit_aliyunpan_candidate() {
-  candidate=$1
-  [ "$aliyunpan_count" -lt 16 ] || return
-  [ -f "$candidate" ] && [ -x "$candidate" ] || return
-  command -v realpath >/dev/null 2>&1 || return
-  canonical=$(realpath "$candidate" 2>/dev/null) || return
-  case "$canonical" in
-    "$HOME"/*) ;;
-    *)
-      canonical_parent=$(dirname "$canonical")
-      case "$canonical_parent" in
-        /bin|/usr/bin|/usr/local/bin|/usr/sbin|/usr/local/sbin) ;;
-        *) return ;;
-      esac
-      ;;
-  esac
-  case "$canonical" in *'|'*|*$'\n'*|*$'\r'*) return ;; esac
-  if printf '%s\n' "$aliyunpan_seen" | grep -Fqx -- "$canonical"; then return; fi
-  aliyunpan_seen="${aliyunpan_seen}${aliyunpan_seen:+$'\n'}${canonical}"
-  encoded_path=$(printf '%s' "$canonical" | base64 | tr -d '\r\n')
-  printf 'GB|aliyunpan-cli|%s\n' "$encoded_path"
-  aliyunpan_count=$((aliyunpan_count + 1))
-}
-
-command_candidate=$(command -v aliyunpan 2>/dev/null || true)
-[ -n "$command_candidate" ] && emit_aliyunpan_candidate "$command_candidate"
-emit_aliyunpan_candidate "$HOME/.local/bin/aliyunpan-v0.4.0-proxyfix"
-emit_aliyunpan_candidate "$HOME/.local/bin/aliyunpan"
-while IFS= read -r candidate; do
-  emit_aliyunpan_candidate "$candidate"
-  [ "$aliyunpan_count" -lt 16 ] || break
-done < <(
-  for root in \
-    "$HOME/.local/bin" \
-    "$HOME/bin" \
-    "$HOME/.local/share" \
-    "$HOME/aliyunpan" \
-    "$HOME/AliyunPan"; do
-    [ -d "$root" ] || continue
-    find "$root" -mindepth 1 -maxdepth 2 -type f -name 'aliyunpan*' -print
-  done | LC_ALL=C sort -u
-)
-if [ "$aliyunpan_count" -gt 0 ]; then
-  aliyunpan_status=available
-else
-  aliyunpan_status=missing
-fi
-printf 'GB|aliyunpan-cli-status|%s|%s\n' "$aliyunpan_status" "$aliyunpan_count"
-
-aliyunpan_config="$HOME/.config/aliyunpan"
-aliyunpan_config_exists=false
-aliyunpan_config_readable=false
-if [ -d "$aliyunpan_config" ]; then
-  aliyunpan_config_exists=true
-  [ -r "$aliyunpan_config" ] && aliyunpan_config_readable=true
-  canonical_config=$(realpath "$aliyunpan_config" 2>/dev/null || printf '%s' "$aliyunpan_config")
-else
-  canonical_config=$aliyunpan_config
-fi
-encoded_config=$(printf '%s' "$canonical_config" | base64 | tr -d '\r\n')
-printf 'GB|aliyunpan-config|%s|%s|%s\n' \
-  "$aliyunpan_config_exists" "$aliyunpan_config_readable" "$encoded_config"
-
+_SCHEDULER_CAPACITY_INSPECTION_SCRIPT = (
+    _SCHEDULER_BASIC_INSPECTION_SCRIPT
+    + "\n"
+    + r"""
 sinfo -h -o 'GB|partition|%P|%a|%l|%D|%C|%G'
 """.strip()
+)
+
+SchedulerInspectionProfile = Literal["slurm-basic", "slurm-capacity"]
+SCHEDULER_INSPECTION_SCRIPTS: Mapping[SchedulerInspectionProfile, str] = MappingProxyType(
+    {
+        "slurm-basic": _SCHEDULER_BASIC_INSPECTION_SCRIPT,
+        "slurm-capacity": _SCHEDULER_CAPACITY_INSPECTION_SCRIPT,
+    }
+)
 
 
 class SlurmProviderError(RuntimeError):
@@ -317,33 +151,6 @@ def _slurm_time(seconds: int) -> str:
 def _clean_output(value: str) -> str:
     value = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", value)
     return value.replace("\r", "").strip()
-
-
-def _optional_probe_value(value: str) -> str | None:
-    return None if value == "(none)" else value
-
-
-def _decoded_approved_discovery_path(value: str, *, home: str | None) -> str | None:
-    try:
-        decoded = base64.b64decode(value, validate=True).decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
-        return None
-    if not decoded.startswith("/") or any(ord(character) < 32 for character in decoded):
-        return None
-    path = Path(decoded)
-    if ".." in path.parts:
-        return None
-    if home and decoded.startswith(f"{home.rstrip('/')}/"):
-        return decoded
-    if str(path.parent) in {
-        "/bin",
-        "/usr/bin",
-        "/usr/local/bin",
-        "/usr/sbin",
-        "/usr/local/sbin",
-    }:
-        return decoded
-    return None
 
 
 def _scheduler_submit_script(
@@ -602,13 +409,6 @@ class CommandSlurmProvider:
         self.upload_timeout_seconds = upload_timeout_seconds
         self.adapter: SlurmCommandSchedulerAdapter = scheduler_adapter(runner=runner)
 
-    @staticmethod
-    def _command_prefix(connection: dict[str, Any]) -> list[str]:
-        try:
-            return SlurmCommandSchedulerAdapter.command_prefix(connection)
-        except AdapterCommandError as exc:
-            raise SlurmProviderError("scheduler target has an invalid command_prefix") from exc
-
     def _run(
         self,
         connection: dict[str, Any],
@@ -631,10 +431,19 @@ class CommandSlurmProvider:
             ) from exc
 
     def access_status(self, connection: dict[str, Any]) -> dict[str, Any]:
+        profile = connection.get("inspection_profile")
+        try:
+            script = SCHEDULER_INSPECTION_SCRIPTS[profile]
+        except (KeyError, TypeError):
+            return {
+                "status": "unavailable",
+                "message": "scheduler target has an unsupported inspection profile",
+                "checked_at": datetime.now(UTC).isoformat(),
+            }
         try:
             output = self._run(
                 connection,
-                ["bash", "-lc", SCHEDULER_INSPECTION_SCRIPT],
+                ["bash", "-lc", script],
                 mutating=False,
             )
         except SlurmProviderError as exc:
@@ -648,13 +457,6 @@ class CommandSlurmProvider:
         filesystem: dict[str, Any] | None = None
         quota_summary: list[str] = []
         partitions: list[dict[str, Any]] = []
-        sbatch_environment: dict[str, Any] | None = None
-        partition_qos: dict[str, Any] | None = None
-        association_qos_status: dict[str, Any] | None = None
-        association_qos: list[dict[str, str | None]] = []
-        aliyunpan_cli_status: str | None = None
-        aliyunpan_executables: list[str] = []
-        aliyunpan_config: dict[str, Any] | None = None
         for line in output.splitlines():
             parts = line.strip().split("|")
             if len(parts) < 2 or parts[0] != "GB":
@@ -687,67 +489,6 @@ class CommandSlurmProvider:
                 }
             elif record_type == "quota" and len(parts) >= 3:
                 quota_summary.append("|".join(parts[2:]))
-            elif record_type == "sbatch-env" and len(parts) == 7:
-                sbatch_environment = {
-                    "name": parts[2],
-                    "present": parts[3] == "true",
-                    "nonempty": parts[4] == "true",
-                    "byte_count": int(parts[5]),
-                    "digest": parts[6],
-                }
-            elif record_type == "qos-probe" and len(parts) >= 5:
-                probe = parts[2]
-                status = parts[3]
-                if probe == "partition" and status == "available" and len(parts) == 8:
-                    partition_qos = {
-                        "status": status,
-                        "partition": _optional_probe_value(parts[4]),
-                        "allow_qos": _optional_probe_value(parts[5]),
-                        "qos": _optional_probe_value(parts[6]),
-                        "default_qos": _optional_probe_value(parts[7]),
-                    }
-                elif probe == "association" and status == "available" and len(parts) == 5:
-                    association_qos_status = {
-                        "status": status,
-                        "count": int(parts[4]),
-                    }
-                elif status in {"denied", "unsupported", "unavailable"} and len(parts) == 7:
-                    failure = {
-                        "status": status,
-                        "output_lines": int(parts[4]),
-                        "output_bytes": int(parts[5]),
-                        "output_digest": parts[6],
-                    }
-                    if probe == "partition":
-                        partition_qos = failure
-                    elif probe == "association":
-                        association_qos_status = failure
-            elif record_type == "association-qos" and len(parts) == 6:
-                association_qos.append(
-                    {
-                        "account": _optional_probe_value(parts[2]),
-                        "partition": _optional_probe_value(parts[3]),
-                        "qos": _optional_probe_value(parts[4]),
-                        "default_qos": _optional_probe_value(parts[5]),
-                    }
-                )
-            elif record_type == "aliyunpan-cli" and len(parts) == 3:
-                home = identity.get("home") if identity is not None else None
-                executable = _decoded_approved_discovery_path(parts[2], home=home)
-                if executable is not None and executable not in aliyunpan_executables:
-                    aliyunpan_executables.append(executable)
-            elif record_type == "aliyunpan-cli-status" and len(parts) == 4:
-                if parts[2] in {"available", "missing"} and parts[3].isdigit():
-                    aliyunpan_cli_status = parts[2]
-            elif record_type == "aliyunpan-config" and len(parts) == 5:
-                home = identity.get("home") if identity is not None else None
-                config_path = _decoded_approved_discovery_path(parts[4], home=home)
-                if config_path is not None:
-                    aliyunpan_config = {
-                        "path": config_path,
-                        "exists": parts[2] == "true",
-                        "readable": parts[3] == "true",
-                    }
             elif record_type == "partition" and len(parts) == 8 and parts[2]:
                 partitions.append(
                     {
@@ -769,23 +510,6 @@ class CommandSlurmProvider:
             "partitions": partitions,
             "checked_at": datetime.now(UTC).isoformat(),
         }
-        if sbatch_environment is not None:
-            result["sbatch_environment"] = sbatch_environment
-        if partition_qos is not None:
-            result["partition_qos"] = partition_qos
-        if association_qos_status is not None:
-            result["association_qos"] = {
-                **association_qos_status,
-                "associations": association_qos,
-            }
-        if aliyunpan_cli_status is not None:
-            result["aliyunpan_cli"] = {
-                "status": "available" if aliyunpan_executables else aliyunpan_cli_status,
-                "count": len(aliyunpan_executables),
-                "executables": aliyunpan_executables,
-            }
-        if aliyunpan_config is not None:
-            result["aliyunpan_config"] = aliyunpan_config
         return result
 
     def find_by_name(

@@ -16,14 +16,22 @@ from pydantic import ValidationError
 from gpu_broker.api import create_app
 from gpu_broker.config import Settings
 from gpu_broker.models import SchedulerJob
-from gpu_broker.schemas import ResourceConstraints, SchedulerOneOffSubmit
+from gpu_broker.schemas import ResourceConstraints, SchedulerOneOffSubmit, SchedulerTargetUpsert
 from gpu_broker.slurm import (
     CommandSlurmProvider,
-    SCHEDULER_INSPECTION_SCRIPT,
+    SCHEDULER_INSPECTION_SCRIPTS,
     SlurmProviderError,
     SlurmSubmission,
     _scheduler_submit_script,
 )
+
+
+@pytest.fixture(autouse=True)
+def approved_scheduler_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "SERVERPILOT_SCHEDULER_TRANSPORTS",
+        '{"test-a":"/usr/local/bin/serverpilot-test-helper-a","test-b":"/usr/local/bin/serverpilot-test-helper-b"}',
+    )
 
 
 class FakeSlurmProvider:
@@ -193,30 +201,31 @@ def _structured_marker(stderr: str, prefix: str) -> dict[str, str]:
 
 def _target() -> dict[str, Any]:
     return {
-        "id": "hanhai22",
-        "display_name": "USTC Hanhai22",
+        "id": "scheduler-a",
+        "display_name": "Example scheduler",
         "adapter": "slurm-command",
-        "command_prefix": ["/Users/test/.local/bin/hh22", "1"],
+        "transport_profile": "test-a",
+        "inspection_profile": "slurm-capacity",
         "credential_refs": {
-            "ssh_password_service": "ustc-hanhai22-ssh-password",
-            "totp_service": "ustc-hanhai22-totp-secret",
+            "ssh_password_service": "example-scheduler-password",
+            "totp_service": "example-scheduler-totp",
         },
         "capabilities": ["access-status", "submit", "status", "cancel"],
-        "access_hint": "Connect USTC SCC VPN and retry; Broker does not operate VPN.",
+        "access_hint": "Connect the approved network and retry; Broker does not operate VPN.",
         "enabled": True,
     }
 
 
 def _profile() -> dict[str, Any]:
     return {
-        "id": "hanhai-a100-smoke",
+        "id": "scheduler-a100-smoke",
         "project_id": "project-a",
-        "display_name": "Hanhai A100 smoke test",
-        "purpose": "approved Hanhai A100 smoke test",
+        "display_name": "Example A100 smoke test",
+        "purpose": "approved Example A100 smoke test",
         "duration_seconds": 3600,
         "constraints": {"gpu_count": 1, "placement": "pack"},
         "runtime_kind": "slurm",
-        "scheduler_target_id": "hanhai22",
+        "scheduler_target_id": "scheduler-a",
         "scheduler": {
             "partition": "GPU-8A100",
             "qos": "gpu_8a100",
@@ -255,6 +264,14 @@ def _upload_target() -> dict[str, Any]:
     return target
 
 
+def test_scheduler_target_schema_rejects_configured_command_argv() -> None:
+    payload = _target()
+    payload["command_prefix"] = ["/tmp/untrusted-helper", "--arg"]
+
+    with pytest.raises(ValidationError, match="command_prefix"):
+        SchedulerTargetUpsert.model_validate(payload)
+
+
 def test_command_slurm_access_status_parses_fixed_inspection_output() -> None:
     calls: list[list[str]] = []
 
@@ -265,34 +282,11 @@ def test_command_slurm_access_status_parses_fixed_inspection_output() -> None:
             0,
             stdout="\n".join(
                 [
-                    "spawn /usr/bin/ssh -- sinfo -h -o '%P|%a|%l'",
-                    "GB|identity|hanhai22-01|jinplu|/home/jinplu|/home/jinplu",
-                    "GB|path|home|/home/jinplu|directory|true",
-                    "GB|path|home-root|/home|directory|false",
-                    "GB|path|software|/opt|directory|false",
+                    "spawn local helper -- sinfo -h -o '%P|%a|%l'",
+                    "GB|identity|scheduler-a-01|agent|/home/agent|/home/agent",
+                    "GB|path|home|/home/agent|directory|true",
                     "GB|filesystem|gpfs|524288000|1024000|523264000|1%|/home",
-                    "GB|quota|Disk quotas for user jinplu:",
-                    "GB|sbatch-env|SBATCH_QOS|true|true|7|cksum:123456789",
-                    (
-                        "GB|qos-probe|partition|available|CPU-64C256GB|"
-                        "cpu,normal|N/A|normal"
-                    ),
-                    "GB|association-qos|acct-a|CPU-64C256GB|cpu,normal|normal",
-                    "GB|association-qos|acct-a|(none)|normal|normal",
-                    "GB|qos-probe|association|available|2",
-                    (
-                        "GB|aliyunpan-cli|"
-                        + base64.b64encode(
-                            b"/home/jinplu/.local/bin/aliyunpan"
-                        ).decode("ascii")
-                    ),
-                    "GB|aliyunpan-cli-status|available|1",
-                    (
-                        "GB|aliyunpan-config|true|true|"
-                        + base64.b64encode(
-                            b"/home/jinplu/.config/aliyunpan"
-                        ).decode("ascii")
-                    ),
+                    "GB|quota|Disk quotas available",
                     "GB|partition|GPU-8A100|up|10-00:00:00|18|0/1152/0/1152|gpu:a100:8",
                     "GB|partition|test*|up|20:00|2|0/128/0/128|(null)",
                 ]
@@ -301,65 +295,23 @@ def test_command_slurm_access_status_parses_fixed_inspection_output() -> None:
         )
 
     provider = CommandSlurmProvider(runner=runner)
-    result = provider.access_status({"command_prefix": ["/Users/test/.local/bin/hh22", "1"]})
+    result = provider.access_status({"transport_profile": "test-a", "inspection_profile": "slurm-capacity"})
 
     assert result["status"] == "ready"
     assert result["identity"] == {
-        "hostname": "hanhai22-01",
-        "user": "jinplu",
-        "home": "/home/jinplu",
-        "pwd": "/home/jinplu",
+        "hostname": "scheduler-a-01",
+        "user": "agent",
+        "home": "/home/agent",
+        "pwd": "/home/agent",
     }
     assert result["paths"][0] == {
         "label": "home",
-        "path": "/home/jinplu",
+        "path": "/home/agent",
         "kind": "directory",
         "writable": True,
     }
     assert result["filesystem"]["available_kib"] == 523264000
-    assert result["quota_summary"] == ["Disk quotas for user jinplu:"]
-    assert result["sbatch_environment"] == {
-        "name": "SBATCH_QOS",
-        "present": True,
-        "nonempty": True,
-        "byte_count": 7,
-        "digest": "cksum:123456789",
-    }
-    assert result["partition_qos"] == {
-        "status": "available",
-        "partition": "CPU-64C256GB",
-        "allow_qos": "cpu,normal",
-        "qos": "N/A",
-        "default_qos": "normal",
-    }
-    assert result["association_qos"] == {
-        "status": "available",
-        "count": 2,
-        "associations": [
-            {
-                "account": "acct-a",
-                "partition": "CPU-64C256GB",
-                "qos": "cpu,normal",
-                "default_qos": "normal",
-            },
-            {
-                "account": "acct-a",
-                "partition": None,
-                "qos": "normal",
-                "default_qos": "normal",
-            },
-        ],
-    }
-    assert result["aliyunpan_cli"] == {
-        "status": "available",
-        "count": 1,
-        "executables": ["/home/jinplu/.local/bin/aliyunpan"],
-    }
-    assert result["aliyunpan_config"] == {
-        "path": "/home/jinplu/.config/aliyunpan",
-        "exists": True,
-        "readable": True,
-    }
+    assert result["quota_summary"] == ["Disk quotas available"]
     assert [partition["partition"] for partition in result["partitions"]] == [
         "GPU-8A100",
         "test",
@@ -369,40 +321,16 @@ def test_command_slurm_access_status_parses_fixed_inspection_output() -> None:
     assert result["partitions"][0]["cpus"] == "0/1152/0/1152"
     assert result["partitions"][0]["gres"] == "gpu:a100:8"
     assert len(calls) == 1
-    assert calls[0][:2] == ["/Users/test/.local/bin/hh22", "1"]
+    assert calls[0][:1] == ["/usr/local/bin/serverpilot-test-helper-a"]
     assert calls[0][-1].startswith("bash -lc ")
 
 
-@pytest.mark.parametrize(
-    ("partition_marker", "association_marker", "partition_status", "assoc_status"),
-    [
-        (
-            "GB|qos-probe|partition|unsupported|1|29|cksum:101",
-            "GB|qos-probe|association|denied|1|17|cksum:202",
-            "unsupported",
-            "denied",
-        ),
-        (
-            "GB|qos-probe|partition|unavailable|0|0|cksum:303",
-            "GB|qos-probe|association|unsupported|1|22|cksum:404",
-            "unavailable",
-            "unsupported",
-        ),
-    ],
-)
-def test_command_slurm_access_status_parses_nonleaking_qos_probe_failures(
-    partition_marker: str,
-    association_marker: str,
-    partition_status: str,
-    assoc_status: str,
-) -> None:
+def test_command_slurm_access_status_ignores_unknown_probe_records() -> None:
     output = "\n".join(
         [
             "GB|identity|host|user|/home/user|/home/user",
-            "GB|sbatch-env|SBATCH_QOS|false|false|0|none",
-            partition_marker,
-            association_marker,
-            "GB|partition|CPU-64C256GB|up|15-00:00:00|1|0/64/0/64|(null)",
+            "GB|custom-site-probe|ignored|forbidden",
+            "GB|partition|cpu-default|up|15-00:00:00|1|0/64/0/64|(null)",
         ]
     )
 
@@ -410,33 +338,19 @@ def test_command_slurm_access_status_parses_nonleaking_qos_probe_failures(
         return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
 
     result = CommandSlurmProvider(runner=runner).access_status(
-        {"command_prefix": ["approved-helper", "1"]}
+        {"transport_profile": "test-a", "inspection_profile": "slurm-capacity"}
     )
 
-    assert result["sbatch_environment"]["present"] is False
-    assert result["partition_qos"]["status"] == partition_status
-    assert result["association_qos"]["status"] == assoc_status
-    assert result["association_qos"]["associations"] == []
-    assert "permission denied" not in str(result)
-    assert "unknown field" not in str(result)
+    assert result["status"] == "ready"
+    assert result["partitions"][0]["partition"] == "cpu-default"
+    assert "custom-site-probe" not in str(result)
 
 
-def test_command_slurm_access_status_rejects_unapproved_discovery_paths() -> None:
-    def encoded(value: str) -> str:
-        return base64.b64encode(value.encode("utf-8")).decode("ascii")
-
+def test_command_slurm_access_status_rejects_unknown_inspection_profile() -> None:
     output = "\n".join(
         [
             "GB|identity|host|user|/home/user|/home/user",
-            f"GB|aliyunpan-cli|{encoded('/home/user/bin/aliyunpan')}",
-            f"GB|aliyunpan-cli|{encoded('/usr/bin/aliyunpan')}",
-            f"GB|aliyunpan-cli|{encoded('/tmp/aliyunpan-secret')}",
-            f"GB|aliyunpan-cli|{encoded('/usr/bin/nested/aliyunpan')}",
-            f"GB|aliyunpan-cli|{encoded('relative/aliyunpan')}",
-            "GB|aliyunpan-cli|not-valid-base64!",
-            "GB|aliyunpan-cli-status|available|99",
-            f"GB|aliyunpan-config|true|true|{encoded('/tmp/private-config')}",
-            "GB|partition|CPU-64C256GB|up|15-00:00:00|1|0/64/0/64|(null)",
+            "GB|partition|cpu-default|up|15-00:00:00|1|0/64/0/64|(null)",
         ]
     )
 
@@ -444,50 +358,27 @@ def test_command_slurm_access_status_rejects_unapproved_discovery_paths() -> Non
         return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
 
     result = CommandSlurmProvider(runner=runner).access_status(
-        {"command_prefix": ["approved-helper", "1"]}
+        {"transport_profile": "test-a", "inspection_profile": "unknown"}
     )
 
-    assert result["aliyunpan_cli"] == {
-        "status": "available",
-        "count": 2,
-        "executables": ["/home/user/bin/aliyunpan", "/usr/bin/aliyunpan"],
-    }
-    assert "aliyunpan_config" not in result
-    assert "/tmp/aliyunpan-secret" not in str(result)
-    assert "/usr/bin/nested/aliyunpan" not in str(result)
+    assert result["status"] == "unavailable"
+    assert result["message"] == "scheduler target has an unsupported inspection profile"
 
 
-def test_scheduler_inspection_reports_only_digest_for_remote_sbatch_qos(
-    tmp_path: Path,
-) -> None:
+def test_scheduler_capacity_profile_runs_only_generic_capacity_query(tmp_path: Path) -> None:
     fake_bin = tmp_path / "inspection-bin"
     fake_bin.mkdir()
     _write_fake_command(
-        fake_bin / "scontrol",
-        (
-            "printf 'PartitionName=CPU-64C256GB AllowQos=cpu,normal "
-            "QoS=N/A DefaultQOS=normal\\n'"
-        ),
-    )
-    _write_fake_command(
-        fake_bin / "sacctmgr",
-        (
-            "printf 'acct-a|%s|CPU-64C256GB|cpu,normal|normal|\\n' "
-            '"$(id -un)"'
-        ),
-    )
-    _write_fake_command(
         fake_bin / "sinfo",
-        "printf 'GB|partition|CPU-64C256GB|up|15-00:00:00|1|0/64/0/64|(null)\\n'",
+        "printf 'GB|partition|cpu-default|up|15-00:00:00|1|0/64/0/64|(null)\\n'",
     )
     _write_fake_command(fake_bin / "quota", "exit 0")
     environment = dict(os.environ)
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
-    environment["SBATCH_QOS"] = "private-remote-qos"
 
     completed = subprocess.run(
         ["/bin/bash"],
-        input=SCHEDULER_INSPECTION_SCRIPT,
+        input=SCHEDULER_INSPECTION_SCRIPTS["slurm-capacity"],
         check=False,
         capture_output=True,
         text=True,
@@ -495,64 +386,28 @@ def test_scheduler_inspection_reports_only_digest_for_remote_sbatch_qos(
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "private-remote-qos" not in completed.stdout
-    env_marker = next(
-        line
-        for line in completed.stdout.splitlines()
-        if line.startswith("GB|sbatch-env|SBATCH_QOS|")
-    )
-    env_parts = env_marker.split("|")
-    assert env_parts[3:6] == ["true", "true", "18"]
-    assert env_parts[6].startswith("cksum:")
-    assert env_parts[6].removeprefix("cksum:").isdigit()
-    assert "GB|qos-probe|partition|available|CPU-64C256GB|" in completed.stdout
-    assert "GB|association-qos|acct-a|CPU-64C256GB|cpu,normal|normal" in completed.stdout
-    assert "GB|qos-probe|association|available|1" in completed.stdout
+    assert "GB|partition|cpu-default|" in completed.stdout
+    assert "sacctmgr" not in SCHEDULER_INSPECTION_SCRIPTS["slurm-capacity"]
+    assert "scontrol" not in SCHEDULER_INSPECTION_SCRIPTS["slurm-capacity"]
 
 
-def test_scheduler_inspection_bounded_aliyunpan_discovery_does_not_read_config(
-    tmp_path: Path,
-) -> None:
+def test_scheduler_basic_profile_does_not_scan_home_or_site_tools(tmp_path: Path) -> None:
     fake_home = tmp_path / "home"
-    local_bin = fake_home / ".local" / "bin"
-    share_bin = fake_home / ".local" / "share" / "tools"
-    local_bin.mkdir(parents=True)
-    share_bin.mkdir(parents=True)
-    for index in range(20):
-        candidate = (
-            local_bin / "aliyunpan"
-            if index == 0
-            else share_bin / f"aliyunpan-{index:02d}"
-        )
-        candidate.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        candidate.chmod(0o700)
-    proxyfix = local_bin / "aliyunpan-v0.4.0-proxyfix"
-    proxyfix.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    proxyfix.chmod(0o700)
-    config_dir = fake_home / ".config" / "aliyunpan"
+    config_dir = fake_home / ".config" / "opaque-tool"
     config_dir.mkdir(parents=True)
     secret = "must-not-read-config-secret"
     (config_dir / "config.json").write_text(secret, encoding="utf-8")
 
     fake_bin = tmp_path / "discovery-bin"
     fake_bin.mkdir()
-    _write_fake_command(
-        fake_bin / "scontrol",
-        "printf 'PartitionName=CPU-64C256GB AllowQos=ALL QoS=N/A\\n'",
-    )
-    _write_fake_command(fake_bin / "sacctmgr", "exit 0")
-    _write_fake_command(
-        fake_bin / "sinfo",
-        "printf 'GB|partition|CPU-64C256GB|up|15-00:00:00|1|0/64/0/64|(null)\\n'",
-    )
     _write_fake_command(fake_bin / "quota", "exit 0")
     environment = dict(os.environ)
     environment["HOME"] = str(fake_home)
-    environment["PATH"] = f"{local_bin}:{fake_bin}:{environment['PATH']}"
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
 
     completed = subprocess.run(
         ["/bin/bash"],
-        input=SCHEDULER_INSPECTION_SCRIPT,
+        input=SCHEDULER_INSPECTION_SCRIPTS["slurm-basic"],
         check=False,
         capture_output=True,
         text=True,
@@ -560,22 +415,9 @@ def test_scheduler_inspection_bounded_aliyunpan_discovery_does_not_read_config(
     )
 
     assert completed.returncode == 0, completed.stderr
-    cli_markers = [
-        line.split("|", 2)[2]
-        for line in completed.stdout.splitlines()
-        if line.startswith("GB|aliyunpan-cli|")
-    ]
-    discovered = [
-        base64.b64decode(value, validate=True).decode("utf-8")
-        for value in cli_markers
-    ]
-    assert len(discovered) == 16
-    assert str(local_bin / "aliyunpan") in discovered
-    assert str(proxyfix) in discovered
-    assert all(path.startswith(f"{fake_home}/") for path in discovered)
-    assert "GB|aliyunpan-cli-status|available|16" in completed.stdout
-    assert "GB|aliyunpan-config|true|true|" in completed.stdout
     assert secret not in completed.stdout
+    assert "find " not in SCHEDULER_INSPECTION_SCRIPTS["slurm-basic"]
+    assert ".config" not in SCHEDULER_INSPECTION_SCRIPTS["slurm-basic"]
 
 
 def test_command_slurm_opaque_command_echo_does_not_trigger_vpn_access_error() -> None:
@@ -590,7 +432,7 @@ def test_command_slurm_opaque_command_echo_does_not_trigger_vpn_access_error() -
     provider = CommandSlurmProvider(runner=runner)
     with pytest.raises(SlurmProviderError) as raised:
         provider._run(
-            {"command_prefix": ["/Users/test/.local/bin/hh22", "1"]},
+            {"transport_profile": "test-a", "inspection_profile": "slurm-capacity"},
             ["encoded-remote-command"],
             mutating=True,
         )
@@ -611,7 +453,7 @@ def test_command_slurm_explicit_vpn_failure_remains_access_required() -> None:
     provider = CommandSlurmProvider(runner=runner)
     with pytest.raises(SlurmProviderError) as raised:
         provider._run(
-            {"command_prefix": ["/Users/test/.local/bin/hh22", "1"]},
+            {"transport_profile": "test-a", "inspection_profile": "slurm-capacity"},
             ["read-only-command"],
             mutating=False,
         )
@@ -637,13 +479,13 @@ def test_command_slurm_cpu_only_submission_omits_gpu_gres() -> None:
 
     provider = CommandSlurmProvider(runner=runner)
     submission = provider.submit(
-        {"command_prefix": ["/Users/test/.local/bin/hh22", "1"]},
+        {"transport_profile": "test-a", "inspection_profile": "slurm-capacity"},
         broker_job_id="cpu-only-job",
         request={
             "duration_seconds": 3600,
             "constraints": {"gpu_count": 0},
             "scheduler": {
-                "partition": "CPU-64C256GB",
+                "partition": "cpu-default",
                 "cpu_cores": 64,
                 "memory_mib": 256 * 1024,
                 "nodes": 1,
@@ -662,7 +504,7 @@ def test_command_slurm_cpu_only_submission_omits_gpu_gres() -> None:
     assert "GB|scheduler-submit|" not in remote_command
     assert "GB|scheduler-submit-error|" not in remote_command
     submit_script = _decoded_submit_script(remote_command)
-    assert "--partition=CPU-64C256GB" in submit_script
+    assert "--partition=cpu-default" in submit_script
     assert "--cpus-per-task=64" in submit_script
     assert "--mem=262144M" in submit_script
     assert "--gres=" not in submit_script
@@ -684,7 +526,7 @@ def test_command_slurm_gpu_submission_includes_gres() -> None:
 
     provider = CommandSlurmProvider(runner=runner)
     submission = provider.submit(
-        {"command_prefix": ["/Users/test/.local/bin/hh22", "1"]},
+        {"transport_profile": "test-a", "inspection_profile": "slurm-capacity"},
         broker_job_id="gpu-job",
         request={
             "duration_seconds": 3600,
@@ -724,7 +566,7 @@ def test_command_slurm_submission_uses_only_stdin_script_and_option_argv(
         (
             f"printf '%s\\n' \"$@\" > {shlex.quote(str(argv_capture))}\n"
             f"cat > {shlex.quote(str(script_capture))}\n"
-            "printf '123456;hanhai22\\n'"
+            "printf '123456;scheduler-a\\n'"
         ),
     )
     _write_fake_command(fake_bin / "squeue", "exit 0")
@@ -751,13 +593,13 @@ def test_command_slurm_submission_uses_only_stdin_script_and_option_argv(
     script_body = "set -euo pipefail\nprintf 'exact script bytes\\n'\n"
     provider = CommandSlurmProvider(runner=runner)
     submission = provider.submit(
-        {"command_prefix": ["approved-helper", "1"]},
+        {"transport_profile": "test-a", "inspection_profile": "slurm-capacity"},
         broker_job_id="stdin-script-job",
         request={
             "duration_seconds": 300,
             "constraints": {"gpu_count": 0},
             "scheduler": {
-                "partition": "CPU-64C256GB",
+                "partition": "cpu-default",
                 "cpu_cores": 1,
                 "memory_mib": 1024,
                 "nodes": 1,
@@ -777,7 +619,7 @@ def test_command_slurm_submission_uses_only_stdin_script_and_option_argv(
         "--parsable",
         "--job-name=gb-stdin-script-job",
         "--comment=gpu-broker:stdin-script-job",
-        "--partition=CPU-64C256GB",
+        "--partition=cpu-default",
         "--nodes=1",
         "--ntasks-per-node=1",
         "--cpus-per-task=1",
@@ -810,7 +652,7 @@ def test_command_slurm_query_ignores_pty_noise_and_parses_naive_sacct_time() -> 
         )
 
     observation = CommandSlurmProvider(runner=runner).query(
-        {"command_prefix": ["approved-helper", "1"]},
+        {"transport_profile": "test-a", "inspection_profile": "slurm-capacity"},
         "1093431",
     )
 
@@ -878,7 +720,7 @@ def test_unquoted_site_forwarder_splits_legacy_wrap_into_residual_arguments(
 @pytest.mark.parametrize(
     "sbatch_body",
     [
-        "printf 'site notice\\n123456;hanhai22\\ntrailing notice\\n'",
+        "printf 'site notice\\n123456;scheduler-a\\ntrailing notice\\n'",
         (
             "printf 'site notice\\n\\033[31mSubmitted batch job "
             "123456\\033[0m\\ntrailing notice\\n'"
@@ -1296,7 +1138,7 @@ def test_scheduler_one_off_accepts_cpu_constraints_but_direct_constraints_reject
 
     submission = SchedulerOneOffSubmit.model_validate(
         {
-            "target_id": "hanhai22",
+            "target_id": "scheduler-a",
             "project_id": "project-a",
             "task_ref": "cpu-one-off",
             "purpose": "approved CPU-only one-off job",
@@ -1304,7 +1146,7 @@ def test_scheduler_one_off_accepts_cpu_constraints_but_direct_constraints_reject
             "duration_seconds": 600,
             "constraints": {"gpu_count": 0},
             "scheduler": {
-                "partition": "CPU-64C256GB",
+                "partition": "cpu-default",
                 "cpu_cores": 64,
                 "memory_mib": 256 * 1024,
                 "nodes": 1,
@@ -1327,7 +1169,7 @@ def test_scheduler_target_is_discoverable_and_access_is_read_only(
     client, provider = _client(tmp_path, inventory)
     headers = {
         "X-GPU-Broker-Actor": "scheduler-admin",
-        "Idempotency-Key": "target-hanhai22",
+        "Idempotency-Key": "target-scheduler-a",
     }
     created = client.post("/api/v1/scheduler-targets", json=_target(), headers=headers)
     assert created.status_code == 200
@@ -1337,12 +1179,12 @@ def test_scheduler_target_is_discoverable_and_access_is_read_only(
         headers={"X-GPU-Broker-Actor": "other-project-agent"},
     )
     assert listed.status_code == 200
-    assert listed.json()["data"][0]["id"] == "hanhai22"
+    assert listed.json()["data"][0]["id"] == "scheduler-a"
     assert listed.json()["data"][0]["kind"] == "external-scheduler"
-    assert "command_prefix" not in listed.json()["data"][0]
+    assert listed.json()["data"][0]["transport_profile"] == "test-a"
 
     access = client.get(
-        "/api/v1/scheduler-targets/hanhai22/access",
+        "/api/v1/scheduler-targets/scheduler-a/access",
         headers={"X-GPU-Broker-Actor": "other-project-agent"},
     )
     assert access.status_code == 200
@@ -1352,7 +1194,7 @@ def test_scheduler_target_is_discoverable_and_access_is_read_only(
         headers={"X-GPU-Broker-Actor": "other-project-agent"},
     )
     cached_target = coordination.json()["data"]["scheduler_targets"][0]
-    assert cached_target["id"] == "hanhai22"
+    assert cached_target["id"] == "scheduler-a"
     assert cached_target["last_access"]["status"] == "ready"
     assert cached_target["last_access"]["checked_at"] is not None
 
@@ -1367,7 +1209,7 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
         json=_target(),
         headers={
             "X-GPU-Broker-Actor": "scheduler-admin",
-            "Idempotency-Key": "target-hanhai22",
+            "Idempotency-Key": "target-scheduler-a",
         },
     )
     profile = client.post(
@@ -1375,7 +1217,7 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
         json=_profile(),
         headers={
             "X-GPU-Broker-Actor": "scheduler-admin",
-            "Idempotency-Key": "profile-hanhai22",
+            "Idempotency-Key": "profile-scheduler-a",
         },
     )
     assert profile.status_code == 200, profile.text
@@ -1385,7 +1227,7 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
         headers={"X-GPU-Broker-Actor": "storyboard-agent"},
     )
     assert [item["id"] for item in visible.json()["data"]] == [
-        "hanhai-a100-smoke"
+        "scheduler-a100-smoke"
     ]
 
     submit_headers = {
@@ -1393,12 +1235,12 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
         "Idempotency-Key": "storyboard-smoke-1",
     }
     first = client.post(
-        "/api/v1/workload-profiles/hanhai-a100-smoke/scheduler-submit",
+        "/api/v1/workload-profiles/scheduler-a100-smoke/scheduler-submit",
         json={"project_id": "project-b", "task_ref": "storyboard-smoke"},
         headers=submit_headers,
     )
     second = client.post(
-        "/api/v1/workload-profiles/hanhai-a100-smoke/scheduler-submit",
+        "/api/v1/workload-profiles/scheduler-a100-smoke/scheduler-submit",
         json={"project_id": "project-b", "task_ref": "storyboard-smoke"},
         headers=submit_headers,
     )
@@ -1452,7 +1294,7 @@ def test_scheduler_refresh_drops_timezone_naive_external_time_without_500(
     submitted = client.post(
         "/api/v1/scheduler-jobs",
         json={
-            "target_id": "hanhai22",
+            "target_id": "scheduler-a",
             "project_id": "project-b",
             "task_ref": "naive-slurm-time",
             "purpose": "verify timezone-naive Slurm status is fail-closed",
@@ -1460,7 +1302,7 @@ def test_scheduler_refresh_drops_timezone_naive_external_time_without_500(
             "duration_seconds": 300,
             "constraints": {"gpu_count": 0},
             "scheduler": {
-                "partition": "CPU-64C256GB",
+                "partition": "cpu-default",
                 "cpu_cores": 1,
                 "memory_mib": 1024,
                 "nodes": 1,
@@ -1506,13 +1348,13 @@ def test_cpu_only_one_off_is_valid_and_reaches_provider_without_gpu_request(
         json=_target(),
         headers={
             "X-GPU-Broker-Actor": "scheduler-admin",
-            "Idempotency-Key": "target-hanhai22",
+            "Idempotency-Key": "target-scheduler-a",
         },
     )
     submitted = client.post(
         "/api/v1/scheduler-jobs",
         json={
-            "target_id": "hanhai22",
+            "target_id": "scheduler-a",
             "project_id": "project-b",
             "task_ref": "cpu-staging",
             "purpose": "approved CPU and memory staging work",
@@ -1520,7 +1362,7 @@ def test_cpu_only_one_off_is_valid_and_reaches_provider_without_gpu_request(
             "duration_seconds": 600,
             "constraints": {"gpu_count": 0},
             "scheduler": {
-                "partition": "CPU-64C256GB",
+                "partition": "cpu-default",
                 "cpu_cores": 64,
                 "memory_mib": 256 * 1024,
                 "nodes": 1,
@@ -1546,7 +1388,7 @@ def test_cpu_only_scheduler_rejects_gpu_type(
 ) -> None:
     client, _provider = _client(tmp_path, inventory)
     request = {
-        "target_id": "hanhai22",
+        "target_id": "scheduler-a",
         "project_id": "project-a",
         "task_ref": "invalid-cpu-contract",
         "purpose": "must not combine a CPU-only request with a GPU type",
@@ -1554,7 +1396,7 @@ def test_cpu_only_scheduler_rejects_gpu_type(
         "duration_seconds": 600,
         "constraints": {"gpu_count": 0},
         "scheduler": {
-            "partition": "CPU-64C256GB",
+            "partition": "cpu-default",
             "qos": "cpu",
             "gpu_type": "a100",
             "cpu_cores": 64,
@@ -1587,11 +1429,11 @@ def test_one_off_requires_access_and_does_not_retain_script_by_default(
         json=_target(),
         headers={
             "X-GPU-Broker-Actor": "scheduler-admin",
-            "Idempotency-Key": "target-hanhai22",
+            "Idempotency-Key": "target-scheduler-a",
         },
     )
     request = {
-        "target_id": "hanhai22",
+        "target_id": "scheduler-a",
         "project_id": "project-b",
         "task_ref": "one-off",
         "purpose": "one-off smoke test",
@@ -1669,7 +1511,7 @@ def test_access_failure_from_submit_is_reported_without_claiming_gpu(
         json=_target(),
         headers={
             "X-GPU-Broker-Actor": "scheduler-admin",
-            "Idempotency-Key": "target-hanhai22",
+            "Idempotency-Key": "target-scheduler-a",
         },
     )
 
@@ -1678,7 +1520,7 @@ def test_access_failure_from_submit_is_reported_without_claiming_gpu(
 
     provider.submit = fail_submit  # type: ignore[method-assign]
     request = {
-        "target_id": "hanhai22",
+        "target_id": "scheduler-a",
         "project_id": "project-a",
         "task_ref": "route-loss",
         "purpose": "test route loss",
@@ -1725,7 +1567,7 @@ def test_scheduler_upload_uses_unique_stage_and_persisted_status(
         json=_upload_target(),
         headers={
             "X-GPU-Broker-Actor": "scheduler-admin",
-            "Idempotency-Key": "target-hanhai22-upload",
+            "Idempotency-Key": "target-scheduler-a-upload",
         },
     )
     source = tmp_path / "dataset.bin"
@@ -1737,7 +1579,7 @@ def test_scheduler_upload_uses_unique_stage_and_persisted_status(
     started = client.post(
         "/api/v1/scheduler-transfers",
         json={
-            "target_id": "hanhai22",
+            "target_id": "scheduler-a",
             "project_id": "project-b",
             "local_path": str(source),
             "remote_directory": "/home/test/staging",
@@ -1766,7 +1608,7 @@ def test_scheduler_upload_uses_unique_stage_and_persisted_status(
     retried = client.post(
         "/api/v1/scheduler-transfers",
         json={
-            "target_id": "hanhai22",
+            "target_id": "scheduler-a",
             "project_id": "project-b",
             "local_path": str(source),
             "remote_directory": "/home/test/staging",

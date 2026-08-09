@@ -1,6 +1,6 @@
 """Global, cooperative GPU resource control plane."""
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 SCHEMA_VERSION = "v1"
 
 # Lets an upgraded MCP fail clearly when the loopback service has not yet been

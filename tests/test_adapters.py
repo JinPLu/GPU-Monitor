@@ -10,11 +10,20 @@ from gpu_broker.adapters import (
     ADAPTER_REGISTRY,
     AdapterRegistryError,
     RAW_SSH_COMBINED_QUERY,
+    RAW_SSH_HOST_ONLY_QUERY,
     RawSSHObservationAdapter,
     SlurmCommandSchedulerAdapter,
 )
 from gpu_broker.config import EndpointConfig
 from gpu_broker.slurm import CommandSlurmProvider, SlurmProviderError
+
+
+@pytest.fixture(autouse=True)
+def approved_scheduler_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "SERVERPILOT_SCHEDULER_TRANSPORTS",
+        '{"test-a":"/usr/local/bin/serverpilot-test-helper-a","test-b":"/usr/local/bin/serverpilot-test-helper-b"}',
+    )
 
 
 def test_registry_is_sealed_to_known_adapters() -> None:
@@ -116,6 +125,42 @@ def test_raw_ssh_adapter_rejects_arbitrary_or_invalid_probes() -> None:
         )
 
 
+def test_raw_ssh_adapter_uses_the_configured_sealed_observation_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok\n", b""
+
+    async def fake_create_subprocess_exec(*command: Any, **_kwargs: Any) -> FakeProcess:
+        calls.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    endpoint = EndpointConfig(
+        id="endpoint-host",
+        host="host.example.test",
+        port=22,
+        ssh_user="monitor",
+        observation_profile="linux-host",
+    )
+
+    asyncio.run(
+        RawSSHObservationAdapter().run_probe(
+            endpoint,
+            probe="endpoint-telemetry",
+            connect_timeout_seconds=7,
+        )
+    )
+
+    assert calls[0][-1] == RAW_SSH_HOST_ONLY_QUERY
+    assert "nvidia-smi" not in RAW_SSH_HOST_ONLY_QUERY
+
+
 def test_slurm_command_adapter_preserves_runner_contract() -> None:
     calls: list[tuple[list[str], dict[str, Any]]] = []
 
@@ -124,7 +169,7 @@ def test_slurm_command_adapter_preserves_runner_contract() -> None:
         return subprocess.CompletedProcess(command, 0, stdout="\x1b[31mok\r\n", stderr="")
 
     output = SlurmCommandSchedulerAdapter(runner=runner).run(
-        {"command_prefix": ["helper", "1"]},
+        {"transport_profile": "test-a", "inspection_profile": "slurm-capacity"},
         ["sinfo", "-h"],
         mutating=False,
         timeout_seconds=3,
@@ -133,17 +178,40 @@ def test_slurm_command_adapter_preserves_runner_contract() -> None:
     assert output == "ok"
     assert calls == [
         (
-            ["helper", "1", "sinfo -h"],
+            ["/usr/local/bin/serverpilot-test-helper-a", "sinfo -h"],
             {"check": False, "capture_output": True, "text": True, "timeout": 3},
         )
     ]
 
 
+def test_scheduler_transport_profiles_route_distinct_targets_to_distinct_wrappers() -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    adapter = SlurmCommandSchedulerAdapter(runner=runner)
+    for profile in ("test-a", "test-b"):
+        adapter.run(
+            {"transport_profile": profile},
+            ["sinfo", "-h"],
+            mutating=False,
+            timeout_seconds=3,
+        )
+
+    assert [call[0] for call in calls] == [
+        "/usr/local/bin/serverpilot-test-helper-a",
+        "/usr/local/bin/serverpilot-test-helper-b",
+    ]
+    assert all(call[-1] == "sinfo -h" for call in calls)
+
+
 def test_command_slurm_provider_uses_adapter_errors() -> None:
     provider = CommandSlurmProvider(runner=lambda *_args, **_kwargs: None)
 
-    with pytest.raises(SlurmProviderError, match="invalid command_prefix") as exc_info:
-        provider._run({"command_prefix": []}, ["sinfo"], mutating=False)
+    with pytest.raises(SlurmProviderError, match="not configured locally") as exc_info:
+        provider._run({"transport_profile": "unknown"}, ["sinfo"], mutating=False)
 
     assert exc_info.value.access_required is False
     assert exc_info.value.uncertain is False

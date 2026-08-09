@@ -14,6 +14,22 @@ Registry 也是封闭的：未知 adapter 或不存在的 capability 会 fail cl
 `argv`、shell、环境或 Agent target。固定 operation 只有带输入/输出 schema 与审批要求的已注册
 操作；目前只为既有 Slurm contract 保留元数据，未新增通用 REST 或 MCP 执行入口。
 
+服务器连接配置只能选择代码注册的 profile，不能提供读取命令：Endpoint 的
+`observation_profile` 当前可选 `linux-nvidia` 或 `linux-host`；SchedulerTarget 的
+`transport_profile` 是受限 profile ID，`inspection_profile` 可选
+`slurm-basic` 或 `slurm-capacity`。因此某个集群的读取差异以通用 profile 表达，由人类在
+连接时选择；新增 profile 必须同时新增固定探针、固定 parser 与测试，不能靠目标 ID、IP 或
+配置中的 shell/argv 分支。
+
+本机管理员用 `SERVERPILOT_SCHEDULER_TRANSPORTS`（兼容
+`GPU_BROKER_SCHEDULER_TRANSPORTS`）维护 profile 到绝对包装器路径的 JSON 映射，例如
+`{"cluster-a":"/opt/serverpilot/cluster-a-router","cluster-b":"/opt/serverpilot/cluster-b-router"}`。
+每个包装器只接收 Broker 在最后一位传入的固定远端命令。为了兼容单目标部署，
+`SERVERPILOT_SCHEDULER_HELPER=/绝对路径/包装器` 只映射 `default` profile。
+SchedulerTarget API 只保存 `transport_profile` 和 `inspection_profile`，不会保存路径或额外参数。
+未配置 profile、遗留 `command_prefix` 或未知 profile 一律 fail closed；升级时旧 target 会被去除
+argv 并禁用，等待管理员重新配置。
+
 `raw-ssh` 的公开执行入口也不接收命令字符串：它只接受 `endpoint-telemetry` 与
 `process-details` 两个 probe 标识；后者仅可使用采集到的正整数 PID。这样即使未来调用点变多，
 配置、Agent 输入和 endpoint 元数据也不能成为远程 shell 内容。

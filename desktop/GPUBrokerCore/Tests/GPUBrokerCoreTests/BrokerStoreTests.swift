@@ -594,17 +594,17 @@ final class BrokerStoreTests: XCTestCase {
                         "available": ["cpu_cores": 24, "memory_mib": 98304]
                     ],
                     [
-                        "id": "scheduler:hanhai22",
+                        "id": "scheduler:scheduler-a",
                         "provider_type": "scheduler",
-                        "display_name": "Hanhai22",
+                        "display_name": "Example scheduler",
                         "state": "PENDING",
                         "available": ["node_count": 2, "scheduler_units": 2]
                     ]
                 ],
                 "allocatable_units": [
                     [
-                        "id": "scheduler-target:hanhai22",
-                        "provider_id": "scheduler:hanhai22",
+                        "id": "scheduler-target:scheduler-a",
+                        "provider_id": "scheduler:scheduler-a",
                         "unit_type": "scheduler-target",
                         "state": "PENDING",
                         "quantities": ["node_count": 2, "scheduler_units": 2]
@@ -612,8 +612,8 @@ final class BrokerStoreTests: XCTestCase {
                 ],
                 "scheduler_targets": [
                     [
-                        "id": "hanhai22",
-                        "display_name": "Hanhai22",
+                        "id": "scheduler-a",
+                        "display_name": "Example scheduler",
                         "kind": "external-scheduler",
                         "adapter": "slurm",
                         "enabled": true,
@@ -623,7 +623,7 @@ final class BrokerStoreTests: XCTestCase {
                 "scheduler_jobs": [
                     [
                         "id": "job-1",
-                        "target_id": "hanhai22",
+                        "target_id": "scheduler-a",
                         "actor_id": "agent-a",
                         "project_id": "project-a",
                         "task_ref": "train",
@@ -635,7 +635,7 @@ final class BrokerStoreTests: XCTestCase {
                 "scheduler_transfers": [
                     [
                         "id": "transfer-1",
-                        "target_id": "hanhai22",
+                        "target_id": "scheduler-a",
                         "actor_id": "agent-a",
                         "project_id": "project-a",
                         "state": "completed",
@@ -711,11 +711,11 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(scheduler.providerType, "scheduler")
         XCTAssertEqual(scheduler.trustBoundary, "等待外部调度器确认；不计入裸机可用容量")
         XCTAssertEqual(snapshot.allocatableUnits.first?.unitType, "scheduler-target")
-        XCTAssertEqual(snapshot.schedulerTargets.first?.id, "hanhai22")
+        XCTAssertEqual(snapshot.schedulerTargets.first?.id, "scheduler-a")
         XCTAssertEqual(snapshot.schedulerTargets.first?.accessStatus, "ACCESS_REQUIRED")
-        XCTAssertEqual(snapshot.schedulerJobs.first?.targetID, "hanhai22")
+        XCTAssertEqual(snapshot.schedulerJobs.first?.targetID, "scheduler-a")
         XCTAssertEqual(snapshot.schedulerJobs.first?.state, "PENDING")
-        XCTAssertEqual(snapshot.schedulerTransfers.first?.targetID, "hanhai22")
+        XCTAssertEqual(snapshot.schedulerTransfers.first?.targetID, "scheduler-a")
         XCTAssertEqual(snapshot.schedulerTransfers.first?.state, "COMPLETED")
         XCTAssertEqual(snapshot.resourceClaims.first?.quantities.compactLabel, "4 CPU · 8 GB RAM")
         XCTAssertEqual(snapshot.resourceClaims.first?.state, "ACTIVE")

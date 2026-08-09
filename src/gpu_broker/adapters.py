@@ -7,12 +7,14 @@ They do not receive BrokerService, database sessions, actors, or claim state.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
 import shlex
 import subprocess
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 from gpu_broker.config import EndpointConfig
 
@@ -22,6 +24,7 @@ Capability = Literal["observation", "scheduler", "provisioning-preview", "operat
 OperationId = Literal["scheduler.submit", "scheduler.cancel", "scheduler.upload"]
 ParameterType = Literal["string", "path"]
 RawSSHProbe = Literal["endpoint-telemetry", "process-details"]
+ObservationProfile = Literal["linux-nvidia", "linux-host"]
 
 
 GPU_QUERY = (
@@ -57,6 +60,19 @@ RAW_SSH_COMBINED_QUERY = (
     f"{PROCESS_QUERY} 2>/dev/null || true; fi; "
     f"printf '{IDENTITY_SECTION}\\n'; {IDENTITY_QUERY}; "
     f"printf '{HOST_RESOURCES_SECTION}\\n'; {HOST_RESOURCES_QUERY}"
+)
+RAW_SSH_HOST_ONLY_QUERY = (
+    f"set -e; printf '{GPU_SECTION}\\n{GPU_UNAVAILABLE}\\n'; "
+    f"printf '{PROCESS_SECTION}\\n'; "
+    f"printf '{IDENTITY_SECTION}\\n'; {IDENTITY_QUERY}; "
+    f"printf '{HOST_RESOURCES_SECTION}\\n'; {HOST_RESOURCES_QUERY}"
+)
+
+_OBSERVATION_QUERIES: Mapping[ObservationProfile, str] = MappingProxyType(
+    {
+        "linux-nvidia": RAW_SSH_COMBINED_QUERY,
+        "linux-host": RAW_SSH_HOST_ONLY_QUERY,
+    }
 )
 
 
@@ -168,7 +184,12 @@ class RawSSHObservationAdapter:
         process_ids: tuple[int, ...] = (),
     ) -> RawSSHResult:
         if probe == "endpoint-telemetry":
-            remote_command = RAW_SSH_COMBINED_QUERY
+            try:
+                remote_command = _OBSERVATION_QUERIES[endpoint.observation_profile]
+            except KeyError as exc:  # defensive for pre-migration/corrupt rows
+                raise ValueError(
+                    f"unknown endpoint observation profile: {endpoint.observation_profile}"
+                ) from exc
         elif probe == "process-details":
             if not process_ids or any(type(pid) is not int or pid <= 0 for pid in process_ids):
                 raise ValueError("process-details probe requires positive integer process ids")
@@ -222,15 +243,43 @@ class SlurmCommandSchedulerAdapter:
         self.runner = runner
 
     @staticmethod
-    def command_prefix(connection: dict[str, Any]) -> list[str]:
-        prefix = connection.get("command_prefix")
-        if (
-            not isinstance(prefix, list)
-            or not prefix
-            or any(not isinstance(item, str) or not item or "\x00" in item for item in prefix)
-        ):
-            raise AdapterCommandError("scheduler target has an invalid command_prefix")
-        return prefix
+    def transport_prefix(connection: dict[str, Any]) -> list[str]:
+        """Resolve a sealed scheduler transport outside target configuration.
+
+        A target can choose only a profile ID. The profile-to-wrapper mapping
+        comes from the local deployment's environment; each wrapper must be an
+        absolute, zero-argument program that accepts the broker's final remote
+        command. This keeps a cooperative API payload from becoming argv.
+        """
+
+        profile = connection.get("transport_profile")
+        if not isinstance(profile, str) or not re.fullmatch(r"[a-z][a-z0-9-]{1,63}", profile):
+            raise AdapterCommandError("scheduler target has an invalid transport profile")
+
+        raw_profiles = os.environ.get("SERVERPILOT_SCHEDULER_TRANSPORTS") or os.environ.get(
+            "GPU_BROKER_SCHEDULER_TRANSPORTS"
+        )
+        if raw_profiles:
+            try:
+                profiles = json.loads(raw_profiles)
+            except json.JSONDecodeError as exc:
+                raise AdapterCommandError("scheduler transport mapping is invalid JSON") from exc
+            if not isinstance(profiles, dict):
+                raise AdapterCommandError("scheduler transport mapping must be an object")
+        else:
+            legacy_helper = os.environ.get("SERVERPILOT_SCHEDULER_HELPER") or os.environ.get(
+                "GPU_BROKER_SCHEDULER_HELPER"
+            )
+            profiles = {"default": legacy_helper} if legacy_helper else {}
+
+        helper = profiles.get(profile)
+        if not isinstance(helper, str):
+            raise AdapterCommandError(
+                f"scheduler transport profile {profile!r} is not configured locally"
+            )
+        if not os.path.isabs(helper) or any(character in helper for character in ("\x00", "\n", "\r")):
+            raise AdapterCommandError("scheduler transport helper must be an absolute single executable path")
+        return [helper]
 
     def run(
         self,
@@ -243,7 +292,7 @@ class SlurmCommandSchedulerAdapter:
         remote_command = shlex.join(arguments)
         try:
             result = self.runner(
-                [*self.command_prefix(connection), remote_command],
+                [*self.transport_prefix(connection), remote_command],
                 check=False,
                 capture_output=True,
                 text=True,

@@ -48,6 +48,10 @@ class EndpointConfig(BaseModel):
     port: int = Field(ge=1, le=65535)
     ssh_user: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
     ssh_alias: str | None = Field(default=None, min_length=1, max_length=120)
+    # A closed, code-owned profile chooses the fixed read-only probe and
+    # parser.  It is deliberately not a command, shell fragment, key path, or
+    # SSH option supplied by inventory.
+    observation_profile: Literal["linux-nvidia", "linux-host"] = "linux-nvidia"
     labels: list[str] = Field(default_factory=list)
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)

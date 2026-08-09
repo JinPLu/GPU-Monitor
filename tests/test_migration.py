@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from gpu_broker.database import Database
 
@@ -83,6 +84,65 @@ def test_migration_upgrades_existing_schema_to_endpoint_telemetry(tmp_path: Path
     gpu_columns = {column["name"] for column in inspect(database.engine).get_columns("gpu_devices")}
     assert {"present", "absent_at"}.issubset(gpu_columns)
     assert "lease_endpoint_commitments" in inspect(database.engine).get_table_names()
+
+
+def test_scheduler_transport_migration_scrubs_legacy_argv_and_disables_target(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    database = Database(f"sqlite:///{tmp_path / 'scheduler-upgrade.sqlite3'}", root)
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "src" / "gpu_broker" / "migrations"))
+    config.set_main_option("sqlalchemy.url", database.url)
+
+    command.upgrade(config, "20260809_0012")
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO scheduler_targets (
+                    id, display_name, adapter, connection_json, credential_refs_json,
+                    capabilities_json, access_hint, enabled, created_at, updated_at
+                ) VALUES (
+                    :id, :display_name, :adapter, :connection_json, :credential_refs_json,
+                    :capabilities_json, :access_hint, :enabled, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                )
+                """
+            ),
+            {
+                "id": "legacy-target",
+                "display_name": "Legacy target",
+                "adapter": "slurm-command",
+                "connection_json": json.dumps(
+                    {
+                        "command_prefix": ["/tmp/legacy-helper", "--site"],
+                        "upload": {"ssh_host": "example.test"},
+                    }
+                ),
+                "credential_refs_json": "{}",
+                "capabilities_json": "[\"access-status\"]",
+                "access_hint": "reconfigure transport",
+                "enabled": True,
+            },
+        )
+
+    command.upgrade(config, "head")
+    with database.engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT connection_json, enabled, access_status, access_message "
+                "FROM scheduler_targets WHERE id = 'legacy-target'"
+            )
+        ).one()
+
+    migrated = json.loads(row.connection_json)
+    assert "command_prefix" not in migrated
+    assert migrated["transport_profile"] == "unconfigured"
+    assert migrated["inspection_profile"] == "slurm-basic"
+    assert migrated["upload"] == {"ssh_host": "example.test"}
+    assert not row.enabled
+    assert row.access_status == "unconfigured"
+    assert "administrator" in row.access_message
 
 
 def test_migration_uses_packaged_scripts_without_project_tree(tmp_path: Path) -> None:

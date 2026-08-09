@@ -440,7 +440,11 @@ class SchedulerTargetUpsert(StrictModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$")
     display_name: str = Field(min_length=1, max_length=120)
     adapter: Literal["slurm-command"] = "slurm-command"
-    command_prefix: list[str] = Field(min_length=1, max_length=16)
+    # The target selects an operator-owned transport profile and a fixed
+    # inspection profile.  The profile resolves to a local helper only in the
+    # deployment environment, never from this cooperative API payload.
+    transport_profile: str = Field(pattern=r"^[a-z][a-z0-9-]{1,63}$", default="default")
+    inspection_profile: Literal["slurm-basic", "slurm-capacity"] = "slurm-basic"
     upload: SchedulerUploadConfig | None = None
     credential_refs: dict[str, str] = Field(default_factory=dict)
     capabilities: list[
@@ -449,7 +453,7 @@ class SchedulerTargetUpsert(StrictModel):
     access_hint: str = Field(min_length=1, max_length=2000)
     enabled: bool = True
 
-    @field_validator("command_prefix", "capabilities")
+    @field_validator("capabilities")
     @classmethod
     def unique_non_empty_values(cls, values: list[str]) -> list[str]:
         if len(values) != len(set(values)):
@@ -534,6 +538,7 @@ class EndpointUpsert(StrictModel):
     port: int = Field(ge=1, le=65535)
     ssh_user: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
     ssh_alias: str | None = Field(default=None, min_length=1, max_length=120)
+    observation_profile: Literal["linux-nvidia", "linux-host"] = "linux-nvidia"
     labels: list[str] = Field(default_factory=list)
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
