@@ -30,6 +30,7 @@ from gpu_broker.models import (
     AuditEvent,
     Endpoint,
     EndpointTelemetryCurrent,
+    EndpointTelemetrySnapshot,
     GPUDevice,
     IdempotencyRecord,
     Lease,
@@ -1001,7 +1002,9 @@ class BrokerService:
         }
 
     @staticmethod
-    def _host_telemetry_dict(telemetry: EndpointTelemetryCurrent | None) -> dict[str, Any] | None:
+    def _host_telemetry_dict(
+        telemetry: EndpointTelemetryCurrent | EndpointTelemetrySnapshot | None,
+    ) -> dict[str, Any] | None:
         if telemetry is None:
             return None
         return {
@@ -1009,10 +1012,34 @@ class BrokerService:
             "collected_at": _iso(telemetry.collected_at),
             "cpu_count": telemetry.cpu_count,
             "load_1m": telemetry.load_1m,
+            "cpu_utilization_pct": telemetry.cpu_utilization_pct,
+            "cpu_total_ticks": telemetry.cpu_total_ticks,
+            "cpu_idle_ticks": telemetry.cpu_idle_ticks,
             "memory_total_mib": telemetry.memory_total_mib,
             "memory_available_mib": telemetry.memory_available_mib,
             "provider": telemetry.provider,
         }
+
+    @staticmethod
+    def _host_cpu_utilization_pct(
+        previous: EndpointTelemetryCurrent | None,
+        *,
+        cpu_total_ticks: int | None,
+        cpu_idle_ticks: int | None,
+    ) -> float | None:
+        if (
+            previous is None
+            or previous.cpu_total_ticks is None
+            or previous.cpu_idle_ticks is None
+            or cpu_total_ticks is None
+            or cpu_idle_ticks is None
+        ):
+            return None
+        total_delta = cpu_total_ticks - previous.cpu_total_ticks
+        idle_delta = cpu_idle_ticks - previous.cpu_idle_ticks
+        if total_delta <= 0 or idle_delta < 0 or idle_delta > total_delta:
+            return None
+        return round((total_delta - idle_delta) * 100 / total_delta, 2)
 
     @staticmethod
     def _resource_quantities_dict(quantities: ResourceQuantities) -> dict[str, Any]:
@@ -2193,9 +2220,97 @@ class BrokerService:
                     "actuals": resource_actual_payloads,
                 }
             )
+            active_host_capacity = [
+                card for card in host_capacity_payloads if card["admission_state"] == "available"
+            ]
+            resource_projection = {
+                "capacity": {
+                    "gpu_count": len(all_gpu_payloads),
+                    "cpu_cores": round(
+                        sum(
+                            card["capacity"]["total_cpu_cores"] or 0.0
+                            for card in host_capacity_payloads
+                        ),
+                        1,
+                    ),
+                    "memory_mib": sum(
+                        card["capacity"]["total_memory_mib"] or 0
+                        for card in host_capacity_payloads
+                    ),
+                    "vram_mib": sum(gpu["total_vram_mib"] for gpu in all_gpu_payloads),
+                },
+                "used": {
+                    "gpu_count": counts["BUSY_UNMANAGED"] + counts["RUNNING_MANAGED"],
+                    "cpu_cores": round(
+                        sum(
+                            (card["telemetry"] or {}).get("load_1m") or 0.0
+                            for card in host_capacity_payloads
+                        ),
+                        1,
+                    ),
+                    "memory_mib": sum(
+                        max(
+                            0,
+                            (card["capacity"]["total_memory_mib"] or 0)
+                            - (card["capacity"]["observed_available_memory_mib"] or 0),
+                        )
+                        for card in host_capacity_payloads
+                    ),
+                    "vram_mib": sum(
+                        (gpu["telemetry"] or {}).get("memory_used_mib") or 0
+                        for gpu in all_gpu_payloads
+                    ),
+                },
+                "claimed": {
+                    "gpu_count": sum(counts[item] for item in claimed_states),
+                    "cpu_cores": round(
+                        sum(
+                            card["capacity"]["committed_cpu_cores"] or 0.0
+                            for card in host_capacity_payloads
+                        ),
+                        1,
+                    ),
+                    "memory_mib": sum(
+                        card["capacity"]["committed_memory_mib"] or 0
+                        for card in host_capacity_payloads
+                    ),
+                    "lease_count": len(visible_lease_payloads),
+                    "claim_count": len(resource_claim_payloads),
+                },
+                "available": {
+                    "gpu_count": counts["AVAILABLE"],
+                    "cpu_cores": round(
+                        sum(
+                            card["capacity"]["available_cpu_cores"] or 0.0
+                            for card in active_host_capacity
+                        ),
+                        1,
+                    ),
+                    "memory_mib": sum(
+                        card["capacity"]["available_memory_mib"] or 0
+                        for card in active_host_capacity
+                    ),
+                    "host_capacity_units": len(active_host_capacity),
+                },
+                "attention": summary["attention"],
+                "semantics": {
+                    "available_is_authoritative": True,
+                    "used_and_claimed_may_overlap": True,
+                    "fail_closed_states": [
+                        "BUSY_UNMANAGED",
+                        "CONFLICT",
+                        "MAINTENANCE",
+                        "ORPHANED_BUSY",
+                        "UNKNOWN_RECOVERING",
+                        "UNKNOWN_STALE",
+                        "UNHEALTHY",
+                    ],
+                },
+            }
 
             data = {
                 "summary": summary,
+                "resource_projection": resource_projection,
                 "data_age_seconds": round(max(ages), 1) if ages else None,
                 "endpoints": endpoint_payloads,
                 "gpus": gpu_payloads,
@@ -2248,6 +2363,7 @@ class BrokerService:
         data = snapshot["data"]
         current_keys = (
             "summary",
+            "resource_projection",
             "data_age_seconds",
             "freshness_seconds",
             "endpoints",
@@ -3303,9 +3419,10 @@ class BrokerService:
                 ).all()
             )
             current = session.get(TelemetryCurrent, gpu_id)
-            if current is not None and (
+            current_observed_at = _as_utc(current.observed_at) if current is not None else None
+            if current is not None and current_observed_at is not None and current_observed_at >= cutoff and (
                 not samples
-                or (_as_utc(current.observed_at) or now) > (_as_utc(samples[-1].observed_at) or now)
+                or current_observed_at > (_as_utc(samples[-1].observed_at) or now)
             ):
                 samples.append(current)
 
@@ -3360,6 +3477,185 @@ class BrokerService:
 
         return self._read(operation)
 
+    def endpoint_history(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        *,
+        window_seconds: int = 3600,
+        max_points: int = 120,
+    ) -> dict[str, Any]:
+        """Return bounded host CPU/load/memory history for one endpoint detail view."""
+
+        if window_seconds not in {3600, 21_600, TELEMETRY_HISTORY_RETENTION_SECONDS}:
+            raise BrokerError(
+                "invalid_history_window",
+                "endpoint history window must be one of 1h, 6h or 24h",
+                status_code=422,
+            )
+        if not 10 <= max_points <= 120:
+            raise BrokerError(
+                "invalid_history_points",
+                "history points must be between 10 and 120",
+                status_code=422,
+            )
+
+        def operation(session: Session) -> dict[str, Any]:
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError(
+                    "endpoint_not_found",
+                    "endpoint is not visible or does not exist",
+                    status_code=404,
+                )
+            now = utcnow()
+            cutoff = now - timedelta(seconds=window_seconds)
+            samples: list[EndpointTelemetryCurrent | EndpointTelemetrySnapshot] = list(
+                session.scalars(
+                    select(EndpointTelemetrySnapshot)
+                    .where(
+                        EndpointTelemetrySnapshot.endpoint_id == endpoint_id,
+                        EndpointTelemetrySnapshot.observed_at >= cutoff,
+                    )
+                    .order_by(
+                        EndpointTelemetrySnapshot.observed_at,
+                        EndpointTelemetrySnapshot.id,
+                    )
+                ).all()
+            )
+            current = session.get(EndpointTelemetryCurrent, endpoint_id)
+            current_observed_at = _as_utc(current.observed_at) if current is not None else None
+            if current is not None and current_observed_at is not None and current_observed_at >= cutoff and (
+                not samples
+                or current_observed_at > (_as_utc(samples[-1].observed_at) or now)
+            ):
+                samples.append(current)
+
+            def buckets_for(values: list[Any]) -> list[list[Any]]:
+                if len(values) <= max_points:
+                    return [[value] for value in values]
+                return [
+                    values[
+                        index * len(values) // max_points : (index + 1)
+                        * len(values)
+                        // max_points
+                    ]
+                    for index in range(max_points)
+                ]
+
+            buckets = buckets_for(samples)
+
+            def average(bucket: list[Any], name: str) -> float | None:
+                values = [getattr(sample, name) for sample in bucket]
+                present = [float(value) for value in values if value is not None]
+                return round(sum(present) / len(present), 2) if present else None
+
+            points = []
+            for bucket in buckets:
+                memory_total = average(bucket, "memory_total_mib")
+                memory_available = average(bucket, "memory_available_mib")
+                points.append(
+                    {
+                        "observed_at": _iso(bucket[-1].observed_at),
+                        "cpu_count": average(bucket, "cpu_count"),
+                        "load_1m": average(bucket, "load_1m"),
+                        "cpu_utilization_pct": average(bucket, "cpu_utilization_pct"),
+                        "memory_total_mib": memory_total,
+                        "memory_available_mib": memory_available,
+                        "memory_used_pct": (
+                            round(
+                                (memory_total - (memory_available or 0))
+                                * 100
+                                / memory_total,
+                                2,
+                            )
+                            if memory_total
+                            else None
+                        ),
+                    }
+                )
+
+            # GPU history is deliberately returned as endpoint-scoped series rather
+            # than asking the desktop to fan out into one request per GPU.  The
+            # identity and historical source remain the canonical GPU device and
+            # telemetry snapshot tables; this is only a bounded read projection.
+            devices = list(
+                session.scalars(
+                    select(GPUDevice)
+                    .where(GPUDevice.endpoint_id == endpoint.id)
+                    .order_by(GPUDevice.gpu_index, GPUDevice.id)
+                ).all()
+            )
+            device_ids = [device.id for device in devices]
+            readings_by_gpu: dict[str, list[TelemetryCurrent | TelemetrySnapshot]] = {
+                device.id: [] for device in devices
+            }
+            if device_ids:
+                historical_readings = session.scalars(
+                    select(TelemetrySnapshot)
+                    .where(
+                        TelemetrySnapshot.gpu_id.in_(device_ids),
+                        TelemetrySnapshot.observed_at >= cutoff,
+                    )
+                    .order_by(TelemetrySnapshot.gpu_id, TelemetrySnapshot.observed_at, TelemetrySnapshot.id)
+                ).all()
+                for reading in historical_readings:
+                    readings_by_gpu[reading.gpu_id].append(reading)
+
+                current_readings = session.scalars(
+                    select(TelemetryCurrent).where(TelemetryCurrent.gpu_id.in_(device_ids))
+                ).all()
+                for reading in current_readings:
+                    observed_at = _as_utc(reading.observed_at)
+                    history = readings_by_gpu[reading.gpu_id]
+                    if observed_at is not None and observed_at >= cutoff and (
+                        not history
+                        or observed_at > (_as_utc(history[-1].observed_at) or now)
+                    ):
+                        history.append(reading)
+
+            gpu_series = []
+            for device in devices:
+                readings = readings_by_gpu[device.id]
+                series_points = []
+                for bucket in buckets_for(readings):
+                    memory_used = average(bucket, "memory_used_mib")
+                    series_points.append(
+                        {
+                            "observed_at": _iso(bucket[-1].observed_at),
+                            "gpu_utilization_pct": average(bucket, "gpu_utilization_pct"),
+                            "memory_used_pct": (
+                                round((memory_used or 0) * 100 / device.total_vram_mib, 2)
+                                if device.total_vram_mib
+                                else None
+                            ),
+                            "memory_used_mib": memory_used,
+                            "memory_total_mib": device.total_vram_mib,
+                        }
+                    )
+                gpu_series.append(
+                    {
+                        "gpu_id": device.id,
+                        "gpu_uuid": device.gpu_uuid,
+                        "gpu_index": device.gpu_index,
+                        "label": f"GPU {device.gpu_index}",
+                        "points": series_points,
+                    }
+                )
+
+            return self.envelope(
+                session,
+                {
+                    "endpoint_id": endpoint.id,
+                    "window_seconds": window_seconds,
+                    "point_count": len(points),
+                    "points": points,
+                    "gpu_series": gpu_series,
+                },
+            )
+
+        return self._read(operation)
+
     def prune_telemetry_history(
         self, older_than_seconds: int = TELEMETRY_HISTORY_RETENTION_SECONDS
     ) -> int:
@@ -3368,10 +3664,15 @@ class BrokerService:
         cutoff = utcnow() - timedelta(seconds=older_than_seconds)
 
         def operation(session: Session) -> int:
-            result = session.execute(
+            gpu_result = session.execute(
                 delete(TelemetrySnapshot).where(TelemetrySnapshot.observed_at < cutoff)
             )
-            return max(0, result.rowcount or 0)
+            endpoint_result = session.execute(
+                delete(EndpointTelemetrySnapshot).where(
+                    EndpointTelemetrySnapshot.observed_at < cutoff
+                )
+            )
+            return max(0, gpu_result.rowcount or 0) + max(0, endpoint_result.rowcount or 0)
 
         return self._write(operation)
 
@@ -3407,11 +3708,48 @@ class BrokerService:
                     "observation_complete": observation.observation_complete,
                     "process_count": len(observation.processes),
                     "history_points_written": 0,
+                    "endpoint_history_points_written": 0,
                     "ignored": True,
                     "ignore_reason": "stale_observation",
                     "current_observed_at": _iso(current_observed_at),
                 }
             revision = self._bump_revision(session, now)
+            host_cpu_total_ticks = observation.host.cpu_total_ticks
+            host_cpu_idle_ticks = observation.host.cpu_idle_ticks
+            host_cpu_utilization_pct = self._host_cpu_utilization_pct(
+                host_telemetry,
+                cpu_total_ticks=host_cpu_total_ticks,
+                cpu_idle_ticks=host_cpu_idle_ticks,
+            )
+            latest_endpoint_history_at = _as_utc(
+                session.scalar(
+                    select(func.max(EndpointTelemetrySnapshot.observed_at)).where(
+                        EndpointTelemetrySnapshot.endpoint_id == endpoint.id
+                    )
+                )
+            )
+            endpoint_history_points_written = 0
+            if (
+                latest_endpoint_history_at is None
+                or (observed_at - latest_endpoint_history_at).total_seconds()
+                >= TELEMETRY_HISTORY_INTERVAL_SECONDS
+            ):
+                session.add(
+                    EndpointTelemetrySnapshot(
+                        endpoint_id=endpoint.id,
+                        observed_at=observed_at,
+                        collected_at=now,
+                        cpu_count=observation.host.cpu_count,
+                        load_1m=observation.host.load_1m,
+                        cpu_total_ticks=host_cpu_total_ticks,
+                        cpu_idle_ticks=host_cpu_idle_ticks,
+                        cpu_utilization_pct=host_cpu_utilization_pct,
+                        memory_total_mib=observation.host.memory_total_mib,
+                        memory_available_mib=observation.host.memory_available_mib,
+                        provider=provider,
+                    )
+                )
+                endpoint_history_points_written = 1
             if host_telemetry is None:
                 host_telemetry = EndpointTelemetryCurrent(
                     endpoint_id=endpoint.id,
@@ -3419,6 +3757,9 @@ class BrokerService:
                     collected_at=now,
                     cpu_count=observation.host.cpu_count,
                     load_1m=observation.host.load_1m,
+                    cpu_total_ticks=host_cpu_total_ticks,
+                    cpu_idle_ticks=host_cpu_idle_ticks,
+                    cpu_utilization_pct=host_cpu_utilization_pct,
                     memory_total_mib=observation.host.memory_total_mib,
                     memory_available_mib=observation.host.memory_available_mib,
                     provider=provider,
@@ -3429,6 +3770,9 @@ class BrokerService:
                 host_telemetry.collected_at = now
                 host_telemetry.cpu_count = observation.host.cpu_count
                 host_telemetry.load_1m = observation.host.load_1m
+                host_telemetry.cpu_total_ticks = host_cpu_total_ticks
+                host_telemetry.cpu_idle_ticks = host_cpu_idle_ticks
+                host_telemetry.cpu_utilization_pct = host_cpu_utilization_pct
                 host_telemetry.memory_total_mib = observation.host.memory_total_mib
                 host_telemetry.memory_available_mib = observation.host.memory_available_mib
                 host_telemetry.provider = provider
@@ -3702,6 +4046,7 @@ class BrokerService:
                 "observation_complete": observation.observation_complete,
                 "process_count": len(observation.processes),
                 "history_points_written": history_points_written,
+                "endpoint_history_points_written": endpoint_history_points_written,
                 "ignored": False,
             }
 
@@ -5627,12 +5972,21 @@ class BrokerService:
             now = utcnow()
             cutoff = now - timedelta(seconds=retention.older_than_seconds)
             revision = self._bump_revision(session, now)
-            deleted = (
+            gpu_deleted = (
                 session.execute(
                     delete(TelemetrySnapshot).where(TelemetrySnapshot.observed_at < cutoff)
                 ).rowcount
                 or 0
             )
+            endpoint_deleted = (
+                session.execute(
+                    delete(EndpointTelemetrySnapshot).where(
+                        EndpointTelemetrySnapshot.observed_at < cutoff
+                    )
+                ).rowcount
+                or 0
+            )
+            deleted = gpu_deleted + endpoint_deleted
             event = self._audit(
                 session,
                 actor_id=actor.id,
@@ -5640,13 +5994,20 @@ class BrokerService:
                 resource_type="telemetry",
                 resource_id="history",
                 result="success",
-                after={"deleted_count": deleted, "cutoff": _iso(cutoff)},
+                after={
+                    "deleted_count": deleted,
+                    "gpu_deleted_count": gpu_deleted,
+                    "endpoint_deleted_count": endpoint_deleted,
+                    "cutoff": _iso(cutoff),
+                },
                 now=now,
             )
             result = {
                 "event_id": event.id,
                 "snapshot_revision": revision,
                 "deleted_count": deleted,
+                "gpu_deleted_count": gpu_deleted,
+                "endpoint_deleted_count": endpoint_deleted,
                 "cutoff": _iso(cutoff),
             }
             self._remember_idempotency(

@@ -98,8 +98,11 @@ App / CLI / MCP ── loopback REST ──> BrokerService ──> SQLite
 GPU / CPU 服务器 ── 固定只读 Collector ──────────────┘
 ```
 
-- App、CLI 和 MCP 的常规读操作共享 `GET /api/v1/state`。
+- App、CLI 和 MCP 的常规读操作共享 `GET /api/v1/state`；GPU Broker 的资源真相仍由
+  `current` 与既有 `history` 共同组成，新增遥测曲线按需通过专用 endpoint history 接口读取。
 - 调度、队列、租约、状态和审计规则只存在于 `BrokerService`。
+- Collector 与 Slurm 的实现现在通过受限 adapter registry 接入：adapter 只能提供观测或调度
+  结果，不能创建 lease/claim、执行任意命令，或增加新的 Agent 凭证路径。
 - 服务器退役使用 `active → draining → retired`；App 各页面从下一份统一状态一起更新。
 - CLI 和 MCP 不直连 SQLite 或 SSH。
 
@@ -117,6 +120,7 @@ GPU / CPU 服务器 ── 固定只读 Collector ──────────
 - 🧮 [瀚海22 / Slurm 调度](docs/HANHAI22_SLURM_zh.md)
 - ✅ [当前实现与验证状态](docs/IMPLEMENTATION_STATUS_zh.md)
 - 🎨 [桌面设计系统](docs/DESIGN_SYSTEM.md)
+- 🔌 [Adapter 能力与边界](docs/ADAPTERS_zh.md)
 - 🧑‍💻 [参与贡献](CONTRIBUTING.md)
 - 🔐 [安全说明](SECURITY.md)
 

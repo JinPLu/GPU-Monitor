@@ -327,6 +327,46 @@ class MacOSDaemonManager:
         match = re.search(r"(?m)^\s*pid = (\d+)\s*$", result.stdout)
         return int(match.group(1)) if match is not None else None
 
+    @staticmethod
+    def _parent_process_id(process_id: int) -> int | None:
+        """Return one process's parent without invoking a shell.
+
+        PyInstaller's onefile bootloader remains the launchd-owned process and
+        starts the Python service as its direct child. A direct parent match is
+        therefore an owned service; arbitrary descendants are intentionally not
+        accepted.
+        """
+
+        try:
+            result = subprocess.run(
+                ["/bin/ps", "-o", "ppid=", "-p", str(process_id)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=0.8,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            parent_id = int(result.stdout.strip())
+        except ValueError:
+            return None
+        return parent_id if parent_id > 0 else None
+
+    def _ready_process_is_owned_by_launchd(
+        self, process_id: object, launchd_pid: int | None
+    ) -> bool:
+        if (
+            launchd_pid is None
+            or isinstance(process_id, bool)
+            or not isinstance(process_id, int)
+            or process_id < 1
+        ):
+            return False
+        return process_id == launchd_pid or self._parent_process_id(process_id) == launchd_pid
+
     def _probe_owned_ready(self) -> dict[str, Any] | None:
         live = probe_live(self.config)
         if live is None:
@@ -335,7 +375,7 @@ class MacOSDaemonManager:
         if ready is None:
             return None
         launchd_pid = self._launchd_pid()
-        if launchd_pid is None or ready.get("process_id") != launchd_pid:
+        if not self._ready_process_is_owned_by_launchd(ready.get("process_id"), launchd_pid):
             raise DaemonError(
                 f"{self.config.base_url} is not served by {self.service_target}"
             )

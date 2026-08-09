@@ -36,6 +36,10 @@ public protocol BrokerSnapshotClient: AnyObject, Sendable {
     func snapshot(actorID: String) async throws -> BrokerSnapshot
 }
 
+public protocol BrokerEndpointTelemetryHistoryClient: AnyObject, Sendable {
+    func history(endpointID: String, range: EndpointTelemetryRange, actorID: String) async throws -> EndpointTelemetryHistory
+}
+
 public final class URLSessionBrokerSnapshotClient: BrokerSnapshotClient {
     private let baseURL: URL
     private let session: URLSession
@@ -69,6 +73,50 @@ public final class URLSessionBrokerSnapshotClient: BrokerSnapshotClient {
     }
 }
 
+public final class URLSessionEndpointTelemetryHistoryClient: BrokerEndpointTelemetryHistoryClient {
+    private let baseURL: URL
+    private let session: URLSession
+
+    public init(baseURL: URL, session: URLSession = .shared) {
+        self.baseURL = baseURL
+        self.session = session
+    }
+
+    public func history(
+        endpointID: String,
+        range: EndpointTelemetryRange,
+        actorID: String
+    ) async throws -> EndpointTelemetryHistory {
+        let endpointURL = baseURL
+            .appendingPathComponent("api/v1/endpoints")
+            .appendingPathComponent(endpointID)
+            .appendingPathComponent("history")
+        var components = URLComponents(url: endpointURL, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "window_seconds", value: String(range.windowSeconds)),
+            URLQueryItem(name: "points", value: "120"),
+        ]
+        guard let url = components?.url else { throw BrokerRefreshError.invalidSnapshot }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 6
+        request.setValue(actorID, forHTTPHeaderField: "X-GPU-Broker-Actor")
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse else {
+            throw BrokerRefreshError.invalidSnapshot
+        }
+        guard (200..<300).contains(response.statusCode) else {
+            throw BrokerRefreshError.serviceRejected(response.statusCode)
+        }
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let envelope = object as? [String: Any]
+        else {
+            throw BrokerRefreshError.invalidSnapshot
+        }
+        return EndpointTelemetryHistory(endpointID: endpointID, range: range, envelope: envelope)
+    }
+}
+
 @MainActor
 public final class BrokerStore: ObservableObject {
     private struct PendingEndpointRemoval {
@@ -76,6 +124,16 @@ public final class BrokerStore: ObservableObject {
         let endpointDisplayName: String
         let expectedLifecycleState: String
         let completion: @MainActor @Sendable (Bool, String?) -> Void
+    }
+
+    private struct EndpointTelemetryHistoryCacheKey: Hashable {
+        let endpointID: String
+        let range: EndpointTelemetryRange
+    }
+
+    private struct CachedEndpointTelemetryHistory {
+        let history: EndpointTelemetryHistory
+        let fetchedAt: Date
     }
 
     @Published public private(set) var snapshot = BrokerSnapshot.empty
@@ -87,14 +145,23 @@ public final class BrokerStore: ObservableObject {
     @Published public private(set) var serviceInfo: ServiceInfo?
     @Published public private(set) var deletingEndpointIDs: Set<String> = []
     @Published public private(set) var releasingLeaseIDs: Set<String> = []
+    @Published public private(set) var endpointTelemetryHistory: [String: EndpointTelemetryHistory] = [:]
+    @Published public private(set) var endpointTelemetryHistoryLoading: Set<String> = []
+    @Published public private(set) var endpointTelemetryHistoryErrors: [String: String] = [:]
     @Published public var actorID: String
     @Published public var notice: String?
     @Published public var errorMessage: String?
 
     private var baseURL: URL?
     private var snapshotClient: BrokerSnapshotClient?
+    private var endpointTelemetryHistoryClient: BrokerEndpointTelemetryHistoryClient?
     private var periodicRefreshTask: Task<Void, Never>?
     private var activeRefreshTask: Task<Void, Never>?
+    private var endpointTelemetryHistoryTasks: [EndpointTelemetryHistoryCacheKey: Task<Void, Never>] = [:]
+    private var endpointTelemetryHistoryGenerations: [EndpointTelemetryHistoryCacheKey: UInt64] = [:]
+    private var endpointTelemetryHistoryCache: [EndpointTelemetryHistoryCacheKey: CachedEndpointTelemetryHistory] = [:]
+    private var endpointTelemetryHistoryCacheRecency: [EndpointTelemetryHistoryCacheKey] = []
+    private var activeEndpointTelemetryHistoryKey: EndpointTelemetryHistoryCacheKey?
     private var pendingRefresh = false
     private var refreshGeneration: UInt64 = 0
     private var discardedRefreshGeneration: UInt64?
@@ -103,6 +170,9 @@ public final class BrokerStore: ObservableObject {
     private let refreshTimeoutSeconds: TimeInterval
     private let refreshIntervalSeconds: TimeInterval
     private let dateProvider: () -> Date
+
+    private static let endpointTelemetryHistoryCacheMaximumAge: TimeInterval = 30
+    private static let endpointTelemetryHistoryCacheLimit = 12
 
     public init(
         actorID: String? = nil,
@@ -119,10 +189,15 @@ public final class BrokerStore: ObservableObject {
     deinit {
         periodicRefreshTask?.cancel()
         activeRefreshTask?.cancel()
+        endpointTelemetryHistoryTasks.values.forEach { $0.cancel() }
     }
 
     public var supportsEndpointDeletion: Bool {
         serviceInfo?.supportsEndpointDeletion == true
+    }
+
+    public var supportsEndpointTelemetryHistory: Bool {
+        serviceInfo?.supportsEndpointTelemetryHistory == true && endpointTelemetryHistoryClient != nil
     }
 
     public var allowsMutations: Bool {
@@ -158,6 +233,9 @@ public final class BrokerStore: ObservableObject {
         self.baseURL = baseURL
         configureSnapshotClient(
             URLSessionBrokerSnapshotClient(baseURL: baseURL),
+            endpointTelemetryHistoryClient: serviceInfo.supportsEndpointTelemetryHistory
+                ? URLSessionEndpointTelemetryHistoryClient(baseURL: baseURL)
+                : nil,
             serviceInfo: serviceInfo,
             startPeriodicRefresh: true
         )
@@ -165,6 +243,7 @@ public final class BrokerStore: ObservableObject {
 
     public func connectForTesting(
         snapshotClient: BrokerSnapshotClient,
+        endpointTelemetryHistoryClient: BrokerEndpointTelemetryHistoryClient? = nil,
         serviceInfo: ServiceInfo = .fixture,
         baseURL: URL? = nil,
         startPeriodicRefresh: Bool = false
@@ -172,13 +251,20 @@ public final class BrokerStore: ObservableObject {
         self.baseURL = baseURL
         configureSnapshotClient(
             snapshotClient,
+            endpointTelemetryHistoryClient: endpointTelemetryHistoryClient,
             serviceInfo: serviceInfo,
             startPeriodicRefresh: startPeriodicRefresh
         )
     }
 
-    public func useFixture(snapshot: BrokerSnapshot, serviceInfo: ServiceInfo = .fixture) {
+    public func useFixture(
+        snapshot: BrokerSnapshot,
+        serviceInfo: ServiceInfo = .fixture,
+        endpointTelemetryHistoryClient: BrokerEndpointTelemetryHistoryClient? = nil
+    ) {
         invalidateRefreshWork()
+        invalidateEndpointTelemetryHistoryWork()
+        self.endpointTelemetryHistoryClient = endpointTelemetryHistoryClient
         self.snapshot = snapshot
         self.lastGoodSnapshot = snapshot
         self.freshness = Self.freshness(for: snapshot)
@@ -188,6 +274,60 @@ public final class BrokerStore: ObservableObject {
         self.serviceInfo = serviceInfo
         self.errorMessage = nil
         self.notice = "正在使用桌面测试夹具。"
+    }
+
+    public func endpointTelemetryHistory(
+        endpointID: String,
+        range: EndpointTelemetryRange
+    ) -> EndpointTelemetryHistory? {
+        let history = endpointTelemetryHistory[endpointID]
+        return history?.range == range ? history : nil
+    }
+
+    public func requestEndpointTelemetryHistory(endpointID: String, range: EndpointTelemetryRange) {
+        guard serviceInfo?.supportsEndpointTelemetryHistory == true else {
+            endpointTelemetryHistoryErrors[endpointID] = "当前本机服务未提供资源历史能力。"
+            endpointTelemetryHistoryLoading.remove(endpointID)
+            return
+        }
+        guard let endpointTelemetryHistoryClient else {
+            endpointTelemetryHistoryErrors[endpointID] = "资源历史客户端尚未连接。"
+            endpointTelemetryHistoryLoading.remove(endpointID)
+            return
+        }
+        let key = EndpointTelemetryHistoryCacheKey(endpointID: endpointID, range: range)
+        cancelInactiveEndpointTelemetryHistoryRequests(keeping: key)
+        if let cachedHistory = cachedEndpointTelemetryHistory(for: key) {
+            activeEndpointTelemetryHistoryKey = key
+            presentEndpointTelemetryHistory(cachedHistory, for: key)
+            activeEndpointTelemetryHistoryKey = nil
+            return
+        }
+        guard endpointTelemetryHistoryTasks[key] == nil else { return }
+
+        let generation = (endpointTelemetryHistoryGenerations[key] ?? 0) &+ 1
+        endpointTelemetryHistoryGenerations[key] = generation
+        activeEndpointTelemetryHistoryKey = key
+        endpointTelemetryHistoryLoading.insert(endpointID)
+        endpointTelemetryHistoryErrors[endpointID] = nil
+        let actorID = self.actorID
+        endpointTelemetryHistoryTasks[key] = Task { [weak self] in
+            let result: Result<EndpointTelemetryHistory, Error>
+            do {
+                result = .success(try await endpointTelemetryHistoryClient.history(
+                    endpointID: endpointID,
+                    range: range,
+                    actorID: actorID
+                ))
+            } catch {
+                result = .failure(error)
+            }
+            self?.completeEndpointTelemetryHistory(
+                result,
+                for: key,
+                generation: generation
+            )
+        }
     }
 
     public func reload() {
@@ -501,16 +641,115 @@ public final class BrokerStore: ObservableObject {
 
     private func configureSnapshotClient(
         _ snapshotClient: BrokerSnapshotClient,
+        endpointTelemetryHistoryClient: BrokerEndpointTelemetryHistoryClient?,
         serviceInfo: ServiceInfo,
         startPeriodicRefresh: Bool
     ) {
         invalidateRefreshWork()
+        invalidateEndpointTelemetryHistoryWork()
         self.snapshotClient = snapshotClient
+        self.endpointTelemetryHistoryClient = endpointTelemetryHistoryClient
         self.serviceInfo = serviceInfo
         if startPeriodicRefresh {
             startPeriodicRefreshLoop()
         }
         requestRefresh()
+    }
+
+    private func completeEndpointTelemetryHistory(
+        _ result: Result<EndpointTelemetryHistory, Error>,
+        for key: EndpointTelemetryHistoryCacheKey,
+        generation: UInt64
+    ) {
+        guard endpointTelemetryHistoryGenerations[key] == generation else { return }
+        endpointTelemetryHistoryTasks[key] = nil
+        let isActiveRequest = activeEndpointTelemetryHistoryKey == key
+        if isActiveRequest {
+            activeEndpointTelemetryHistoryKey = nil
+            endpointTelemetryHistoryLoading.remove(key.endpointID)
+        }
+        switch result {
+        case .success(let history):
+            guard history.endpointID == key.endpointID, history.range == key.range else {
+                setEndpointTelemetryHistoryError(BrokerRefreshError.invalidSnapshot, for: key.endpointID)
+                return
+            }
+            cacheEndpointTelemetryHistory(history, for: key)
+            if isActiveRequest {
+                presentEndpointTelemetryHistory(history, for: key)
+            }
+        case .failure(let error):
+            if isActiveRequest {
+                setEndpointTelemetryHistoryError(error, for: key.endpointID)
+            }
+        }
+    }
+
+    private func cancelInactiveEndpointTelemetryHistoryRequests(keeping key: EndpointTelemetryHistoryCacheKey) {
+        let inactiveRequests = endpointTelemetryHistoryTasks.filter { $0.key != key }
+        for (inactiveKey, task) in inactiveRequests {
+            task.cancel()
+            endpointTelemetryHistoryTasks[inactiveKey] = nil
+            endpointTelemetryHistoryGenerations[inactiveKey] = (endpointTelemetryHistoryGenerations[inactiveKey] ?? 0) &+ 1
+            endpointTelemetryHistoryLoading.remove(inactiveKey.endpointID)
+        }
+        if activeEndpointTelemetryHistoryKey != key {
+            activeEndpointTelemetryHistoryKey = nil
+        }
+    }
+
+    private func cachedEndpointTelemetryHistory(
+        for key: EndpointTelemetryHistoryCacheKey
+    ) -> EndpointTelemetryHistory? {
+        guard let cached = endpointTelemetryHistoryCache[key] else { return nil }
+        let age = max(0, dateProvider().timeIntervalSince(cached.fetchedAt))
+        guard age <= Self.endpointTelemetryHistoryCacheMaximumAge else {
+            endpointTelemetryHistoryCache[key] = nil
+            endpointTelemetryHistoryCacheRecency.removeAll { $0 == key }
+            return nil
+        }
+        endpointTelemetryHistoryCacheRecency.removeAll { $0 == key }
+        endpointTelemetryHistoryCacheRecency.append(key)
+        return cached.history
+    }
+
+    private func cacheEndpointTelemetryHistory(
+        _ history: EndpointTelemetryHistory,
+        for key: EndpointTelemetryHistoryCacheKey
+    ) {
+        endpointTelemetryHistoryCache[key] = CachedEndpointTelemetryHistory(
+            history: history,
+            fetchedAt: dateProvider()
+        )
+        endpointTelemetryHistoryCacheRecency.removeAll { $0 == key }
+        endpointTelemetryHistoryCacheRecency.append(key)
+        while endpointTelemetryHistoryCacheRecency.count > Self.endpointTelemetryHistoryCacheLimit {
+            let leastRecentKey = endpointTelemetryHistoryCacheRecency.removeFirst()
+            endpointTelemetryHistoryCache[leastRecentKey] = nil
+        }
+    }
+
+    private func presentEndpointTelemetryHistory(
+        _ history: EndpointTelemetryHistory,
+        for key: EndpointTelemetryHistoryCacheKey
+    ) {
+        if endpointTelemetryHistory[key.endpointID] != history {
+            endpointTelemetryHistory[key.endpointID] = history
+        }
+        if endpointTelemetryHistoryLoading.contains(key.endpointID) {
+            endpointTelemetryHistoryLoading.remove(key.endpointID)
+        }
+        if endpointTelemetryHistoryErrors[key.endpointID] != nil {
+            endpointTelemetryHistoryErrors[key.endpointID] = nil
+        }
+    }
+
+    private func setEndpointTelemetryHistoryError(_ error: Error, for endpointID: String) {
+        endpointTelemetryHistoryLoading.remove(endpointID)
+        let message = "无法读取资源历史：\(error.localizedDescription)"
+        if endpointTelemetryHistoryErrors[endpointID] != message {
+            endpointTelemetryHistoryErrors[endpointID] = message
+        }
     }
 
     private func requestRefresh() {
@@ -596,17 +835,37 @@ public final class BrokerStore: ObservableObject {
             switch result {
             case .success(let snapshot):
                 if let revisionError = snapshotRevisionFloorError(for: snapshot) {
-                    self.isConnected = false
-                    self.freshness = lastGoodSnapshot == nil ? .failed : .stale
-                    self.errorMessage = "无法更新资源：\(revisionError.localizedDescription)"
+                    if isConnected {
+                        self.isConnected = false
+                    }
+                    let failedFreshness: BrokerRefreshFreshness = lastGoodSnapshot == nil ? .failed : .stale
+                    if freshness != failedFreshness {
+                        self.freshness = failedFreshness
+                    }
+                    let message = "无法更新资源：\(revisionError.localizedDescription)"
+                    if errorMessage != message {
+                        self.errorMessage = message
+                    }
                     resolvedResult = .failure(revisionError)
                 } else {
-                    self.snapshot = snapshot
-                    self.lastGoodSnapshot = snapshot
-                    self.freshness = Self.freshness(for: snapshot)
-                    self.isConnected = true
+                    let shouldPublishSnapshot = !self.snapshot.isSemanticallyEquivalentForRefresh(to: snapshot)
+                    if shouldPublishSnapshot {
+                        self.snapshot = snapshot
+                    }
+                    if lastGoodSnapshot?.isSemanticallyEquivalentForRefresh(to: snapshot) != true {
+                        self.lastGoodSnapshot = snapshot
+                    }
+                    let refreshedFreshness = Self.freshness(for: snapshot)
+                    if freshness != refreshedFreshness {
+                        self.freshness = refreshedFreshness
+                    }
+                    if !isConnected {
+                        self.isConnected = true
+                    }
                     self.lastUpdated = dateProvider()
-                    self.errorMessage = nil
+                    if errorMessage != nil {
+                        self.errorMessage = nil
+                    }
                     if let requiredRevision = minimumRequiredSnapshotRevision,
                        let snapshotRevision = snapshot.snapshotRevision,
                        snapshotRevision >= requiredRevision {
@@ -615,9 +874,17 @@ public final class BrokerStore: ObservableObject {
                     resolvedResult = .success(snapshot)
                 }
             case .failure(let error):
-                self.isConnected = false
-                self.freshness = lastGoodSnapshot == nil ? .failed : .stale
-                self.errorMessage = "无法更新资源：\(error.localizedDescription)"
+                if isConnected {
+                    self.isConnected = false
+                }
+                let failedFreshness: BrokerRefreshFreshness = lastGoodSnapshot == nil ? .failed : .stale
+                if freshness != failedFreshness {
+                    self.freshness = failedFreshness
+                }
+                let message = "无法更新资源：\(error.localizedDescription)"
+                if errorMessage != message {
+                    self.errorMessage = message
+                }
                 resolvedResult = .failure(error)
             }
             resolvePendingEndpointRemovals(with: resolvedResult)
@@ -650,6 +917,18 @@ public final class BrokerStore: ObservableObject {
         periodicRefreshTask?.cancel()
         periodicRefreshTask = nil
         invalidateActiveRefresh()
+    }
+
+    private func invalidateEndpointTelemetryHistoryWork() {
+        endpointTelemetryHistoryTasks.values.forEach { $0.cancel() }
+        endpointTelemetryHistoryTasks.removeAll()
+        endpointTelemetryHistoryGenerations.removeAll()
+        endpointTelemetryHistoryCache.removeAll()
+        endpointTelemetryHistoryCacheRecency.removeAll()
+        activeEndpointTelemetryHistoryKey = nil
+        endpointTelemetryHistoryLoading.removeAll()
+        endpointTelemetryHistoryErrors.removeAll()
+        endpointTelemetryHistory.removeAll()
     }
 
     private func invalidateActiveRefresh() {

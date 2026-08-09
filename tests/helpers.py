@@ -14,6 +14,7 @@ def observation(
     gpu_uuids: list[str] | None = None,
     observation_complete: bool = True,
     observed_at: datetime | None = None,
+    host: dict[str, object] | None = None,
 ) -> EndpointObservation:
     now = observed_at or datetime.now(UTC)
     uuids = (
@@ -21,16 +22,19 @@ def observation(
         if gpu_uuids is not None
         else [f"{prefix}-{endpoint_id}-{index}" for index in range(count)]
     )
+    host_payload = {
+        "cpu_count": 64,
+        "load_1m": 4.0,
+        "memory_total_mib": 262_144,
+        "memory_available_mib": 196_608,
+    }
+    if host is not None:
+        host_payload.update(host)
     return EndpointObservation(
         endpoint_id=endpoint_id,
         observed_at=now,
         boot_id=f"boot-{endpoint_id}",
-        host={
-            "cpu_count": 64,
-            "load_1m": 4.0,
-            "memory_total_mib": 262_144,
-            "memory_available_mib": 196_608,
-        },
+        host=host_payload,
         gpus=[
             TelemetryInput(
                 gpu_uuid=gpu_uuid,

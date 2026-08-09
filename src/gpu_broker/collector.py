@@ -12,44 +12,25 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Awaitable, Callable
 
+from gpu_broker.adapters import (
+    GPU_SECTION,
+    GPU_UNAVAILABLE,
+    HOST_RESOURCES_SECTION,
+    IDENTITY_SECTION,
+    PROCESS_SECTION,
+    RAW_SSH_COMBINED_QUERY,
+    RAW_SSH_OBSERVATION_ADAPTER,
+    RawSSHProbe,
+)
 from gpu_broker.config import EndpointConfig, InventoryConfig
 from gpu_broker.schemas import EndpointObservation, ProcessInput, TelemetryInput
 from gpu_broker.service import BrokerService
 from gpu_broker.timeutil import utcnow
 
 
-GPU_QUERY = (
-    "nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,memory.free,"
-    "utilization.gpu,utilization.memory,temperature.gpu,power.draw,pstate "
-    "--format=csv,noheader,nounits"
-)
-PROCESS_QUERY = (
-    "nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory,process_name "
-    "--format=csv,noheader,nounits"
-)
-IDENTITY_QUERY = "hostname; cat /proc/sys/kernel/random/boot_id"
-HOST_RESOURCES_QUERY = (
-    "getconf _NPROCESSORS_ONLN; "
-    "awk '/MemTotal:/{total=$2} /MemAvailable:/{available=$2} "
-    "END {printf \"%d %d\\n\", total/1024, available/1024}' /proc/meminfo; "
-    "cut -d ' ' -f1 /proc/loadavg"
-)
-GPU_SECTION = "__GPU_BROKER_GPU__"
-PROCESS_SECTION = "__GPU_BROKER_PROCESSES__"
-IDENTITY_SECTION = "__GPU_BROKER_IDENTITY__"
-HOST_RESOURCES_SECTION = "__GPU_BROKER_HOST_RESOURCES__"
-GPU_UNAVAILABLE = "__GPU_BROKER_GPU_UNAVAILABLE__"
-COMBINED_QUERY = (
-    f"set -e; printf '{GPU_SECTION}\\n'; "
-    f"if command -v nvidia-smi >/dev/null 2>&1; then "
-    f"{GPU_QUERY} 2>/dev/null || printf '{GPU_UNAVAILABLE}\\n'; "
-    f"else printf '{GPU_UNAVAILABLE}\\n'; fi; "
-    f"printf '{PROCESS_SECTION}\\n'; "
-    f"if command -v nvidia-smi >/dev/null 2>&1; then "
-    f"{PROCESS_QUERY} 2>/dev/null || true; fi; "
-    f"printf '{IDENTITY_SECTION}\\n'; {IDENTITY_QUERY}; "
-    f"printf '{HOST_RESOURCES_SECTION}\\n'; {HOST_RESOURCES_QUERY}"
-)
+# Compatibility alias for deterministic test runners. Production collection
+# passes a typed probe kind to the sealed adapter instead of a command string.
+COMBINED_QUERY = RAW_SSH_COMBINED_QUERY
 
 
 class CollectionError(RuntimeError):
@@ -154,15 +135,23 @@ def parse_identity(raw: str) -> tuple[str, str]:
     return lines[0], lines[1]
 
 
-def parse_host_resources(raw: str) -> tuple[int, float, int, int]:
+def parse_host_resource_snapshot(raw: str) -> tuple[int, float, int | None, int | None, int, int]:
     """Parse CPU capacity/load and Linux MemAvailable from the immutable probe."""
 
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    if len(lines) != 3:
+    if len(lines) not in {3, 4}:
         raise CollectionError("host resource probe must return CPU count, memory, and load")
     cpu_count = _int(lines[0])
     memory = lines[1].split()
     load_1m = _float(lines[2])
+    cpu_total_ticks: int | None = None
+    cpu_idle_ticks: int | None = None
+    if len(lines) == 4:
+        cpu_ticks = lines[3].split()
+        if len(cpu_ticks) != 2:
+            raise CollectionError("host resource probe returned invalid CPU ticks")
+        cpu_total_ticks = _int(cpu_ticks[0])
+        cpu_idle_ticks = _int(cpu_ticks[1])
     if cpu_count is None or len(memory) != 2 or load_1m is None:
         raise CollectionError("host resource probe returned invalid values")
     memory_total = _int(memory[0])
@@ -174,8 +163,22 @@ def parse_host_resources(raw: str) -> tuple[int, float, int, int]:
         or memory_available is None
         or memory_available < 0
         or memory_available > memory_total
+        or (cpu_total_ticks is not None and cpu_total_ticks < 0)
+        or (cpu_idle_ticks is not None and cpu_idle_ticks < 0)
+        or (
+            cpu_total_ticks is not None
+            and cpu_idle_ticks is not None
+            and cpu_idle_ticks > cpu_total_ticks
+        )
     ):
         raise CollectionError("host resource probe returned out-of-range values")
+    return cpu_count, load_1m, cpu_total_ticks, cpu_idle_ticks, memory_total, memory_available
+
+
+def parse_host_resources(raw: str) -> tuple[int, float, int, int]:
+    cpu_count, load_1m, _cpu_total_ticks, _cpu_idle_ticks, memory_total, memory_available = (
+        parse_host_resource_snapshot(raw)
+    )
     return cpu_count, load_1m, memory_total, memory_available
 
 
@@ -215,34 +218,24 @@ def parse_ps_output(raw: str, observed_at) -> dict[int, tuple[str | None, object
 
 
 async def default_runner(
-    endpoint: EndpointConfig, remote_command: str, connect_timeout_seconds: int = 8
+    endpoint: EndpointConfig,
+    probe: RawSSHProbe,
+    connect_timeout_seconds: int = 8,
+    *,
+    process_ids: tuple[int, ...] = (),
 ) -> str:
-    """Execute one immutable command over SSH without a local shell.
+    """Execute a sealed, read-only SSH probe without a local shell."""
 
-    The remote command is one of this module's constants or a `ps` form whose
-    only interpolated values are numeric PIDs parsed from nvidia-smi output.
-    """
-
-    process = await asyncio.create_subprocess_exec(
-        "ssh",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        f"ConnectTimeout={connect_timeout_seconds}",
-        "-p",
-        str(endpoint.port),
-        f"{endpoint.ssh_user}@{endpoint.host}",
-        remote_command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+    result = await RAW_SSH_OBSERVATION_ADAPTER.run_probe(
+        endpoint,
+        probe=probe,
+        connect_timeout_seconds=connect_timeout_seconds,
+        process_ids=process_ids,
     )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        detail = stderr.decode("utf-8", errors="replace").strip().replace("\n", " ")[:500]
-        raise CollectionError(f"SSH probe failed for {endpoint.id}: {detail or process.returncode}")
-    return stdout.decode("utf-8", errors="replace")
+    if result.returncode != 0:
+        detail = result.stderr.strip().replace("\n", " ")[:500]
+        raise CollectionError(f"SSH probe failed for {endpoint.id}: {detail or result.returncode}")
+    return result.stdout
 
 
 class SSHCollector:
@@ -250,29 +243,58 @@ class SSHCollector:
         self.inventory = inventory
         self.runner = runner
 
-    async def _run(self, endpoint: EndpointConfig, command: str) -> str:
+    async def _run(
+        self,
+        endpoint: EndpointConfig,
+        command: str,
+        *,
+        probe: RawSSHProbe,
+        process_ids: tuple[int, ...] = (),
+    ) -> str:
         if self.runner is default_runner:
             return await default_runner(
-                endpoint, command, self.inventory.collector.ssh_connect_timeout_seconds
+                endpoint,
+                probe,
+                self.inventory.collector.ssh_connect_timeout_seconds,
+                process_ids=process_ids,
             )
         return await self.runner(endpoint, command)
 
     async def observe_endpoint(self, endpoint: EndpointConfig) -> EndpointObservation:
         observed_at = utcnow()
         gpu_raw, process_raw, identity_raw, host_raw = parse_combined_probe(
-            await self._run(endpoint, COMBINED_QUERY)
+            await self._run(endpoint, COMBINED_QUERY, probe="endpoint-telemetry")
         )
-        gpu_probe_available = GPU_UNAVAILABLE not in gpu_raw.splitlines()
+        # Some CPU-only hosts expose an `nvidia-smi` wrapper that succeeds but
+        # emits no rows. Treat that shape exactly like an unavailable NVIDIA
+        # runtime so the already-valid host CPU/memory observation remains
+        # useful, while any previously known GPU inventory stays fail-closed.
+        gpu_probe_available = bool(gpu_raw.strip()) and GPU_UNAVAILABLE not in gpu_raw.splitlines()
         gpus = parse_gpu_csv(gpu_raw) if gpu_probe_available else []
         apps = parse_process_csv(process_raw) if gpu_probe_available else []
         _hostname, boot_id = parse_identity(identity_raw)
-        cpu_count, load_1m, memory_total_mib, memory_available_mib = parse_host_resources(host_raw)
+        (
+            cpu_count,
+            load_1m,
+            cpu_total_ticks,
+            cpu_idle_ticks,
+            memory_total_mib,
+            memory_available_mib,
+        ) = parse_host_resource_snapshot(host_raw)
         pids = sorted({app.pid for app in apps})
         details: dict[int, tuple[str | None, object, str]] = {}
         if pids:
             # Values are parsed positive integers only; no client input is interpolated.
             ps_command = "ps -o pid=,user=,etimes=,comm= -p " + ",".join(str(pid) for pid in pids)
-            details = parse_ps_output(await self._run(endpoint, ps_command), observed_at)
+            details = parse_ps_output(
+                await self._run(
+                    endpoint,
+                    ps_command,
+                    probe="process-details",
+                    process_ids=tuple(pids),
+                ),
+                observed_at,
+            )
         processes = []
         for app in apps:
             username, started_at, executable = details.get(
@@ -295,6 +317,8 @@ class SSHCollector:
             host={
                 "cpu_count": cpu_count,
                 "load_1m": load_1m,
+                "cpu_total_ticks": cpu_total_ticks,
+                "cpu_idle_ticks": cpu_idle_ticks,
                 "memory_total_mib": memory_total_mib,
                 "memory_available_mib": memory_available_mib,
             },

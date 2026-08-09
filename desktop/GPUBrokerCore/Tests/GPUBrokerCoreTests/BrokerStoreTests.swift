@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import GPUBrokerCore
@@ -21,6 +22,74 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(metrics.maxConcurrentCalls, 1)
         XCTAssertEqual(store.snapshot.summary.totalGPUs, 8)
         XCTAssertEqual(store.freshness, .fresh)
+    }
+
+    func testEquivalentRefreshDoesNotRepublishSnapshotOrLastGoodSnapshot() async throws {
+        let initial = try Self.snapshot(named: "1")
+        var equivalent = initial
+        equivalent.serverTime = "2026-08-10T10:00:00Z"
+        let client = DelayedSequenceClient(
+            snapshots: [initial, equivalent],
+            delayNanoseconds: 5_000_000
+        )
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+        var snapshotPublicationCount = 0
+        var lastGoodPublicationCount = 0
+        let snapshotSubscription = store.$snapshot.dropFirst().sink { _ in
+            snapshotPublicationCount += 1
+        }
+        let lastGoodSubscription = store.$lastGoodSnapshot.dropFirst().sink { _ in
+            lastGoodPublicationCount += 1
+        }
+        defer {
+            snapshotSubscription.cancel()
+            lastGoodSubscription.cancel()
+        }
+
+        store.connectForTesting(snapshotClient: client)
+        try await waitUntil { store.snapshot.snapshotRevision == initial.snapshotRevision && !store.isRefreshing }
+        snapshotPublicationCount = 0
+        lastGoodPublicationCount = 0
+
+        store.reload()
+        try await waitUntilAsync { await client.metrics().callCount == 2 }
+        try await waitUntil { !store.isRefreshing }
+
+        XCTAssertEqual(snapshotPublicationCount, 0)
+        XCTAssertEqual(lastGoodPublicationCount, 0)
+        XCTAssertEqual(store.snapshot.serverTime, initial.serverTime)
+        XCTAssertEqual(store.lastGoodSnapshot?.serverTime, initial.serverTime)
+        XCTAssertEqual(store.freshness, .fresh)
+        XCTAssertTrue(store.isConnected)
+        XCTAssertNil(store.errorMessage)
+    }
+
+    func testEquivalentRefreshRecoversFreshnessAndClearsError() async throws {
+        let initial = try Self.snapshot(named: "1")
+        var equivalent = initial
+        equivalent.serverTime = "2026-08-10T10:00:00Z"
+        let client = ScriptedClient(results: [
+            .success(initial),
+            .failure(BrokerRefreshError.invalidSnapshot),
+            .success(equivalent)
+        ])
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+
+        store.connectForTesting(snapshotClient: client)
+        try await waitUntil { store.snapshot.snapshotRevision == initial.snapshotRevision && !store.isRefreshing }
+
+        store.reload()
+        try await waitUntil { store.freshness == .stale && !store.isRefreshing }
+        XCTAssertFalse(store.isConnected)
+        XCTAssertNotNil(store.errorMessage)
+
+        store.reload()
+        try await waitUntil { store.freshness == .fresh && !store.isRefreshing }
+
+        XCTAssertTrue(store.isConnected)
+        XCTAssertNil(store.errorMessage)
+        XCTAssertEqual(store.snapshot.serverTime, initial.serverTime)
+        XCTAssertEqual(store.lastGoodSnapshot?.serverTime, initial.serverTime)
     }
 
     func testTimeoutDoesNotCommitCancellationIgnoringClient() async throws {
@@ -133,6 +202,185 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(StateRouteURLProtocol.lastRequest?.value(forHTTPHeaderField: "X-GPU-Broker-Actor"), "tester")
         XCTAssertEqual(snapshot.snapshotRevision, 101)
         XCTAssertEqual(snapshot.summary.totalGPUs, 1)
+    }
+
+    func testURLSessionEndpointTelemetryHistoryClientUsesSeparateOptionalRoute() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StateRouteURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let client = URLSessionEndpointTelemetryHistoryClient(
+            baseURL: URL(string: "http://broker.test/")!,
+            session: session
+        )
+        StateRouteURLProtocol.responseData = try JSONSerialization.data(withJSONObject: [
+            "schema_version": "v1",
+            "server_time": "2026-08-06T08:10:00Z",
+            "data": [
+                "endpoint_id": "gpu-node-01",
+                "window_seconds": 3600,
+                "point_count": 1,
+                "points": [
+                    [
+                        "observed_at": "2026-08-06T08:00:00Z",
+                        "cpu_count": 64,
+                        "load_1m": 16,
+                        "cpu_utilization_pct": 25,
+                        "memory_total_mib": 100,
+                        "memory_available_mib": 60,
+                        "memory_used_pct": 40
+                    ]
+                ],
+                "gpu_series": [
+                    [
+                        "gpu_id": "gpu-node-01:GPU-uuid-0",
+                        "gpu_uuid": "GPU-uuid-0",
+                        "gpu_index": 0,
+                        "label": "GPU 0",
+                        "points": [
+                            [
+                                "observed_at": "2026-08-06T08:00:00Z",
+                                "gpu_utilization_pct": 80,
+                                "memory_used_pct": 25,
+                                "memory_used_mib": 20000,
+                                "memory_total_mib": 80000
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ])
+        defer { StateRouteURLProtocol.reset() }
+
+        let history = try await client.history(endpointID: "gpu-node-01", range: .oneHour, actorID: "tester")
+
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/gpu-node-01/history")
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.query, "window_seconds=3600&points=120")
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.value(forHTTPHeaderField: "X-GPU-Broker-Actor"), "tester")
+        XCTAssertEqual(history.endpointID, "gpu-node-01")
+        XCTAssertEqual(history.range, .oneHour)
+        XCTAssertEqual(history.samples.first?.cpuLoadFraction, 0.25)
+        XCTAssertEqual(history.samples.first?.memoryFraction, 0.40)
+        XCTAssertNil(history.samples.first?.gpuUtilizationFraction)
+        XCTAssertEqual(history.gpuSeries.count, 1)
+        XCTAssertEqual(history.gpuSeries.first?.id, "gpu-node-01:GPU-uuid-0")
+        XCTAssertEqual(history.gpuSeries.first?.samples.first?.gpuUtilizationFraction, 0.8)
+        XCTAssertEqual(history.gpuSeries.first?.samples.first?.memoryFraction, 0.25)
+    }
+
+    func testEndpointTelemetryHistoryCapabilityGateDegradesWithoutChangingSnapshot() throws {
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+        let snapshot = try Self.snapshot(named: "1")
+
+        store.useFixture(snapshot: snapshot)
+        store.requestEndpointTelemetryHistory(endpointID: "fixture-1", range: .oneHour)
+
+        XCTAssertEqual(store.snapshot, snapshot)
+        XCTAssertEqual(store.endpointTelemetryHistoryErrors["fixture-1"], "当前本机服务未提供资源历史能力。")
+        XCTAssertFalse(store.endpointTelemetryHistoryLoading.contains("fixture-1"))
+    }
+
+    func testEndpointTelemetryHistoryCancelsOlderRequestAndIgnoresOutOfOrderCompletion() async throws {
+        let endpointID = "fixture-1"
+        let snapshotClient = ScriptedClient(results: [.success(try Self.snapshot(named: "1"))])
+        let historyClient = DelayedEndpointHistoryClient(
+            results: [
+                .success(.init(endpointID: endpointID, range: .twentyFourHours, samples: [
+                    EndpointTelemetrySample(raw: [
+                        "timestamp": "2026-08-06T06:00:00Z",
+                        "gpu_utilization_pct": 10
+                    ])!
+                ], generatedAt: nil)),
+                .success(.init(endpointID: endpointID, range: .oneHour, samples: [
+                    EndpointTelemetrySample(raw: [
+                        "timestamp": "2026-08-06T08:00:00Z",
+                        "gpu_utilization_pct": 80
+                    ])!
+                ], generatedAt: nil))
+            ],
+            delaysNanoseconds: [180_000_000, 20_000_000]
+        )
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+        store.connectForTesting(
+            snapshotClient: snapshotClient,
+            endpointTelemetryHistoryClient: historyClient,
+            serviceInfo: ServiceInfo(
+                schemaVersion: "v1",
+                version: "test",
+                capabilities: ["instant_claims", "endpoint_telemetry_history"]
+            )
+        )
+
+        store.requestEndpointTelemetryHistory(endpointID: endpointID, range: .twentyFourHours)
+        store.requestEndpointTelemetryHistory(endpointID: endpointID, range: .oneHour)
+
+        try await waitUntil {
+            store.endpointTelemetryHistory(endpointID: endpointID, range: .oneHour)?.samples.first?.gpuUtilizationFraction == 0.8
+                && !store.endpointTelemetryHistoryLoading.contains(endpointID)
+        }
+        try await Task.sleep(nanoseconds: 220_000_000)
+
+        XCTAssertEqual(store.endpointTelemetryHistory(endpointID: endpointID, range: .oneHour)?.samples.first?.gpuUtilizationFraction, 0.8)
+        XCTAssertNil(store.endpointTelemetryHistory(endpointID: endpointID, range: .twentyFourHours))
+    }
+
+    func testEndpointTelemetryHistoryReusesFreshCachedRange() async throws {
+        let endpointID = "fixture-1"
+        let snapshotClient = ScriptedClient(results: [.success(try Self.snapshot(named: "1"))])
+        let historyClient = CountingEndpointHistoryClient()
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+        store.connectForTesting(
+            snapshotClient: snapshotClient,
+            endpointTelemetryHistoryClient: historyClient,
+            serviceInfo: ServiceInfo(
+                schemaVersion: "v1",
+                version: "test",
+                capabilities: ["endpoint_telemetry_history"]
+            )
+        )
+
+        store.requestEndpointTelemetryHistory(endpointID: endpointID, range: .oneHour)
+        try await waitUntil {
+            store.endpointTelemetryHistory(endpointID: endpointID, range: .oneHour) != nil
+                && !store.endpointTelemetryHistoryLoading.contains(endpointID)
+        }
+        store.requestEndpointTelemetryHistory(endpointID: endpointID, range: .oneHour)
+
+        XCTAssertEqual(await historyClient.callCount(), 1)
+        XCTAssertNil(store.endpointTelemetryHistoryErrors[endpointID])
+    }
+
+    func testEndpointTelemetryHistoryCancelsInactiveDetailRequest() async throws {
+        let firstEndpointID = "fixture-1"
+        let secondEndpointID = "fixture-2"
+        let snapshotClient = ScriptedClient(results: [.success(try Self.snapshot(named: "1"))])
+        let historyClient = CooperativeDelayedEndpointHistoryClient(
+            delaysNanoseconds: [500_000_000, 5_000_000]
+        )
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+        store.connectForTesting(
+            snapshotClient: snapshotClient,
+            endpointTelemetryHistoryClient: historyClient,
+            serviceInfo: ServiceInfo(
+                schemaVersion: "v1",
+                version: "test",
+                capabilities: ["endpoint_telemetry_history"]
+            )
+        )
+
+        store.requestEndpointTelemetryHistory(endpointID: firstEndpointID, range: .oneHour)
+        try await waitUntilAsync { await historyClient.metrics().callCount == 1 }
+        XCTAssertTrue(store.endpointTelemetryHistoryLoading.contains(firstEndpointID))
+
+        store.requestEndpointTelemetryHistory(endpointID: secondEndpointID, range: .oneHour)
+        try await waitUntil {
+            store.endpointTelemetryHistory(endpointID: secondEndpointID, range: .oneHour) != nil
+                && !store.endpointTelemetryHistoryLoading.contains(secondEndpointID)
+        }
+        try await waitUntilAsync { await historyClient.metrics().cancellationCount == 1 }
+
+        XCTAssertFalse(store.endpointTelemetryHistoryLoading.contains(firstEndpointID))
+        XCTAssertNil(store.endpointTelemetryHistory(endpointID: firstEndpointID, range: .oneHour))
+        XCTAssertNil(store.endpointTelemetryHistoryErrors[firstEndpointID])
     }
 
     func testUnifiedStateEnvelopeParsesCurrentAndHistory() throws {
@@ -492,6 +740,19 @@ final class BrokerStoreTests: XCTestCase {
         }
     }
 
+    func testEndpointHistoryFixtureIsSeparateFromAllocationSnapshotFixture() throws {
+        let fixturesRoot = Self.fixturesRoot
+        let historyURL = try FixtureSnapshots.resolve("8-history", fixturesRoot: fixturesRoot)
+
+        let history = try FixtureSnapshots.loadEndpointTelemetryHistory(from: historyURL)
+
+        XCTAssertEqual(history.endpointID, "fixture-8")
+        XCTAssertEqual(history.range, .oneHour)
+        XCTAssertEqual(history.samples.count, 6)
+        XCTAssertEqual(history.gpuSeries.count, 8)
+        XCTAssertTrue(history.gpuSeries.allSatisfy { $0.samples.count == 6 })
+    }
+
     func testFixtureSymlinkIntoProjectStateIsRejected() throws {
         let fileManager = FileManager.default
         let projectRoot = fileManager.temporaryDirectory
@@ -648,6 +909,77 @@ private actor ScriptedClient: BrokerSnapshotClient {
     func snapshot(actorID: String) async throws -> BrokerSnapshot {
         let result = results.isEmpty ? .failure(BrokerRefreshError.invalidSnapshot) : results.removeFirst()
         return try result.get()
+    }
+}
+
+private actor DelayedEndpointHistoryClient: BrokerEndpointTelemetryHistoryClient {
+    private var results: [Result<EndpointTelemetryHistory, BrokerRefreshError>]
+    private let delaysNanoseconds: [UInt64]
+    private var nextIndex = 0
+
+    init(results: [Result<EndpointTelemetryHistory, BrokerRefreshError>], delaysNanoseconds: [UInt64]) {
+        self.results = results
+        self.delaysNanoseconds = delaysNanoseconds
+    }
+
+    func history(endpointID: String, range: EndpointTelemetryRange, actorID: String) async throws -> EndpointTelemetryHistory {
+        let index = nextIndex
+        nextIndex += 1
+        let delay = delaysNanoseconds[min(index, delaysNanoseconds.count - 1)]
+        let result = results.isEmpty
+            ? Result<EndpointTelemetryHistory, BrokerRefreshError>.failure(BrokerRefreshError.invalidSnapshot)
+            : results[min(index, results.count - 1)]
+        do {
+            try await Task.sleep(nanoseconds: delay)
+        } catch {
+            try? await Task.sleep(nanoseconds: delay)
+        }
+        return try result.get()
+    }
+}
+
+private actor CountingEndpointHistoryClient: BrokerEndpointTelemetryHistoryClient {
+    private var calls = 0
+
+    func history(endpointID: String, range: EndpointTelemetryRange, actorID: String) async throws -> EndpointTelemetryHistory {
+        calls += 1
+        return .empty(endpointID: endpointID, range: range)
+    }
+
+    func callCount() -> Int { calls }
+}
+
+private actor CooperativeDelayedEndpointHistoryClient: BrokerEndpointTelemetryHistoryClient {
+    struct Metrics: Sendable {
+        let callCount: Int
+        let cancellationCount: Int
+    }
+
+    private let delaysNanoseconds: [UInt64]
+    private var nextIndex = 0
+    private var calls = 0
+    private var cancellations = 0
+
+    init(delaysNanoseconds: [UInt64]) {
+        self.delaysNanoseconds = delaysNanoseconds
+    }
+
+    func history(endpointID: String, range: EndpointTelemetryRange, actorID: String) async throws -> EndpointTelemetryHistory {
+        let index = nextIndex
+        nextIndex += 1
+        calls += 1
+        let delay = delaysNanoseconds[min(index, delaysNanoseconds.count - 1)]
+        do {
+            try await Task.sleep(nanoseconds: delay)
+        } catch {
+            cancellations += 1
+            throw error
+        }
+        return .empty(endpointID: endpointID, range: range)
+    }
+
+    func metrics() -> Metrics {
+        Metrics(callCount: calls, cancellationCount: cancellations)
     }
 }
 

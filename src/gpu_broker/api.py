@@ -323,6 +323,20 @@ def create_app(settings: Settings) -> FastAPI:
     def endpoints(actor: ApiActor) -> dict[str, Any]:
         return service.list_endpoints(actor)
 
+    @app.get("/api/v1/endpoints/{endpoint_id}/history")
+    def endpoint_history(
+        endpoint_id: str,
+        actor: ApiActor,
+        window_seconds: int = 3600,
+        points: int = 120,
+    ) -> dict[str, Any]:
+        return service.endpoint_history(
+            actor,
+            endpoint_id,
+            window_seconds=window_seconds,
+            max_points=points,
+        )
+
     @app.get("/api/v1/coordination")
     def coordination(actor: ApiActor) -> dict[str, Any]:
         return service.coordination(actor)

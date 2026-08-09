@@ -267,6 +267,56 @@ def test_ensure_rejects_matching_identity_from_non_launchd_process(
         manager.ensure()
 
 
+def test_probe_owned_ready_accepts_direct_pyinstaller_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daemon.sys, "platform", "darwin")
+    config = _config(tmp_path)
+    manager = MacOSDaemonManager(config)
+    ready = {
+        "status": "ready",
+        "database_ready": True,
+        "inventory_readable": True,
+        "single_writer": True,
+        "daemon_instance_id": daemon_instance_id(config),
+        "process_id": 9001,
+    }
+    monkeypatch.setattr(daemon, "probe_live", lambda _config: {"status": "live"})
+    monkeypatch.setattr(daemon, "probe_ready", lambda _config: ready)
+    monkeypatch.setattr(manager, "_launchd_pid", lambda: 4242)
+    monkeypatch.setattr(manager, "_parent_process_id", lambda process_id: 4242)
+
+    assert manager._probe_owned_ready() == ready
+
+
+def test_probe_owned_ready_rejects_unrelated_child_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daemon.sys, "platform", "darwin")
+    config = _config(tmp_path)
+    manager = MacOSDaemonManager(config)
+    monkeypatch.setattr(daemon, "probe_live", lambda _config: {"status": "live"})
+    monkeypatch.setattr(
+        daemon,
+        "probe_ready",
+        lambda _config: {
+            "status": "ready",
+            "database_ready": True,
+            "inventory_readable": True,
+            "single_writer": True,
+            "daemon_instance_id": daemon_instance_id(config),
+            "process_id": 9001,
+        },
+    )
+    monkeypatch.setattr(manager, "_launchd_pid", lambda: 4242)
+    monkeypatch.setattr(manager, "_parent_process_id", lambda process_id: 8123)
+
+    with pytest.raises(DaemonError, match="not served by"):
+        manager._probe_owned_ready()
+
+
 def test_serve_rejects_daemon_identity_for_alternate_paths(tmp_path: Path) -> None:
     config = _config(tmp_path)
     alternate_inventory = tmp_path / "alternate.yaml"

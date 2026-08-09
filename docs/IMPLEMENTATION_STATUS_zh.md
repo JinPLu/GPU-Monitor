@@ -1,6 +1,6 @@
 # gpu-broker 实施状态
 
-更新时间：2026-08-06（Asia/Shanghai）
+更新时间：2026-08-10（Asia/Shanghai）
 
 ## 当前状态
 
@@ -10,9 +10,36 @@
   `~/Library/Application Support/GPU Broker/`。MCP 首次 REST 调用会执行
   带 daemon identity 的 health/ready 检查并在单进程锁内自动 ensure；迁移先在
   同目录临时文件中校验，再以 no-clobber 原子发布。GUI 仅作为客户端，启动时先
-  ensure，退出时不再终止后端。MCP 仍不直连 SQLite/SSH，也不会创建备用状态目录。
+  ensure，退出时不再终止后端。onefile PyInstaller bootloader 的直接服务子进程也会被
+  daemon identity 检查认定为同一 LaunchAgent；其他子进程仍拒绝接管。MCP 仍不直连
+  SQLite/SSH，也不会创建备用状态目录。
   Windows 首轮保持原行为。
 - 默认无登录且仅监听 loopback；Collector 固定只读，异常、失效 telemetry 和非托管进程均 fail closed。
+- 已新增受限 adapter registry：`raw-ssh` 只封装既有固定只读 observation，`slurm-command`
+  只封装既有固定 scheduler 命令。adapter 不能持有领域 session 或 actor、不能写 lease/claim，
+  不从配置接受任意 argv/shell/env/Agent target，也没有新增认证、REST 或 MCP 执行面。
+- endpoint telemetry 现已保存 CPU、load、内存的 24 小时 history：采集示例间隔为 10 秒，
+  stale 判定为 30 秒，历史入库节流为 60 秒。`GET /api/v1/endpoints/{endpoint_id}/history`
+  提供受限的 1h/6h/24h、10–120 点查询；同一响应额外携带按稳定 `gpu_id`/`gpu_uuid` 区分的
+  已下采样 GPU 利用率与显存占用序列，不会让桌面为 8 张卡发送 8 个请求。首样本、缺 tick 或
+  counter reset 的 CPU 利用率明确为 unknown，不用 0 冒充。GPU 既有 history 不变，`/api/v1/state` 的
+  `data.current + data.history` envelope 也不变。
+- 当前状态新增由领域服务统一计算的 `resource_projection`：`capacity` 是可信物理上限，
+  `used` 是实际 telemetry/process 用量，`claimed` 是 Broker 承诺，`available` 是安全准入值。
+  `used` 与 `claimed` 可以重叠；stale、unknown、unmanaged、conflict、maintenance 等状态一律
+  不显示可分配。人类界面与 Agent 不再各自用减法重算容量。
+- macOS App 的默认“资源”页已收敛总览与服务器：紧凑摘要、attention、可搜索/过滤/排序的
+  endpoint 资源表和详情共同回答资源是否可分配。工作页保留项目、Agent、任务视角，并将其命名为
+  “归属与安排”；lease/reservation 可显示已知区间，未落到具体 GPU 的 queue 始终单独显示，
+  不伪造成 GPU 历史归属。时序图表按 endpoint history capability 按需加载，在能力不可用时
+  显示明确降级而非假趋势。
+- 2026-08-10 的原生监控优化把 Beszel 可借鉴的观察模式落实为本地 SwiftUI：资源总览可按压力
+  过滤、排序并切换紧凑/舒展密度；行内同时呈现 CPU、内存、GPU 压力、attention 与新鲜度。
+  endpoint 历史将 CPU、内存、GPU 利用率、GPU 显存占用拆为四张自适应图；GPU 图最多显示 8 条按 GPU UUID
+  稳定识别的线。静态折线/坐标轴在新历史响应到达时才构建；悬停以预处理、二分查找的轻量覆盖层显示时间点，
+  不重建整张图。只在当前详情可见时按需读取，并以 60 秒节奏刷新，30 秒缓存最多 12 个 endpoint/range 键。
+  没有逐 GPU UUID 历史时不伪造 GPU 曲线。等价 revision/资源数据而仅 server time 变化的
+  `/api/v1/state` 响应不会重新发布整份 native snapshot，保留连接恢复、错误和 stale 语义。
 - 裸机租约不替 Agent 执行命令。Agent 获得 lease 后，用项目既有执行路径在
   `lease.resources[]` 返回的 endpoint、GPU、`cuda_visible_devices` 上运行或停止已获授权的
   workload；Broker 只协调分配与观测归属。外部 Slurm 是独立的
@@ -48,7 +75,8 @@
   元数据污染的 `~/Applications/GPU Broker.app`，`dist/GPU Broker.app` 保持为项目入口链接。
 - Collector 同时展示每台服务器的 CPU 核数、1 分钟负载及系统内存可用量/总量；调度会将
   lease 的 CPU/内存需求持久化为 endpoint commitment，并按剩余量及显存下限筛选候选资源。
-- 固定 SSH 探针把 NVIDIA 查询改为可选段。远端没有主机侧 `nvidia-smi` 或驱动不可用时，
+- 固定 SSH 探针把 NVIDIA 查询改为可选段。远端没有主机侧 `nvidia-smi`、驱动不可用，或
+  `nvidia-smi` 成功但返回空 GPU 行时，
   CPU、负载和内存仍能完成采集，服务器保持在线并作为 CPU 计算节点显示；该次 GPU 观察标记为
   不完整，因此不会把历史 GPU 误判为全部消失。GPU 仍需在 Broker 能执行固定只读探针的运行环境
   中可见，任意容器命令或运行时切换仍未开放。
@@ -116,10 +144,24 @@
   `snapshot_revision` 并拒绝 revision 回退。旧读工具名保留兼容，但不再作为碎片化
   operational REST 读入口；history、doctor、scheduler access/status 等诊断读路径仍保留专用接口。
   后端 canonical route、单 revision 状态组装、mutation revision floor 与跨端消费合同已经并入。
-- 本轮统一状态路径已通过 233 个 Python 测试、全仓 Ruff、Swift core build、macOS 应用打包、
+- 本轮统一状态路径已通过全量 Python 测试、全仓 Ruff、Swift core build、macOS 应用打包、
   standalone app 验证、fixture 合同校验与 `git diff --check`。当前机器只有 CommandLineTools、
   缺少完整 Xcode/XCTest，因此 Swift XCTest、XCUI 与 VoiceOver 自动化仍是环境 gate；benchmark
   会对此明确失败，不会把 0 测试或 skipped run 报为成功。
+- 2026-08-09 的优化在临时数据库、fake collector 和 fixture desktop 路径中验证：adapter、
+  endpoint history、迁移、容量/attention 投影、API/client 与既有 macOS 入口均有定向 Python
+  测试；全仓 Python 套件两次完成且 exit 0，Ruff 通过，macOS app 打包及 standalone 验证通过。
+  完整 Xcode 未安装，故 Swift XCTest/XCUITest/VoiceOver 和 xcresult 三视口证据仍是未完成的
+  环境 gate，不能以当前 `swiftc` 构建替代。
+- 2026-08-10：全量 Python 回归与 Ruff 均通过；macOS app 重新打包通过，Core Swift build 和
+  图表/桌面 typecheck 通过。当前机器仍只有 CommandLineTools，Swift XCTest/XCUITest 无法加载
+  `XCTest`，所以三视口 xcresult 与自动 VoiceOver 检查仍未宣称完成。此前未能在录制 fixture 中
+  重现用户反馈的持续高 CPU：该路径仅观察到有界的初始 SwiftUI layout 峰值；真实事件仍需采集
+  App/WindowServer 与 12 秒 snapshot 刷新的时间关联后再做针对性修复。
+- 2026-08-10：新增独立 `8-history` fixture，以同一可选 endpoint-history 合同提供 8 个 GPU UUID
+  序列；它与 allocation snapshot 分离，测试模式也不会触达真实服务。已实际渲染四张图并检查 GPU
+  利用率与显存图各有 8 条线；正式 App 随后重新打开并连接 CPU-only endpoint，确认 CPU/内存图在
+  无 GPU 时明确降级、不伪造 GPU 历史。
 
 ## 未完成 gate
 

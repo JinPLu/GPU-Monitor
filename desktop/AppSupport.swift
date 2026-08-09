@@ -44,8 +44,7 @@ enum DesignTokens {
 }
 
 enum DashboardSection: Hashable {
-    case overview
-    case serverPool
+    case resources
     case leases
     case settings
 }

@@ -29,6 +29,10 @@ public struct ServiceInfo: Equatable, Sendable {
     public var supportsEndpointDeletion: Bool {
         capabilities.contains("endpoint_deletion") || capabilities.contains("server_deletion")
     }
+
+    public var supportsEndpointTelemetryHistory: Bool {
+        capabilities.contains("endpoint_telemetry_history") || capabilities.contains("telemetry_history")
+    }
 }
 
 public struct ResourceSummary: Equatable, Sendable {
@@ -563,6 +567,151 @@ public struct BrokerStateHistory: Equatable, Sendable {
     }
 }
 
+public enum EndpointTelemetryRange: String, CaseIterable, Identifiable, Sendable {
+    case oneHour = "1h"
+    case sixHours = "6h"
+    case twentyFourHours = "24h"
+
+    public var id: String { rawValue }
+
+    public var windowSeconds: Int {
+        switch self {
+        case .oneHour:
+            3_600
+        case .sixHours:
+            21_600
+        case .twentyFourHours:
+            86_400
+        }
+    }
+}
+
+public struct EndpointTelemetrySample: Identifiable, Equatable, Sendable {
+    public var id: String { timestamp }
+    public let timestamp: String
+    public let cpuLoadFraction: Double?
+    public let memoryFraction: Double?
+    public let gpuUtilizationFraction: Double?
+    public let gpuMemoryFraction: Double?
+    public let status: String?
+
+    public init?(raw: [String: Any]) {
+        guard let timestamp = raw.string("timestamp") ?? raw.string("observed_at") ?? raw.string("server_time") else {
+            return nil
+        }
+        self.timestamp = timestamp
+        let cpuCount = raw.optionalDouble("cpu_count")
+        let load1m = raw.optionalDouble("load_1m")
+        cpuLoadFraction = raw.optionalFraction("cpu_load_fraction")
+            ?? raw.optionalFraction("cpu_fraction")
+            ?? raw.optionalFraction("load_fraction")
+            ?? raw.optionalPercent("cpu_utilization_pct")
+            ?? (cpuCount.flatMap { count in
+                guard count > 0, let load1m else { return nil }
+                return min(max(load1m / count, 0), 1)
+            })
+        memoryFraction = raw.optionalFraction("memory_fraction")
+            ?? raw.optionalFraction("memory_used_fraction")
+            ?? raw.optionalPercent("memory_used_pct")
+        gpuUtilizationFraction = raw.optionalFraction("gpu_utilization_fraction")
+            ?? raw.optionalPercent("gpu_utilization_pct")
+        gpuMemoryFraction = raw.optionalFraction("gpu_memory_fraction")
+            ?? raw.optionalFraction("vram_fraction")
+            ?? raw.optionalFraction("gpu_memory_used_fraction")
+        status = raw.string("status")?.uppercased()
+    }
+}
+
+public struct EndpointGPUHistorySample: Identifiable, Equatable, Sendable {
+    public var id: String { timestamp }
+    public let timestamp: String
+    public let gpuUtilizationFraction: Double?
+    public let memoryFraction: Double?
+    public let memoryUsedMiB: Double?
+    public let memoryTotalMiB: Double?
+
+    public init?(raw: [String: Any]) {
+        guard let timestamp = raw.string("timestamp") ?? raw.string("observed_at") else {
+            return nil
+        }
+        self.timestamp = timestamp
+        gpuUtilizationFraction = raw.optionalFraction("gpu_utilization_fraction")
+            ?? raw.optionalPercent("gpu_utilization_pct")
+        memoryFraction = raw.optionalFraction("memory_fraction")
+            ?? raw.optionalPercent("memory_used_pct")
+        memoryUsedMiB = raw.optionalDouble("memory_used_mib")
+        memoryTotalMiB = raw.optionalDouble("memory_total_mib")
+    }
+}
+
+public struct EndpointGPUHistorySeries: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let gpuUUID: String
+    public let index: Int
+    public let label: String
+    public let samples: [EndpointGPUHistorySample]
+
+    public init?(raw: [String: Any]) {
+        guard
+            let id = raw.string("gpu_id"),
+            let gpuUUID = raw.string("gpu_uuid"),
+            let index = raw.optionalInt("gpu_index")
+        else {
+            return nil
+        }
+        self.id = id
+        self.gpuUUID = gpuUUID
+        self.index = index
+        label = raw.string("label") ?? "GPU \(index)"
+        let payload = raw["points"] as? [[String: Any]]
+            ?? raw["samples"] as? [[String: Any]]
+            ?? []
+        samples = payload.compactMap(EndpointGPUHistorySample.init)
+    }
+}
+
+public struct EndpointTelemetryHistory: Equatable, Sendable {
+    public let endpointID: String
+    public let range: EndpointTelemetryRange
+    public let samples: [EndpointTelemetrySample]
+    public let gpuSeries: [EndpointGPUHistorySeries]
+    public let generatedAt: String?
+
+    public static func empty(endpointID: String, range: EndpointTelemetryRange) -> EndpointTelemetryHistory {
+        EndpointTelemetryHistory(endpointID: endpointID, range: range, samples: [], gpuSeries: [], generatedAt: nil)
+    }
+
+    public init(
+        endpointID: String,
+        range: EndpointTelemetryRange,
+        samples: [EndpointTelemetrySample],
+        gpuSeries: [EndpointGPUHistorySeries] = [],
+        generatedAt: String?
+    ) {
+        self.endpointID = endpointID
+        self.range = range
+        self.samples = samples
+        self.gpuSeries = gpuSeries
+        self.generatedAt = generatedAt
+    }
+
+    public init(endpointID: String, range: EndpointTelemetryRange, envelope: [String: Any]) {
+        let data = envelope["data"] as? [String: Any] ?? envelope
+        let samplePayload = data["points"] as? [[String: Any]]
+            ?? data["samples"] as? [[String: Any]]
+            ?? data["history"] as? [[String: Any]]
+            ?? envelope["samples"] as? [[String: Any]]
+            ?? []
+        self.endpointID = data.string("endpoint_id") ?? endpointID
+        self.range = EndpointTelemetryRange.allCases.first {
+            $0.windowSeconds == data.optionalInt("window_seconds")
+        } ?? EndpointTelemetryRange(rawValue: data.string("range") ?? range.rawValue) ?? range
+        self.samples = samplePayload.compactMap(EndpointTelemetrySample.init)
+        self.gpuSeries = (data["gpu_series"] as? [[String: Any]] ?? []).compactMap(EndpointGPUHistorySeries.init)
+        self.generatedAt = envelope.string("server_time") ?? data.string("generated_at") ?? data.string("server_time")
+    }
+}
+
 public struct BrokerSnapshot: Equatable, Sendable {
     public var schemaVersion: String?
     public var snapshotRevision: Int?
@@ -725,6 +874,32 @@ public struct BrokerSnapshot: Equatable, Sendable {
         self.dataAgeSeconds = dataAgeSeconds
         self.freshnessSeconds = freshnessSeconds
         self.admissionBoundary = admissionBoundary
+    }
+
+    /// Compares the data that drives the desktop UI while intentionally ignoring
+    /// the response timestamp. The service emits a new `serverTime` for every
+    /// state read even when the revision and resource data have not changed.
+    public func isSemanticallyEquivalentForRefresh(to other: BrokerSnapshot) -> Bool {
+        schemaVersion == other.schemaVersion
+            && snapshotRevision == other.snapshotRevision
+            && summary == other.summary
+            && endpoints == other.endpoints
+            && gpus == other.gpus
+            && leases == other.leases
+            && requests == other.requests
+            && reservations == other.reservations
+            && resourceProviders == other.resourceProviders
+            && allocatableUnits == other.allocatableUnits
+            && schedulerTargets == other.schedulerTargets
+            && schedulerJobs == other.schedulerJobs
+            && schedulerTransfers == other.schedulerTransfers
+            && resourceClaims == other.resourceClaims
+            && resourcePlanEvaluations == other.resourcePlanEvaluations
+            && resourceRunActuals == other.resourceRunActuals
+            && history == other.history
+            && dataAgeSeconds == other.dataAgeSeconds
+            && freshnessSeconds == other.freshnessSeconds
+            && admissionBoundary == other.admissionBoundary
     }
 
     public var monitoringProviders: [ResourceProviderRecord] {
@@ -1254,6 +1429,14 @@ public extension Dictionary where Key == String, Value == Any {
         if let value = self[key] as? NSNumber { return value.doubleValue }
         if let value = self[key] as? String { return Double(value) }
         return nil
+    }
+
+    func optionalFraction(_ key: String) -> Double? {
+        optionalDouble(key).map { Swift.min(Swift.max($0, 0), 1) }
+    }
+
+    func optionalPercent(_ key: String) -> Double? {
+        optionalDouble(key).map { Swift.min(Swift.max($0 / 100, 0), 1) }
     }
 
     func bool(_ key: String, default fallback: Bool) -> Bool {

@@ -100,6 +100,17 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     )
     assert history.status_code == 200
     assert history.json()["data"]["point_count"] <= 120
+    endpoint_history = client.get(
+        "/api/v1/endpoints/endpoint-a/history?window_seconds=3600&points=120",
+        headers={"X-GPU-Broker-Actor": "test-agent"},
+    )
+    assert endpoint_history.status_code == 200
+    assert endpoint_history.json()["data"]["point_count"] <= 120
+    invalid_endpoint_history = client.get(
+        "/api/v1/endpoints/endpoint-a/history?window_seconds=300",
+        headers={"X-GPU-Broker-Actor": "test-agent"},
+    )
+    assert invalid_endpoint_history.status_code == 422
     requests = client.get("/ui/requests")
     assert requests.status_code == 200
     assert "申请 GPU" in requests.text

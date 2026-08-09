@@ -16,6 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from gpu_broker.adapters import AdapterCommandError, SlurmCommandSchedulerAdapter, scheduler_adapter
+
 
 TERMINAL_SLURM_STATES = {
     "BOOT_FAIL",
@@ -598,17 +600,14 @@ class CommandSlurmProvider:
         self.runner = runner
         self.timeout_seconds = timeout_seconds
         self.upload_timeout_seconds = upload_timeout_seconds
+        self.adapter: SlurmCommandSchedulerAdapter = scheduler_adapter(runner=runner)
 
     @staticmethod
     def _command_prefix(connection: dict[str, Any]) -> list[str]:
-        prefix = connection.get("command_prefix")
-        if (
-            not isinstance(prefix, list)
-            or not prefix
-            or any(not isinstance(item, str) or not item or "\x00" in item for item in prefix)
-        ):
-            raise SlurmProviderError("scheduler target has an invalid command_prefix")
-        return prefix
+        try:
+            return SlurmCommandSchedulerAdapter.command_prefix(connection)
+        except AdapterCommandError as exc:
+            raise SlurmProviderError("scheduler target has an invalid command_prefix") from exc
 
     def _run(
         self,
@@ -617,48 +616,19 @@ class CommandSlurmProvider:
         *,
         mutating: bool,
     ) -> str:
-        remote_command = shlex.join(arguments)
         try:
-            result = self.runner(
-                [*self._command_prefix(connection), remote_command],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
+            return self.adapter.run(
+                connection,
+                arguments,
+                mutating=mutating,
+                timeout_seconds=self.timeout_seconds,
             )
-        except subprocess.TimeoutExpired as exc:
+        except AdapterCommandError as exc:
             raise SlurmProviderError(
-                "scheduler mutation timed out; its remote outcome is unknown"
-                if mutating
-                else "scheduler access timed out; connect the approved VPN and retry",
-                access_required=not mutating,
-                uncertain=mutating,
+                str(exc),
+                access_required=exc.access_required,
+                uncertain=exc.uncertain,
             ) from exc
-        except OSError as exc:
-            raise SlurmProviderError(f"scheduler helper could not start: {type(exc).__name__}") from exc
-        output = _clean_output("\n".join(part for part in (result.stdout, result.stderr) if part))
-        if result.returncode != 0:
-            access_required = result.returncode in {20, 21, 22, 23, 24, 25, 255} or any(
-                marker in output.lower()
-                for marker in (
-                    "connection timed out",
-                    "network is unreachable",
-                    "no route to host",
-                    "vpn disconnected",
-                    "vpn is disconnected",
-                    "vpn required",
-                    "connect the approved vpn",
-                    "认证失败",
-                    "验证",
-                )
-            )
-            message = output[-1500:] if output else f"helper exited with code {result.returncode}"
-            raise SlurmProviderError(
-                message,
-                access_required=access_required,
-                uncertain=mutating and not access_required,
-            )
-        return output
 
     def access_status(self, connection: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1046,30 +1016,11 @@ class CommandSlurmProvider:
             ]
         )
         try:
-            result = self.runner(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.upload_timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
+            self.adapter.upload(command, upload_timeout_seconds=self.upload_timeout_seconds)
+        except AdapterCommandError as exc:
             raise SlurmProviderError(
-                "staged upload timed out",
-                uncertain=True,
+                str(exc),
+                access_required=exc.access_required,
+                uncertain=exc.uncertain,
             ) from exc
-        except OSError as exc:
-            raise SlurmProviderError(
-                f"scp could not start: {type(exc).__name__}"
-            ) from exc
-        output = _clean_output(
-            "\n".join(part for part in (result.stdout, result.stderr) if part)
-        )
-        if result.returncode != 0:
-            access_required = result.returncode == 255
-            raise SlurmProviderError(
-                output[-1500:] or f"scp exited with code {result.returncode}",
-                access_required=access_required,
-                uncertain=not access_required,
-            )
         return f"{remote_stage}/{basename}"

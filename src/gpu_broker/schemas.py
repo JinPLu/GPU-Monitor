@@ -659,6 +659,8 @@ class HostTelemetryInput(StrictModel):
 
     cpu_count: int = Field(ge=1, le=1_048_576)
     load_1m: float = Field(ge=0)
+    cpu_total_ticks: int | None = Field(default=None, ge=0)
+    cpu_idle_ticks: int | None = Field(default=None, ge=0)
     memory_total_mib: int = Field(ge=1)
     memory_available_mib: int = Field(ge=0)
 
@@ -666,6 +668,12 @@ class HostTelemetryInput(StrictModel):
     def available_memory_is_bounded(self) -> "HostTelemetryInput":
         if self.memory_available_mib > self.memory_total_mib:
             raise ValueError("memory_available_mib must not exceed memory_total_mib")
+        if (
+            self.cpu_total_ticks is not None
+            and self.cpu_idle_ticks is not None
+            and self.cpu_idle_ticks > self.cpu_total_ticks
+        ):
+            raise ValueError("cpu_idle_ticks must not exceed cpu_total_ticks")
         return self
 
 

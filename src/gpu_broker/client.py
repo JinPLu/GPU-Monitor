@@ -221,6 +221,18 @@ class BrokerClient:
     def endpoints(self) -> dict[str, Any]:
         return self._state_projection("endpoints")
 
+    def endpoint_history(
+        self,
+        endpoint_id: str,
+        *,
+        window_seconds: int = 3600,
+        points: int = 120,
+    ) -> dict[str, Any]:
+        return self.get(
+            f"/api/v1/endpoints/{endpoint_id}/history",
+            params={"window_seconds": window_seconds, "points": points},
+        )
+
     def gpus(
         self,
         *,

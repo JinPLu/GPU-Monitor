@@ -68,4 +68,49 @@ public enum FixtureSnapshots {
         }
         return BrokerSnapshot(envelope: envelope)
     }
+
+    /// Loads only the additive endpoint-history contract.  It is deliberately
+    /// separate from the state fixture so desktop visual checks cannot make
+    /// history appear to be canonical allocation truth.
+    public static func loadEndpointTelemetryHistory(from url: URL) throws -> EndpointTelemetryHistory {
+        let data = try Data(contentsOf: url)
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let envelope = object as? [String: Any],
+            let payload = envelope["data"] as? [String: Any],
+            let endpointID = payload.string("endpoint_id"),
+            let windowSeconds = payload.optionalInt("window_seconds"),
+            EndpointTelemetryRange.allCases.contains(where: { $0.windowSeconds == windowSeconds }),
+            payload["points"] is [[String: Any]]
+        else {
+            throw FixtureSnapshotError.invalid(url)
+        }
+        let range = EndpointTelemetryRange.allCases.first { $0.windowSeconds == windowSeconds }!
+        let history = EndpointTelemetryHistory(endpointID: endpointID, range: range, envelope: envelope)
+        guard history.endpointID == endpointID, history.range == range else {
+            throw FixtureSnapshotError.invalid(url)
+        }
+        return history
+    }
+}
+
+/// A deterministic, in-process history endpoint for desktop visual fixtures.
+/// It accepts exactly one endpoint/range pair and never reaches a real service.
+public final class FixtureEndpointTelemetryHistoryClient: BrokerEndpointTelemetryHistoryClient {
+    private let fixture: EndpointTelemetryHistory
+
+    public init(history: EndpointTelemetryHistory) {
+        fixture = history
+    }
+
+    public func history(
+        endpointID: String,
+        range: EndpointTelemetryRange,
+        actorID: String
+    ) async throws -> EndpointTelemetryHistory {
+        guard fixture.endpointID == endpointID, fixture.range == range else {
+            throw BrokerRefreshError.invalidSnapshot
+        }
+        return fixture
+    }
 }

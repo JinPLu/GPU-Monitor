@@ -82,6 +82,33 @@ class EndpointTelemetryCurrent(Base):
     collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     cpu_count: Mapped[int] = mapped_column(Integer, nullable=False)
     load_1m: Mapped[float] = mapped_column(nullable=False)
+    cpu_total_ticks: Mapped[int | None] = mapped_column(Integer)
+    cpu_idle_ticks: Mapped[int | None] = mapped_column(Integer)
+    cpu_utilization_pct: Mapped[float | None] = mapped_column()
+    memory_total_mib: Mapped[int] = mapped_column(Integer, nullable=False)
+    memory_available_mib: Mapped[int] = mapped_column(Integer, nullable=False)
+    provider: Mapped[str] = mapped_column(String(40), nullable=False, default="raw-ssh")
+
+
+class EndpointTelemetrySnapshot(Base):
+    """Bounded history of host-wide CPU and memory observations."""
+
+    __tablename__ = "endpoint_telemetry_snapshots"
+    __table_args__ = (
+        Index("ix_endpoint_telemetry_endpoint_observed", "endpoint_id", "observed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    endpoint_id: Mapped[str] = mapped_column(
+        ForeignKey("endpoints.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    cpu_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    load_1m: Mapped[float] = mapped_column(nullable=False)
+    cpu_total_ticks: Mapped[int | None] = mapped_column(Integer)
+    cpu_idle_ticks: Mapped[int | None] = mapped_column(Integer)
+    cpu_utilization_pct: Mapped[float | None] = mapped_column()
     memory_total_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     memory_available_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     provider: Mapped[str] = mapped_column(String(40), nullable=False, default="raw-ssh")

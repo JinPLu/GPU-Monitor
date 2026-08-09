@@ -19,10 +19,10 @@ final class FixtureModeUITests: XCTestCase {
     }
 
     func testFixtureModeLaunchesWithoutProductionDaemon() {
-        let overview = app.descendants(matching: .any)["总览"]
-        XCTAssertTrue(overview.waitForExistence(timeout: 5), "Fixture launch must reach the native fleet overview")
+        let resources = app.descendants(matching: .any)["资源"]
+        XCTAssertTrue(resources.waitForExistence(timeout: 5), "Fixture launch must reach the native resource surface")
 
-        let refreshButton = app.buttons["刷新资源快照"]
+        let refreshButton = app.buttons["更新资源数据"]
         XCTAssertTrue(refreshButton.exists, "The native refresh control must be exposed to accessibility")
 
         let fixtureNotice = app.staticTexts.matching(

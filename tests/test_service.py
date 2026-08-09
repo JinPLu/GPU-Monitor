@@ -14,6 +14,8 @@ from gpu_broker.models import (
     Alert,
     AuditEvent,
     Endpoint,
+    EndpointTelemetryCurrent,
+    EndpointTelemetrySnapshot,
     GPUDevice,
     Lease,
     LeaseResource,
@@ -31,6 +33,7 @@ from gpu_broker.schemas import (
     MaintenanceCreate,
     ReservationCreate,
     RequestCreate,
+    RetentionPrune,
     WorkloadProfileClaim,
     WorkloadProfileUpsert,
 )
@@ -922,10 +925,119 @@ def test_endpoint_cpu_and_memory_telemetry_is_exposed_in_snapshot(service, admin
         "collected_at": endpoint["host_telemetry"]["collected_at"],
         "cpu_count": 64,
         "load_1m": 4.0,
+        "cpu_utilization_pct": None,
+        "cpu_total_ticks": None,
+        "cpu_idle_ticks": None,
         "memory_total_mib": 262_144,
         "memory_available_mib": 196_608,
         "provider": "raw-ssh",
     }
+
+
+def test_endpoint_history_is_throttled_and_calculates_cpu_utilization(service, admin) -> None:
+    start = utcnow() - timedelta(minutes=10)
+    first = service.ingest_observation(
+        observation(
+            count=1,
+            observed_at=start,
+            host={"cpu_total_ticks": 1_000, "cpu_idle_ticks": 700},
+        )
+    )
+    second = service.ingest_observation(
+        observation(
+            count=1,
+            observed_at=start + timedelta(seconds=30),
+            host={"cpu_total_ticks": 1_100, "cpu_idle_ticks": 750},
+        )
+    )
+    third = service.ingest_observation(
+        observation(
+            count=1,
+            observed_at=start + timedelta(seconds=61),
+            host={"cpu_total_ticks": 1_200, "cpu_idle_ticks": 810},
+        )
+    )
+
+    def endpoint_history_count(session):  # type: ignore[no-untyped-def]
+        return len(session.scalars(select(EndpointTelemetrySnapshot)).all())
+
+    assert first["endpoint_history_points_written"] == 1
+    assert second["endpoint_history_points_written"] == 0
+    assert third["endpoint_history_points_written"] == 1
+    assert service._read(endpoint_history_count) == 2
+
+    current_host = service.snapshot(admin)["data"]["endpoints"][0]["host_telemetry"]
+    assert current_host["cpu_utilization_pct"] == 40.0
+    history = service.endpoint_history(admin, "endpoint-a", window_seconds=3600, max_points=120)
+    assert history["data"]["point_count"] == 2
+    assert history["data"]["points"][0]["cpu_utilization_pct"] is None
+    assert history["data"]["points"][1]["cpu_utilization_pct"] == 40.0
+    assert history["data"]["points"][1]["memory_used_pct"] == 25.0
+    gpu_series = history["data"]["gpu_series"]
+    assert len(gpu_series) == 1
+    assert gpu_series[0]["gpu_id"] == "endpoint-a:GPU-endpoint-a-0"
+    assert gpu_series[0]["gpu_uuid"] == "GPU-endpoint-a-0"
+    assert gpu_series[0]["gpu_index"] == 0
+    assert len(gpu_series[0]["points"]) == 2
+    assert gpu_series[0]["points"][1]["gpu_utilization_pct"] == 0.0
+    assert gpu_series[0]["points"][1]["memory_used_pct"] == 0.0
+
+
+def test_endpoint_history_validates_window_points_and_identity(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+
+    assert service.endpoint_history(admin, "endpoint-a", window_seconds=21_600)["data"][
+        "window_seconds"
+    ] == 21_600
+    with pytest.raises(BrokerError) as bad_window:
+        service.endpoint_history(admin, "endpoint-a", window_seconds=300)
+    with pytest.raises(BrokerError) as bad_points:
+        service.endpoint_history(admin, "endpoint-a", max_points=121)
+    with pytest.raises(BrokerError) as missing_endpoint:
+        service.endpoint_history(admin, "missing", window_seconds=3600)
+
+    assert bad_window.value.code == "invalid_history_window"
+    assert bad_points.value.code == "invalid_history_points"
+    assert missing_endpoint.value.code == "endpoint_not_found"
+
+
+def test_endpoint_history_excludes_current_outside_requested_window(service, admin) -> None:
+    service.ingest_observation(
+        observation(count=1, observed_at=utcnow() - timedelta(hours=2))
+    )
+
+    history = service.endpoint_history(admin, "endpoint-a", window_seconds=3600, max_points=120)
+
+    assert history["data"]["point_count"] == 0
+
+
+def test_telemetry_prune_deletes_gpu_and_endpoint_history_but_not_current(
+    service,
+    admin,
+) -> None:
+    service.ingest_observation(
+        observation(count=1, observed_at=utcnow() - timedelta(minutes=10))
+    )
+    service.ingest_observation(observation(count=1))
+
+    result = service.prune_telemetry(
+        admin,
+        RetentionPrune(older_than_seconds=60),
+        idempotency_key="prune-endpoint-history",
+    )
+
+    def counts(session):  # type: ignore[no-untyped-def]
+        return (
+            len(session.scalars(select(TelemetryCurrent)).all()),
+            len(session.scalars(select(EndpointTelemetryCurrent)).all()),
+            len(session.scalars(select(TelemetrySnapshot)).all()),
+            len(session.scalars(select(EndpointTelemetrySnapshot)).all()),
+        )
+
+    assert result["deleted_count"] == 2
+    assert result["gpu_deleted_count"] == 1
+    assert result["endpoint_deleted_count"] == 1
+    assert service._read(counts) == (1, 1, 1, 1)
 
 
 def test_gpu_history_is_downsampled_to_requested_cap(service, admin) -> None:

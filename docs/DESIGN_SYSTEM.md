@@ -6,7 +6,7 @@
 - Primary user: one person who needs to see available GPU/CPU capacity, decide which project or Agent receives it, and resolve blocked work.
 - Not a multi-user product: actor IDs are local audit and Agent labels, not people, seats, teams, or accounts.
 - Single job of the overview: show what compute is available and which project or Agent needs attention, then make the next safe action obvious.
-- Platform: macOS desktop only. The target implementation is native SwiftUI/AppKit, not a browser page and not a WKWebView skin.
+- Primary desktop experience: native macOS SwiftUI/AppKit, not a browser page and not a WKWebView skin. The loopback Web/Jinja/JavaScript surface remains a supported Windows desktop compatibility path and must keep using the same REST/domain contracts.
 - Reference: Apple Home for macOS for spatial grouping, Apple's official [Color](https://developer.apple.com/design/human-interface-guidelines/color), [Materials](https://developer.apple.com/design/human-interface-guidelines/materials), and [Sidebars](https://developer.apple.com/design/human-interface-guidelines/sidebars) guidance, plus the concrete neutral/accent/spacing tokens summarized by [Open Design's Apple system](https://open-design.ai/zh/plugins/design-system-apple/).
 
 ## Design decision
@@ -132,4 +132,14 @@ Copy should sound like local desktop product UI, not an agent log. Prefer direct
 
 ## Native implementation boundary
 
-The target native shell is a SwiftUI/AppKit split view with `NSVisualEffectView` / SwiftUI materials and SF Symbols. It consumes the existing loopback REST API. Once native parity is achieved, remove the browser-facing Jinja templates, JavaScript, CSS, static asset routing, and WKWebView hosting path; retain only REST/MCP/CLI contracts and the desktop process lifecycle.
+The target native shell is a SwiftUI/AppKit split view with `NSVisualEffectView` / SwiftUI materials and SF Symbols. It consumes the existing loopback REST API. Native parity may retire duplicated macOS-only presentation code, but it must not remove the browser-facing Jinja templates, JavaScript, CSS, static asset routing, or loopback Web UI while the Windows launcher owns that compatibility surface.
+
+## Beszel reference boundary
+
+GPU Broker may borrow Beszel's system-first information architecture, dense sortable tables, field visibility controls, compact endpoint information bar, on-demand history, request-generation protection, ownership markers, and its visible-only chart discipline. Native trend charts use timestamped samples, explicit gaps, no decorative animation, and a bounded selected-sample inspector; hidden details do not fetch or redraw histories. It must not import Beszel's React/PocketBase runtime, authentication and registration model, target/claim/reaper control plane, browser storage, or arbitrary command adapters. The Broker REST API remains the presentation boundary and `service.py` remains the allocation truth.
+
+The first native delivery presents current truth: resources, endpoint/GPU detail, attention, leases, requests, reservations, and current ownership arrangements. Time-series telemetry is an additive, capability-gated surface. A queue entry without a concrete GPU allocation belongs on an unassigned lane; it must never be drawn as historical ownership of a GPU.
+
+## Adapter presentation boundary
+
+Vendor adapter identities are diagnostic provenance, not an operator or Agent workflow. The native UI and MCP continue to expose unified resource monitoring, claim, queue, reservation, and scheduler concepts. Adding an adapter must not add a discovery/configuration round trip to a routine claim, create a second credential system, or permit the adapter to write lease/claim truth.

@@ -1,6 +1,9 @@
 import AppKit
 import Foundation
 import SwiftUI
+#if canImport(Charts)
+import Charts
+#endif
 
 private enum DesktopError: LocalizedError {
     case projectRootMissing
@@ -286,7 +289,30 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
                 fixturesRoot: fixturesRoot,
                 projectRoot: projectRoot
             )
-            brokerStore.useFixture(snapshot: try FixtureSnapshots.load(from: fixtureURL))
+            let snapshot = try FixtureSnapshots.load(from: fixtureURL)
+            if let historyFixture = environment["GPU_BROKER_DESKTOP_HISTORY_FIXTURE"], !historyFixture.isEmpty {
+                let historyURL = try FixtureSnapshots.resolve(
+                    historyFixture,
+                    fixturesRoot: fixturesRoot,
+                    projectRoot: projectRoot
+                )
+                let history = try FixtureSnapshots.loadEndpointTelemetryHistory(from: historyURL)
+                guard snapshot.endpoints.contains(where: { $0.id == history.endpointID }) else {
+                    throw FixtureSnapshotError.invalid(historyURL)
+                }
+                let serviceInfo = ServiceInfo(
+                    schemaVersion: ServiceInfo.fixture.schemaVersion,
+                    version: ServiceInfo.fixture.version,
+                    capabilities: ServiceInfo.fixture.capabilities.union(["endpoint_telemetry_history"])
+                )
+                brokerStore.useFixture(
+                    snapshot: snapshot,
+                    serviceInfo: serviceInfo,
+                    endpointTelemetryHistoryClient: FixtureEndpointTelemetryHistoryClient(history: history)
+                )
+            } else {
+                brokerStore.useFixture(snapshot: snapshot)
+            }
             return true
         } catch {
             showFatalError(error.localizedDescription)
@@ -435,14 +461,14 @@ private struct NativeBrokerRoot: View {
 #if DEBUG
         let requested = ProcessInfo.processInfo.environment["GPU_BROKER_DESKTOP_SECTION"]
         let initialSection: DashboardSection = switch requested {
-        case "server-pool": .serverPool
+        case "server-pool": .resources
         case "resource-usage", "leases": .leases
         case "settings": .settings
-        default: .overview
+        default: .resources
         }
         _selectedDashboardSection = State(initialValue: initialSection)
 #else
-        _selectedDashboardSection = State(initialValue: .overview)
+        _selectedDashboardSection = State(initialValue: .resources)
 #endif
     }
 
@@ -596,11 +622,8 @@ private struct AppSidebar: View {
                     .padding(.bottom, 8)
             }
 
-            SidebarSelection(title: "总览", systemImage: "house.fill", color: DesignTokens.interaction, selected: selectedSection == .overview, compact: compact) {
-                navigate(.overview)
-            }
-            SidebarSelection(title: "服务器", systemImage: "server.rack", color: DesignTokens.interaction, selected: selectedSection == .serverPool, compact: compact) {
-                navigate(.serverPool)
+            SidebarSelection(title: "资源", systemImage: "server.rack", color: DesignTokens.interaction, selected: selectedSection == .resources, compact: compact) {
+                navigate(.resources)
             }
             SidebarSelection(title: "项目与 Agent", systemImage: "folder.fill", color: DesignTokens.interaction, selected: selectedSection == .leases, compact: compact) {
                 navigate(.leases)
@@ -814,9 +837,8 @@ private struct AppToolbar: View {
 
     private var title: String {
         switch selectedSection {
-        case .overview: return "总览"
-        case .serverPool: return "服务器"
-        case .leases: return "项目与 Agent"
+        case .resources: return "资源"
+        case .leases: return "归属与安排"
         case .settings: return "本机设置"
         }
     }
@@ -882,15 +904,8 @@ private struct DashboardView: View {
 
             Group {
                 switch selectedSection {
-                case .overview:
-                    FleetOverview(
-                        snapshot: store.snapshot,
-                        openEndpoint: openEndpoint,
-                        selectGPU: selectGPU,
-                        openServerPool: { selectedSection = .serverPool }
-                    )
-                case .serverPool:
-                    SpatialServerPool(
+                case .resources:
+                    ResourcesDashboard(
                         store: store,
                         claimEndpoint: claimEndpoint,
                         removeEndpoint: removeEndpoint,
@@ -1038,9 +1053,88 @@ private struct NoticeBanner: View {
     }
 }
 
-private struct SpatialServerPool: View {
+private enum EndpointFilter: String, CaseIterable, Identifiable {
+    case all
+    case available
+    case attention
+    case highPressure
+    case offline
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .all: return "全部"
+        case .available: return "可分配"
+        case .attention: return "需关注"
+        case .highPressure: return "高压力"
+        case .offline: return "未在线"
+        }
+    }
+}
+
+private enum EndpointSort: String, CaseIterable, Identifiable {
+    case attention
+    case id
+    case availableGPU
+    case pressure
+    case cpu
+    case memory
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .attention: return "关注优先"
+        case .id: return "标识"
+        case .availableGPU: return "可用 GPU"
+        case .pressure: return "压力最高"
+        case .cpu: return "CPU"
+        case .memory: return "内存"
+        }
+    }
+}
+
+private enum EndpointDensity: String, CaseIterable, Identifiable {
+    case compact
+    case comfortable
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .compact: return "紧凑"
+        case .comfortable: return "舒展"
+        }
+    }
+}
+
+private enum EndpointField: String, CaseIterable, Identifiable, Hashable {
+    case cpu
+    case memory
+    case gpu
+    case status
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .cpu: return "CPU"
+        case .memory: return "内存"
+        case .gpu: return "GPU"
+        case .status: return "状态"
+        }
+    }
+}
+
+private struct ResourcesDashboard: View {
     @ObservedObject var store: BrokerStore
     @State private var selectedEndpointID = ""
+    @State private var searchText = ""
+    @State private var filter: EndpointFilter = .all
+    @State private var sort: EndpointSort = .attention
+    @State private var density: EndpointDensity = .compact
+    @State private var visibleFields: Set<EndpointField> = [.cpu, .memory, .gpu, .status]
     let claimEndpoint: (String) -> Void
     let removeEndpoint: (EndpointRecord) -> Void
     let selectGPU: (GPURecord) -> Void
@@ -1059,84 +1153,559 @@ private struct SpatialServerPool: View {
         endpoints.compactMap(\.memoryTotalMiB).reduce(0, +) / 1024
     }
 
-    var body: some View {
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("服务器")
-                            .font(.system(size: 18, weight: .semibold))
-                        Text("\(store.snapshot.summary.onlineServers) / \(store.snapshot.summary.totalServers) 在线")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(DesignTokens.mutedInk)
-                    }
-                    Spacer()
-                    Text("\(totalCPUCores) 核 · \(totalMemoryGiB) GB · \(store.snapshot.summary.totalGPUs) GPU")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundStyle(DesignTokens.mutedInk)
-                }
-                .padding(20)
+    private var onlineEndpointCount: Int {
+        endpoints.filter { $0.monitorStatus == "ONLINE" }.count
+    }
 
-                Divider()
+    private var allocatableGPUCount: Int {
+        guard store.freshness == .fresh else { return 0 }
+        return endpoints
+            .filter { $0.monitorStatus == "ONLINE" }
+            .flatMap { store.snapshot.gpus(for: $0) }
+            .filter { $0.state == "AVAILABLE" }
+            .count
+    }
 
-                if endpoints.isEmpty {
-                    ContentUnavailableView("暂无服务器", systemImage: "server.rack", description: Text("从命令岛添加一台服务器"))
-                        .frame(maxHeight: .infinity)
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 6) {
-                            ForEach(endpoints) { endpoint in
-                                SpatialServerRow(
-                                    endpoint: endpoint,
-                                    gpus: store.snapshot.gpus(for: endpoint),
-                                    selected: endpoint.id == selectedEndpoint?.id
-                                ) {
-                                    withAnimation(.easeOut(duration: 0.14)) {
-                                        selectedEndpointID = endpoint.id
-                                    }
-                                }
-                            }
-                        }
-                        .padding(10)
-                    }
-                }
+    private var attentionEndpoints: [EndpointRecord] {
+        endpoints.filter { endpointRequiresAttention(endpoint: $0, gpus: store.snapshot.gpus(for: $0)) }
+    }
 
-                if store.serviceInfo != nil, !store.supportsEndpointDeletion {
-                    Label("更新本机服务后可移除服务器", systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(DesignTokens.warning)
-                        .padding(14)
+    private var attentionGPUCount: Int {
+        store.snapshot.operationalGPUs.filter { gpuNeedsAttention($0) }.count
+    }
+
+    private var filteredEndpoints: [EndpointRecord] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return endpoints
+            .filter { endpoint in
+                switch filter {
+                case .all:
+                    true
+                case .available:
+                    store.freshness == .fresh
+                        && endpoint.monitorStatus == "ONLINE"
+                        && store.snapshot.gpus(for: endpoint).contains { $0.state == "AVAILABLE" }
+                case .attention:
+                    endpointRequiresAttention(endpoint: endpoint, gpus: store.snapshot.gpus(for: endpoint))
+                case .highPressure:
+                    endpointHighPressure(endpoint: endpoint, gpus: store.snapshot.gpus(for: endpoint))
+                case .offline:
+                    endpoint.monitorStatus != "ONLINE"
                 }
             }
-            .frame(width: 344)
-            .background(DesignTokens.surface)
+            .filter { endpoint in
+                guard !query.isEmpty else { return true }
+                return endpoint.id.lowercased().contains(query)
+                    || endpoint.displayName.lowercased().contains(query)
+                    || endpoint.host.lowercased().contains(query)
+            }
+            .sorted(by: endpointSort)
+    }
 
-            Divider().opacity(0.36)
+    var body: some View {
+        VStack(spacing: 0) {
+            resourceSummary
+            Divider().opacity(0.45)
+            HStack(spacing: 0) {
+                endpointTable
+                    .frame(width: 430)
+                    .background(DesignTokens.surface)
 
-            if let selectedEndpoint {
-                SpatialServerDetail(
-                    store: store,
-                    endpoint: selectedEndpoint,
-                    gpus: store.snapshot.gpus(for: selectedEndpoint),
-                    claim: { claimEndpoint(selectedEndpoint.id) },
-                    remove: { removeEndpoint(selectedEndpoint) },
-                    selectGPU: selectGPU
-                )
-                .id(selectedEndpoint.id)
-                .transition(.opacity.combined(with: .offset(x: 8)))
-            } else {
-                ContentUnavailableView("选择服务器", systemImage: "server.rack")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider().opacity(0.36)
+
+                if let selectedEndpoint {
+                    SpatialServerDetail(
+                        store: store,
+                        endpoint: selectedEndpoint,
+                        gpus: store.snapshot.gpus(for: selectedEndpoint),
+                        claim: { claimEndpoint(selectedEndpoint.id) },
+                        remove: { removeEndpoint(selectedEndpoint) },
+                        selectGPU: selectGPU
+                    )
+                    .id(selectedEndpoint.id)
+                    .transition(.opacity.combined(with: .offset(x: 8)))
+                } else if endpoints.isEmpty {
+                    ContentUnavailableView("暂无资源", systemImage: "server.rack", description: Text("添加服务器后会显示端点和 GPU。"))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ContentUnavailableView("没有匹配的端点", systemImage: "line.3.horizontal.decrease.circle")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
         }
         .onAppear { ensureSelection() }
-        .onChange(of: endpoints.map(\.id)) { _, _ in ensureSelection() }
+        .onChange(of: filteredEndpoints.map(\.id)) { _, _ in ensureSelection() }
+        .accessibilityLabel("资源")
+    }
+
+    private var resourceSummary: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("资源")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text("查看可分配资源、异常状态和当前使用情况")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                }
+                Spacer()
+                Text(snapshotTrustLabel)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(store.freshness == .fresh ? DesignTokens.mutedInk : DesignTokens.danger)
+            }
+            HStack(spacing: 8) {
+                ResourceSummaryPill(title: "端点", value: "\(onlineEndpointCount)/\(endpoints.count)", icon: "server.rack", color: DesignTokens.network)
+                ResourceSummaryPill(title: "CPU", value: "\(totalCPUCores) 核", icon: "cpu", color: DesignTokens.cpu)
+                ResourceSummaryPill(title: "内存", value: "\(totalMemoryGiB) GB", icon: "memorychip", color: DesignTokens.memory)
+                ResourceSummaryPill(title: "GPU", value: allocatableGPUSummary, icon: "square.stack.3d.up.fill", color: DesignTokens.gpu)
+                ResourceSummaryPill(title: "需关注", value: "\(attentionEndpoints.count + attentionGPUCount)", icon: "exclamationmark.triangle.fill", color: attentionEndpoints.isEmpty && attentionGPUCount == 0 ? DesignTokens.success : DesignTokens.danger)
+            }
+            if store.freshness != .fresh || !attentionEndpoints.isEmpty || attentionGPUCount > 0 {
+                Label(attentionSummary, systemImage: "hand.raised.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(store.freshness == .fresh ? DesignTokens.warning : DesignTokens.danger)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .background(DesignTokens.surface)
+    }
+
+    private var endpointTable: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(spacing: 9) {
+                TextField("搜索端点、主机或 ID", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, weight: .medium))
+                    .accessibilityLabel("搜索端点")
+                HStack(spacing: 8) {
+                    Picker("过滤", selection: $filter) {
+                        ForEach(EndpointFilter.allCases) { item in
+                            Text(item.label).tag(item)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityLabel("端点过滤")
+
+                    Menu {
+                        Picker("排序", selection: $sort) {
+                            ForEach(EndpointSort.allCases) { item in
+                                Text(item.label).tag(item)
+                            }
+                        }
+                        Divider()
+                        Picker("行密度", selection: $density) {
+                            ForEach(EndpointDensity.allCases) { item in
+                                Text(item.label).tag(item)
+                            }
+                        }
+                        Divider()
+                        ForEach(EndpointField.allCases) { field in
+                            Toggle(field.label, isOn: fieldBinding(field))
+                        }
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .frame(width: 30, height: 30)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .help("排序、行密度和字段")
+                    .accessibilityLabel("端点排序、行密度和字段")
+                }
+            }
+            .padding(12)
+
+            EndpointTableHeader(visibleFields: visibleFields)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+
+            if filteredEndpoints.isEmpty {
+                ContentUnavailableView(
+                    endpoints.isEmpty ? "暂无端点" : "没有匹配端点",
+                    systemImage: endpoints.isEmpty ? "server.rack" : "magnifyingglass",
+                    description: Text(endpoints.isEmpty ? "添加服务器后会显示资源。" : "调整搜索或过滤条件。")
+                )
+                .frame(maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 4) {
+                        ForEach(filteredEndpoints) { endpoint in
+                            EndpointTableRow(
+                                endpoint: endpoint,
+                                gpus: store.snapshot.gpus(for: endpoint),
+                                visibleFields: visibleFields,
+                                density: density,
+                                isSnapshotFresh: store.freshness == .fresh,
+                                selected: endpoint.id == selectedEndpoint?.id
+                            ) {
+                                withAnimation(.easeOut(duration: 0.14)) {
+                                    selectedEndpointID = endpoint.id
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 10)
+                }
+            }
+
+            if store.serviceInfo != nil, !store.supportsEndpointDeletion {
+                Label("更新本机服务后可移除服务器", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(DesignTokens.warning)
+                    .padding(12)
+            }
+        }
     }
 
     private func ensureSelection() {
-        if !endpoints.contains(where: { $0.id == selectedEndpointID }) {
-            selectedEndpointID = endpoints.first?.id ?? ""
+        if !filteredEndpoints.contains(where: { $0.id == selectedEndpointID }) {
+            selectedEndpointID = filteredEndpoints.first?.id ?? ""
         }
+    }
+
+    private func fieldBinding(_ field: EndpointField) -> Binding<Bool> {
+        Binding(
+            get: { visibleFields.contains(field) },
+            set: { isVisible in
+                if isVisible {
+                    visibleFields.insert(field)
+                } else if visibleFields.count > 1 {
+                    visibleFields.remove(field)
+                }
+            }
+        )
+    }
+
+    private func endpointSort(_ lhs: EndpointRecord, _ rhs: EndpointRecord) -> Bool {
+        switch sort {
+        case .attention:
+            let left = endpointAttentionRank(lhs)
+            let right = endpointAttentionRank(rhs)
+            if left != right { return left > right }
+            return lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
+        case .id:
+            return lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
+        case .availableGPU:
+            let left = availableGPUCount(lhs)
+            let right = availableGPUCount(rhs)
+            if left != right { return left > right }
+            return lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
+        case .pressure:
+            let left = endpointPressureFraction(endpoint: lhs, gpus: store.snapshot.gpus(for: lhs)) ?? -1
+            let right = endpointPressureFraction(endpoint: rhs, gpus: store.snapshot.gpus(for: rhs)) ?? -1
+            if left != right { return left > right }
+            return lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
+        case .cpu:
+            let left = lhs.cpuCount ?? 0
+            let right = rhs.cpuCount ?? 0
+            if left != right { return left > right }
+            return lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
+        case .memory:
+            let left = lhs.memoryTotalMiB ?? 0
+            let right = rhs.memoryTotalMiB ?? 0
+            if left != right { return left > right }
+            return lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
+        }
+    }
+
+    private func endpointAttentionRank(_ endpoint: EndpointRecord) -> Int {
+        let endpointGPUs = store.snapshot.gpus(for: endpoint)
+        let gpuRank = endpointGPUs.contains { gpuNeedsAttention($0) } ? 2 : 0
+        let pressureRank = endpointHighPressure(endpoint: endpoint, gpus: endpointGPUs) ? 1 : 0
+        return (endpointNeedsAttention(endpoint) ? 3 : 0) + gpuRank + pressureRank
+    }
+
+    private func availableGPUCount(_ endpoint: EndpointRecord) -> Int {
+        guard store.freshness == .fresh, endpoint.monitorStatus == "ONLINE" else { return 0 }
+        return store.snapshot.gpus(for: endpoint).filter { $0.state == "AVAILABLE" }.count
+    }
+
+    private var allocatableGPUSummary: String {
+        guard store.freshness == .fresh else { return "未确认" }
+        return "\(allocatableGPUCount)/\(store.snapshot.operationalGPUs.count)"
+    }
+
+    private var snapshotTrustLabel: String {
+        if store.freshness == .stale { return "快照过期，资源 fail-closed" }
+        if store.freshness == .failed { return "刷新失败，资源 fail-closed" }
+        if let revision = store.snapshot.snapshotRevision {
+            return "rev \(revision) · \(formattedTimestamp(store.snapshot.serverTime))"
+        }
+        return "等待快照"
+    }
+
+    private var attentionSummary: String {
+        if store.freshness != .fresh {
+            return "数据不新鲜时不会把资源显示为可安全分配。"
+        }
+        let attentionPrefix: String
+        switch (attentionEndpoints.count, attentionGPUCount) {
+        case (0, 0):
+            attentionPrefix = "当前没有需要处理的资源"
+        case (0, let gpuCount):
+            attentionPrefix = "\(gpuCount) 块 GPU 需要处理"
+        case (let endpointCount, 0):
+            attentionPrefix = "\(endpointCount) 个端点需要处理"
+        case (let endpointCount, let gpuCount):
+            attentionPrefix = "\(endpointCount) 个端点、\(gpuCount) 块 GPU 需要处理"
+        }
+        return "\(attentionPrefix)；高压力、stale、error、unknown、unmanaged、disabled 均不会计入可分配。"
+    }
+}
+
+private struct ResourceSummaryPill: View {
+    let title: String
+    let value: String
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(color)
+                .frame(width: 26, height: 26)
+                .background(color.opacity(0.11), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(value)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                Text(title)
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+        .background(DesignTokens.glassSmoke, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityValue(value)
+    }
+}
+
+private struct EndpointTableHeader: View {
+    let visibleFields: Set<EndpointField>
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("端点")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if visibleFields.contains(.cpu) {
+                Text("CPU 压力").frame(width: 54, alignment: .trailing)
+            }
+            if visibleFields.contains(.memory) {
+                Text("内存压力").frame(width: 58, alignment: .trailing)
+            }
+            if visibleFields.contains(.gpu) {
+                Text("GPU 压力").frame(width: 58, alignment: .trailing)
+            }
+            if visibleFields.contains(.status) {
+                Text("注意 / 新鲜度").frame(width: 72, alignment: .trailing)
+            }
+        }
+        .font(.system(size: 9, weight: .semibold))
+        .foregroundStyle(DesignTokens.mutedInk)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct EndpointTableRow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hovering = false
+    let endpoint: EndpointRecord
+    let gpus: [GPURecord]
+    let visibleFields: Set<EndpointField>
+    let density: EndpointDensity
+    let isSnapshotFresh: Bool
+    let selected: Bool
+    let select: () -> Void
+
+    var body: some View {
+        Button(action: select) {
+            HStack(alignment: .center, spacing: 8) {
+                Image(systemName: hasAttention ? "exclamationmark.triangle.fill" : "server.rack")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(statusColor)
+                    .frame(width: 26, height: 26)
+                    .background(statusColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                VStack(alignment: .leading, spacing: density == .compact ? 2 : 4) {
+                    Text(endpoint.id)
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("\(endpoint.displayName) · \(freshnessLabel)")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if visibleFields.contains(.cpu) {
+                    EndpointPressureCell(
+                        label: "CPU 压力",
+                        fraction: endpoint.cpuLoadFraction,
+                        caption: cpuCaption
+                    )
+                    .frame(width: 54)
+                }
+                if visibleFields.contains(.memory) {
+                    EndpointPressureCell(
+                        label: "内存压力",
+                        fraction: endpoint.memoryFraction,
+                        caption: memoryCaption
+                    )
+                    .frame(width: 58)
+                }
+                if visibleFields.contains(.gpu) {
+                    EndpointPressureCell(
+                        label: "GPU 压力",
+                        fraction: gpuPressure,
+                        caption: gpuCaption
+                    )
+                    .frame(width: 58)
+                }
+                if visibleFields.contains(.status) {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Label(attentionLabel, systemImage: attentionIcon)
+                            .lineLimit(1)
+                        Text(freshnessLabel)
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundStyle(DesignTokens.mutedInk)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .foregroundStyle(statusColor)
+                    .frame(width: 72, alignment: .trailing)
+                }
+            }
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .padding(.horizontal, 10)
+            .frame(height: density == .compact ? 64 : 78)
+            .background(
+                selected ? DesignTokens.interaction.opacity(0.13) : DesignTokens.ink.opacity(hovering ? 0.045 : 0),
+                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: hovering)
+        .help("\(endpoint.id)\n\(endpoint.sshCommand)")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("端点 \(endpoint.id)")
+        .accessibilityValue("\(attentionLabel)，\(freshnessLabel)，CPU 压力 \(percentageLabel(endpoint.cpuLoadFraction))，内存压力 \(percentageLabel(endpoint.memoryFraction))，GPU 压力 \(percentageLabel(gpuPressure))，\(gpuCaption)")
+    }
+
+    private var availableGPUCount: Int {
+        guard isSnapshotFresh, endpoint.monitorStatus == "ONLINE" else { return 0 }
+        return gpus.filter { $0.state == "AVAILABLE" }.count
+    }
+
+    private var hasAttention: Bool {
+        !isSnapshotFresh || endpointRequiresAttention(endpoint: endpoint, gpus: gpus)
+    }
+
+    private var gpuPressure: Double? {
+        endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus)
+    }
+
+    private var cpuCaption: String {
+        endpoint.cpuCount.map { "\($0) 核" } ?? "无数据"
+    }
+
+    private var memoryCaption: String {
+        endpoint.memoryTotalMiB.map { "\($0 / 1024) GB" } ?? "无数据"
+    }
+
+    private var gpuCaption: String {
+        guard !gpus.isEmpty else { return "无 GPU" }
+        return isSnapshotFresh ? "\(availableGPUCount)/\(gpus.count) 可用" : "可用性未确认"
+    }
+
+    private var freshnessLabel: String {
+        guard isSnapshotFresh else { return "快照过期" }
+        guard endpoint.monitorStatus == "ONLINE" else { return endpoint.monitorLabel }
+        guard let lastSuccess = endpoint.monitorLastSuccessAt else { return "等待遥测" }
+        return "更新 \(formattedTimestamp(lastSuccess))"
+    }
+
+    private var attentionLabel: String {
+        if !isSnapshotFresh { return "不可分配" }
+        if endpointNeedsAttention(endpoint) { return endpoint.monitorLabel }
+        if gpus.contains(where: gpuNeedsAttention) { return "GPU 需关注" }
+        if endpointHighPressure(endpoint: endpoint, gpus: gpus) { return "压力较高" }
+        return endpoint.monitorLabel
+    }
+
+    private var attentionIcon: String {
+        hasAttention ? "exclamationmark.triangle.fill" : "checkmark.circle.fill"
+    }
+
+    private var statusColor: Color {
+        if !isSnapshotFresh { return DesignTokens.danger }
+        switch endpoint.monitorStatus {
+        case "ONLINE":
+            return endpointRequiresAttention(endpoint: endpoint, gpus: gpus) ? DesignTokens.warning : DesignTokens.success
+        case "PENDING", "DRAINING":
+            return DesignTokens.warning
+        default:
+            return DesignTokens.danger
+        }
+    }
+}
+
+private struct EndpointPressureCell: View {
+    let label: String
+    let fraction: Double?
+    let caption: String
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 3) {
+            Text(percentageLabel(fraction))
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(pressureColor(fraction))
+                .lineLimit(1)
+            PressureMeter(fraction: fraction, color: pressureColor(fraction))
+            Text(caption)
+                .font(.system(size: 7, weight: .medium, design: .rounded))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue("\(percentageLabel(fraction))，\(caption)")
+    }
+}
+
+private struct PressureMeter: View {
+    let fraction: Double?
+    let color: Color
+
+    private var normalizedFraction: CGFloat {
+        CGFloat(min(max(fraction ?? 0, 0), 1))
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            Capsule()
+                .fill(DesignTokens.surfaceStroke)
+                .overlay(alignment: .leading) {
+                    Capsule()
+                        .fill(color)
+                        .frame(width: proxy.size.width * normalizedFraction)
+                }
+        }
+        .frame(height: 3)
+        .accessibilityHidden(true)
     }
 }
 
@@ -1240,6 +1809,8 @@ private struct SpatialServerDetail: View {
         ["ERROR", "STALE", "DISABLED", "DRAINING", "RETIRED"].contains(endpoint.monitorStatus)
     }
 
+    private var telemetryIsFresh: Bool { store.freshness == .fresh }
+
     private var availableCount: Int { gpus.filter { $0.state == "AVAILABLE" }.count }
 
     var body: some View {
@@ -1251,6 +1822,14 @@ private struct SpatialServerDetail: View {
                     serverAction
                 }
 
+                if !telemetryIsFresh {
+                    DetailCallout(
+                        icon: "hand.raised.fill",
+                        color: DesignTokens.danger,
+                        message: "当前快照不新鲜；CPU、内存和 GPU 压力仅显示最后已知状态，GPU 可用性未确认且不会用于分配。"
+                    )
+                }
+
                 if unavailable {
                     DetailCallout(
                         icon: "exclamationmark.triangle.fill",
@@ -1260,13 +1839,28 @@ private struct SpatialServerDetail: View {
                 }
 
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 170, maximum: 260), spacing: 12)], spacing: 12) {
-                    SpatialMetric(icon: "cpu", label: "CPU 负载", value: metricPercent(endpoint.cpuLoadFraction), detail: cpuDetail, color: DesignTokens.cpu)
-                    SpatialMetric(icon: "memorychip", label: "系统内存", value: metricPercent(endpoint.memoryFraction), detail: memoryDetail, color: DesignTokens.memory)
+                    SpatialMetric(
+                        icon: "cpu",
+                        label: "CPU 压力",
+                        value: metricPercent(endpoint.cpuLoadFraction),
+                        detail: cpuDetail,
+                        fraction: endpoint.cpuLoadFraction,
+                        color: DesignTokens.cpu
+                    )
+                    SpatialMetric(
+                        icon: "memorychip",
+                        label: "内存压力",
+                        value: metricPercent(endpoint.memoryFraction),
+                        detail: memoryDetail,
+                        fraction: endpoint.memoryFraction,
+                        color: DesignTokens.memory
+                    )
                     SpatialMetric(
                         icon: "square.stack.3d.up.fill",
-                        label: "GPU",
-                        value: gpus.isEmpty ? "0 块" : "\(availableCount) / \(gpus.count)",
+                        label: "GPU 压力",
+                        value: metricPercent(endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus)),
                         detail: gpuMetricDetail,
+                        fraction: endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus),
                         color: DesignTokens.gpu
                     )
                 }
@@ -1296,6 +1890,8 @@ private struct SpatialServerDetail: View {
                 if !gpus.isEmpty {
                     ServerLeaseSummary(gpus: gpus)
                 }
+
+                EndpointTelemetryHistoryPanel(store: store, endpoint: endpoint)
             }
             .padding(26)
             .padding(.bottom, 70)
@@ -1312,6 +1908,10 @@ private struct SpatialServerDetail: View {
                 Text(endpoint.monitorLabel)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DesignTokens.mutedInk)
+                Text(telemetryIsFresh ? freshnessDetail : "快照过期 · 不可分配")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(telemetryIsFresh ? DesignTokens.mutedInk : DesignTokens.danger)
+                    .lineLimit(1)
             }
             Text(endpoint.sshCommand)
                 .font(.system(size: 19, weight: .semibold, design: .monospaced))
@@ -1361,8 +1961,10 @@ private struct SpatialServerDetail: View {
 
     private var gpuMetricDetail: String? {
         if gpus.isEmpty { return "未检测到 GPU" }
-        guard let gpuMemoryDetail else { return "显存等待数据" }
-        return "显存 \(gpuMemoryDetail)"
+        guard telemetryIsFresh else { return "可用性未确认" }
+        let availability = "可用 \(availableCount) / \(gpus.count)"
+        guard let gpuMemoryDetail else { return "\(availability) · 显存等待数据" }
+        return "\(availability) · 显存 \(gpuMemoryDetail)"
     }
 
     private var cpuDetail: String? {
@@ -1373,6 +1975,11 @@ private struct SpatialServerDetail: View {
     private var memoryDetail: String? {
         guard let total = endpoint.memoryTotalMiB, let available = endpoint.memoryAvailableMiB else { return nil }
         return "可用 \(available / 1024) / \(total / 1024) GB"
+    }
+
+    private var freshnessDetail: String {
+        guard let lastSuccess = endpoint.monitorLastSuccessAt else { return "等待遥测" }
+        return "更新 \(formattedTimestamp(lastSuccess))"
     }
 
     private func metricPercent(_ value: Double?) -> String {
@@ -1386,6 +1993,7 @@ private struct SpatialMetric: View {
     let label: String
     let value: String
     let detail: String?
+    let fraction: Double?
     let color: Color
 
     var body: some View {
@@ -1402,7 +2010,8 @@ private struct SpatialMetric: View {
                     .foregroundStyle(DesignTokens.mutedInk)
                 Text(value)
                     .font(.system(size: 18, weight: .bold, design: .rounded))
-                    .foregroundStyle(DesignTokens.ink)
+                    .foregroundStyle(fraction == nil ? DesignTokens.ink : pressureColor(fraction))
+                PressureMeter(fraction: fraction, color: pressureColor(fraction))
                 Text(detail ?? "暂无数据")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(detail == nil ? DesignTokens.mutedInk.opacity(0.65) : color)
@@ -1417,6 +2026,617 @@ private struct SpatialMetric: View {
         .accessibilityLabel(label)
         .accessibilityValue("\(value)，\(detail ?? "暂无数据")")
     }
+}
+
+private struct EndpointTelemetryHistoryPanel: View {
+    @ObservedObject var store: BrokerStore
+    let endpoint: EndpointRecord
+    @State private var range: EndpointTelemetryRange = .oneHour
+
+    private var history: EndpointTelemetryHistory? {
+        store.endpointTelemetryHistory(endpointID: endpoint.id, range: range)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("资源历史")
+                    .font(.system(size: 16, weight: .semibold))
+                Text("独立可选能力")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                Spacer()
+                Picker("时间范围", selection: $range) {
+                    Text("1h").tag(EndpointTelemetryRange.oneHour)
+                    Text("6h").tag(EndpointTelemetryRange.sixHours)
+                    Text("24h").tag(EndpointTelemetryRange.twentyFourHours)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 148)
+                .accessibilityLabel("资源历史时间范围")
+            }
+
+            if !store.supportsEndpointTelemetryHistory {
+                DetailCallout(
+                    icon: "chart.line.uptrend.xyaxis",
+                    color: DesignTokens.warning,
+                    message: "当前服务没有声明 endpoint telemetry history capability；首屏资源状态仍只使用当前快照。"
+                )
+            } else if store.endpointTelemetryHistoryLoading.contains(endpoint.id) {
+                Label("正在读取 \(range.rawValue) 历史", systemImage: "arrow.clockwise")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .background(DesignTokens.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+            } else if let error = store.endpointTelemetryHistoryErrors[endpoint.id] {
+                DetailCallout(icon: "exclamationmark.triangle.fill", color: DesignTokens.danger, message: error)
+            } else if let history, !history.samples.isEmpty {
+                if history.endpointID == endpoint.id {
+                    EndpointTelemetryHistoryChart(history: history).equatable()
+                } else {
+                    DetailCallout(
+                        icon: "exclamationmark.shield.fill",
+                        color: DesignTokens.danger,
+                        message: "返回的历史端点标识与当前端点不一致，已拒绝显示该趋势。"
+                    )
+                }
+            } else {
+                DetailCallout(icon: "clock", color: DesignTokens.mutedInk, message: "此范围内没有历史样本。")
+            }
+        }
+        // History persists at a 60-second cadence. Refresh only while this
+        // selected detail is visible, so the overview never fans out into one
+        // request per endpoint and hidden charts cannot become a render driver.
+        .task(id: "\(endpoint.id):\(range.rawValue)") {
+            requestIfSupported()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                guard !Task.isCancelled else { return }
+                requestIfSupported()
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("资源历史")
+    }
+
+    private func requestIfSupported() {
+        guard store.supportsEndpointTelemetryHistory else { return }
+        store.requestEndpointTelemetryHistory(endpointID: endpoint.id, range: range)
+    }
+}
+
+private struct EndpointTelemetryHistoryChart: View, Equatable {
+    let history: EndpointTelemetryHistory
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.history == rhs.history }
+
+    var body: some View {
+        let prepared = EndpointTelemetryPreparedHistory(history: history)
+        VStack(alignment: .leading, spacing: 10) {
+            EndpointTelemetryHistoryContext(prepared: prepared)
+            if prepared.hostSamples.isEmpty {
+                Label(
+                    "历史响应中没有可验证时间、状态和指标的样本，因此没有绘制趋势。",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(DesignTokens.warning)
+                .frame(maxWidth: .infinity, minHeight: 112, alignment: .leading)
+            } else {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 320), spacing: 10)],
+                    alignment: .leading,
+                    spacing: 10
+                ) {
+                    EndpointTelemetryMetricChart(
+                        title: "CPU 占用",
+                        subtitle: "主机 CPU 使用率",
+                        series: prepared.cpuSeries,
+                        hoverItems: prepared.cpuHoverItems,
+                        emptyMessage: "没有可验证的 CPU 历史样本。"
+                    )
+                    EndpointTelemetryMetricChart(
+                        title: "内存占用",
+                        subtitle: "主机已用内存比例",
+                        series: prepared.memorySeries,
+                        hoverItems: prepared.memoryHoverItems,
+                        emptyMessage: "没有可验证的内存历史样本。"
+                    )
+                    EndpointTelemetryMetricChart(
+                        title: "GPU 利用率",
+                        subtitle: prepared.gpuSeries.isEmpty ? "此端点没有 GPU 历史" : "每条线对应一张 GPU",
+                        series: prepared.gpuUtilizationSeries,
+                        hoverItems: prepared.gpuUtilizationHoverItems,
+                        emptyMessage: prepared.gpuSeries.isEmpty ? "此端点未检测到 NVIDIA GPU。" : "没有可验证的 GPU 利用率样本。"
+                    )
+                    EndpointTelemetryMetricChart(
+                        title: "GPU 显存占用",
+                        subtitle: prepared.gpuSeries.isEmpty ? "此端点没有 GPU 历史" : "每条线对应一张 GPU",
+                        series: prepared.gpuMemorySeries,
+                        hoverItems: prepared.gpuMemoryHoverItems,
+                        emptyMessage: prepared.gpuSeries.isEmpty ? "此端点未检测到 NVIDIA GPU。" : "没有可验证的 GPU 显存样本。"
+                    )
+                }
+            }
+        }
+        .padding(12)
+        .background(DesignTokens.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("端点资源历史")
+        .accessibilityValue(prepared.accessibilityValue)
+    }
+}
+
+private struct EndpointTelemetryHistoryContext: View {
+    let prepared: EndpointTelemetryPreparedHistory
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label(prepared.lastObservationLabel, systemImage: "clock.arrow.circlepath")
+                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                .foregroundStyle(DesignTokens.ink)
+            Text(prepared.freshnessAndTrustLabel)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private struct EndpointTelemetryMetricChart: View, Equatable {
+    let title: String
+    let subtitle: String
+    let series: [EndpointTelemetryLineSeries]
+    let hoverItems: [EndpointTelemetryHoverItem]
+    let emptyMessage: String
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.title == rhs.title
+            && lhs.subtitle == rhs.subtitle
+            && lhs.series == rhs.series
+            && lhs.hoverItems == rhs.hoverItems
+            && lhs.emptyMessage == rhs.emptyMessage
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Text(subtitle)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Text("\(series.count) 条")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(DesignTokens.mutedInk)
+            }
+
+            if series.allSatisfy({ $0.points.isEmpty }) {
+                Label(emptyMessage, systemImage: "chart.line.flattrend.xyaxis")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .frame(maxWidth: .infinity, minHeight: 154, alignment: .leading)
+            } else {
+#if canImport(Charts)
+                chart
+#else
+                Text("当前系统没有 Swift Charts，使用文本降级。")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .frame(maxWidth: .infinity, minHeight: 154, alignment: .leading)
+#endif
+            }
+
+            if series.count > 1 { legend }
+        }
+        .padding(10)
+        .background(DesignTokens.glassSmoke.opacity(0.58), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 0.8))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(title)
+        .accessibilityValue("\(subtitle)，\(series.count) 条序列，\(hoverItems.count) 个已验证时间点。")
+    }
+
+    private var legend: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 58), spacing: 5)], alignment: .leading, spacing: 3) {
+            ForEach(series) { line in
+                HStack(spacing: 3) {
+                    Circle().fill(line.color).frame(width: 6, height: 6)
+                    Text(line.label).lineLimit(1)
+                }
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(DesignTokens.mutedInk)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+#if canImport(Charts)
+    private var chart: some View {
+        Chart {
+            ForEach(series) { line in
+                ForEach(line.points) { point in
+                    LineMark(
+                        x: .value("观测时间", point.timestamp),
+                        y: .value("使用率", point.value),
+                        series: .value("连续片段", point.segmentID)
+                    )
+                    .foregroundStyle(line.color)
+                    .interpolationMethod(.linear)
+                    .lineStyle(StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
+                }
+            }
+        }
+        .chartYScale(domain: 0...1)
+        .chartXAxis {
+            AxisMarks(values: .automatic(desiredCount: 3)) { _ in
+                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5)).foregroundStyle(DesignTokens.surfaceStroke)
+                AxisTick()
+                AxisValueLabel(format: .dateTime.hour().minute())
+            }
+        }
+        .chartYAxis {
+            AxisMarks(position: .leading, values: [0, 0.5, 1]) { value in
+                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5)).foregroundStyle(DesignTokens.surfaceStroke)
+                AxisTick()
+                AxisValueLabel {
+                    if let fraction = value.as(Double.self) { Text(historyPercent(fraction)) }
+                }
+            }
+        }
+        .chartOverlay { proxy in
+            EndpointTelemetryChartHoverOverlay(proxy: proxy, items: hoverItems)
+        }
+        .frame(height: 154)
+        .accessibilityElement(children: .ignore)
+        .accessibilityHint("将指针悬停在图表上可检查最近的观测样本。")
+    }
+#endif
+}
+
+#if canImport(Charts)
+private struct EndpointTelemetryChartHoverOverlay: View {
+    let proxy: ChartProxy
+    let items: [EndpointTelemetryHoverItem]
+    @State private var selectedIndex: Int?
+
+    var body: some View {
+        GeometryReader { geometry in
+            if let anchor = proxy.plotFrame {
+                let frame = geometry[anchor]
+                Rectangle()
+                    .fill(.clear)
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let location):
+                            let x = location.x - frame.origin.x
+                            guard x >= 0, x <= frame.width, let date = proxy.value(atX: x, as: Date.self) else { return }
+                            updateSelection(for: date)
+                        case .ended:
+                            updateSelection(to: nil)
+                        }
+                    }
+                    .overlay {
+                        if let selected = selectedItem, let position = proxy.position(forX: selected.timestamp) {
+                            let x = frame.minX + position
+                            Path { path in
+                                path.move(to: CGPoint(x: x, y: frame.minY))
+                                path.addLine(to: CGPoint(x: x, y: frame.maxY))
+                            }
+                            .stroke(DesignTokens.ink.opacity(0.55), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                            .allowsHitTesting(false)
+                            Text("\(historyDateTime(selected.timestamp))  \(selected.summary)")
+                                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(DesignTokens.ink)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 3)
+                                .background(DesignTokens.surface.opacity(0.96), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 0.8))
+                                .position(x: min(max(frame.minX + 80, x), frame.maxX - 80), y: frame.minY + 11)
+                                .allowsHitTesting(false)
+                        }
+                    }
+            } else {
+                Color.clear
+            }
+        }
+    }
+
+    private var selectedItem: EndpointTelemetryHoverItem? {
+        guard let selectedIndex, items.indices.contains(selectedIndex) else { return nil }
+        return items[selectedIndex]
+    }
+
+    private func updateSelection(for date: Date) {
+        guard !items.isEmpty else { return }
+        var lowerBound = 0
+        var upperBound = items.count
+        while lowerBound < upperBound {
+            let middle = (lowerBound + upperBound) / 2
+            if items[middle].timestamp < date { lowerBound = middle + 1 } else { upperBound = middle }
+        }
+        let candidate: Int
+        if lowerBound == 0 {
+            candidate = 0
+        } else if lowerBound == items.count {
+            candidate = items.count - 1
+        } else {
+            let earlier = items[lowerBound - 1]
+            let later = items[lowerBound]
+            candidate = abs(earlier.timestamp.timeIntervalSince(date)) <= abs(later.timestamp.timeIntervalSince(date))
+                ? lowerBound - 1 : lowerBound
+        }
+        updateSelection(to: candidate)
+    }
+
+    private func updateSelection(to index: Int?) {
+        guard selectedIndex != index else { return }
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) { selectedIndex = index }
+    }
+}
+#endif
+
+private struct EndpointTelemetryPreparedHistory: Equatable {
+    let range: EndpointTelemetryRange
+    let hostSamples: [EndpointTelemetryPreparedHostSample]
+    let gpuSeries: [EndpointTelemetryPreparedGPUSeries]
+    let cpuSeries: [EndpointTelemetryLineSeries]
+    let memorySeries: [EndpointTelemetryLineSeries]
+    let gpuUtilizationSeries: [EndpointTelemetryLineSeries]
+    let gpuMemorySeries: [EndpointTelemetryLineSeries]
+    let cpuHoverItems: [EndpointTelemetryHoverItem]
+    let memoryHoverItems: [EndpointTelemetryHoverItem]
+    let gpuUtilizationHoverItems: [EndpointTelemetryHoverItem]
+    let gpuMemoryHoverItems: [EndpointTelemetryHoverItem]
+    let rejectedHostSampleCount: Int
+    let generatedAt: Date?
+    let hostSamplingGapCount: Int
+
+    init(history: EndpointTelemetryHistory) {
+        range = history.range
+        generatedAt = history.generatedAt.flatMap(endpointTelemetryHistoryDate)
+        var seenHostIDs = Set<String>()
+        let decodedHost = history.samples.compactMap(EndpointTelemetryPreparedHostSample.init).sorted { $0.timestamp < $1.timestamp }
+        hostSamples = decodedHost.filter { seenHostIDs.insert($0.id).inserted }
+        rejectedHostSampleCount = history.samples.count - hostSamples.count
+        hostSamplingGapCount = EndpointTelemetryPreparedHistory.gapCount(in: hostSamples.map(\.timestamp))
+
+        cpuSeries = [EndpointTelemetryPreparedHistory.lineSeries(
+            id: "cpu", label: "CPU", color: DesignTokens.cpu,
+            samples: hostSamples.map { ($0.timestamp, $0.cpuFraction) }
+        )]
+        memorySeries = [EndpointTelemetryPreparedHistory.lineSeries(
+            id: "memory", label: "内存", color: DesignTokens.memory,
+            samples: hostSamples.map { ($0.timestamp, $0.memoryFraction) }
+        )]
+        cpuHoverItems = hostSamples.map { EndpointTelemetryHoverItem(timestamp: $0.timestamp, summary: "CPU \(historyPercent($0.cpuFraction))") }
+        memoryHoverItems = hostSamples.map { EndpointTelemetryHoverItem(timestamp: $0.timestamp, summary: "内存 \(historyPercent($0.memoryFraction))") }
+
+        gpuSeries = history.gpuSeries.map(EndpointTelemetryPreparedGPUSeries.init).sorted { $0.index < $1.index }
+        gpuUtilizationSeries = gpuSeries.enumerated().map { offset, gpu in
+            EndpointTelemetryPreparedHistory.lineSeries(
+                id: gpu.id, label: gpu.label, color: EndpointTelemetryPreparedHistory.gpuColor(offset),
+                samples: gpu.samples.map { ($0.timestamp, $0.gpuUtilizationFraction) }
+            )
+        }
+        gpuMemorySeries = gpuSeries.enumerated().map { offset, gpu in
+            EndpointTelemetryPreparedHistory.lineSeries(
+                id: "\(gpu.id)-memory", label: gpu.label, color: EndpointTelemetryPreparedHistory.gpuColor(offset),
+                samples: gpu.samples.map { ($0.timestamp, $0.memoryFraction) }
+            )
+        }
+        gpuUtilizationHoverItems = EndpointTelemetryPreparedHistory.hoverItems(
+            series: gpuUtilizationSeries,
+            prefix: "GPU 利用率"
+        )
+        gpuMemoryHoverItems = EndpointTelemetryPreparedHistory.hoverItems(
+            series: gpuMemorySeries,
+            prefix: "GPU 显存"
+        )
+    }
+
+    var lastObservationLabel: String {
+        guard let latest = hostSamples.last else { return "最后观测时间无法验证" }
+        return "最后观测 \(historyDateTime(latest.timestamp))"
+    }
+
+    var freshnessAndTrustLabel: String {
+        var contexts = [freshnessLabel]
+        if rejectedHostSampleCount > 0 { contexts.append("已省略 \(rejectedHostSampleCount) 个无法验证的主机样本。") }
+        if hostSamples.count < 3, hostSamples.count > 1 {
+            contexts.append("样本不足 3 个，未假设连续采样。")
+        } else if hostSamplingGapCount > 0 {
+            contexts.append("发现 \(hostSamplingGapCount) 段采样间隔，趋势已在间隔处断开。")
+        }
+        contexts.append("历史趋势只供检查；资源申请仍以当前快照和端点状态为准。")
+        return contexts.joined(separator: " ")
+    }
+
+    var accessibilityValue: String {
+        "范围 \(range.rawValue)，已验证主机样本 \(hostSamples.count) 个，GPU 序列 \(gpuSeries.count) 条。\(freshnessAndTrustLabel)"
+    }
+
+    private var freshnessLabel: String {
+        guard let generatedAt else { return "服务未提供历史响应生成时间，无法判定历史数据新鲜度。" }
+        guard let latest = hostSamples.last else { return "响应生成于 \(historyDateTime(generatedAt))，但没有可验证的观测样本。" }
+        let lag = generatedAt.timeIntervalSince(latest.timestamp)
+        guard lag >= 0 else { return "响应生成时间早于最后观测时间，无法判定历史数据新鲜度。" }
+        return "响应生成于 \(historyDateTime(generatedAt))；最后观测落后 \(historyElapsedDescription(lag))。"
+    }
+
+    private static func lineSeries(
+        id: String, label: String, color: Color, samples: [(Date, Double?)]
+    ) -> EndpointTelemetryLineSeries {
+        let threshold = gapThreshold(samples.map(\.0))
+        var points: [EndpointTelemetryChartPoint] = []
+        var segment = 0
+        var previousTimestamp: Date?
+        for (timestamp, value) in samples {
+            if let previousTimestamp, let threshold, timestamp.timeIntervalSince(previousTimestamp) > threshold { segment += 1 }
+            guard let value else {
+                segment += 1
+                previousTimestamp = timestamp
+                continue
+            }
+            points.append(EndpointTelemetryChartPoint(
+                id: "\(id)-\(timestamp.timeIntervalSince1970)-\(segment)", timestamp: timestamp, value: value, segmentID: "\(id)-\(segment)"
+            ))
+            previousTimestamp = timestamp
+        }
+        return EndpointTelemetryLineSeries(id: id, label: label, color: color, points: points)
+    }
+
+    private static func hoverItems(series: [EndpointTelemetryLineSeries], prefix: String) -> [EndpointTelemetryHoverItem] {
+        var values = [Date: [String]]()
+        for line in series {
+            for point in line.points {
+                values[point.timestamp, default: []].append("\(line.label) \(historyPercent(point.value))")
+            }
+        }
+        return values.map { timestamp, labels in
+            EndpointTelemetryHoverItem(timestamp: timestamp, summary: "\(prefix)：\(labels.joined(separator: " · "))")
+        }.sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private static func gapCount(in timestamps: [Date]) -> Int {
+        guard let threshold = gapThreshold(timestamps) else { return 0 }
+        return zip(timestamps, timestamps.dropFirst()).filter { $1.timeIntervalSince($0) > threshold }.count
+    }
+
+    private static func gapThreshold(_ timestamps: [Date]) -> TimeInterval? {
+        let intervals = zip(timestamps, timestamps.dropFirst()).map { $1.timeIntervalSince($0) }.filter { $0 > 0 }
+        guard intervals.count >= 2 else { return nil }
+        let sorted = intervals.sorted()
+        let middle = sorted.count / 2
+        let median = sorted.count.isMultiple(of: 2) ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle]
+        return median * 2.5
+    }
+
+    private static func gpuColor(_ index: Int) -> Color {
+        let colors: [Color] = [DesignTokens.gpu, DesignTokens.cpu, DesignTokens.memory, DesignTokens.warning, .pink, .teal, .indigo, .brown]
+        return colors[index % colors.count]
+    }
+}
+
+private struct EndpointTelemetryPreparedHostSample: Identifiable, Equatable {
+    let id: String
+    let timestamp: Date
+    let cpuFraction: Double?
+    let memoryFraction: Double?
+
+    init?(_ sample: EndpointTelemetrySample) {
+        guard let timestamp = endpointTelemetryHistoryDate(sample.timestamp), sample.status.map({ ["ONLINE", "OK"].contains($0) }) ?? true else { return nil }
+        let cpu = sample.cpuLoadFraction.flatMap(endpointTelemetryHistoryFraction)
+        let memory = sample.memoryFraction.flatMap(endpointTelemetryHistoryFraction)
+        guard cpu != nil || memory != nil else { return nil }
+        id = sample.timestamp
+        self.timestamp = timestamp
+        cpuFraction = cpu
+        memoryFraction = memory
+    }
+}
+
+private struct EndpointTelemetryPreparedGPUSeries: Identifiable, Equatable {
+    let id: String
+    let index: Int
+    let label: String
+    let samples: [EndpointTelemetryPreparedGPUSample]
+
+    init(_ series: EndpointGPUHistorySeries) {
+        let samples = series.samples.compactMap(EndpointTelemetryPreparedGPUSample.init).sorted { $0.timestamp < $1.timestamp }
+        id = series.id
+        index = series.index
+        label = series.label
+        self.samples = samples
+    }
+}
+
+private struct EndpointTelemetryPreparedGPUSample: Identifiable, Equatable {
+    let id: String
+    let timestamp: Date
+    let gpuUtilizationFraction: Double?
+    let memoryFraction: Double?
+
+    init?(_ sample: EndpointGPUHistorySample) {
+        guard let timestamp = endpointTelemetryHistoryDate(sample.timestamp) else { return nil }
+        let gpu = sample.gpuUtilizationFraction.flatMap(endpointTelemetryHistoryFraction)
+        let memory = sample.memoryFraction.flatMap(endpointTelemetryHistoryFraction)
+        guard gpu != nil || memory != nil else { return nil }
+        id = sample.timestamp
+        self.timestamp = timestamp
+        gpuUtilizationFraction = gpu
+        memoryFraction = memory
+    }
+}
+
+private struct EndpointTelemetryLineSeries: Identifiable, Equatable {
+    let id: String
+    let label: String
+    let color: Color
+    let points: [EndpointTelemetryChartPoint]
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.label == rhs.label && lhs.points == rhs.points
+    }
+}
+
+private struct EndpointTelemetryChartPoint: Identifiable, Equatable {
+    let id: String
+    let timestamp: Date
+    let value: Double
+    let segmentID: String
+}
+
+private struct EndpointTelemetryHoverItem: Identifiable, Equatable {
+    var id: Date { timestamp }
+    let timestamp: Date
+    let summary: String
+}
+
+private func endpointTelemetryHistoryDate(_ value: String) -> Date? {
+    EndpointTelemetryHistoryDateParser.fractional.date(from: value)
+        ?? EndpointTelemetryHistoryDateParser.standard.date(from: value)
+}
+
+private enum EndpointTelemetryHistoryDateParser {
+    static let fractional: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    static let standard = ISO8601DateFormatter()
+}
+
+private func endpointTelemetryHistoryFraction(_ value: Double) -> Double? {
+    guard value.isFinite, (0...1).contains(value) else { return nil }
+    return value
+}
+
+private func historyPercent(_ value: Double?) -> String {
+    guard let value else { return "—" }
+    return "\(Int((value * 100).rounded()))%"
+}
+
+private func historyDateTime(_ value: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.dateFormat = "M 月 d 日 HH:mm:ss"
+    return formatter.string(from: value)
+}
+
+private func historyElapsedDescription(_ value: TimeInterval) -> String {
+    let seconds = max(0, Int(value.rounded()))
+    if seconds < 60 { return "\(seconds) 秒" }
+    if seconds < 3_600 { return "\(seconds / 60) 分钟" }
+    return "\(seconds / 3_600) 小时 \((seconds % 3_600) / 60) 分钟"
 }
 
 private struct SpatialGPUCell: View {
@@ -1714,8 +2934,60 @@ private func percentageLabel(_ value: Double?) -> String {
     value.map { "\(Int(($0 * 100).rounded()))%" } ?? "—"
 }
 
+private let endpointHighPressureThreshold = 0.85
+
+private func endpointPressureFraction(endpoint: EndpointRecord, gpus: [GPURecord]) -> Double? {
+    [
+        endpoint.cpuLoadFraction,
+        endpoint.memoryFraction,
+        endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus)
+    ]
+    .compactMap { $0 }
+    .max()
+}
+
+private func endpointHighPressure(endpoint: EndpointRecord, gpus: [GPURecord]) -> Bool {
+    guard let pressure = endpointPressureFraction(endpoint: endpoint, gpus: gpus) else { return false }
+    return pressure >= endpointHighPressureThreshold
+}
+
+private func endpointRequiresAttention(endpoint: EndpointRecord, gpus: [GPURecord]) -> Bool {
+    endpointNeedsAttention(endpoint)
+        || gpus.contains(where: gpuNeedsAttention)
+        || endpointHighPressure(endpoint: endpoint, gpus: gpus)
+}
+
+private func pressureColor(_ fraction: Double?) -> Color {
+    guard let fraction else { return DesignTokens.mutedInk }
+    switch fraction {
+    case ..<0.70: return DesignTokens.success
+    case ..<0.90: return DesignTokens.warning
+    default: return DesignTokens.danger
+    }
+}
+
 private func isGPUClaimed(_ gpu: GPURecord) -> Bool {
     return ["HELD", "LEASED_IDLE", "RUNNING_MANAGED", "ORPHANED_BUSY", "CONFLICT", "RESERVED"].contains(gpu.state)
+}
+
+private func endpointNeedsAttention(_ endpoint: EndpointRecord) -> Bool {
+    ["ERROR", "STALE", "DISABLED", "DRAINING", "RETIRED"].contains(endpoint.monitorStatus)
+        || !endpoint.enabled
+}
+
+private func gpuNeedsAttention(_ gpu: GPURecord) -> Bool {
+    [
+        "BUSY_UNMANAGED",
+        "UNKNOWN_RECOVERING",
+        "UNKNOWN_STALE",
+        "UNHEALTHY",
+        "CONFLICT",
+        "ORPHANED_BUSY",
+        "DISABLED",
+        "DRAINING",
+        "RETIRED",
+        "MAINTENANCE"
+    ].contains(gpu.state)
 }
 
 private func gpuStateColor(_ state: String) -> Color {
@@ -1800,6 +3072,17 @@ private func formattedTimestamp(_ value: String?) -> String {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "zh_CN")
     formatter.dateFormat = "M 月 d 日 HH:mm"
+    return formatter.string(from: date)
+}
+
+private func historyTimestamp(_ value: String) -> String {
+    let parser = ISO8601DateFormatter()
+    parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date = parser.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+    guard let date else { return value }
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.dateFormat = "HH:mm"
     return formatter.string(from: date)
 }
 

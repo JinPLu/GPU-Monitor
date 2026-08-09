@@ -1,0 +1,49 @@
+{
+  "schema_version": "v1",
+  "snapshot_revision": 101,
+  "server_time": "2026-08-01T00:00:00Z",
+  "data": {
+    "summary": {
+      "online_servers": 1,
+      "total_servers": 1,
+      "total_gpus": 1,
+      "available_gpus": 1,
+      "busy_gpus": 0,
+      "claimed_gpus": 0,
+      "abnormal_gpus": 0
+    },
+    "data_age_seconds": 2,
+    "freshness_seconds": 30,
+    "admission_boundary": "Fixture: allocation only.",
+    "endpoints": [
+      {
+        "id": "fixture-1",
+        "host": "127.0.0.1",
+        "port": 2221,
+        "ssh_user": "gpu",
+        "labels": {"fixture": "true"},
+        "lifecycle_state": "active",
+        "enabled": true,
+        "monitor": {"status": "ONLINE"}
+      }
+    ],
+    "gpus": [
+      {
+        "id": "fixture-1:GPU-fixture-1-00-UUID",
+        "endpoint_id": "fixture-1",
+        "gpu_uuid": "GPU-fixture-1-00-UUID",
+        "gpu_index": 0,
+        "name": "Fixture GPU",
+        "total_vram_mib": 81920,
+        "labels": {"fixture": "true"},
+        "health": "OK",
+        "enabled": true,
+        "state": "AVAILABLE",
+        "processes": []
+      }
+    ],
+    "leases": [],
+    "requests": [],
+    "reservations": []
+  }
+}

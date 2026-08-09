@@ -71,6 +71,14 @@ def test_host_capacity_claim_allocates_without_gpu_and_releases(service, admin) 
     current = service.control_plane_state(admin)["data"]["current"]
     monitor = service.resource_monitor(admin)["data"]
     assert current["host_capacity"] == monitor["host_capacity"]
+    projection = current["resource_projection"]
+    assert projection["capacity"]["cpu_cores"] == 64.0
+    assert projection["used"]["cpu_cores"] == 4.0
+    assert projection["claimed"]["cpu_cores"] == 8.0
+    assert projection["available"]["cpu_cores"] == 52.0
+    assert projection["semantics"]["available_is_authoritative"] is True
+    assert projection["semantics"]["used_and_claimed_may_overlap"] is True
+    assert "BUSY_UNMANAGED" in projection["semantics"]["fail_closed_states"]
     assert [
         allocation
         for claim in current["resource_claims"]

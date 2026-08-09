@@ -33,6 +33,7 @@ private struct ResourceUsageBucket {
     var claims: [ResourceClaimRecord] = []
     var leases: [LeaseRecord] = []
     var requests: [AllocationRequestRecord] = []
+    var reservations: [ReservationRecord] = []
     var actuals: [ResourceRunActualRecord] = []
 }
 
@@ -46,6 +47,7 @@ private struct ResourceUsageGroup: Identifiable {
     let claims: [ResourceClaimRecord]
     let leases: [LeaseRecord]
     let requests: [AllocationRequestRecord]
+    let reservations: [ReservationRecord]
     let actuals: [ResourceRunActualRecord]
 
     private let assignedClaimStates = Set(["HELD", "ACTIVE"])
@@ -120,7 +122,7 @@ private struct ResourceUsageGroup: Identifiable {
     }
 
     var activityCount: Int {
-        claims.count + leases.count + visibleLegacyRequests.count + actuals.count
+        claims.count + leases.count + visibleLegacyRequests.count + reservations.count + actuals.count
     }
 
     var hasPendingWork: Bool {
@@ -221,6 +223,7 @@ private struct ResourceUsageProjection {
 struct ResourceUsageDashboard: View {
     @ObservedObject var store: BrokerStore
     @State private var scope: ResourceUsageScope = .project
+    @State private var projection: ResourceUsageProjection
     @State private var selectedGroupID = ""
     @State private var inlineMessage: String?
 
@@ -235,14 +238,13 @@ struct ResourceUsageDashboard: View {
         default: initialScope = .project
         }
         _scope = State(initialValue: initialScope)
+#else
+        let initialScope: ResourceUsageScope = .project
 #endif
+        _projection = State(initialValue: ResourceUsageProjection(snapshot: store.snapshot, scope: initialScope))
     }
 
     private var snapshot: BrokerSnapshot { store.snapshot }
-
-    private var projection: ResourceUsageProjection {
-        ResourceUsageProjection(snapshot: snapshot, scope: scope)
-    }
 
     private var groups: [ResourceUsageGroup] {
         projection.groups(for: scope)
@@ -306,20 +308,23 @@ struct ResourceUsageDashboard: View {
             }
         }
         .background(DesignTokens.surface)
-        .onAppear { ensureSelectedGroup() }
-        .onChange(of: scope) { _, _ in ensureSelectedGroup(reset: true) }
-        .onChange(of: store.snapshot.snapshotRevision) { _, _ in ensureSelectedGroup() }
-        .accessibilityLabel("项目与 Agent")
+        .onAppear { updateProjection() }
+        .onChange(of: scope) { _, _ in updateProjection(resetSelection: true) }
+        .onChange(of: store.snapshot.snapshotRevision) { _, _ in updateProjection() }
+        .accessibilityLabel("归属与安排")
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("项目与 Agent")
+                    Text("归属与安排")
                         .font(.system(size: 22, weight: .semibold))
                         .foregroundStyle(DesignTokens.ink)
-                    Text("按项目、Agent 或任务查看资源分配、运行和排队状态")
+                    Text("项目与 Agent")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                    Text("按项目、Agent 或任务查看归属与安排租约、申请和预约")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                 }
@@ -360,7 +365,7 @@ struct ResourceUsageDashboard: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .padding(14)
-            .accessibilityLabel("按项目、Agent 或任务查看")
+            .accessibilityLabel("按项目、Agent 或任务查看归属与安排")
 
             HStack {
                 Text("\(scope.label)列表")
@@ -399,6 +404,11 @@ struct ResourceUsageDashboard: View {
             selectedGroupID = groups.first?.id ?? ""
             inlineMessage = nil
         }
+    }
+
+    private func updateProjection(resetSelection: Bool = false) {
+        projection = ResourceUsageProjection(snapshot: store.snapshot, scope: scope)
+        ensureSelectedGroup(reset: resetSelection)
     }
 
     private func release(_ lease: LeaseRecord) {
@@ -621,10 +631,10 @@ private struct ResourceUsageGroupDetail: View {
                     }
                 }
 
-                if !group.pendingClaims.isEmpty || !group.visibleLegacyRequests.isEmpty {
+                if !group.pendingClaims.isEmpty || !group.visibleLegacyRequests.isEmpty || !group.reservations.isEmpty {
                     ResourceUsageSectionTitle(
-                        title: "等待中的申请",
-                        detail: "\(group.pendingClaims.count + group.visibleLegacyRequests.count) 条"
+                        title: "申请与预约",
+                        detail: "\(group.pendingClaims.count + group.visibleLegacyRequests.count + group.reservations.count) 条"
                     )
                     VStack(spacing: 6) {
                         ForEach(group.pendingClaims) { claim in
@@ -632,6 +642,9 @@ private struct ResourceUsageGroupDetail: View {
                         }
                         ForEach(group.visibleLegacyRequests) { request in
                             ResourceRequestDetailRow(request: request)
+                        }
+                        ForEach(group.reservations) { reservation in
+                            ResourceReservationDetailRow(reservation: reservation)
                         }
                     }
                 }
@@ -847,6 +860,37 @@ private struct ResourceRequestDetailRow: View {
     }
 }
 
+private struct ResourceReservationDetailRow: View {
+    let reservation: ReservationRecord
+
+    var body: some View {
+        ResourceUsageRecordShell {
+            HStack(spacing: 10) {
+                ResourceRecordIcon(systemName: "calendar.badge.clock")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(reservation.purpose ?? "预约资源")
+                        .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(1)
+                    Text("\(reservation.projectID ?? "未标注项目") · \(reservation.actorID ?? "未标注 Agent") · \(usageTimestamp(reservation.startsAt))")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(DesignTokens.mutedInk)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 10)
+                Text("\(reservation.gpuIDs.count) GPU")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(DesignTokens.ink)
+                Text(reservation.stateLabel)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(DesignTokens.warning)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("预约 \(reservation.purpose ?? reservation.id)")
+        .accessibilityValue("\(reservation.gpuIDs.count) GPU，\(reservation.stateLabel)")
+    }
+}
+
 private struct ResourceActualDetailRow: View {
     let actual: ResourceRunActualRecord
 
@@ -930,6 +974,13 @@ private func resourceUsageIdentities(snapshot: BrokerSnapshot) -> [ResourceUsage
     identities.append(contentsOf: snapshot.requests.filter { !linkedRequestIDs.contains($0.id) }.map {
         ResourceUsageIdentity(projectID: $0.projectID, actorID: $0.actorID, taskReference: normalizedTask($0.taskReference))
     })
+    identities.append(contentsOf: snapshot.reservations.map {
+        ResourceUsageIdentity(
+            projectID: $0.projectID ?? "未标注项目",
+            actorID: $0.actorID ?? "未标注 Agent",
+            taskReference: normalizedTask($0.purpose)
+        )
+    })
     identities.append(contentsOf: snapshot.resourceRunActuals.map {
         ResourceUsageIdentity(projectID: $0.projectID, actorID: $0.actorID, taskReference: normalizedTask($0.taskReference))
     })
@@ -989,6 +1040,13 @@ private func makeResourceUsageGroups(snapshot: BrokerSnapshot, scope: ResourceUs
             taskReference: normalizedTask(request.taskReference)
         ) { $0.requests.append(request) }
     }
+    for reservation in snapshot.reservations {
+        add(
+            projectID: reservation.projectID ?? "未标注项目",
+            actorID: reservation.actorID ?? "未标注 Agent",
+            taskReference: normalizedTask(reservation.purpose)
+        ) { $0.reservations.append(reservation) }
+    }
     for actual in snapshot.resourceRunActuals {
         add(
             projectID: actual.projectID,
@@ -1008,6 +1066,7 @@ private func makeResourceUsageGroups(snapshot: BrokerSnapshot, scope: ResourceUs
             claims: bucket.claims.sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") },
             leases: bucket.leases.sorted { ($0.issuedAt ?? "") > ($1.issuedAt ?? "") },
             requests: bucket.requests.sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") },
+            reservations: bucket.reservations.sorted { ($0.startsAt ?? "") > ($1.startsAt ?? "") },
             actuals: bucket.actuals.sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
         )
     }

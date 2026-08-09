@@ -13,4 +13,5 @@ API_CAPABILITIES = (
     "external_slurm_scheduler",
     "general_resource_scheduler",
     "control_plane_state",
+    "endpoint_telemetry_history",
 )
