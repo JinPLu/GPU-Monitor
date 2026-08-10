@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/JinPLu/ServerPilot/releases/tag/v1.3.0"><img src="https://img.shields.io/badge/release-v1.3.0-0F766E" alt="ServerPilot v1.3.0"></a>
+  <a href="https://github.com/JinPLu/ServerPilot/releases/tag/v1.4.0"><img src="https://img.shields.io/badge/release-v1.4.0-0F766E" alt="ServerPilot v1.4.0"></a>
   <img src="https://img.shields.io/badge/Python-3.12%2B-2563EB?logo=python&logoColor=white" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/macOS-14%2B-111827?logo=apple&logoColor=white" alt="macOS 14+">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-334155" alt="MIT License"></a>

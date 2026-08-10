@@ -155,7 +155,7 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
     assert "gpu_grant_server_project" not in adapter
     assert "gpu_grant_server_project" not in mcp.instructions
     assert "approval_ref" in adapter
-    assert "approval_ref" not in mcp_instructions
+    assert "approval_ref" in mcp_instructions
 
 
 def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
@@ -196,7 +196,7 @@ def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
     ):
         assert runtime_detail in mcp_instructions
     assert "approval_ref" in global_policy
-    assert "approval_ref" not in mcp_instructions
+    assert "approval_ref" in mcp_instructions
     assert "gpu_scheduler_upload" not in global_policy
     assert "gpu_scheduler_upload" not in mcp_instructions
 

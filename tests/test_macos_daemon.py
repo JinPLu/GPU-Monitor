@@ -496,6 +496,30 @@ def test_macos_gui_defaults_to_low_composition_surfaces() -> None:
     assert "background(DesignTokens.surface, in: shape)" in surface_body
 
 
+def test_macos_resource_split_preserves_readable_endpoint_rows_when_narrow() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    split_source = (project_root / "desktop" / "ResizableSplitPane.swift").read_text(
+        encoding="utf-8"
+    )
+    dashboard_source = (project_root / "desktop" / "ServerPilot.swift").read_text(
+        encoding="utf-8"
+    )
+
+    assert "minimumMasterWidth: 400" in split_source
+    assert "minimumDetailWidth: 560" in split_source
+    assert "NSCursor.resizeLeftRight.push()" in split_source
+    assert "NSCursor.pop()" in split_source
+    assert 'accessibilityLabel("调整列表与详情宽度")' in split_source
+
+    endpoint_table_body = dashboard_source.split(
+        "private struct EndpointTableRow", maxsplit=1
+    )[1].split("private struct EndpointPressureCell", maxsplit=1)[0]
+    assert "ViewThatFits(in: .horizontal)" in endpoint_table_body
+    assert "compactRow" in endpoint_table_body
+    assert "LazyVGrid(" in endpoint_table_body
+    assert 'Text("端点与资源状态")' in dashboard_source
+
+
 def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry_claims() -> None:
     project_root = Path(__file__).resolve().parents[1]
     usage_source = (
@@ -509,7 +533,7 @@ def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry
     assert 'case "resource-usage", "leases": .leases' in window_source
     for scope in ("case project", "case agent", "case task"):
         assert scope in usage_source
-    for status_label in ('label: "已分配"', 'label: "运行中"', 'label: "申请中"'):
+    for status_label in ('label: "已申领，待使用"', 'label: "运行中"', 'label: "申请中"'):
         assert status_label in usage_source
     assert 'snapshot.resourceClaims.filter {' in usage_source
     assert '$0.runtimeState == "RUNNING" || $0.state == "RUNNING"' in usage_source

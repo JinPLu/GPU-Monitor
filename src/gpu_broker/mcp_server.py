@@ -48,8 +48,10 @@ MCP_INSTRUCTIONS = (
     "The low-level request, activate, release-lease, and bind-workload tools remain advanced "
     "compatibility tools; prefer the normal path. "
     "Endpoints are shared loopback inventory; project ownership is optional attribution. Authorized "
-    "actors may add them or retire them into draining; retirement prevents new placement and never "
-    "stops an existing workload. "
+    "actors may administer them only with a current-task approval_ref and caller-stable idempotency_key. "
+    "Pause moves active endpoints to draining, prevents new placement while collection and existing workloads continue; resume reverses a "
+    "pause, while explicit retirement requires the drained endpoint's active leases and pinned queue "
+    "requests to be clear. None of these operations stops an existing workload. "
     "External Slurm clusters are SchedulerTargets, never raw SSH endpoints. Use "
     "gpu_scheduler_targets and gpu_scheduler_access_status to discover a target, then use owner-scoped "
     "submit, status, and cancel operations. "
@@ -134,6 +136,13 @@ def _require_resource_plan_fields(evaluation: dict[str, Any]) -> None:
             )
         if not isinstance(candidate["quantities"], dict) or not _has_resource_quantity(candidate["quantities"]):
             raise ValueError(f"resource_evaluate_plan candidate {index} quantities must include a resource")
+
+
+def _require_endpoint_admin_contract(approval_ref: str, idempotency_key: str) -> None:
+    if not isinstance(approval_ref, str) or not approval_ref.strip():
+        raise ValueError("endpoint administration requires a non-empty current-task approval_ref")
+    if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+        raise ValueError("endpoint administration requires a caller-stable non-empty idempotency_key")
 
 
 def _bounded_seconds(value: float, *, name: str, minimum: float, maximum: float) -> float:
@@ -846,15 +855,23 @@ def gpu_add_server(
     agent_name: str,
     project_id: str,
     host: str,
+    approval_ref: str,
+    idempotency_key: str,
     port: int = 22,
     ssh_user: str = "root",
     server_id: str | None = None,
-    idempotency_key: str | None = None,
+    ssh_alias: str | None = None,
+    observation_profile: str = "server-script-v1",
+    labels: list[str] | None = None,
+    storage_group: str | None = None,
+    expected_gpu_count: int | None = None,
+    expected_gpu_total_vram_mib: int | None = None,
 ) -> dict[str, Any]:
-    """Add a shared endpoint with project attribution to read-only monitoring."""
+    """Create a shared endpoint after explicit current-task human approval."""
 
     if not project_id.strip():
         raise ValueError("project_id must not be empty")
+    _require_endpoint_admin_contract(approval_ref, idempotency_key)
     client = _client(agent_name)
     generated_id = "server-" + re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:96]
     generated_id = f"{generated_id}-p{port}"
@@ -865,10 +882,101 @@ def gpu_add_server(
             "host": host,
             "port": port,
             "ssh_user": ssh_user,
+            "ssh_alias": ssh_alias,
+            "observation_profile": observation_profile,
+            "labels": labels or [],
+            "storage_group": storage_group,
+            "expected_gpu_count": expected_gpu_count,
+            "expected_gpu_total_vram_mib": expected_gpu_total_vram_mib,
             "owner_project_id": project_id,
-            "enabled": True,
         },
-        idempotency_key=idempotency_key or secrets.token_hex(16),
+        idempotency_key=idempotency_key,
+    )
+
+
+@mcp.tool()
+def gpu_update_server(
+    agent_name: str,
+    server_id: str,
+    approval_ref: str,
+    idempotency_key: str,
+    ssh_user: str | None = None,
+    ssh_alias: str | None = None,
+    observation_profile: str | None = None,
+    labels: list[str] | None = None,
+    storage_group: str | None = None,
+    expected_gpu_count: int | None = None,
+    expected_gpu_total_vram_mib: int | None = None,
+    owner_project_id: str | None = None,
+) -> dict[str, Any]:
+    """Update safe endpoint metadata; endpoint id, host, and port are immutable."""
+
+    _require_endpoint_admin_contract(approval_ref, idempotency_key)
+    body = {
+        key: value
+        for key, value in {
+            "ssh_user": ssh_user,
+            "ssh_alias": ssh_alias,
+            "observation_profile": observation_profile,
+            "labels": labels,
+            "storage_group": storage_group,
+            "expected_gpu_count": expected_gpu_count,
+            "expected_gpu_total_vram_mib": expected_gpu_total_vram_mib,
+            "owner_project_id": owner_project_id,
+        }.items()
+        if value is not None
+    }
+    if not body:
+        raise ValueError("gpu_update_server requires at least one safe metadata field")
+    return _client(agent_name).patch(
+        f"/api/v1/endpoints/{server_id}",
+        body,
+        idempotency_key=idempotency_key,
+    )
+
+
+@mcp.tool()
+def gpu_pause_server(
+    agent_name: str,
+    server_id: str,
+    approval_ref: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Pause new placement (active -> draining) without stopping collection or workloads."""
+
+    _require_endpoint_admin_contract(approval_ref, idempotency_key)
+    return _client(agent_name).post(
+        f"/api/v1/endpoints/{server_id}/pause", {}, idempotency_key=idempotency_key
+    )
+
+
+@mcp.tool()
+def gpu_resume_server(
+    agent_name: str,
+    server_id: str,
+    approval_ref: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Resume a draining endpoint (draining -> active)."""
+
+    _require_endpoint_admin_contract(approval_ref, idempotency_key)
+    return _client(agent_name).post(
+        f"/api/v1/endpoints/{server_id}/resume", {}, idempotency_key=idempotency_key
+    )
+
+
+@mcp.tool()
+def gpu_retire_server(
+    agent_name: str,
+    server_id: str,
+    approval_ref: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    """Retire a drained endpoint only after active leases and pinned queue work are clear."""
+
+    _require_endpoint_admin_contract(approval_ref, idempotency_key)
+    return _client(agent_name).post(
+        f"/api/v1/endpoints/{server_id}/retire", {}, idempotency_key=idempotency_key
     )
 
 
@@ -876,13 +984,14 @@ def gpu_add_server(
 def gpu_delete_server(
     agent_name: str,
     server_id: str,
-    idempotency_key: str | None = None,
+    approval_ref: str,
+    idempotency_key: str,
 ) -> dict[str, Any]:
-    """Retire an endpoint into draining; this never stops a remote workload."""
+    """Deprecated compatibility alias for gpu_pause_server; it never retires an endpoint."""
 
-    return _client(agent_name).delete(
-        f"/api/v1/endpoints/{server_id}",
-        idempotency_key=idempotency_key or secrets.token_hex(16),
+    _require_endpoint_admin_contract(approval_ref, idempotency_key)
+    return _client(agent_name).post(
+        f"/api/v1/endpoints/{server_id}/pause", {}, idempotency_key=idempotency_key
     )
 
 

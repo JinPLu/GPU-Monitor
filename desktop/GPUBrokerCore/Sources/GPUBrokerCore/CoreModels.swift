@@ -23,15 +23,34 @@ public struct ServiceInfo: Equatable, Sendable {
     public static let fixture = ServiceInfo(
         schemaVersion: "v1",
         version: "fixture",
-        capabilities: ["instant_claims", "endpoint_deletion"]
+        capabilities: ["instant_claims", "endpoint_update", "endpoint_pause_resume", "endpoint_retirement"]
     )
 
     public var supportsEndpointDeletion: Bool {
         capabilities.contains("endpoint_deletion") || capabilities.contains("server_deletion")
     }
 
+    public var supportsEndpointUpdate: Bool {
+        supports("endpoint_update")
+    }
+
+    public var supportsEndpointPauseResume: Bool {
+        supports("endpoint_pause_resume")
+    }
+
+    public var supportsEndpointRetirement: Bool {
+        supports("endpoint_retirement")
+    }
+
     public var supportsEndpointTelemetryHistory: Bool {
         capabilities.contains("endpoint_telemetry_history") || capabilities.contains("telemetry_history")
+    }
+
+    /// Services predating capability advertisement are allowed to make the
+    /// request and return a compatibility error.  A service which explicitly
+    /// advertises capabilities is authoritative, so the UI can fail closed.
+    private func supports(_ capability: String) -> Bool {
+        capabilities.isEmpty || capabilities.contains(capability)
     }
 }
 
@@ -229,11 +248,12 @@ public struct ResourceProviderRecord: Identifiable, Equatable, Sendable {
         switch state {
         case "ONLINE", "READY", "AVAILABLE": return "可用"
         case "PENDING", "QUEUED", "SUBMITTED": return "等待外部系统确认"
-        case "ALLOCATED", "LEASED", "RUNNING": return "已分配"
+        case "ALLOCATED", "LEASED": return "已申领，待使用"
+        case "RUNNING": return "运行中"
         case "STALE": return "状态过期"
         case "ERROR", "CONFLICT": return "需要处理"
         case "DISABLED": return "已停用"
-        case "DRAINING": return "排空中"
+        case "DRAINING": return "已暂停（正在排空）"
         case "RETIRED": return "已退役"
         default: return state
         }
@@ -372,6 +392,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
     public let port: Int
     public let sshUser: String
     public let sshAlias: String?
+    public let observationProfile: String
     public let enabled: Bool
     public let lifecycleState: String?
     public let monitorStatus: String
@@ -392,10 +413,11 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         self.port = raw.int("port", default: 22)
         self.sshUser = sshUser
         self.sshAlias = raw.string("ssh_alias")
+        self.observationProfile = raw.string("observation_profile") ?? "linux-nvidia"
         self.enabled = raw.bool("enabled", default: true)
         self.lifecycleState = raw.string("lifecycle_state")?.uppercased()
         let monitor = raw["monitor"] as? [String: Any] ?? [:]
-        self.monitorStatus = monitor.string("status") ?? "PENDING"
+        self.monitorStatus = (monitor.string("status") ?? "PENDING").uppercased()
         self.monitorError = monitor.string("last_error")
         self.monitorLastSuccessAt = monitor.string("last_success_at")
         self.monitorLastAttemptAt = monitor.string("last_attempt_at")
@@ -426,7 +448,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         case "STALE": return "状态过期"
         case "ERROR": return "连接异常"
         case "DISABLED": return "已停用"
-        case "DRAINING": return "排空中"
+        case "DRAINING": return "已暂停（正在排空）"
         case "RETIRED": return "已退役"
         default: return monitorStatus
         }
@@ -456,7 +478,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
             return "上次尝试连接：\(monitorLastAttemptAt)"
         }
         if lifecycleState == "DRAINING" || monitorStatus == "DRAINING" {
-            return "这台服务器正在排空，不再接收新的分配。"
+            return "这台服务器已暂停接收新任务，正在排空；不会停止远端任务。"
         }
         if lifecycleState == "RETIRED" || monitorStatus == "RETIRED" {
             return "这台服务器已退役，仅保留历史状态。"
@@ -1032,7 +1054,7 @@ public struct ResourceClaimRecord: Identifiable, Equatable, Sendable {
         case "QUEUED": return "排队中"
         case "PENDING_APPROVAL": return "等待批准"
         case "BLOCKED": return "等待资源"
-        case "HELD", "ACTIVE": return "已分配"
+        case "HELD", "ACTIVE": return "已申领，待使用"
         case "RUNNING": return "运行中"
         case "REJECTED": return "已拒绝"
         case "RELEASED": return "已释放"
@@ -1214,8 +1236,7 @@ public struct LeaseRecord: Identifiable, Equatable, Sendable {
 
     public var stateLabel: String {
         switch state {
-        case "ACTIVE": return "使用中"
-        case "HELD": return "已保留"
+        case "ACTIVE", "HELD": return "已申领，待使用"
         case "CONFLICT": return "需要处理"
         case "ORPHANED_BUSY": return "释放后仍占用"
         case "RELEASED": return "已释放"
@@ -1250,7 +1271,7 @@ public struct AllocationRequestRecord: Identifiable, Equatable, Sendable {
         self.projectID = projectID
         self.taskReference = taskReference
         self.purpose = raw.string("purpose") ?? ""
-        self.state = raw.string("state") ?? "UNKNOWN"
+        self.state = (raw.string("state") ?? "UNKNOWN").uppercased()
         self.blockedReason = raw.string("blocked_reason")
         self.gpuCount = (raw["constraints"] as? [String: Any])?.int("gpu_count", default: 1) ?? 1
         self.createdAt = raw.string("created_at")
@@ -1260,7 +1281,7 @@ public struct AllocationRequestRecord: Identifiable, Equatable, Sendable {
         switch state {
         case "QUEUED": return "排队中"
         case "PENDING_APPROVAL": return "等待批准"
-        case "ACTIVE": return "已分配"
+        case "ACTIVE": return "已申领，待使用"
         case "CANCELLED": return "已取消"
         case "RELEASED": return "已释放"
         default: return state
@@ -1317,14 +1338,31 @@ public struct EndpointDraft: Equatable, Sendable {
     public let host: String
     public let port: Int
     public let sshUser: String
+    public let observationProfile: EndpointObservationProfile
 
-    public init(command: String, suppliedID: String) throws {
-        let parsed = try ParsedSSHCommand(command: command)
+    public init(
+        host: String,
+        port: Int,
+        sshUser: String,
+        observationProfile: EndpointObservationProfile,
+        suppliedID: String
+    ) throws {
+        let cleanedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedUser = sshUser.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedID = suppliedID.trimmingCharacters(in: .whitespacesAndNewlines)
-        id = cleanedID.isEmpty ? Self.defaultID(host: parsed.host, port: parsed.port) : cleanedID
-        host = parsed.host
-        port = parsed.port
-        sshUser = parsed.user
+        guard
+            !cleanedHost.isEmpty,
+            (1...65535).contains(port),
+            Self.isValidUser(cleanedUser),
+            Self.isValidID(cleanedID.isEmpty ? Self.defaultID(host: cleanedHost, port: port) : cleanedID)
+        else {
+            throw EndpointDraftError.invalidEndpointFields
+        }
+        id = cleanedID.isEmpty ? Self.defaultID(host: cleanedHost, port: port) : cleanedID
+        self.host = cleanedHost
+        self.port = port
+        self.sshUser = cleanedUser
+        self.observationProfile = observationProfile
     }
 
     private static func defaultID(host: String, port: Int) -> String {
@@ -1337,74 +1375,77 @@ public struct EndpointDraft: Equatable, Sendable {
         let base = compact.first?.isLetter == true ? compact : "server-\(compact)"
         return String("\(base)-p\(port)".prefix(120))
     }
-}
 
-public enum EndpointDraftError: LocalizedError, Equatable, Sendable {
-    case invalidSSHCommand
-
-    public var errorDescription: String? {
-        "请输入形如 ssh -p 2201 gpu@server.example.com 的 SSH 指令。"
-    }
-}
-
-public struct ParsedSSHCommand: Equatable, Sendable {
-    public let host: String
-    public let port: Int
-    public let user: String
-
-    public init(command: String) throws {
-        let parts = command
-            .split(whereSeparator: { $0.isWhitespace })
-            .map(String.init)
-        guard parts.first == "ssh" else { throw EndpointDraftError.invalidSSHCommand }
-        var port = 22
-        var target: String?
-        var index = 1
-        while index < parts.count {
-            let value = parts[index]
-            if value == "-p", index + 1 < parts.count {
-                guard let parsedPort = Int(parts[index + 1]), (1...65535).contains(parsedPort) else {
-                    throw EndpointDraftError.invalidSSHCommand
-                }
-                port = parsedPort
-                index += 2
-                continue
-            }
-            if value.hasPrefix("-p"), value.count > 2 {
-                guard let parsedPort = Int(value.dropFirst(2)), (1...65535).contains(parsedPort) else {
-                    throw EndpointDraftError.invalidSSHCommand
-                }
-                port = parsedPort
-            } else if !value.hasPrefix("-"), value.contains("@") {
-                target = value
-            }
-            index += 1
+    private static func isValidID(_ value: String) -> Bool {
+        guard (1...128).contains(value.count), let first = value.unicodeScalars.first else { return false }
+        guard CharacterSet.lowercaseLetters.contains(first) else { return false }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet.lowercaseLetters.union(.decimalDigits).union(CharacterSet(charactersIn: "-")).contains($0)
         }
-        guard
-            let target,
-            let separator = target.firstIndex(of: "@"),
-            separator != target.startIndex,
-            target.index(after: separator) != target.endIndex
-        else {
-            throw EndpointDraftError.invalidSSHCommand
-        }
-        let user = String(target[..<separator])
-        let host = String(target[target.index(after: separator)...])
-        guard Self.isValidUser(user), !host.isEmpty else {
-            throw EndpointDraftError.invalidSSHCommand
-        }
-        self.host = host
-        self.port = port
-        self.user = user
     }
 
     private static func isValidUser(_ value: String) -> Bool {
         guard let first = value.unicodeScalars.first else { return false }
-        let firstValid = CharacterSet.letters.union(CharacterSet(charactersIn: "_")).contains(first)
-        guard firstValid else { return false }
+        guard CharacterSet.letters.union(CharacterSet(charactersIn: "_")).contains(first) else { return false }
         return value.unicodeScalars.allSatisfy {
-            CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-")).contains($0)
+            CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-" )).contains($0)
         }
+    }
+}
+
+public enum EndpointDraftError: LocalizedError, Equatable, Sendable {
+    case invalidEndpointFields
+
+    public var errorDescription: String? {
+        "请填写有效的服务器地址、端口、SSH 用户和服务器标识。"
+    }
+}
+
+public enum EndpointObservationProfile: String, CaseIterable, Equatable, Sendable, Identifiable {
+    case linuxNvidia = "linux-nvidia"
+    case linuxHost = "linux-host"
+    case serverScript = "server-script-v1"
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .linuxNvidia: return "标准 NVIDIA 采集"
+        case .linuxHost: return "主机容量采集"
+        case .serverScript: return "服务器采集脚本"
+        }
+    }
+
+    public var scriptInfo: String {
+        switch self {
+        case .linuxNvidia:
+            return "使用内置、只读的 Linux NVIDIA 观测配置。"
+        case .linuxHost:
+            return "使用内置、只读的 Linux 主机容量观测配置。"
+        case .serverScript:
+            return "使用管理员配置的密封只读服务器采集脚本；此处不能输入命令或容器参数。"
+        }
+    }
+
+    public init(rawValueOrDefault value: String?) {
+        self = EndpointObservationProfile(rawValue: value ?? "") ?? .linuxNvidia
+    }
+}
+
+public struct EndpointUpdateDraft: Equatable, Sendable {
+    public let sshUser: String
+    public let observationProfile: EndpointObservationProfile
+
+    public init(endpoint: EndpointRecord) {
+        sshUser = endpoint.sshUser
+        observationProfile = EndpointObservationProfile(rawValueOrDefault: endpoint.observationProfile)
+    }
+
+    public init(sshUser: String, observationProfile: EndpointObservationProfile) throws {
+        let cleanedUser = sshUser.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedUser.isEmpty else { throw EndpointDraftError.invalidEndpointFields }
+        self.sshUser = cleanedUser
+        self.observationProfile = observationProfile
     }
 }
 

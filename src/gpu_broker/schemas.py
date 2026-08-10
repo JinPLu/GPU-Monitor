@@ -532,23 +532,23 @@ class SchedulerUploadRequest(StrictModel):
         return value
 
 
-class EndpointUpsert(StrictModel):
+class EndpointCreate(StrictModel):
+    """Immutable endpoint identity plus its initial safe monitoring metadata."""
+
     id: str = Field(pattern=r"^[a-z][a-z0-9-]{1,127}$")
     host: str = Field(min_length=1, max_length=253)
     port: int = Field(ge=1, le=65535)
     ssh_user: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
     ssh_alias: str | None = Field(default=None, min_length=1, max_length=120)
-    observation_profile: Literal["linux-nvidia", "linux-host"] = "linux-nvidia"
+    observation_profile: Literal["linux-nvidia", "linux-host", "server-script-v1"] = "server-script-v1"
     labels: list[str] = Field(default_factory=list)
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
     expected_gpu_total_vram_mib: int | None = Field(default=None, ge=1)
     owner_project_id: str | None = Field(default=None, min_length=1, max_length=64)
-    lifecycle_state: Literal["active", "draining", "retired"] | None = None
     # Kept only for one-project legacy imports.  Endpoint ownership is now one
     # project, rather than a scheduler placement allowlist.
     project_ids: list[str] = Field(default_factory=list)
-    enabled: bool | None = None
 
     @field_validator("labels", "project_ids")
     @classmethod
@@ -560,12 +560,48 @@ class EndpointUpsert(StrictModel):
         return values
 
     @model_validator(mode="after")
-    def resolve_owner(self) -> "EndpointUpsert":
+    def resolve_owner(self) -> "EndpointCreate":
         if self.owner_project_id and self.project_ids and self.project_ids != [self.owner_project_id]:
             raise ValueError("project_ids may only repeat owner_project_id for legacy imports")
         if self.owner_project_id is None and len(self.project_ids) == 1:
             self.owner_project_id = self.project_ids[0]
         return self
+
+
+class EndpointUpdate(StrictModel):
+    """Only mutable endpoint metadata; identity and lifecycle use dedicated operations."""
+
+    ssh_user: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
+    ssh_alias: str | None = Field(default=None, min_length=1, max_length=120)
+    observation_profile: Literal["linux-nvidia", "linux-host", "server-script-v1"] | None = None
+    labels: list[str] | None = None
+    storage_group: str | None = Field(default=None, max_length=120)
+    expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
+    expected_gpu_total_vram_mib: int | None = Field(default=None, ge=1)
+    owner_project_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("labels")
+    @classmethod
+    def unique_labels(cls, values: list[str] | None) -> list[str] | None:
+        if values is not None and (len(values) != len(set(values)) or any(not value for value in values)):
+            raise ValueError("endpoint labels must contain unique non-empty values")
+        return values
+
+    @model_validator(mode="after")
+    def has_update(self) -> "EndpointUpdate":
+        if not self.model_fields_set:
+            raise ValueError("endpoint update must include at least one mutable field")
+        return self
+
+
+class EndpointUpsert(EndpointCreate):
+    """Deprecated in-process compatibility model for the legacy GUI importer.
+
+    Public REST clients use EndpointCreate (POST) and EndpointUpdate (PATCH).
+    """
+
+    lifecycle_state: Literal["active", "draining", "retired"] | None = None
+    enabled: bool | None = None
 
 
 class EndpointEnabled(StrictModel):

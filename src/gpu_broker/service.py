@@ -61,8 +61,10 @@ from gpu_broker.models import (
 from gpu_broker.schemas import (
     ActorCreate,
     AlertAcknowledge,
+    EndpointCreate,
     EndpointObservation,
     EndpointEnabled,
+    EndpointUpdate,
     EndpointUpsert,
     LeaseBind,
     LeaseObservedBind,
@@ -5492,16 +5494,7 @@ class BrokerService:
                 for process in self._current_processes(session, resource.gpu_id, now)
             ]
             expires_at = _as_utc(lease.expires_at) or now
-            startup_grace_deadline = (_as_utc(lease.issued_at) or now) + timedelta(
-                seconds=self.inventory.held_lease_startup_grace_seconds
-            )
-            startup_grace_expired = (
-                lease.state == "HELD"
-                and startup_grace_deadline <= now
-                and not processes
-                and self._resources_have_fresh_telemetry(session, resources, now)
-            )
-            if lease.state in {"HELD", "ACTIVE"} and (expires_at <= now or startup_grace_expired):
+            if lease.state in {"HELD", "ACTIVE"} and expires_at <= now:
                 before = self._lease_dict(session, lease)
                 if processes:
                     lease.state = "ORPHANED_BUSY"
@@ -5517,11 +5510,7 @@ class BrokerService:
                 else:
                     lease.state = "EXPIRED_EMPTY"
                     lease.released_at = now
-                    lease.release_reason = (
-                        "startup grace elapsed without observed process"
-                        if startup_grace_expired
-                        else "expired without observed process"
-                    )
+                    lease.release_reason = "expired without observed process"
                     for resource in resources:
                         resource.active = False
                         resource.released_at = now
@@ -7452,6 +7441,436 @@ class BrokerService:
         allowed_gpu_ids = constraints.get("gpu_ids") or []
         return endpoint_id in endpoint_ids or bool(gpu_ids.intersection(allowed_gpu_ids))
 
+    def create_endpoint(
+        self, actor: ActorContext, endpoint_data: EndpointCreate, *, idempotency_key: str
+    ) -> dict[str, Any]:
+        """Create one active endpoint; identity is never updated in place."""
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="endpoint.create", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            if session.get(Endpoint, endpoint_data.id) is not None:
+                raise BrokerError("endpoint_exists", "endpoint id already exists", status_code=409)
+            same_address = session.scalar(
+                select(Endpoint).where(
+                    Endpoint.host == endpoint_data.host,
+                    Endpoint.port == endpoint_data.port,
+                )
+            )
+            if same_address is not None:
+                raise BrokerError(
+                    "endpoint_address_exists",
+                    "an immutable endpoint already owns this host:port",
+                    status_code=409,
+                )
+            now = utcnow()
+            revision = self._bump_revision(session, now)
+            endpoint = Endpoint(
+                id=endpoint_data.id,
+                host=endpoint_data.host,
+                port=endpoint_data.port,
+                ssh_user=endpoint_data.ssh_user,
+                ssh_alias=endpoint_data.ssh_alias,
+                observation_profile=endpoint_data.observation_profile,
+                labels_json=json_dump(endpoint_data.labels),
+                storage_group=endpoint_data.storage_group,
+                expected_gpu_count=endpoint_data.expected_gpu_count,
+                expected_gpu_total_vram_mib=endpoint_data.expected_gpu_total_vram_mib,
+                owner_project_id=endpoint_data.owner_project_id,
+                lifecycle_state="active",
+                enabled=True,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(endpoint)
+            session.flush()
+            payload = self._endpoint_dict(endpoint)
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="endpoint.created",
+                resource_type="endpoint",
+                resource_id=endpoint.id,
+                result="success",
+                after=payload,
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "endpoint": payload,
+                "changed": True,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="endpoint.create",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def update_endpoint(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        endpoint_data: EndpointUpdate,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Update only safe monitoring metadata on an active or draining endpoint."""
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="endpoint.update", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            if endpoint.lifecycle_state == "retired":
+                raise BrokerError(
+                    "endpoint_retired",
+                    "a retired endpoint retains its evidence and cannot be modified",
+                    status_code=409,
+                )
+            before = self._endpoint_dict(endpoint)
+            fields = endpoint_data.model_fields_set
+            values = endpoint_data.model_dump()
+            changed = False
+            for field in fields:
+                value = values[field]
+                attribute = "labels_json" if field == "labels" else field
+                if field == "labels":
+                    value = json_dump(value)
+                if getattr(endpoint, attribute) != value:
+                    setattr(endpoint, attribute, value)
+                    changed = True
+            now = utcnow()
+            if changed:
+                endpoint.updated_at = now
+                revision = self._bump_revision(session, now)
+                session.flush()
+                payload = self._endpoint_dict(endpoint)
+                event = self._audit(
+                    session,
+                    actor_id=actor.id,
+                    action="endpoint.updated",
+                    resource_type="endpoint",
+                    resource_id=endpoint.id,
+                    result="success",
+                    before=before,
+                    after=payload,
+                    now=now,
+                )
+                event_id: int | None = event.id
+            else:
+                revision = self._revision(session)
+                payload = before
+                event_id = None
+            result = {
+                "event_id": event_id,
+                "snapshot_revision": revision,
+                "endpoint": payload,
+                "changed": changed,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="endpoint.update",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def pause_endpoint(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        *,
+        idempotency_key: str,
+        _idempotency_action: str = "endpoint.pause",
+        _compatibility_alias: bool = False,
+    ) -> dict[str, Any]:
+        """Move active -> draining without changing collection or existing leases."""
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action=_idempotency_action, key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            if endpoint.lifecycle_state == "retired":
+                raise BrokerError(
+                    "endpoint_retired",
+                    "a retired endpoint cannot be paused; create a new endpoint id",
+                    status_code=409,
+                )
+            now = utcnow()
+            before = self._endpoint_dict(endpoint)
+            changed = endpoint.lifecycle_state == "active"
+            if changed:
+                endpoint.lifecycle_state = "draining"
+                endpoint.enabled = False
+                endpoint.updated_at = now
+                revision = self._bump_revision(session, now)
+                session.flush()
+                payload = self._endpoint_dict(endpoint)
+                event = self._audit(
+                    session,
+                    actor_id=actor.id,
+                    action="endpoint.paused",
+                    resource_type="endpoint",
+                    resource_id=endpoint.id,
+                    result="success",
+                    before=before,
+                    after=payload,
+                    summary={"collection_continues": True, "history_retained": True},
+                    now=now,
+                )
+                event_id: int | None = event.id
+            else:
+                revision = self._revision(session)
+                payload = before
+                event_id = None
+            result = {
+                "event_id": event_id,
+                "snapshot_revision": revision,
+                "endpoint": payload,
+                "endpoint_id": endpoint.id,
+                "changed": changed,
+                "history_retained": True,
+            }
+            if _compatibility_alias:
+                result["deprecated_compatibility_alias"] = "DELETE /api/v1/endpoints/{endpoint_id}"
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action=_idempotency_action,
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def resume_endpoint(
+        self, actor: ActorContext, endpoint_id: str, *, idempotency_key: str
+    ) -> dict[str, Any]:
+        """Move draining -> active; retired endpoint ids are intentionally final."""
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="endpoint.resume", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            if endpoint.lifecycle_state == "retired":
+                raise BrokerError(
+                    "endpoint_retired",
+                    "a retired endpoint cannot be resumed; create a new endpoint id",
+                    status_code=409,
+                )
+            now = utcnow()
+            before = self._endpoint_dict(endpoint)
+            changed = endpoint.lifecycle_state == "draining"
+            if changed:
+                endpoint.lifecycle_state = "active"
+                endpoint.enabled = True
+                endpoint.updated_at = now
+                revision = self._bump_revision(session, now)
+                session.flush()
+                payload = self._endpoint_dict(endpoint)
+                event = self._audit(
+                    session,
+                    actor_id=actor.id,
+                    action="endpoint.resumed",
+                    resource_type="endpoint",
+                    resource_id=endpoint.id,
+                    result="success",
+                    before=before,
+                    after=payload,
+                    now=now,
+                )
+                event_id: int | None = event.id
+            else:
+                revision = self._revision(session)
+                payload = before
+                event_id = None
+            result = {
+                "event_id": event_id,
+                "snapshot_revision": revision,
+                "endpoint": payload,
+                "endpoint_id": endpoint.id,
+                "changed": changed,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="endpoint.resume",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def retire_endpoint(
+        self, actor: ActorContext, endpoint_id: str, *, idempotency_key: str
+    ) -> dict[str, Any]:
+        """Move a drained endpoint to retired only after leases and pinned queues clear."""
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="endpoint.retire", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            now = utcnow()
+            before = self._endpoint_dict(endpoint)
+            if endpoint.lifecycle_state == "retired":
+                result = {
+                    "event_id": None,
+                    "snapshot_revision": self._revision(session),
+                    "endpoint": before,
+                    "endpoint_id": endpoint.id,
+                    "changed": False,
+                    "history_retained": True,
+                }
+                self._remember_idempotency(
+                    session,
+                    actor=actor,
+                    action="endpoint.retire",
+                    key=idempotency_key,
+                    response=result,
+                    now=now,
+                )
+                return result
+            if endpoint.lifecycle_state != "draining":
+                raise BrokerError(
+                    "endpoint_lifecycle_invalid_transition",
+                    "endpoint must be draining before it can retire",
+                    status_code=409,
+                )
+            gpu_ids = set(
+                session.scalars(
+                    select(GPUDevice.id).where(GPUDevice.endpoint_id == endpoint.id)
+                ).all()
+            )
+            active_lease_count = (
+                session.scalar(
+                    select(func.count())
+                    .select_from(LeaseResource)
+                    .join(Lease, Lease.id == LeaseResource.lease_id)
+                    .join(GPUDevice, GPUDevice.id == LeaseResource.gpu_id)
+                    .where(
+                        GPUDevice.endpoint_id == endpoint.id,
+                        LeaseResource.active.is_(True),
+                        Lease.state.in_(ACTIVE_LEASE_STATES),
+                    )
+                )
+                or 0
+            )
+            if active_lease_count:
+                raise BrokerError(
+                    "endpoint_has_active_leases",
+                    "a draining endpoint remains observable until active leases finish",
+                    status_code=409,
+                    details={"active_lease_count": active_lease_count},
+                )
+            queued_request_ids = [
+                request.id
+                for request in session.scalars(
+                    select(AllocationRequest)
+                    .where(AllocationRequest.state.in_({"QUEUED", "PENDING_APPROVAL"}))
+                    .order_by(AllocationRequest.created_at)
+                ).all()
+                if self._constraints_reference_endpoint(
+                    request.constraints_json,
+                    endpoint_id=endpoint.id,
+                    gpu_ids=gpu_ids,
+                )
+            ]
+            if queued_request_ids:
+                raise BrokerError(
+                    "endpoint_has_queued_requests",
+                    "a draining endpoint remains until requests pinned to it are cancelled or changed",
+                    status_code=409,
+                    details={"request_ids": queued_request_ids[:20]},
+                )
+            endpoint.lifecycle_state = "retired"
+            endpoint.enabled = False
+            endpoint.updated_at = now
+            revision = self._bump_revision(session, now)
+            session.flush()
+            payload = self._endpoint_dict(endpoint)
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="endpoint.retired",
+                resource_type="endpoint",
+                resource_id=endpoint.id,
+                result="success",
+                before=before,
+                after=payload,
+                summary={"history_retained": True},
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "endpoint": payload,
+                "endpoint_id": endpoint.id,
+                "changed": True,
+                "history_retained": True,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="endpoint.retire",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
     def upsert_endpoint(
         self, actor: ActorContext, endpoint_data: EndpointUpsert, *, idempotency_key: str
     ) -> dict[str, Any]:
@@ -7812,20 +8231,14 @@ class BrokerService:
 
         return self._write(operation)
 
-    def delete_endpoint(
+    def _legacy_delete_endpoint_lifecycle(
         self,
         actor: ActorContext,
         endpoint_id: str,
         *,
         idempotency_key: str,
     ) -> dict[str, Any]:
-        """Advance an endpoint lifecycle without deleting evidence or history.
-
-        A first self-service delete drains the endpoint immediately, which
-        blocks further claims but keeps the fixed collector active.  A second
-        request retires a drained endpoint only after its active leases have
-        ended; telemetry and audit evidence are deliberately retained.
-        """
+        """Pre-split lifecycle transition retained only for migration-era diagnostics."""
 
         self._require_role(actor, MUTATING_ROLES)
 
@@ -7935,7 +8348,24 @@ class BrokerService:
 
         return self._write(operation)
 
-    def set_endpoint_enabled(
+    def delete_endpoint(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Deprecated compatibility alias for pause; it never auto-retires."""
+
+        return self.pause_endpoint(
+            actor,
+            endpoint_id,
+            idempotency_key=idempotency_key,
+            _idempotency_action="endpoint.delete",
+            _compatibility_alias=True,
+        )
+
+    def _legacy_set_endpoint_enabled(
         self,
         actor: ActorContext,
         endpoint_id: str,
@@ -7943,6 +8373,8 @@ class BrokerService:
         *,
         idempotency_key: str,
     ) -> dict[str, Any]:
+        """Pre-split boolean lifecycle update retained only for migration-era diagnostics."""
+
         self._require_role(actor, MUTATING_ROLES)
 
         def operation(session: Session) -> dict[str, Any]:
@@ -8016,6 +8448,20 @@ class BrokerService:
             return result
 
         return self._write(operation)
+
+    def set_endpoint_enabled(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        state: EndpointEnabled,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Deprecated boolean compatibility facade for explicit pause/resume."""
+
+        if state.enabled:
+            return self.resume_endpoint(actor, endpoint_id, idempotency_key=idempotency_key)
+        return self.pause_endpoint(actor, endpoint_id, idempotency_key=idempotency_key)
 
     def create_actor(
         self, actor: ActorContext, actor_data: ActorCreate, *, idempotency_key: str

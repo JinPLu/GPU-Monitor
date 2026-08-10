@@ -9,12 +9,15 @@ import pytest
 from gpu_broker.adapters import (
     ADAPTER_REGISTRY,
     AdapterRegistryError,
+    MAX_RAW_SSH_STDERR_BYTES,
+    MAX_RAW_SSH_STDOUT_BYTES,
     RAW_SSH_COMBINED_QUERY,
     RAW_SSH_HOST_ONLY_QUERY,
     RawSSHObservationAdapter,
     SlurmCommandSchedulerAdapter,
 )
 from gpu_broker.config import EndpointConfig
+from gpu_broker.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
 from gpu_broker.slurm import CommandSlurmProvider, SlurmProviderError
 
 
@@ -159,6 +162,92 @@ def test_raw_ssh_adapter_uses_the_configured_sealed_observation_profile(
 
     assert calls[0][-1] == RAW_SSH_HOST_ONLY_QUERY
     assert "nvidia-smi" not in RAW_SSH_HOST_ONLY_QUERY
+
+
+def test_raw_ssh_adapter_uses_the_exact_server_script_entry_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"{}\n", b""
+
+    async def fake_create_subprocess_exec(*command: Any, **_kwargs: Any) -> FakeProcess:
+        calls.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    endpoint = EndpointConfig(
+        id="endpoint-script",
+        host="script.example.test",
+        port=22,
+        ssh_user="monitor",
+        observation_profile="server-script-v1",
+    )
+
+    asyncio.run(
+        RawSSHObservationAdapter().run_probe(
+            endpoint,
+            probe="endpoint-telemetry",
+            connect_timeout_seconds=7,
+        )
+    )
+
+    assert calls == [
+        (
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ConnectTimeout=7",
+            "-p",
+            "22",
+            "monitor@script.example.test",
+            SERVER_SCRIPT_REMOTE_COMMAND,
+        )
+    ]
+
+
+def test_raw_ssh_adapter_bounds_and_drains_noisy_remote_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_data(b"o" * (MAX_RAW_SSH_STDOUT_BYTES + 1))
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_data(b"e" * (MAX_RAW_SSH_STDERR_BYTES + 1))
+            self.stderr.feed_eof()
+
+        async def wait(self) -> None:
+            return None
+
+    async def fake_create_subprocess_exec(*_command: Any, **_kwargs: Any) -> FakeProcess:
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    endpoint = EndpointConfig(id="endpoint-a", host="gpu.example.test", port=22, ssh_user="gpu")
+
+    result = asyncio.run(
+        RawSSHObservationAdapter().run_probe(
+            endpoint,
+            probe="endpoint-telemetry",
+            connect_timeout_seconds=7,
+        )
+    )
+
+    assert result.stdout_truncated is True
+    assert result.stderr_truncated is True
+    assert len(result.stdout) == MAX_RAW_SSH_STDOUT_BYTES
+    assert len(result.stderr) == MAX_RAW_SSH_STDERR_BYTES
 
 
 def test_slurm_command_adapter_preserves_runner_contract() -> None:

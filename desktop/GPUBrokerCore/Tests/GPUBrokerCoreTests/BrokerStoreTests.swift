@@ -184,6 +184,31 @@ final class BrokerStoreTests: XCTestCase {
         )
     }
 
+    func testEndpointDraftUsesStructuredSealedObservationProfile() throws {
+        let draft = try EndpointDraft(
+            host: "gpu.example.test",
+            port: 2201,
+            sshUser: "collector",
+            observationProfile: .serverScript,
+            suppliedID: ""
+        )
+
+        XCTAssertEqual(draft.id, "gpu-example-test-p2201")
+        XCTAssertEqual(draft.host, "gpu.example.test")
+        XCTAssertEqual(draft.observationProfile, .serverScript)
+        XCTAssertEqual(draft.observationProfile.label, "服务器采集脚本")
+        XCTAssertFalse(draft.observationProfile.scriptInfo.contains("Docker"))
+        XCTAssertThrowsError(
+            try EndpointDraft(
+                host: "",
+                port: 0,
+                sshUser: "collector",
+                observationProfile: .linuxNvidia,
+                suppliedID: "bad id"
+            )
+        )
+    }
+
     func testURLSessionClientFetchesUnifiedStateRoute() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StateRouteURLProtocol.self]
@@ -490,51 +515,72 @@ final class BrokerStoreTests: XCTestCase {
         )
     }
 
-    func testEndpointRemovalRefreshDiscardsPreMutationResponseWithoutOverlapOrRollback() async throws {
-        let beforeDeletion = try Self.snapshot(named: "1")
-        let endpoint = try XCTUnwrap(beforeDeletion.endpoints.first)
-        let retiredEndpoint = try XCTUnwrap(EndpointRecord(raw: [
-            "id": endpoint.id,
-            "host": endpoint.host,
-            "port": endpoint.port,
-            "ssh_user": endpoint.sshUser,
-            "enabled": false,
-            "lifecycle_state": "retired",
-            "monitor": ["status": "RETIRED"]
-        ]))
-        var afterDeletion = beforeDeletion
-        afterDeletion.snapshotRevision = (beforeDeletion.snapshotRevision ?? 0) + 1
-        afterDeletion.endpoints = [retiredEndpoint]
-        let client = DelayedSequenceClient(
-            snapshots: [beforeDeletion, afterDeletion],
-            delaysNanoseconds: [80_000_000, 80_000_000]
+    func testEndpointLifecycleActionsUseDistinctDocumentedRoutes() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StateRouteURLProtocol.self]
+        let mutationSession = URLSession(configuration: configuration)
+        let snapshot = try Self.snapshot(named: "1")
+        let endpoint = try XCTUnwrap(snapshot.endpoints.first)
+        let capabilities: Set<String> = ["endpoint_update", "endpoint_pause_resume", "endpoint_retirement"]
+        let serviceInfo = ServiceInfo(schemaVersion: "v1", capabilities: capabilities)
+        let store = BrokerStore(
+            actorID: "tester",
+            refreshTimeoutSeconds: 1,
+            refreshIntervalSeconds: 0,
+            mutationSession: mutationSession
         )
-        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
-        let recorder = CompletionRecorder()
+        StateRouteURLProtocol.responseData = try JSONSerialization.data(withJSONObject: ["snapshot_revision": 102])
+        defer { StateRouteURLProtocol.reset() }
+        store.connectForTesting(
+            snapshotClient: ScriptedClient(results: [.success(snapshot), .success(snapshot), .success(snapshot), .success(snapshot)]),
+            serviceInfo: serviceInfo,
+            baseURL: URL(string: "http://broker.test/")!
+        )
+        try await waitUntil { store.freshness == .fresh && !store.isRefreshing }
 
-        store.connectForTesting(snapshotClient: client)
-        try await waitUntilAsync { await client.metrics().activeCalls == 1 }
-        store.confirmEndpointRemovalAfterMutation(
+        let updateRecorder = CompletionRecorder()
+        store.updateEndpoint(
             endpoint,
-            expectedLifecycleState: "RETIRED"
+            draft: try EndpointUpdateDraft(sshUser: "collector", observationProfile: .serverScript)
         ) { success, message in
-            recorder.success = success
-            recorder.message = message
+            updateRecorder.success = success
+            updateRecorder.message = message
         }
+        try await waitUntil { updateRecorder.success != nil }
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "PATCH")
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/fixture-1")
+        let updateBody = try XCTUnwrap(StateRouteURLProtocol.lastRequest?.httpBody)
+        let updatePayload = try XCTUnwrap(try JSONSerialization.jsonObject(with: updateBody) as? [String: Any])
+        XCTAssertEqual(updatePayload["ssh_user"] as? String, "collector")
+        XCTAssertEqual(updatePayload["observation_profile"] as? String, "server-script-v1")
 
-        try await waitUntilAsync { await client.metrics().callCount == 2 }
-        XCTAssertEqual(store.snapshot, .empty, "The delayed pre-delete snapshot must not be committed")
-        try await waitUntil { recorder.success != nil && !store.isRefreshing }
+        let pauseRecorder = CompletionRecorder()
+        store.pauseEndpoint(endpoint) { success, message in
+            pauseRecorder.success = success
+            pauseRecorder.message = message
+        }
+        try await waitUntil { pauseRecorder.success != nil }
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "POST")
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/fixture-1/pause")
 
-        let metrics = await client.metrics()
-        XCTAssertEqual(metrics.callCount, 2)
-        XCTAssertEqual(metrics.maxConcurrentCalls, 1)
-        XCTAssertEqual(store.snapshot, afterDeletion)
-        XCTAssertTrue(store.snapshot.operationalEndpoints.isEmpty)
-        XCTAssertTrue(store.snapshot.operationalGPUs.isEmpty)
-        XCTAssertTrue(store.snapshot.monitoringProviders.isEmpty)
-        XCTAssertEqual(recorder.success, true)
-        XCTAssertNil(recorder.message)
+        let resumeRecorder = CompletionRecorder()
+        store.resumeEndpoint(endpoint) { success, message in
+            resumeRecorder.success = success
+            resumeRecorder.message = message
+        }
+        try await waitUntil { resumeRecorder.success != nil }
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "POST")
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/fixture-1/resume")
+
+        let retireRecorder = CompletionRecorder()
+        store.retireEndpoint(endpoint) { success, message in
+            retireRecorder.success = success
+            retireRecorder.message = message
+        }
+        try await waitUntil { retireRecorder.success != nil }
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "POST")
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/fixture-1/retire")
+        XCTAssertTrue(store.notice?.contains("彻底退役") == true)
     }
 
     func testEndpointLifecycleMutationStaysAvailableWhenTelemetryIsStale() async throws {
@@ -551,15 +597,9 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertTrue(store.allowsEndpointLifecycleMutations)
     }
 
-    func testEndpointLifecycleResponseParsingNormalizesState() throws {
-        let payload = try JSONSerialization.data(withJSONObject: [
-            "snapshot_revision": 250,
-            "data": ["endpoint": ["lifecycle_state": "draining"]]
-        ])
-
-        XCTAssertEqual(BrokerStore.endpointLifecycleState(from: payload), "DRAINING")
+    func testEndpointLifecycleCapabilityGateAndErrorParsingRemainSafe() throws {
+        let payload = try JSONSerialization.data(withJSONObject: ["snapshot_revision": 250])
         XCTAssertEqual(BrokerStore.snapshotRevision(from: payload), 250)
-        XCTAssertNil(BrokerStore.endpointLifecycleState(from: Data("{}".utf8)))
 
         let errorPayload = try JSONSerialization.data(withJSONObject: [
             "error": ["code": "endpoint_already_retired"]

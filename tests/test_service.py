@@ -26,9 +26,9 @@ from gpu_broker.models import (
 )
 from gpu_broker.schemas import (
     ActorCreate,
-    EndpointEnabled,
+    EndpointCreate,
     EndpointObservation,
-    EndpointUpsert,
+    EndpointUpdate,
     LeaseObservedBind,
     MaintenanceCreate,
     ReservationCreate,
@@ -360,7 +360,7 @@ def test_queued_routine_claim_starts_held_when_capacity_arrives(service, admin) 
     assert lease["state"] == "HELD"
 
 
-def test_unstarted_held_claim_expires_after_startup_grace_and_retries_queue(
+def test_unstarted_held_claim_is_retained_after_deprecated_startup_grace(
     tmp_path: Path, inventory
 ) -> None:
     broker = BrokerService(
@@ -401,13 +401,11 @@ def test_unstarted_held_claim_expires_after_startup_grace_and_retries_queue(
     broker.reconcile(admin)
 
     leases = {lease["id"]: lease for lease in broker.list_leases(admin)["data"]}
-    assert leases[first_lease_id]["state"] == "EXPIRED_EMPTY"
-    assert leases[first_lease_id]["release_reason"] == "startup grace elapsed without observed process"
-    replacement = next(lease for lease in leases.values() if lease["id"] != first_lease_id)
-    assert replacement["state"] == "HELD"
+    assert leases[first_lease_id]["state"] == "HELD"
+    assert len(leases) == 1
     requests = {request["task_ref"]: request for request in broker.list_requests(admin)["data"]}
-    assert requests["grace-first"]["state"] == "EXPIRED"
-    assert requests["grace-second"]["state"] == "LEASED"
+    assert requests["grace-first"]["state"] == "LEASED"
+    assert requests["grace-second"]["state"] == "QUEUED"
 
 
 def test_renewal_cannot_cross_a_future_reservation(service, admin) -> None:
@@ -543,9 +541,9 @@ def test_fair_queue_interleaves_projects_after_fresh_telemetry(service, admin) -
 
 def test_endpoint_identity_is_enforced(service, admin) -> None:
     service.ingest_observation(observation(count=4))
-    created = service.upsert_endpoint(
+    created = service.create_endpoint(
         admin,
-        EndpointUpsert(
+        EndpointCreate(
             id="endpoint-new",
             host="127.0.0.1",
             port=2203,
@@ -555,17 +553,25 @@ def test_endpoint_identity_is_enforced(service, admin) -> None:
         idempotency_key="endpoint-new",
     )
     assert created["endpoint"]["id"] == "endpoint-new"
-    disabled = service.set_endpoint_enabled(
+    updated = service.update_endpoint(
         admin,
         "endpoint-new",
-        EndpointEnabled(enabled=False),
-        idempotency_key="endpoint-disable",
+        EndpointUpdate(ssh_user="gpu-updated", observation_profile="server-script-v1"),
+        idempotency_key="endpoint-update",
     )
-    assert disabled["endpoint"]["enabled"] is False
+    assert updated["endpoint"]["ssh_user"] == "gpu-updated"
+    assert updated["endpoint"]["observation_profile"] == "server-script-v1"
+    paused = service.pause_endpoint(admin, "endpoint-new", idempotency_key="endpoint-pause")
+    assert paused["endpoint"]["lifecycle_state"] == "draining"
+    assert "endpoint-new" in {endpoint.id for endpoint in service.collector_endpoints()}
+    resumed = service.resume_endpoint(admin, "endpoint-new", idempotency_key="endpoint-resume")
+    assert resumed["endpoint"]["lifecycle_state"] == "active"
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        EndpointUpdate.model_validate({"host": "127.0.0.1"})
     with pytest.raises(BrokerError) as error:
-        service.upsert_endpoint(
+        service.create_endpoint(
             admin,
-            EndpointUpsert(
+            EndpointCreate(
                 id="endpoint-new",
                 host="127.0.0.1",
                 port=2299,
@@ -574,7 +580,7 @@ def test_endpoint_identity_is_enforced(service, admin) -> None:
             ),
             idempotency_key="endpoint-move",
         )
-    assert error.value.code == "endpoint_identity_immutable"
+    assert error.value.code == "endpoint_exists"
 
 
 def test_endpoint_delete_drains_then_retires_without_erasing_monitoring_state(service, admin) -> None:
@@ -588,11 +594,16 @@ def test_endpoint_delete_drains_then_retires_without_erasing_monitoring_state(se
     assert deleted["endpoint_id"] == "endpoint-a"
     assert deleted["endpoint"]["lifecycle_state"] == "draining"
     assert deleted["history_retained"] is True
-    retired = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-retire")
+    repeated_compatibility_delete = service.delete_endpoint(
+        admin, "endpoint-a", idempotency_key="endpoint-delete-again"
+    )
+    assert repeated_compatibility_delete["endpoint"]["lifecycle_state"] == "draining"
+    assert repeated_compatibility_delete["changed"] is False
+    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-retire")
     assert retired["endpoint"]["lifecycle_state"] == "retired"
     assert [endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]] == ["endpoint-a", "endpoint-b"]
     assert any(gpu["endpoint_id"] == "endpoint-a" for gpu in service.list_gpus(admin)["data"])
-    assert any(event["action"] == "endpoint.draining" for event in service.list_events(admin)["data"])
+    assert any(event["action"] == "endpoint.paused" for event in service.list_events(admin)["data"])
     assert any(event["action"] == "endpoint.retired" for event in service.list_events(admin)["data"])
     snapshot = service.snapshot(admin)["data"]
     assert all(endpoint["id"] != "endpoint-a" for endpoint in snapshot["endpoints"])
@@ -629,9 +640,9 @@ def test_endpoint_inventory_mutations_do_not_require_project_membership(service,
         role="allocator",
         project_ids=frozenset(),
     )
-    created = service.upsert_endpoint(
+    created = service.create_endpoint(
         desktop_actor,
-        EndpointUpsert(
+        EndpointCreate(
             id="desktop-ownerless",
             host="127.0.0.1",
             port=2298,
@@ -641,13 +652,13 @@ def test_endpoint_inventory_mutations_do_not_require_project_membership(service,
     )
 
     assert created["endpoint"]["owner_project_id"] is None
-    drained = service.delete_endpoint(
+    drained = service.pause_endpoint(
         desktop_actor,
         "endpoint-a",
         idempotency_key="desktop-delete-without-project",
     )
     assert drained["endpoint"]["lifecycle_state"] == "draining"
-    retired = service.delete_endpoint(
+    retired = service.retire_endpoint(
         desktop_actor,
         "endpoint-a",
         idempotency_key="desktop-retire-without-project",
@@ -660,11 +671,11 @@ def test_endpoint_delete_waits_for_active_lease_then_retires_with_history(servic
     claimed = service.create_request(admin, request_data("delete-blocked"), idempotency_key="delete-blocked")
     assert claimed["lease"] is not None
 
-    drained = service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-active")
+    drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="delete-active")
     assert drained["endpoint"]["lifecycle_state"] == "draining"
 
     with pytest.raises(BrokerError) as active_error:
-        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-active-retire")
+        service.retire_endpoint(admin, "endpoint-a", idempotency_key="delete-active-retire")
     assert active_error.value.code == "endpoint_has_active_leases"
 
     service.release_lease(
@@ -673,7 +684,7 @@ def test_endpoint_delete_waits_for_active_lease_then_retires_with_history(servic
         reason="finished",
         idempotency_key="delete-blocked-release",
     )
-    retired = service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-history")
+    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="delete-history")
     assert retired["endpoint"]["lifecycle_state"] == "retired"
 
 
@@ -691,16 +702,16 @@ def test_endpoint_retirement_waits_for_queued_request_pinned_to_endpoint(service
         idempotency_key="endpoint-pinned-queue",
     )
     assert queued["lease"] is None
-    drained = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-drain")
+    drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-drain")
     assert drained["endpoint"]["lifecycle_state"] == "draining"
 
     with pytest.raises(BrokerError) as error:
-        service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire")
+        service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire")
     assert error.value.code == "endpoint_has_queued_requests"
     assert error.value.details == {"request_ids": [queued["request"]["id"]]}
 
     service.cancel_request(admin, queued["request"]["id"], idempotency_key="endpoint-pinned-cancel")
-    retired = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire-after-cancel")
+    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire-after-cancel")
     assert retired["endpoint"]["lifecycle_state"] == "retired"
 
 
@@ -717,7 +728,7 @@ def test_endpoint_delete_preserves_maintenance_history(service, admin) -> None:
         idempotency_key="endpoint-maintenance",
     )
 
-    drained = service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-maintenance")
+    drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="delete-maintenance")
     assert drained["endpoint"]["lifecycle_state"] == "draining"
     assert service._read(lambda session: session.get(MaintenanceWindow, created["maintenance"]["id"])) is not None
 
@@ -738,7 +749,7 @@ def test_endpoint_delete_preserves_enabled_workload_profile_references(service, 
         idempotency_key="endpoint-bound-profile",
     )
 
-    drained = service.delete_endpoint(admin, "endpoint-b", idempotency_key="delete-profile-ref")
+    drained = service.pause_endpoint(admin, "endpoint-b", idempotency_key="delete-profile-ref")
     assert drained["endpoint"]["lifecycle_state"] == "draining"
 
 
@@ -1195,7 +1206,7 @@ def test_cooperative_actor_labels_are_not_admin_and_lease_ownership_is_exact(ser
 
 def test_endpoint_lifecycle_retains_history_and_blocks_new_claims(service, admin) -> None:
     service.ingest_observation(observation(endpoint_id="endpoint-a", count=1))
-    drained = service.delete_endpoint(admin, "endpoint-a", idempotency_key="drain-a")
+    drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="drain-a")
     assert drained["endpoint"]["lifecycle_state"] == "draining"
     assert {endpoint.id for endpoint in service.collector_endpoints()} == {"endpoint-a", "endpoint-b"}
     blocked = service.create_request(
@@ -1213,13 +1224,13 @@ def test_endpoint_lifecycle_retains_history_and_blocks_new_claims(service, admin
     assert blocked["lease"] is None
     assert "endpoint_lifecycle" in blocked["request"]["blocked_reason"]
     with pytest.raises(BrokerError, match="pinned to it"):
-        service.delete_endpoint(admin, "endpoint-a", idempotency_key="retire-a-blocked")
+        service.retire_endpoint(admin, "endpoint-a", idempotency_key="retire-a-blocked")
     service.cancel_request(
         admin,
         blocked["request"]["id"],
         idempotency_key="cancel-draining-claim",
     )
-    retired = service.delete_endpoint(admin, "endpoint-a", idempotency_key="retire-a")
+    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="retire-a")
     assert retired["endpoint"]["lifecycle_state"] == "retired"
     assert {endpoint.id for endpoint in service.collector_endpoints()} == {"endpoint-b"}
     assert any(item["id"] == "endpoint-a" for item in service.list_endpoints(admin)["data"])

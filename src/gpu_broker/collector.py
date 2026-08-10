@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
+import math
 from dataclasses import dataclass
-from datetime import timedelta
-from typing import Awaitable, Callable
+from datetime import datetime, timedelta
+from typing import Any, Awaitable, Callable
 
 from gpu_broker.adapters import (
     GPU_SECTION,
@@ -20,9 +22,14 @@ from gpu_broker.adapters import (
     PROCESS_SECTION,
     RAW_SSH_COMBINED_QUERY,
     RAW_SSH_OBSERVATION_ADAPTER,
+    MAX_RAW_SSH_STDOUT_BYTES,
     RawSSHProbe,
 )
 from gpu_broker.config import EndpointConfig, InventoryConfig
+from gpu_broker.collector_protocol import (
+    SERVER_SCRIPT_REMOTE_COMMAND,
+    SERVER_SCRIPT_SCHEMA_VERSION,
+)
 from gpu_broker.schemas import EndpointObservation, ProcessInput, TelemetryInput
 from gpu_broker.service import BrokerService
 from gpu_broker.timeutil import utcnow
@@ -32,12 +39,351 @@ from gpu_broker.timeutil import utcnow
 # passes a typed probe kind to the sealed adapter instead of a command string.
 COMBINED_QUERY = RAW_SSH_COMBINED_QUERY
 
+# The adapter enforces this bound for real SSH subprocesses.  The collector
+# repeats it for injected runners so tests and future adapters cannot bypass
+# the protocol's memory/fail-closed boundary.
+MAX_SERVER_SCRIPT_SNAPSHOT_BYTES = MAX_RAW_SSH_STDOUT_BYTES
+MAX_SERVER_SCRIPT_GPU_COUNT = 1024
+MAX_SERVER_SCRIPT_PROCESS_COUNT = 16_384
+
 
 class CollectionError(RuntimeError):
     pass
 
 
 Runner = Callable[[EndpointConfig, str], Awaitable[str]]
+
+
+def _no_duplicate_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CollectionError(f"server collector JSON contains duplicate key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> None:
+    raise CollectionError(f"server collector JSON contains invalid numeric constant: {value}")
+
+
+def _mapping(value: Any, *, label: str, keys: set[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CollectionError(f"server collector {label} must be an object")
+    actual = set(value)
+    if actual != keys:
+        missing = sorted(keys - actual)
+        unexpected = sorted(actual - keys)
+        raise CollectionError(
+            f"server collector {label} has invalid fields "
+            f"(missing={missing}, unexpected={unexpected})"
+        )
+    return value
+
+
+def _list(value: Any, *, label: str, maximum: int) -> list[Any]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise CollectionError(f"server collector {label} must be a list of at most {maximum} values")
+    return value
+
+
+def _text(value: Any, *, label: str, maximum: int, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise CollectionError(f"server collector {label} must be a non-empty string")
+    if value != value.strip() or any(ord(character) < 32 for character in value):
+        raise CollectionError(f"server collector {label} contains unsafe whitespace or control characters")
+    return value
+
+
+def _integer(
+    value: Any,
+    *,
+    label: str,
+    minimum: int,
+    maximum: int | None = None,
+    nullable: bool = False,
+) -> int | None:
+    if value is None and nullable:
+        return None
+    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+        raise CollectionError(f"server collector {label} must be an integer in range")
+    return value
+
+
+def _number(
+    value: Any,
+    *,
+    label: str,
+    minimum: float,
+    maximum: float | None = None,
+    nullable: bool = False,
+) -> float | None:
+    if value is None and nullable:
+        return None
+    if type(value) not in {int, float}:
+        raise CollectionError(f"server collector {label} must be a JSON number")
+    number = float(value)
+    if not math.isfinite(number) or number < minimum or (maximum is not None and number > maximum):
+        raise CollectionError(f"server collector {label} must be a finite number in range")
+    return number
+
+
+def _timestamp(value: Any, *, label: str) -> datetime:
+    text = _text(value, label=label, maximum=64)
+    assert text is not None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CollectionError(f"server collector {label} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise CollectionError(f"server collector {label} must include a timezone")
+    return parsed
+
+
+def parse_server_script_snapshot(
+    raw: str,
+    *,
+    endpoint_id: str,
+    observed_at: datetime,
+) -> EndpointObservation:
+    """Validate a schema-v1 server-script snapshot before building domain input.
+
+    This accepts one JSON object only.  It rejects duplicate object keys,
+    unknown fields, type coercion, unbounded collections, duplicate GPU/process
+    identities, and GPU/process relationships that the broker cannot safely
+    attribute to one endpoint.
+    """
+
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise CollectionError("server collector stdout is not valid Unicode") from exc
+    if len(encoded) > MAX_SERVER_SCRIPT_SNAPSHOT_BYTES:
+        raise CollectionError("server collector snapshot exceeded the stdout limit")
+    try:
+        decoded = json.loads(
+            raw,
+            object_pairs_hook=_no_duplicate_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, CollectionError) as exc:
+        raise CollectionError(f"server collector returned invalid JSON: {exc}") from exc
+    snapshot = _mapping(
+        decoded,
+        label="snapshot",
+        keys={"schema_version", "identity", "host", "gpu_probe_available", "gpus", "processes"},
+    )
+    if (
+        type(snapshot["schema_version"]) is not int
+        or snapshot["schema_version"] != SERVER_SCRIPT_SCHEMA_VERSION
+    ):
+        raise CollectionError(
+            f"server collector schema_version must be {SERVER_SCRIPT_SCHEMA_VERSION}"
+        )
+    if type(snapshot["gpu_probe_available"]) is not bool:
+        raise CollectionError("server collector gpu_probe_available must be a boolean")
+
+    identity = _mapping(snapshot["identity"], label="identity", keys={"hostname", "boot_id"})
+    _text(identity["hostname"], label="identity.hostname", maximum=253)
+    boot_id = _text(identity["boot_id"], label="identity.boot_id", maximum=120)
+    assert boot_id is not None
+    host = _mapping(
+        snapshot["host"],
+        label="host",
+        keys={
+            "cpu_count",
+            "load_1m",
+            "cpu_total_ticks",
+            "cpu_idle_ticks",
+            "memory_total_mib",
+            "memory_available_mib",
+        },
+    )
+    cpu_count = _integer(host["cpu_count"], label="host.cpu_count", minimum=1, maximum=1_048_576)
+    load_1m = _number(host["load_1m"], label="host.load_1m", minimum=0)
+    cpu_total_ticks = _integer(
+        host["cpu_total_ticks"], label="host.cpu_total_ticks", minimum=0
+    )
+    cpu_idle_ticks = _integer(host["cpu_idle_ticks"], label="host.cpu_idle_ticks", minimum=0)
+    memory_total_mib = _integer(
+        host["memory_total_mib"], label="host.memory_total_mib", minimum=1
+    )
+    memory_available_mib = _integer(
+        host["memory_available_mib"], label="host.memory_available_mib", minimum=0
+    )
+    assert (
+        cpu_count is not None
+        and load_1m is not None
+        and cpu_total_ticks is not None
+        and cpu_idle_ticks is not None
+        and memory_total_mib is not None
+        and memory_available_mib is not None
+    )
+    if cpu_idle_ticks > cpu_total_ticks or memory_available_mib > memory_total_mib:
+        raise CollectionError("server collector host telemetry is internally inconsistent")
+
+    gpus: list[TelemetryInput] = []
+    gpu_uuids: set[str] = set()
+    gpu_indexes: set[int] = set()
+    gpu_totals: dict[str, int] = {}
+    for position, value in enumerate(
+        _list(snapshot["gpus"], label="gpus", maximum=MAX_SERVER_SCRIPT_GPU_COUNT)
+    ):
+        gpu = _mapping(
+            value,
+            label=f"gpus[{position}]",
+            keys={
+                "gpu_index",
+                "gpu_uuid",
+                "name",
+                "total_vram_mib",
+                "memory_used_mib",
+                "memory_free_mib",
+                "gpu_utilization_pct",
+                "memory_utilization_pct",
+                "temperature_c",
+                "power_watts",
+                "pstate",
+                "health",
+            },
+        )
+        gpu_index = _integer(gpu["gpu_index"], label=f"gpus[{position}].gpu_index", minimum=0, maximum=1024)
+        gpu_uuid = _text(gpu["gpu_uuid"], label=f"gpus[{position}].gpu_uuid", maximum=160)
+        name = _text(gpu["name"], label=f"gpus[{position}].name", maximum=255)
+        total = _integer(gpu["total_vram_mib"], label=f"gpus[{position}].total_vram_mib", minimum=1)
+        used = _integer(gpu["memory_used_mib"], label=f"gpus[{position}].memory_used_mib", minimum=0)
+        free = _integer(gpu["memory_free_mib"], label=f"gpus[{position}].memory_free_mib", minimum=0)
+        gpu_utilization = _integer(
+            gpu["gpu_utilization_pct"],
+            label=f"gpus[{position}].gpu_utilization_pct",
+            minimum=0,
+            maximum=100,
+            nullable=True,
+        )
+        memory_utilization = _integer(
+            gpu["memory_utilization_pct"],
+            label=f"gpus[{position}].memory_utilization_pct",
+            minimum=0,
+            maximum=100,
+            nullable=True,
+        )
+        temperature = _integer(
+            gpu["temperature_c"],
+            label=f"gpus[{position}].temperature_c",
+            minimum=-100,
+            maximum=300,
+            nullable=True,
+        )
+        power = _number(
+            gpu["power_watts"], label=f"gpus[{position}].power_watts", minimum=0, nullable=True
+        )
+        pstate = _text(gpu["pstate"], label=f"gpus[{position}].pstate", maximum=32, nullable=True)
+        health = _text(gpu["health"], label=f"gpus[{position}].health", maximum=32)
+        assert (
+            gpu_index is not None
+            and gpu_uuid is not None
+            and name is not None
+            and total is not None
+            and used is not None
+            and free is not None
+            and health is not None
+        )
+        if gpu_uuid in gpu_uuids or gpu_index in gpu_indexes:
+            raise CollectionError("server collector snapshot contains duplicate GPU identities")
+        if used > total or free > total:
+            raise CollectionError("server collector GPU memory telemetry is internally inconsistent")
+        gpu_uuids.add(gpu_uuid)
+        gpu_indexes.add(gpu_index)
+        gpu_totals[gpu_uuid] = total
+        gpus.append(
+            TelemetryInput(
+                gpu_index=gpu_index,
+                gpu_uuid=gpu_uuid,
+                name=name,
+                total_vram_mib=total,
+                memory_used_mib=used,
+                memory_free_mib=free,
+                gpu_utilization_pct=gpu_utilization,
+                memory_utilization_pct=memory_utilization,
+                temperature_c=temperature,
+                power_watts=power,
+                pstate=pstate,
+                health=health,
+            )
+        )
+
+    processes: list[ProcessInput] = []
+    process_identities: set[tuple[str, int]] = set()
+    for position, value in enumerate(
+        _list(snapshot["processes"], label="processes", maximum=MAX_SERVER_SCRIPT_PROCESS_COUNT)
+    ):
+        process = _mapping(
+            value,
+            label=f"processes[{position}]",
+            keys={
+                "gpu_uuid",
+                "pid",
+                "used_memory_mib",
+                "executable",
+                "username",
+                "process_started_at",
+            },
+        )
+        gpu_uuid = _text(process["gpu_uuid"], label=f"processes[{position}].gpu_uuid", maximum=160)
+        pid = _integer(process["pid"], label=f"processes[{position}].pid", minimum=1, maximum=2**31 - 1)
+        used_memory_mib = _integer(
+            process["used_memory_mib"], label=f"processes[{position}].used_memory_mib", minimum=0
+        )
+        executable = _text(process["executable"], label=f"processes[{position}].executable", maximum=255)
+        username = _text(
+            process["username"], label=f"processes[{position}].username", maximum=120, nullable=True
+        )
+        process_started_at = _timestamp(
+            process["process_started_at"], label=f"processes[{position}].process_started_at"
+        )
+        assert gpu_uuid is not None and pid is not None and used_memory_mib is not None and executable is not None
+        identity_key = (gpu_uuid, pid)
+        if (
+            gpu_uuid not in gpu_uuids
+            or identity_key in process_identities
+            or used_memory_mib > gpu_totals[gpu_uuid]
+        ):
+            raise CollectionError("server collector snapshot contains invalid or duplicate process identities")
+        process_identities.add(identity_key)
+        processes.append(
+            ProcessInput(
+                gpu_uuid=gpu_uuid,
+                pid=pid,
+                used_memory_mib=used_memory_mib,
+                executable=executable,
+                username=username,
+                process_started_at=process_started_at,
+            )
+        )
+
+    gpu_probe_available = snapshot["gpu_probe_available"]
+    if not gpu_probe_available and (gpus or processes):
+        raise CollectionError("server collector marked GPU probe unavailable but returned GPU data")
+    if gpu_probe_available and not gpus:
+        raise CollectionError("server collector marked GPU probe available but returned no GPUs")
+    return EndpointObservation(
+        endpoint_id=endpoint_id,
+        observed_at=observed_at,
+        boot_id=boot_id,
+        host={
+            "cpu_count": cpu_count,
+            "load_1m": load_1m,
+            "cpu_total_ticks": cpu_total_ticks,
+            "cpu_idle_ticks": cpu_idle_ticks,
+            "memory_total_mib": memory_total_mib,
+            "memory_available_mib": memory_available_mib,
+        },
+        gpus=gpus,
+        processes=processes,
+        observation_complete=gpu_probe_available,
+    )
 
 
 def _value(row: list[str], index: int) -> str | None:
@@ -232,6 +578,8 @@ async def default_runner(
         connect_timeout_seconds=connect_timeout_seconds,
         process_ids=process_ids,
     )
+    if result.stdout_truncated or result.stderr_truncated:
+        raise CollectionError(f"SSH probe output exceeded bounded limits for {endpoint.id}")
     if result.returncode != 0:
         detail = result.stderr.strip().replace("\n", " ")[:500]
         raise CollectionError(f"SSH probe failed for {endpoint.id}: {detail or result.returncode}")
@@ -252,16 +600,34 @@ class SSHCollector:
         process_ids: tuple[int, ...] = (),
     ) -> str:
         if self.runner is default_runner:
-            return await default_runner(
+            output = await default_runner(
                 endpoint,
                 probe,
                 self.inventory.collector.ssh_connect_timeout_seconds,
                 process_ids=process_ids,
             )
-        return await self.runner(endpoint, command)
+        else:
+            output = await self.runner(endpoint, command)
+        try:
+            output_size = len(output.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise CollectionError("SSH probe output is not valid Unicode") from exc
+        if output_size > MAX_SERVER_SCRIPT_SNAPSHOT_BYTES:
+            raise CollectionError("SSH probe output exceeded the stdout limit")
+        return output
 
     async def observe_endpoint(self, endpoint: EndpointConfig) -> EndpointObservation:
         observed_at = utcnow()
+        if endpoint.observation_profile == "server-script-v1":
+            return parse_server_script_snapshot(
+                await self._run(
+                    endpoint,
+                    SERVER_SCRIPT_REMOTE_COMMAND,
+                    probe="endpoint-telemetry",
+                ),
+                endpoint_id=endpoint.id,
+                observed_at=observed_at,
+            )
         gpu_raw, process_raw, identity_raw, host_raw = parse_combined_probe(
             await self._run(endpoint, COMBINED_QUERY, probe="endpoint-telemetry")
         )

@@ -59,7 +59,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             width: max(1024, min(1440, visibleSize.width - 48)),
             height: max(640, min(820, visibleSize.height - 48))
         )
-#if DEBUG
+#if DEBUG || DESKTOP_FIXTURES
         if let fixtureViewport = fixtureViewportIfRequested() {
             initialSize = fixtureViewport
         }
@@ -79,7 +79,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         createdWindow.appearance = NSAppearance(named: .aqua)
         createdWindow.backgroundColor = .windowBackgroundColor
         createdWindow.isOpaque = true
-        createdWindow.minSize = NSSize(width: 1024, height: 640)
+        createdWindow.minSize = NSSize(width: 900, height: 640)
         createdWindow.center()
         createdWindow.delegate = self
 
@@ -90,7 +90,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         window = createdWindow
         createdWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-#if DEBUG
+#if DEBUG || DESKTOP_FIXTURES
         if configureFixtureModeIfRequested() {
             captureFixtureScreenshotIfRequested(from: view)
             return
@@ -257,7 +257,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         }
     }
 
-#if DEBUG
+#if DEBUG || DESKTOP_FIXTURES
     private func fixtureViewportIfRequested() -> NSSize? {
         guard let rawValue = ProcessInfo.processInfo.environment["GPU_BROKER_DESKTOP_VIEWPORT"] else {
             return nil
@@ -267,7 +267,7 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
             components.count == 2,
             let width = Double(components[0]),
             let height = Double(components[1]),
-            width >= 1024,
+            width >= 900,
             height >= 640,
             width <= 1440,
             height <= 820
@@ -419,12 +419,12 @@ private enum ServiceProbeResult {
 }
 
 @discardableResult
-private func confirmEndpointRemoval(_ endpoint: EndpointRecord) -> Bool {
+private func confirmEndpointRetirement(_ endpoint: EndpointRecord) -> Bool {
     let alert = NSAlert()
     alert.alertStyle = .warning
-    alert.messageText = "移除并退役这台服务器？"
-    alert.informativeText = "移除后，这台服务器不再接收新的资源申请。当它没有正在使用的资源或排队申请时，会从服务器列表中隐藏。历史记录会保留，远端机器和任务不会被停止。"
-    alert.addButton(withTitle: "移除并退役")
+    alert.messageText = "彻底退役服务器？"
+    alert.informativeText = "退役前请先暂停接收新任务并等待排空。历史记录会保留；远端机器和任务不会被停止。"
+    alert.addButton(withTitle: "彻底退役服务器")
     alert.addButton(withTitle: "取消")
     guard alert.runModal() == .alertFirstButtonReturn else { return false }
     return true
@@ -454,11 +454,12 @@ private struct NativeBrokerRoot: View {
     @State private var claimInitialEndpointID = ""
     @State private var selectedGPUID: String?
     @State private var selectedEndpointDetailID: String?
+    @State private var editingEndpointID: String?
     @State private var selectedDashboardSection: DashboardSection
 
     init(store: BrokerStore) {
         self.store = store
-#if DEBUG
+#if DEBUG || DESKTOP_FIXTURES
         let requested = ProcessInfo.processInfo.environment["GPU_BROKER_DESKTOP_SECTION"]
         let initialSection: DashboardSection = switch requested {
         case "server-pool": .resources
@@ -483,6 +484,13 @@ private struct NativeBrokerRoot: View {
         Binding(
             get: { selectedEndpointDetailID.map(StableRecordSelection.init(id:)) },
             set: { selectedEndpointDetailID = $0?.id }
+        )
+    }
+
+    private var editingEndpointSelection: Binding<StableRecordSelection?> {
+        Binding(
+            get: { editingEndpointID.map(StableRecordSelection.init(id:)) },
+            set: { editingEndpointID = $0?.id }
         )
     }
 
@@ -530,10 +538,18 @@ private struct NativeBrokerRoot: View {
                             openEndpoint: { endpoint in
                                 selectedEndpointDetailID = endpoint.id
                             },
-                            removeEndpoint: { endpoint in
-                                guard store.allowsEndpointLifecycleMutations else { return }
-                                guard confirmEndpointRemoval(endpoint) else { return }
-                                store.deleteEndpoint(endpoint) { _, _ in }
+                            editEndpoint: { endpoint in
+                                editingEndpointID = endpoint.id
+                            },
+                            pauseEndpoint: { endpoint in
+                                store.pauseEndpoint(endpoint) { _, _ in }
+                            },
+                            resumeEndpoint: { endpoint in
+                                store.resumeEndpoint(endpoint) { _, _ in }
+                            },
+                            retireEndpoint: { endpoint in
+                                guard confirmEndpointRetirement(endpoint) else { return }
+                                store.retireEndpoint(endpoint) { _, _ in }
                             },
                             selectedSection: $selectedDashboardSection,
                             selectGPU: { gpu in
@@ -562,6 +578,11 @@ private struct NativeBrokerRoot: View {
         }
         .sheet(item: selectedEndpointSelection) { selection in
             ServerDetailSheet(store: store, endpointID: selection.id)
+        }
+        .sheet(item: editingEndpointSelection) { selection in
+            if let endpoint = store.snapshot.endpoint(id: selection.id) {
+                EditServerSheet(store: store, endpoint: endpoint)
+            }
         }
         .sheet(item: selectedGPUSelection) { selection in
             if let gpu = store.snapshot.gpu(id: selection.id) {
@@ -882,7 +903,10 @@ private struct DashboardView: View {
     let claimGPU: () -> Void
     let claimEndpoint: (String) -> Void
     let openEndpoint: (EndpointRecord) -> Void
-    let removeEndpoint: (EndpointRecord) -> Void
+    let editEndpoint: (EndpointRecord) -> Void
+    let pauseEndpoint: (EndpointRecord) -> Void
+    let resumeEndpoint: (EndpointRecord) -> Void
+    let retireEndpoint: (EndpointRecord) -> Void
     @Binding var selectedSection: DashboardSection
     let selectGPU: (GPURecord) -> Void
 
@@ -908,7 +932,10 @@ private struct DashboardView: View {
                     ResourcesDashboard(
                         store: store,
                         claimEndpoint: claimEndpoint,
-                        removeEndpoint: removeEndpoint,
+                        editEndpoint: editEndpoint,
+                        pauseEndpoint: pauseEndpoint,
+                        resumeEndpoint: resumeEndpoint,
+                        retireEndpoint: retireEndpoint,
                         selectGPU: selectGPU
                     )
                 case .leases:
@@ -990,7 +1017,7 @@ private struct SettingsDashboard: View {
                     SettingsFact(label: "连接", value: store.isConnected ? "已连接" : "未连接", icon: store.isConnected ? "checkmark.circle.fill" : "wifi.exclamationmark")
                     SettingsFact(label: "Schema", value: store.serviceInfo?.schemaVersion ?? "未知", icon: "curlybraces")
                     SettingsFact(label: "版本", value: store.serviceInfo?.version ?? "未知", icon: "number")
-                    SettingsFact(label: "移除服务器", value: store.supportsEndpointDeletion ? "可用" : "需要更新本机服务", icon: "trash")
+                    SettingsFact(label: "服务器生命周期", value: store.supportsEndpointPauseResume && store.supportsEndpointRetirement ? "可用" : "需要更新本机服务", icon: "pause.circle")
                 }
                 .padding(16)
                 .background(DesignTokens.surface.opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -1130,13 +1157,17 @@ private enum EndpointField: String, CaseIterable, Identifiable, Hashable {
 private struct ResourcesDashboard: View {
     @ObservedObject var store: BrokerStore
     @State private var selectedEndpointID = ""
+    @State private var showsCompactDetail = false
     @State private var searchText = ""
     @State private var filter: EndpointFilter = .all
     @State private var sort: EndpointSort = .attention
     @State private var density: EndpointDensity = .compact
     @State private var visibleFields: Set<EndpointField> = [.cpu, .memory, .gpu, .status]
     let claimEndpoint: (String) -> Void
-    let removeEndpoint: (EndpointRecord) -> Void
+    let editEndpoint: (EndpointRecord) -> Void
+    let pauseEndpoint: (EndpointRecord) -> Void
+    let resumeEndpoint: (EndpointRecord) -> Void
+    let retireEndpoint: (EndpointRecord) -> Void
     let selectGPU: (GPURecord) -> Void
 
     private var endpoints: [EndpointRecord] { store.snapshot.operationalEndpoints }
@@ -1206,34 +1237,21 @@ private struct ResourcesDashboard: View {
         VStack(spacing: 0) {
             resourceSummary
             Divider().opacity(0.45)
-            HStack(spacing: 0) {
-                endpointTable
-                    .frame(width: 430)
-                    .background(DesignTokens.surface)
-
-                Divider().opacity(0.36)
-
-                if let selectedEndpoint {
-                    SpatialServerDetail(
-                        store: store,
-                        endpoint: selectedEndpoint,
-                        gpus: store.snapshot.gpus(for: selectedEndpoint),
-                        claim: { claimEndpoint(selectedEndpoint.id) },
-                        remove: { removeEndpoint(selectedEndpoint) },
-                        selectGPU: selectGPU
-                    )
-                    .id(selectedEndpoint.id)
-                    .transition(.opacity.combined(with: .offset(x: 8)))
-                } else if endpoints.isEmpty {
-                    ContentUnavailableView("暂无资源", systemImage: "server.rack", description: Text("添加服务器后会显示端点和 GPU。"))
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ContentUnavailableView("没有匹配的端点", systemImage: "line.3.horizontal.decrease.circle")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            }
+            PersistedMasterDetailSplit(
+                configuration: .resources,
+                showsCompactDetail: $showsCompactDetail,
+                master: { endpointTable.background(DesignTokens.surface) },
+                detail: { detailContent }
+            )
         }
-        .onAppear { ensureSelection() }
+        .onAppear {
+            ensureSelection()
+#if DEBUG || DESKTOP_FIXTURES
+            if ProcessInfo.processInfo.environment["GPU_BROKER_DESKTOP_SHOW_COMPACT_DETAIL"] == "1" {
+                showsCompactDetail = true
+            }
+#endif
+        }
         .onChange(of: filteredEndpoints.map(\.id)) { _, _ in ensureSelection() }
         .accessibilityLabel("资源")
     }
@@ -1342,6 +1360,7 @@ private struct ResourcesDashboard: View {
                             ) {
                                 withAnimation(.easeOut(duration: 0.14)) {
                                     selectedEndpointID = endpoint.id
+                                    showsCompactDetail = true
                                 }
                             }
                         }
@@ -1351,8 +1370,9 @@ private struct ResourcesDashboard: View {
                 }
             }
 
-            if store.serviceInfo != nil, !store.supportsEndpointDeletion {
-                Label("更新本机服务后可移除服务器", systemImage: "exclamationmark.triangle.fill")
+            if store.serviceInfo != nil,
+               !store.supportsEndpointPauseResume || !store.supportsEndpointRetirement {
+                Label("更新本机服务后可管理服务器生命周期", systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(DesignTokens.warning)
                     .padding(12)
@@ -1363,6 +1383,31 @@ private struct ResourcesDashboard: View {
     private func ensureSelection() {
         if !filteredEndpoints.contains(where: { $0.id == selectedEndpointID }) {
             selectedEndpointID = filteredEndpoints.first?.id ?? ""
+        }
+    }
+
+    @ViewBuilder
+    private var detailContent: some View {
+        if let selectedEndpoint {
+            SpatialServerDetail(
+                store: store,
+                endpoint: selectedEndpoint,
+                gpus: store.snapshot.gpus(for: selectedEndpoint),
+                claim: { claimEndpoint(selectedEndpoint.id) },
+                edit: { editEndpoint(selectedEndpoint) },
+                pause: { pauseEndpoint(selectedEndpoint) },
+                resume: { resumeEndpoint(selectedEndpoint) },
+                retire: { retireEndpoint(selectedEndpoint) },
+                selectGPU: selectGPU
+            )
+            .id(selectedEndpoint.id)
+            .transition(.opacity.combined(with: .offset(x: 8)))
+        } else if endpoints.isEmpty {
+            ContentUnavailableView("暂无资源", systemImage: "server.rack", description: Text("添加服务器后会显示端点和 GPU。"))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ContentUnavailableView("没有匹配的端点", systemImage: "line.3.horizontal.decrease.circle")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -1495,21 +1540,27 @@ private struct EndpointTableHeader: View {
     let visibleFields: Set<EndpointField>
 
     var body: some View {
-        HStack(spacing: 8) {
-            Text("端点")
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 8) {
+                Text("端点")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if visibleFields.contains(.cpu) {
+                    Text("CPU 压力").frame(width: 54, alignment: .trailing)
+                }
+                if visibleFields.contains(.memory) {
+                    Text("内存压力").frame(width: 58, alignment: .trailing)
+                }
+                if visibleFields.contains(.gpu) {
+                    Text("GPU 压力").frame(width: 58, alignment: .trailing)
+                }
+                if visibleFields.contains(.status) {
+                    Text("注意 / 新鲜度").frame(width: 72, alignment: .trailing)
+                }
+            }
+            .frame(minWidth: 470, alignment: .leading)
+
+            Text("端点与资源状态")
                 .frame(maxWidth: .infinity, alignment: .leading)
-            if visibleFields.contains(.cpu) {
-                Text("CPU 压力").frame(width: 54, alignment: .trailing)
-            }
-            if visibleFields.contains(.memory) {
-                Text("内存压力").frame(width: 58, alignment: .trailing)
-            }
-            if visibleFields.contains(.gpu) {
-                Text("GPU 压力").frame(width: 58, alignment: .trailing)
-            }
-            if visibleFields.contains(.status) {
-                Text("注意 / 新鲜度").frame(width: 72, alignment: .trailing)
-            }
         }
         .font(.system(size: 9, weight: .semibold))
         .foregroundStyle(DesignTokens.mutedInk)
@@ -1530,65 +1581,14 @@ private struct EndpointTableRow: View {
 
     var body: some View {
         Button(action: select) {
-            HStack(alignment: .center, spacing: 8) {
-                Image(systemName: hasAttention ? "exclamationmark.triangle.fill" : "server.rack")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(statusColor)
-                    .frame(width: 26, height: 26)
-                    .background(statusColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                VStack(alignment: .leading, spacing: density == .compact ? 2 : 4) {
-                    Text(endpoint.id)
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text("\(endpoint.displayName) · \(freshnessLabel)")
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
-                        .foregroundStyle(DesignTokens.mutedInk)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                if visibleFields.contains(.cpu) {
-                    EndpointPressureCell(
-                        label: "CPU 压力",
-                        fraction: endpoint.cpuLoadFraction,
-                        caption: cpuCaption
-                    )
-                    .frame(width: 54)
-                }
-                if visibleFields.contains(.memory) {
-                    EndpointPressureCell(
-                        label: "内存压力",
-                        fraction: endpoint.memoryFraction,
-                        caption: memoryCaption
-                    )
-                    .frame(width: 58)
-                }
-                if visibleFields.contains(.gpu) {
-                    EndpointPressureCell(
-                        label: "GPU 压力",
-                        fraction: gpuPressure,
-                        caption: gpuCaption
-                    )
-                    .frame(width: 58)
-                }
-                if visibleFields.contains(.status) {
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Label(attentionLabel, systemImage: attentionIcon)
-                            .lineLimit(1)
-                        Text(freshnessLabel)
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundStyle(DesignTokens.mutedInk)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
-                    .foregroundStyle(statusColor)
-                    .frame(width: 72, alignment: .trailing)
-                }
+            ViewThatFits(in: .horizontal) {
+                standardRow
+                    .frame(minWidth: 470, alignment: .leading)
+                compactRow
             }
-            .font(.system(size: 10, weight: .semibold, design: .rounded))
             .padding(.horizontal, 10)
-            .frame(height: density == .compact ? 64 : 78)
+            .padding(.vertical, density == .compact ? 9 : 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 selected ? DesignTokens.interaction.opacity(0.13) : DesignTokens.ink.opacity(hovering ? 0.045 : 0),
                 in: RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -1602,6 +1602,140 @@ private struct EndpointTableRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("端点 \(endpoint.id)")
         .accessibilityValue("\(attentionLabel)，\(freshnessLabel)，CPU 压力 \(percentageLabel(endpoint.cpuLoadFraction))，内存压力 \(percentageLabel(endpoint.memoryFraction))，GPU 压力 \(percentageLabel(gpuPressure))，\(gpuCaption)")
+    }
+
+    private var standardRow: some View {
+        HStack(alignment: .center, spacing: 8) {
+            endpointIcon
+            endpointTitle
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if visibleFields.contains(.cpu) {
+                EndpointPressureCell(
+                    label: "CPU 压力",
+                    fraction: endpoint.cpuLoadFraction,
+                    caption: cpuCaption
+                )
+                .frame(width: 54)
+            }
+            if visibleFields.contains(.memory) {
+                EndpointPressureCell(
+                    label: "内存压力",
+                    fraction: endpoint.memoryFraction,
+                    caption: memoryCaption
+                )
+                .frame(width: 58)
+            }
+            if visibleFields.contains(.gpu) {
+                EndpointPressureCell(
+                    label: "GPU 压力",
+                    fraction: gpuPressure,
+                    caption: gpuCaption
+                )
+                .frame(width: 58)
+            }
+            if visibleFields.contains(.status) {
+                statusSummary
+                    .frame(width: 72, alignment: .trailing)
+            }
+        }
+        .font(.system(size: 10, weight: .semibold, design: .rounded))
+    }
+
+    private var compactRow: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .top, spacing: 8) {
+                endpointIcon
+                endpointTitle
+                Spacer(minLength: 0)
+                if visibleFields.contains(.status) {
+                    Label(attentionLabel, systemImage: attentionIcon)
+                        .font(.system(size: 9, weight: .semibold, design: .rounded))
+                        .foregroundStyle(statusColor)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 76, alignment: .trailing)
+                }
+            }
+
+            LazyVGrid(
+                columns: [GridItem(.flexible(minimum: 110), spacing: 7), GridItem(.flexible(minimum: 110), spacing: 7)],
+                alignment: .leading,
+                spacing: 7
+            ) {
+                if visibleFields.contains(.cpu) {
+                    compactMetric(label: "CPU 压力", value: percentageLabel(endpoint.cpuLoadFraction), caption: cpuCaption, color: pressureColor(endpoint.cpuLoadFraction))
+                }
+                if visibleFields.contains(.memory) {
+                    compactMetric(label: "内存压力", value: percentageLabel(endpoint.memoryFraction), caption: memoryCaption, color: pressureColor(endpoint.memoryFraction))
+                }
+                if visibleFields.contains(.gpu) {
+                    compactMetric(label: "GPU 压力", value: percentageLabel(gpuPressure), caption: gpuCaption, color: pressureColor(gpuPressure))
+                }
+                if visibleFields.contains(.status) {
+                    compactMetric(label: "数据状态", value: attentionLabel, caption: freshnessLabel, color: statusColor)
+                }
+            }
+        }
+    }
+
+    private var endpointIcon: some View {
+        Image(systemName: hasAttention ? "exclamationmark.triangle.fill" : "server.rack")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(statusColor)
+            .frame(width: 26, height: 26)
+            .background(statusColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+
+    private var endpointTitle: some View {
+        VStack(alignment: .leading, spacing: density == .compact ? 2 : 4) {
+            Text(endpoint.id)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text("\(endpoint.displayName) · \(freshnessLabel)")
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private var statusSummary: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            Label(attentionLabel, systemImage: attentionIcon)
+                .lineLimit(1)
+            Text(freshnessLabel)
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(statusColor)
+    }
+
+    private func compactMetric(label: String, value: String, caption: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .lineLimit(1)
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Text(value)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(color)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Text(caption)
+                    .font(.system(size: 8, weight: .medium, design: .rounded))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DesignTokens.ink.opacity(0.035), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 
     private var availableGPUCount: Int {
@@ -1802,7 +1936,10 @@ private struct SpatialServerDetail: View {
     let endpoint: EndpointRecord
     let gpus: [GPURecord]
     let claim: () -> Void
-    let remove: () -> Void
+    let edit: () -> Void
+    let pause: () -> Void
+    let resume: () -> Void
+    let retire: () -> Void
     let selectGPU: (GPURecord) -> Void
 
     private var unavailable: Bool {
@@ -1812,6 +1949,9 @@ private struct SpatialServerDetail: View {
     private var telemetryIsFresh: Bool { store.freshness == .fresh }
 
     private var availableCount: Int { gpus.filter { $0.state == "AVAILABLE" }.count }
+    private var isPaused: Bool { endpoint.lifecycleState == "DRAINING" || endpoint.monitorStatus == "DRAINING" }
+    private var isRetired: Bool { endpoint.lifecycleState == "RETIRED" || endpoint.monitorStatus == "RETIRED" }
+    private var isMutating: Bool { store.mutatingEndpointIDs.contains(endpoint.id) }
 
     var body: some View {
         ScrollView {
@@ -1925,30 +2065,62 @@ private struct SpatialServerDetail: View {
 
     @ViewBuilder
     private var serverAction: some View {
-        if unavailable {
-            Button(action: remove) {
-                Label(store.deletingEndpointIDs.contains(endpoint.id) ? "移除中" : "移除", systemImage: "trash")
+        HStack(spacing: 8) {
+            Button(action: edit) {
+                Label("编辑服务器", systemImage: "slider.horizontal.3")
                     .font(.system(size: 11, weight: .semibold))
             }
-            .buttonStyle(HomeClaimButtonStyle(tint: DesignTokens.danger, foreground: DesignTokens.onInteraction))
-            .disabled(!store.allowsEndpointLifecycleMutations || !store.supportsEndpointDeletion || store.deletingEndpointIDs.contains(endpoint.id))
-            .help(!store.allowsEndpointLifecycleMutations ? store.endpointLifecycleMutationUnavailableReason : (store.supportsEndpointDeletion ? "排空并退役服务器；不会停止远端任务" : "当前本机服务版本不支持移除"))
-        } else if gpus.isEmpty {
-            Label("CPU 节点", systemImage: "cpu")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(DesignTokens.cpu)
-                .padding(.horizontal, 11)
-                .frame(height: 34)
-                .background(DesignTokens.cpu.opacity(0.13), in: Capsule())
-                .accessibilityLabel("CPU 节点，当前没有可申请的 GPU")
-        } else {
-            Button(action: claim) {
-                Label("申请此服务器的 GPU", systemImage: "key.fill")
+            .buttonStyle(SecondaryActionButtonStyle())
+            .disabled(!store.allowsEndpointLifecycleMutations || !store.supportsEndpointUpdate || isMutating)
+            .help(!store.allowsEndpointLifecycleMutations ? store.endpointLifecycleMutationUnavailableReason : (store.supportsEndpointUpdate ? "修改受控采集设置" : "当前本机服务版本不支持更新服务器设置"))
+
+            if isRetired {
+                Label("已彻底退役", systemImage: "archivebox.fill")
                     .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(DesignTokens.mutedInk)
+            } else if isPaused {
+                Button(action: resume) {
+                    Label(isMutating ? "处理中" : "恢复接收新任务", systemImage: "play.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(HomeClaimButtonStyle(tint: DesignTokens.interaction, foreground: DesignTokens.onInteraction))
+                .disabled(!store.allowsEndpointLifecycleMutations || !store.supportsEndpointPauseResume || isMutating)
+                .help("恢复接收新任务不会启动远端任务")
+
+                Button(action: retire) {
+                    Label(isMutating ? "处理中" : "彻底退役服务器", systemImage: "archivebox.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(HomeClaimButtonStyle(tint: DesignTokens.danger, foreground: DesignTokens.onInteraction))
+                .disabled(!store.allowsEndpointLifecycleMutations || !store.supportsEndpointRetirement || isMutating)
+                .help("彻底退役只保留历史记录，不会停止远端任务")
+            } else {
+                Button(action: pause) {
+                    Label(isMutating ? "处理中" : "暂停接收新任务", systemImage: "pause.circle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(SecondaryActionButtonStyle())
+                .disabled(!store.allowsEndpointLifecycleMutations || !store.supportsEndpointPauseResume || isMutating)
+                .help("暂停接收新任务会进入排空状态，不会停止远端任务")
+
+                if !unavailable, !gpus.isEmpty {
+                    Button(action: claim) {
+                        Label("申请此服务器的 GPU", systemImage: "key.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(HomeClaimButtonStyle(tint: DesignTokens.interaction, foreground: DesignTokens.onInteraction))
+                    .disabled(!store.allowsMutations)
+                    .help(store.allowsMutations ? "只申请这台服务器上的 GPU；不会启动任务" : store.mutationUnavailableReason)
+                } else if gpus.isEmpty {
+                    Label("CPU 节点", systemImage: "cpu")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(DesignTokens.cpu)
+                        .padding(.horizontal, 11)
+                        .frame(height: 34)
+                        .background(DesignTokens.cpu.opacity(0.13), in: Capsule())
+                        .accessibilityLabel("CPU 节点，当前没有可申请的 GPU")
+                }
             }
-            .buttonStyle(HomeClaimButtonStyle(tint: DesignTokens.interaction, foreground: DesignTokens.onInteraction))
-            .disabled(!store.allowsMutations)
-            .help(store.allowsMutations ? "只申请这台服务器上的 GPU" : store.mutationUnavailableReason)
         }
     }
 
@@ -2653,7 +2825,8 @@ private struct SpatialGPUCell: View {
                     Text(gpuStateLabel(gpu.state))
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
             }
@@ -2670,7 +2843,6 @@ private struct ServerPool: View {
     let snapshot: BrokerSnapshot
     let claimEndpoint: (String) -> Void
     let openEndpoint: (EndpointRecord) -> Void
-    let removeEndpoint: (EndpointRecord) -> Void
     let selectGPU: (GPURecord) -> Void
 
     var body: some View {
@@ -2709,7 +2881,6 @@ private struct ServerPool: View {
                             gpus: snapshot.gpus(for: endpoint),
                             claim: { claimEndpoint(endpoint.id) },
                             open: { openEndpoint(endpoint) },
-                            remove: { removeEndpoint(endpoint) },
                             selectGPU: selectGPU
                         )
                     }
@@ -2725,7 +2896,6 @@ private struct ServerAccessoryCard: View {
     let gpus: [GPURecord]
     let claim: () -> Void
     let open: () -> Void
-    let remove: () -> Void
     let selectGPU: (GPURecord) -> Void
     @State private var hovering = false
 
@@ -2765,10 +2935,6 @@ private struct ServerAccessoryCard: View {
 
     private var isUnavailable: Bool {
         ["ERROR", "STALE", "DISABLED", "DRAINING", "RETIRED"].contains(endpoint.monitorStatus)
-    }
-
-    private var isRemoving: Bool {
-        store.deletingEndpointIDs.contains(endpoint.id)
     }
 
     var body: some View {
@@ -2847,13 +3013,12 @@ private struct ServerAccessoryCard: View {
                         .lineLimit(1)
                     Spacer(minLength: 0)
                     if isUnavailable {
-                        Button(action: remove) {
-                            Label(isRemoving ? "移除中" : "移除", systemImage: "trash")
+                        Button(action: open) {
+                            Label("查看详情", systemImage: "chevron.right")
                                 .font(.system(size: 11, weight: .semibold))
                         }
-                        .buttonStyle(HomeClaimButtonStyle(tint: DesignTokens.danger, foreground: DesignTokens.onInteraction))
-                        .help(store.allowsEndpointLifecycleMutations ? removeHelp : store.endpointLifecycleMutationUnavailableReason)
-                        .disabled(!store.allowsEndpointLifecycleMutations || isRemoving || !store.supportsEndpointDeletion)
+                        .buttonStyle(SecondaryActionButtonStyle())
+                        .help("查看服务器详情并管理生命周期")
                     } else {
                         Button(action: claim) {
                             Label("申请", systemImage: "key.fill")
@@ -2900,16 +3065,9 @@ private struct ServerAccessoryCard: View {
 
     private var footerHint: String {
         if isUnavailable {
-            return store.supportsEndpointDeletion ? "可刷新状态或移除服务器" : "旧版本服务暂不支持移除"
+            return "可查看详情并管理服务器生命周期"
         }
         return gpus.isEmpty ? "读取完成后显示 GPU 明细" : "点击编号查看 GPU 详情"
-    }
-
-    private var removeHelp: String {
-        guard store.supportsEndpointDeletion else {
-            return "当前本机服务不支持移除服务器。请重启或升级服务。"
-        }
-        return "排空并退役服务器；保留审计历史，不会关闭远端机器或停止任务"
     }
 }
 
@@ -3002,7 +3160,7 @@ private func gpuStateColor(_ state: String) -> Color {
 private func gpuStateLabel(_ state: String) -> String {
     switch state {
     case "AVAILABLE": return "可用"
-    case "HELD", "LEASED_IDLE": return "已分配"
+    case "HELD", "LEASED_IDLE": return "已申领，待使用"
     case "RUNNING_MANAGED": return "运行中"
     case "BUSY_UNMANAGED": return "非托管占用"
     case "ORPHANED_BUSY": return "释放后仍占用"
@@ -3013,7 +3171,7 @@ private func gpuStateLabel(_ state: String) -> String {
     case "CONFLICT": return "需要处理"
     case "DISABLED": return "已停用"
     case "MAINTENANCE": return "维护中"
-    case "DRAINING": return "排空中"
+    case "DRAINING": return "已暂停（正在排空）"
     case "RETIRED": return "已退役"
     default: return "需处理"
     }
@@ -4555,28 +4713,33 @@ private struct CoordinationBoundaryCard: View {
 private struct AddServerSheet: View {
     @ObservedObject var store: BrokerStore
     @Environment(\.dismiss) private var dismiss
-    @State private var sshCommand = ""
     @State private var endpointID = ""
+    @State private var host = ""
+    @State private var port = "22"
+    @State private var sshUser = ""
+    @State private var observationProfile: EndpointObservationProfile = .serverScript
     @State private var validationMessage: String?
     @State private var isSubmitting = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             SheetTitle(icon: "server.rack", title: "添加服务器", subtitle: "把直连计算服务器加入本机资源池。")
-            VStack(alignment: .leading, spacing: 8) {
-                Text("SSH 指令")
-                    .fieldLabel()
-                TextField("ssh -p 2201 gpu@server.example.com", text: $sshCommand)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 13, weight: .medium, design: .monospaced))
+            HStack(spacing: 14) {
+                LabeledField(label: "服务器地址", placeholder: "gpu.example.com", text: $host)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("端口")
+                        .fieldLabel()
+                    TextField("22", text: $port)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 84)
+                }
             }
-            VStack(alignment: .leading, spacing: 8) {
-                Text("服务器标识（可选）")
-                    .fieldLabel()
-                TextField("留空则由主机名自动生成", text: $endpointID)
-                    .textFieldStyle(.roundedBorder)
+            HStack(spacing: 14) {
+                LabeledField(label: "SSH 用户", placeholder: "collector", text: $sshUser)
+                LabeledField(label: "服务器标识（可选）", placeholder: "留空则自动生成", text: $endpointID)
             }
-            Text("采集成功后，这台服务器可供你的项目和 Agent 申请。这里只读取状态，不执行任务。")
+            EndpointObservationProfileField(selection: $observationProfile)
+            Text("采集成功后，这台服务器可供你的项目和 Agent 申请。这里只读取状态，不执行任务，也不接受任意命令或 Docker 参数。")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(DesignTokens.mutedInk)
                 .fixedSize(horizontal: false, vertical: true)
@@ -4601,7 +4764,14 @@ private struct AddServerSheet: View {
 
     private func submit() {
         do {
-            let draft = try EndpointDraft(command: sshCommand, suppliedID: endpointID)
+            guard let parsedPort = Int(port) else { throw EndpointDraftError.invalidEndpointFields }
+            let draft = try EndpointDraft(
+                host: host,
+                port: parsedPort,
+                sshUser: sshUser,
+                observationProfile: observationProfile,
+                suppliedID: endpointID
+            )
             validationMessage = nil
             isSubmitting = true
             store.addEndpoint(draft) { success, error in
@@ -4615,6 +4785,98 @@ private struct AddServerSheet: View {
         } catch {
             validationMessage = error.localizedDescription
         }
+    }
+}
+
+private struct EditServerSheet: View {
+    @ObservedObject var store: BrokerStore
+    @Environment(\.dismiss) private var dismiss
+    let endpoint: EndpointRecord
+    @State private var sshUser: String
+    @State private var observationProfile: EndpointObservationProfile
+    @State private var validationMessage: String?
+    @State private var isSubmitting = false
+
+    init(store: BrokerStore, endpoint: EndpointRecord) {
+        self.store = store
+        self.endpoint = endpoint
+        _sshUser = State(initialValue: endpoint.sshUser)
+        _observationProfile = State(initialValue: EndpointObservationProfile(rawValueOrDefault: endpoint.observationProfile))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            SheetTitle(icon: "slider.horizontal.3", title: "编辑服务器", subtitle: "端点地址和端口是身份边界，不能在此修改。")
+            VStack(alignment: .leading, spacing: 7) {
+                Text("端点")
+                    .fieldLabel()
+                Text(endpoint.sshCommand)
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .textSelection(.enabled)
+            }
+            LabeledField(label: "SSH 用户", placeholder: "collector", text: $sshUser)
+            EndpointObservationProfileField(selection: $observationProfile)
+            if let validationMessage {
+                InlineValidation(message: validationMessage)
+            }
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("保存设置") { submit() }
+                    .buttonStyle(SoftButtonStyle(tint: DesignTokens.ink, foreground: DesignTokens.onInteraction))
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!store.allowsEndpointLifecycleMutations || !store.supportsEndpointUpdate || isSubmitting)
+                    .help(store.allowsEndpointLifecycleMutations ? "保存受控采集设置" : store.endpointLifecycleMutationUnavailableReason)
+            }
+        }
+        .padding(28)
+        .frame(width: 520)
+        .background(VisualEffect(material: .hudWindow, blendingMode: .behindWindow))
+    }
+
+    private func submit() {
+        do {
+            let draft = try EndpointUpdateDraft(sshUser: sshUser, observationProfile: observationProfile)
+            validationMessage = nil
+            isSubmitting = true
+            store.updateEndpoint(endpoint, draft: draft) { success, error in
+                isSubmitting = false
+                if success {
+                    dismiss()
+                } else {
+                    validationMessage = error
+                }
+            }
+        } catch {
+            validationMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct EndpointObservationProfileField: View {
+    @Binding var selection: EndpointObservationProfile
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("受控采集协议")
+                .fieldLabel()
+            Picker("受控采集协议", selection: $selection) {
+                ForEach(EndpointObservationProfile.allCases) { profile in
+                    Text(profile.label).tag(profile)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(selection.scriptInfo)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(DesignTokens.mutedInk)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("受控采集协议")
+        .accessibilityValue(selection.label)
     }
 }
 

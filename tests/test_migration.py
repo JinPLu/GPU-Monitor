@@ -84,6 +84,8 @@ def test_migration_upgrades_existing_schema_to_endpoint_telemetry(tmp_path: Path
     gpu_columns = {column["name"] for column in inspect(database.engine).get_columns("gpu_devices")}
     assert {"present", "absent_at"}.issubset(gpu_columns)
     assert "lease_endpoint_commitments" in inspect(database.engine).get_table_names()
+    with database.engine.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260810_0014"
 
 
 def test_scheduler_transport_migration_scrubs_legacy_argv_and_disables_target(

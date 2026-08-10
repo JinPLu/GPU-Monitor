@@ -1,6 +1,6 @@
 """Global, cooperative GPU resource control plane."""
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 SCHEMA_VERSION = "v1"
 
 # Lets an upgraded MCP fail clearly when the loopback service has not yet been
@@ -14,4 +14,7 @@ API_CAPABILITIES = (
     "general_resource_scheduler",
     "control_plane_state",
     "endpoint_telemetry_history",
+    "endpoint_update",
+    "endpoint_pause_resume",
+    "endpoint_retirement",
 )

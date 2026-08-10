@@ -36,8 +36,10 @@ from gpu_broker.importer import ParsedSSHCommand, parse_ssh_command
 from gpu_broker.schemas import (
     ActorCreate,
     AlertAcknowledge,
+    EndpointCreate,
     ControlPlaneSnapshot,
     EndpointEnabled,
+    EndpointUpdate,
     EndpointUpsert,
     LeaseBind,
     LeaseObservedBind,
@@ -807,14 +809,64 @@ def create_app(settings: Settings) -> FastAPI:
         )
 
     @app.post("/api/v1/endpoints")
-    def upsert_endpoint(
-        endpoint_data: EndpointUpsert,
+    def create_endpoint(
+        endpoint_data: EndpointCreate,
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        return service.upsert_endpoint(
+        return service.create_endpoint(
             actor,
             endpoint_data,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.patch("/api/v1/endpoints/{endpoint_id}")
+    def update_endpoint(
+        endpoint_id: str,
+        endpoint_data: EndpointUpdate,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.update_endpoint(
+            actor,
+            endpoint_id,
+            endpoint_data,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/endpoints/{endpoint_id}/pause")
+    def pause_endpoint(
+        endpoint_id: str,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.pause_endpoint(
+            actor,
+            endpoint_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/endpoints/{endpoint_id}/resume")
+    def resume_endpoint(
+        endpoint_id: str,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.resume_endpoint(
+            actor,
+            endpoint_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/endpoints/{endpoint_id}/retire")
+    def retire_endpoint(
+        endpoint_id: str,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.retire_endpoint(
+            actor,
+            endpoint_id,
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
@@ -838,10 +890,12 @@ def create_app(settings: Settings) -> FastAPI:
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        return service.delete_endpoint(
+        return service.pause_endpoint(
             actor,
             endpoint_id,
             idempotency_key=_idempotency_key(idempotency_key),
+            _idempotency_action="endpoint.delete",
+            _compatibility_alias=True,
         )
 
     @app.post("/ui/endpoints/ssh/preview")
@@ -1617,10 +1671,12 @@ def create_app(settings: Settings) -> FastAPI:
             response.headers["Pragma"] = "no-cache"
             return response
 
-        if action in {"quick-claim", "profile-claim"}:
-            message = "GPU 已保留，等待 workload 启动；不会启动远端任务" if result.get("lease") else "资源请求已进入队列"
-        elif action == "request":
-            message = "资源请求已获分配，租约等待激活" if result.get("lease") else "资源请求已进入队列"
+        if action in {"quick-claim", "profile-claim", "request"}:
+            message = (
+                "GPU 已申领，待使用；请在项目环境启动任务。未启动不会提前释放，且不会由 Broker 启动远端任务"
+                if result.get("lease")
+                else "资源请求已进入队列"
+            )
         else:
             message = f"操作完成（事件 {result.get('event_id', 'no-event')}）"
         notice = quote(message)

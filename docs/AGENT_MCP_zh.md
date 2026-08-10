@@ -87,7 +87,7 @@ ServerPilot 的分工很明确：Agent 按明确合同申请、等待、执行�
 4. Agent 只通过项目既有、已获授权的执行路径启动 workload；观测到后 bind，完成或启动失败后 release。每次重试 mutation 均复用同一个 `idempotency_key`。
 5. 任务结论应回报 request / lease 或 scheduler job ID、最终状态与任何阻塞原因，方便人类在 ServerPilot 中继续跟踪。
 
-端点添加、draining、retire、取消外部作业等属于管理动作，不能进入默认 Agent 工具白名单。只有当前任务给出明确人类授权时才启用对应工具；`owner_project_id` 仅供归属展示，不构成管理权限。
+端点添加、更新、pause、resume、retire、取消外部作业等属于管理动作，不能进入默认 Agent 工具白名单。只有当前任务给出明确人类授权时才启用对应工具；每个端点管理 MCP 写操作还必须提供非空的当前任务 `approval_ref` 和调用方生成、可重试复用的非空 `idempotency_key`；`owner_project_id` 仅供归属展示，不构成管理权限。
 
 默认工作流：
 
@@ -102,7 +102,9 @@ ServerPilot 的分工很明确：Agent 按明确合同申请、等待、执行�
 - Agent 对当前任务提供由自身基准或历史运行得出的、从小到大的候选资源合同，先调用 `resource_evaluate_plan`。Broker 只在相邻扩容同时节省至少 10% 剩余时间且至少 120 秒时选择更大合同；首个收益不足的候选会终止扩容。
 - CPU/内存-only 合同允许 `gpu_count=0`。已获配的主机容量通过 `resource_claim` 认领，完成后 `resource_release`；实际耗时用 `resource_record_actual` 追加记录。这些工具不会启动远端命令、绕过 owner、配额或新鲜 telemetry 校验。
 
-端点是本机服务器清单。端点返回可选的 `owner_project_id` 归属说明和 `lifecycle_state`，但归属不构成管理权限。新增、draining 或退役 endpoint 仅在当前任务有明确人类授权时使用对应管理工具；`gpu_delete_server` 的语义是先转为 `draining`：不再接收新 placement，已有 workload 不会被停止，待关联租约和队列需求排空后再完成退役。
+端点是本机服务器清单。端点返回可选的 `owner_project_id` 归属说明和 `lifecycle_state`，但归属不构成管理权限。`gpu_add_server`、`gpu_update_server`、`gpu_pause_server`、`gpu_resume_server` 和 `gpu_retire_server` 只能在当前任务有明确人类授权、并带 `approval_ref` 与稳定 `idempotency_key` 时使用。pause 是 `active → draining`：不再接收新 placement，但采集和已有 lease/workload 继续；resume 是 `draining → active`；retire 只能在 draining 且关联活跃 lease、端点 pinned 队列均已清空后执行，历史证据保留。兼容工具 `gpu_delete_server` 已弃用且只等同于 pause，不会通过重复调用自动退役。
+
+端点的 `observation_profile` 只能选择代码封闭的只读协议，不能携带命令、argv、shell、SSH 选项或秘密。新 REST/MCP 创建端点默认使用 `server-script-v1`；既有 inventory/档案中未指定 profile 的端点保持兼容的 `linux-nvidia`。`server-script-v1` 固定对应部署拥有的 `serverpilot-collect --schema-version 1` 只读协议；记录里不会保存或接受可执行命令配置。
 
 `gpu_request`、`gpu_request_status`、`gpu_cancel_request`、`gpu_activate_lease`、`gpu_release_lease` 与 `gpu_bind_workload` 是兼容性高级低层工具，不放在默认路径；新 Agent 优先采用上面的 claim / wait / execute / bind / release 流程。
 

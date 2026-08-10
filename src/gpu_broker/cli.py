@@ -332,13 +332,70 @@ def endpoint_delete(
     url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")]=None,
     actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")]=None,
 ) -> None:
-    """Delete a server from monitoring; this never stops a remote workload."""
+    """Deprecated compatibility alias for pause; it never retires a server."""
 
     _print(
         _call(
             lambda: _client(url, actor).delete(
                 f"/api/v1/endpoints/{endpoint_id}",
                 idempotency_key=secrets.token_hex(16),
+            )
+        ),
+        as_json,
+    )
+
+
+@endpoint_app.command("pause")
+def endpoint_pause(
+    endpoint_id: str,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    """Block new placement while retaining collection and current leases."""
+
+    _print(
+        _call(
+            lambda: _client(url, actor).post(
+                f"/api/v1/endpoints/{endpoint_id}/pause", {}, idempotency_key=secrets.token_hex(16)
+            )
+        ),
+        as_json,
+    )
+
+
+@endpoint_app.command("resume")
+def endpoint_resume(
+    endpoint_id: str,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    """Resume a draining endpoint."""
+
+    _print(
+        _call(
+            lambda: _client(url, actor).post(
+                f"/api/v1/endpoints/{endpoint_id}/resume", {}, idempotency_key=secrets.token_hex(16)
+            )
+        ),
+        as_json,
+    )
+
+
+@endpoint_app.command("retire")
+def endpoint_retire(
+    endpoint_id: str,
+    as_json: Annotated[bool, typer.Option("--json")] = False,
+    url: Annotated[str | None, typer.Option(envvar="GPU_BROKER_URL")] = None,
+    actor: Annotated[str | None, typer.Option(envvar="GPU_BROKER_ACTOR")] = None,
+) -> None:
+    """Retire a drained endpoint after active leases and pinned queues have cleared."""
+
+    _print(
+        _call(
+            lambda: _client(url, actor).post(
+                f"/api/v1/endpoints/{endpoint_id}/retire", {}, idempotency_key=secrets.token_hex(16)
             )
         ),
         as_json,

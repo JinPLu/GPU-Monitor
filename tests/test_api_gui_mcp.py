@@ -87,6 +87,9 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     capabilities = client.get("/health/live").json()["capabilities"]
     assert capabilities[: len(API_CAPABILITIES)] == list(API_CAPABILITIES)
     assert "endpoint_deletion" in capabilities
+    assert {"endpoint_update", "endpoint_pause_resume", "endpoint_retirement"}.issubset(
+        capabilities
+    )
     compact = client.get(
         "/api/v1/gpus?compact=true",
         headers={"X-GPU-Broker-Actor": "test-agent"},
@@ -286,7 +289,7 @@ def test_workload_profile_rest_and_gui_claim(tmp_path: Path, inventory) -> None:
         follow_redirects=True,
     )
     assert claimed.status_code == 200
-    assert "GPU 已保留，等待 workload 启动" in claimed.text
+    assert "GPU 已申领，待使用" in claimed.text
     request = service.list_requests(service.local_actor("human"))["data"][0]
     assert request["profile_id"] == "api-eval-1gpu"
     assert request["purpose"] == "approved API evaluation"
@@ -622,6 +625,95 @@ def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> 
     assert endpoints["endpoint-b"]["lifecycle_state"] == "draining"
 
 
+def test_endpoint_rest_lifecycle_uses_explicit_create_update_pause_resume_retire(
+    tmp_path: Path, inventory
+) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'endpoint-lifecycle.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    client = TestClient(app)
+    actor = {"X-GPU-Broker-Actor": "endpoint-admin"}
+    endpoint = {
+        "id": "endpoint-lifecycle",
+        "host": "127.0.0.1",
+        "port": 2399,
+        "ssh_user": "gpu",
+    }
+    created = client.post(
+        "/api/v1/endpoints", json=endpoint, headers={**actor, "Idempotency-Key": "endpoint-create"}
+    )
+    assert created.status_code == 200
+    assert created.json()["endpoint"]["lifecycle_state"] == "active"
+    assert created.json()["endpoint"]["observation_profile"] == "server-script-v1"
+    duplicate = client.post(
+        "/api/v1/endpoints", json=endpoint, headers={**actor, "Idempotency-Key": "endpoint-create-new"}
+    )
+    assert duplicate.status_code == 409
+    identity_patch = client.patch(
+        "/api/v1/endpoints/endpoint-lifecycle",
+        json={"host": "127.0.0.2"},
+        headers={**actor, "Idempotency-Key": "endpoint-host-change"},
+    )
+    assert identity_patch.status_code == 422
+    updated = client.patch(
+        "/api/v1/endpoints/endpoint-lifecycle",
+        json={"ssh_alias": "lab-script", "labels": ["lab"]},
+        headers={**actor, "Idempotency-Key": "endpoint-update"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["endpoint"]["ssh_alias"] == "lab-script"
+    paused = client.post(
+        "/api/v1/endpoints/endpoint-lifecycle/pause",
+        json={},
+        headers={**actor, "Idempotency-Key": "endpoint-pause"},
+    )
+    assert paused.status_code == 200
+    assert paused.json()["endpoint"]["lifecycle_state"] == "draining"
+    paused_again = client.post(
+        "/api/v1/endpoints/endpoint-lifecycle/pause",
+        json={},
+        headers={**actor, "Idempotency-Key": "endpoint-pause-again"},
+    )
+    assert paused_again.json()["changed"] is False
+    resumed = client.post(
+        "/api/v1/endpoints/endpoint-lifecycle/resume",
+        json={},
+        headers={**actor, "Idempotency-Key": "endpoint-resume"},
+    )
+    assert resumed.status_code == 200
+    assert resumed.json()["endpoint"]["lifecycle_state"] == "active"
+    active_retire = client.post(
+        "/api/v1/endpoints/endpoint-lifecycle/retire",
+        json={},
+        headers={**actor, "Idempotency-Key": "endpoint-retire-active"},
+    )
+    assert active_retire.status_code == 409
+    client.post(
+        "/api/v1/endpoints/endpoint-lifecycle/pause",
+        json={},
+        headers={**actor, "Idempotency-Key": "endpoint-pause-before-retire"},
+    )
+    retired = client.post(
+        "/api/v1/endpoints/endpoint-lifecycle/retire",
+        json={},
+        headers={**actor, "Idempotency-Key": "endpoint-retire"},
+    )
+    assert retired.status_code == 200
+    assert retired.json()["endpoint"]["lifecycle_state"] == "retired"
+    retired_update = client.patch(
+        "/api/v1/endpoints/endpoint-lifecycle",
+        json={"ssh_user": "other"},
+        headers={**actor, "Idempotency-Key": "endpoint-update-retired"},
+    )
+    assert retired_update.status_code == 409
+
+
 def test_endpoint_delete_rest_route_preserves_maintenance_history(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
@@ -715,7 +807,7 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
         follow_redirects=True,
     )
     assert submitted.status_code == 200
-    assert "GPU 已保留，等待 workload 启动" in submitted.text
+    assert "GPU 已申领，待使用" in submitted.text
 
     lease = service.list_leases(service.local_actor("human"))["data"][0]
     assert lease["state"] == "HELD"
@@ -798,6 +890,10 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_release",
         "gpu_schedule",
         "gpu_add_server",
+        "gpu_update_server",
+        "gpu_pause_server",
+        "gpu_resume_server",
+        "gpu_retire_server",
         "gpu_delete_server",
         "resource_providers",
         "resource_monitor",
@@ -821,6 +917,76 @@ def test_mcp_exposes_required_tools() -> None:
         by_name["gpu_claim_profile"].inputSchema["required"]
     )
     assert "reason" not in by_name["gpu_release"].inputSchema["required"]
+    for name in (
+        "gpu_add_server",
+        "gpu_update_server",
+        "gpu_pause_server",
+        "gpu_resume_server",
+        "gpu_retire_server",
+        "gpu_delete_server",
+    ):
+        assert {"approval_ref", "idempotency_key"}.issubset(by_name[name].inputSchema["required"])
+
+
+def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = []
+
+    class FakeClient:
+        def post(self, path, body=None, *, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append(("POST", path, body, idempotency_key))
+            return {"endpoint": {"id": "server-a"}}
+
+        def patch(self, path, body=None, *, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append(("PATCH", path, body, idempotency_key))
+            return {"endpoint": {"id": "server-a"}}
+
+    monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
+    with pytest.raises(ValueError, match="approval_ref"):
+        mcp_server.gpu_pause_server("agent", "server-a", "", "stable-key")
+    with pytest.raises(ValueError, match="idempotency_key"):
+        mcp_server.gpu_pause_server("agent", "server-a", "approved-task", "")
+
+    created = mcp_server.gpu_add_server(
+        "agent",
+        "project-a",
+        "10.0.0.8",
+        "approved-task",
+        "create-stable",
+        server_id="server-a",
+    )
+    assert created["endpoint"]["id"] == "server-a"
+    assert calls[-1] == (
+        "POST",
+        "/api/v1/endpoints",
+        {
+            "id": "server-a",
+            "host": "10.0.0.8",
+            "port": 22,
+            "ssh_user": "root",
+            "ssh_alias": None,
+            "observation_profile": "server-script-v1",
+            "labels": [],
+            "storage_group": None,
+            "expected_gpu_count": None,
+            "expected_gpu_total_vram_mib": None,
+            "owner_project_id": "project-a",
+        },
+        "create-stable",
+    )
+    mcp_server.gpu_update_server(
+        "agent", "server-a", "approved-task", "update-stable", ssh_user="gpu"
+    )
+    mcp_server.gpu_pause_server("agent", "server-a", "approved-task", "pause-stable")
+    mcp_server.gpu_resume_server("agent", "server-a", "approved-task", "resume-stable")
+    mcp_server.gpu_retire_server("agent", "server-a", "approved-task", "retire-stable")
+    mcp_server.gpu_delete_server("agent", "server-a", "approved-task", "delete-stable")
+    assert calls[1:] == [
+        ("PATCH", "/api/v1/endpoints/server-a", {"ssh_user": "gpu"}, "update-stable"),
+        ("POST", "/api/v1/endpoints/server-a/pause", {}, "pause-stable"),
+        ("POST", "/api/v1/endpoints/server-a/resume", {}, "resume-stable"),
+        ("POST", "/api/v1/endpoints/server-a/retire", {}, "retire-stable"),
+        ("POST", "/api/v1/endpoints/server-a/pause", {}, "delete-stable"),
+    ]
 
 
 def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type: ignore[no-untyped-def]

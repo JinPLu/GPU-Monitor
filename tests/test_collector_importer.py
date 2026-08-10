@@ -1,22 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from gpu_broker.collector import (
     COMBINED_QUERY,
+    CollectionError,
     GPU_UNAVAILABLE,
+    MAX_SERVER_SCRIPT_SNAPSHOT_BYTES,
     SSHCollector,
     parse_gpu_csv,
     parse_host_resource_snapshot,
     parse_host_resources,
     parse_process_csv,
+    parse_server_script_snapshot,
 )
 from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig
+from gpu_broker.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
 from gpu_broker.importer import import_servers_files, parse_ssh_command
 
 
@@ -127,6 +133,134 @@ def test_collector_keeps_cpu_only_endpoint_online_when_nvidia_smi_returns_no_row
     endpoint = next(value for value in snapshot["endpoints"] if value["id"] == "endpoint-a")
     assert endpoint["monitor"]["status"] == "ONLINE"
     assert endpoint["host_telemetry"]["memory_available_mib"] == 49152
+
+
+def _server_script_snapshot(*, gpu_probe_available: bool = True) -> dict[str, object]:
+    gpus: list[dict[str, object]] = []
+    processes: list[dict[str, object]] = []
+    if gpu_probe_available:
+        gpus = [
+            {
+                "gpu_index": 0,
+                "gpu_uuid": "GPU-script-0",
+                "name": "Script GPU",
+                "total_vram_mib": 80_000,
+                "memory_used_mib": 1_024,
+                "memory_free_mib": 78_976,
+                "gpu_utilization_pct": 10,
+                "memory_utilization_pct": 2,
+                "temperature_c": 40,
+                "power_watts": 125.5,
+                "pstate": "P0",
+                "health": "OK",
+            }
+        ]
+        processes = [
+            {
+                "gpu_uuid": "GPU-script-0",
+                "pid": 123,
+                "used_memory_mib": 1_024,
+                "executable": "python",
+                "username": "gpu",
+                "process_started_at": "2026-08-10T00:00:00+00:00",
+            }
+        ]
+    return {
+        "schema_version": 1,
+        "identity": {"hostname": "script-host", "boot_id": "script-boot"},
+        "host": {
+            "cpu_count": 64,
+            "load_1m": 1.25,
+            "cpu_total_ticks": 1000,
+            "cpu_idle_ticks": 750,
+            "memory_total_mib": 262_144,
+            "memory_available_mib": 196_608,
+        },
+        "gpu_probe_available": gpu_probe_available,
+        "gpus": gpus,
+        "processes": processes,
+    }
+
+
+def _server_script_endpoint(inventory: InventoryConfig) -> EndpointConfig:
+    return inventory.endpoints[0].model_copy(update={"observation_profile": "server-script-v1"})
+
+
+def test_server_script_collector_uses_one_immutable_entry_and_imports_processes(
+    inventory: InventoryConfig,
+) -> None:
+    calls: list[str] = []
+
+    async def fake_runner(endpoint, command):  # type: ignore[no-untyped-def]
+        assert endpoint.id == "endpoint-a"
+        calls.append(command)
+        return json.dumps(_server_script_snapshot())
+
+    observation = asyncio.run(
+        SSHCollector(inventory, runner=fake_runner).observe_endpoint(_server_script_endpoint(inventory))
+    )
+
+    assert calls == [SERVER_SCRIPT_REMOTE_COMMAND]
+    assert observation.observation_complete is True
+    assert observation.gpus[0].gpu_uuid == "GPU-script-0"
+    assert observation.processes[0].pid == 123
+    assert observation.processes[0].username == "gpu"
+
+
+def test_server_script_collector_keeps_cpu_only_host_online(
+    inventory: InventoryConfig,
+) -> None:
+    async def fake_runner(_endpoint, command):  # type: ignore[no-untyped-def]
+        assert command == SERVER_SCRIPT_REMOTE_COMMAND
+        return json.dumps(_server_script_snapshot(gpu_probe_available=False))
+
+    observation = asyncio.run(
+        SSHCollector(inventory, runner=fake_runner).observe_endpoint(_server_script_endpoint(inventory))
+    )
+
+    assert observation.observation_complete is False
+    assert observation.gpus == []
+    assert observation.processes == []
+    assert observation.host.cpu_count == 64
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not-json",
+        json.dumps({"schema_version": 1}),
+        '{"schema_version":1,"schema_version":1}',
+        json.dumps({**_server_script_snapshot(), "unexpected": True}),
+    ],
+)
+def test_server_script_parser_rejects_malformed_or_unsafe_snapshot(raw: str) -> None:
+    with pytest.raises(CollectionError):
+        parse_server_script_snapshot(
+            raw,
+            endpoint_id="endpoint-a",
+            observed_at=datetime.now(timezone.utc),
+        )
+
+
+def test_server_script_parser_rejects_oversized_or_duplicate_gpu_identities() -> None:
+    oversized = "x" * (MAX_SERVER_SCRIPT_SNAPSHOT_BYTES + 1)
+    with pytest.raises(CollectionError, match="stdout limit"):
+        parse_server_script_snapshot(
+            oversized,
+            endpoint_id="endpoint-a",
+            observed_at=datetime.now(timezone.utc),
+        )
+
+    duplicate = _server_script_snapshot()
+    gpus = duplicate["gpus"]
+    assert isinstance(gpus, list)
+    gpus.append(dict(gpus[0]))
+    with pytest.raises(CollectionError, match="duplicate GPU"):
+        parse_server_script_snapshot(
+            json.dumps(duplicate),
+            endpoint_id="endpoint-a",
+            observed_at=datetime.now(timezone.utc),
+        )
 
 
 def test_importer_keeps_same_ip_different_ports_distinct(tmp_path: Path) -> None:

@@ -30,6 +30,39 @@ def test_client_retries_a_transient_gateway_error(monkeypatch) -> None:  # type:
     assert all(call[1]["trust_env"] is False for call in calls)
 
 
+def test_client_patch_sends_endpoint_update_over_rest(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls = []
+
+    def request(method, url, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append((method, url, kwargs))
+        return httpx.Response(200, json={"schema_version": "v1", "endpoint": {"id": "server-a"}})
+
+    monkeypatch.setattr("gpu_broker.client.httpx.request", request)
+    response = BrokerClient("http://127.0.0.1:8787", actor="endpoint-admin").patch(
+        "/api/v1/endpoints/server-a",
+        {"ssh_user": "gpu"},
+        idempotency_key="endpoint-update-key",
+    )
+
+    assert response["endpoint"]["id"] == "server-a"
+    assert calls == [
+        (
+            "PATCH",
+            "http://127.0.0.1:8787/api/v1/endpoints/server-a",
+            {
+                "headers": {
+                    "X-GPU-Broker-Actor": "endpoint-admin",
+                    "Idempotency-Key": "endpoint-update-key",
+                },
+                "json": {"ssh_user": "gpu"},
+                "params": None,
+                "timeout": 20,
+                "trust_env": False,
+            },
+        )
+    ]
+
+
 def _state(revision: int, current: dict | None = None) -> dict:
     return {
         "schema_version": "v1",

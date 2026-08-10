@@ -104,6 +104,15 @@ class BrokerClient:
     ) -> dict[str, Any]:
         return self.request("POST", path, json_body=body, idempotency_key=idempotency_key)
 
+    def patch(
+        self,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.request("PATCH", path, json_body=body, idempotency_key=idempotency_key)
+
     def delete(self, path: str, *, idempotency_key: str) -> dict[str, Any]:
         return self.request("DELETE", path, idempotency_key=idempotency_key)
 

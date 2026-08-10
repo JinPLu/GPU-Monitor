@@ -18,6 +18,11 @@
 - 已新增受限 adapter registry：`raw-ssh` 只封装既有固定只读 observation，`slurm-command`
   只封装既有固定 scheduler 命令。adapter 不能持有领域 session 或 actor、不能写 lease/claim，
   不从配置接受任意 argv/shell/env/Agent target，也没有新增认证、REST 或 MCP 执行面。
+- 已新增 `server-script-v1`：每台服务器可在固定 `serverpilot-collect --schema-version 1`
+  入口后维护自己的只读采集脚本，以处理容器或站点前缀差异；脚本只能输出受限 JSON 快照，不能由
+  endpoint、App 或 MCP 配置命令。中央 Collector 仍是唯一执行与节流入口，App/MCP 只读 REST
+  快照；脚本缺失、超限或输出不合法均 fail closed。既有 inventory 未声明 profile 时仍兼容
+  `linux-nvidia`，新 REST/MCP 端点默认使用服务器采集脚本。
 - endpoint telemetry 现已保存 CPU、load、内存的 24 小时 history：采集示例间隔为 10 秒，
   stale 判定为 30 秒，历史入库节流为 60 秒。`GET /api/v1/endpoints/{endpoint_id}/history`
   提供受限的 1h/6h/24h、10–120 点查询；同一响应额外携带按稳定 `gpu_id`/`gpu_uuid` 区分的
@@ -45,11 +50,14 @@
   workload；Broker 只协调分配与观测归属。外部 Slurm 是独立的
   `SchedulerTarget/SchedulerJob` adapter，由项目 owner 提交、查询和取消其作业。
 - endpoint 是本机服务器清单。`owner_project_id` 只用于可选归属展示，不参与权限判断；
-  任一本机可写调用方都可添加、更新、维护、drain 和 retire endpoint。删除的第一步是
-  `active → draining`：不再放置新任务，但不停止既有任务，也不删除遥测或审计；活跃 lease
-  结束后第二次操作转为 `retired`。macOS App 的一次“移除并退役”会自动推进这两个受领域服务
-  保护的阶段；全局 GPU telemetry 过期不再阻止本地 endpoint 生命周期操作。退役记录继续保留
-  审计证据，但从日常服务器池、实时容量、异常统计和资源来源卡片中隐藏。
+  服务器操作明确分为添加、更新、**暂停接收新任务**、恢复接收新任务和彻底退役。暂停是
+  `active → draining`：不再放置新任务，但采集、既有 lease 与远端任务继续；恢复是
+  `draining → active`；退役只能在排空活跃 lease 与固定队列需求后执行。兼容 DELETE 只等同于
+  暂停，重复调用不会自动退役。退役记录继续保留审计证据，但从日常服务器池、实时容量、异常统计和
+  资源来源卡片中隐藏。
+- `HELD` 租约的用户文案为“已申领，待使用”。未观测到任务或未调用低层 activation 不再触发
+  启动宽限自动回收；租约仅在明确 `expires_at` 到期、显式归还或既有冲突/孤儿安全路径下变化。
+  activation 仅是兼容记录，不会启动远端工作负载。
 - Windows 桌面源码构建入口已加入：PowerShell + PyInstaller 生成 `dist/windows/ServerPilot/ServerPilot.exe`，运行时继续使用 `%LOCALAPPDATA%\GPU Broker` 兼容数据目录，启动同一 loopback REST/Web UI，不复制调度、租约或审计规则；它仍不是已签名安装包。
 - 预设任务（workload profile）是可选的持久化资源合同：明确 `profile_id` 的 GUI/MCP 认领只传配置与任务，服务在立即或排队后分配时自动激活。没有 profile 时，一次性认领需要任意非空项目标识、任务、GPU 数量，以及需要的 CPU 核数、系统内存 MiB、单卡总显存/可用显存 MiB 等绝对值下限，任务名自动记录为用途；项目标识首次使用会自动登记为中性归属标签，不需要预创建、项目管理入口或服务器项目授权。申请不再要求预计占用时间，任务完成后释放租约；最大租约窗口是调度与未来预约共同遵守的硬边界。Agent 不得根据任务、目录或空闲容量自行挑选 profile，也不得推断项目、GPU 数量或 CPU/内存/显存需求。
 - Broker 提供面向同一用户的项目与 Agent 协调看板：`gpu_coordination` 返回服务器、GPU、队列、
@@ -58,7 +66,7 @@
   已被 Collector 观测到的 lease 进程登记为受管，不启动或停止进程。
 - macOS 桌面总览是人类的实时观察面：区分已登记、在线/新鲜和可分配容量，并显示空租约、
   队列与 stale 信号；不再把人工操作当作资源调度的必经步骤。
-- macOS“资源使用”页按项目、Agent、任务三种稳定维度展示资源归属。当前状态严格区分“已分配”
+- macOS“资源使用”页按项目、Agent、任务三种稳定维度展示资源归属。当前状态严格区分“已申领，待使用”
   （活动 claim/lease 且未观察到托管进程）、“运行中”（关联 GPU 已观察到 `RUNNING_MANAGED`）和
   “申请中”（`blocked/QUEUED/PENDING_APPROVAL`），每种状态同时展示 CPU、系统内存与 GPU 数量。
   “运行中”的数量是对应资源分配量，不是瞬时 CPU/内存消耗；服务器 CPU 负载与物理内存用量只
@@ -158,6 +166,11 @@
   `XCTest`，所以三视口 xcresult 与自动 VoiceOver 检查仍未宣称完成。此前未能在录制 fixture 中
   重现用户反馈的持续高 CPU：该路径仅观察到有界的初始 SwiftUI layout 峰值；真实事件仍需采集
   App/WindowServer 与 12 秒 snapshot 刷新的时间关联后再做针对性修复。
+- 本轮服务器可运营性优化已在临时数据库与 fake collector 路径验证：全量 Python 测试
+  `263 passed`、Ruff 通过，macOS App 重新打包通过；资源与归属页以 fixture 分别在
+  1024×640、1280×800、1440×820 截图复查，窄屏详情也显示明确返回操作。分栏宽度会持久化，
+  暂停/恢复/退役与“服务器采集脚本”均由新增 REST/MCP 契约消费。完整 Xcode 仍未安装，故
+  Swift XCTest/XCUITest、VoiceOver 自动化和 xcresult 三视口附件仍是未完成的环境 gate。
 - 2026-08-10：新增独立 `8-history` fixture，以同一可选 endpoint-history 合同提供 8 个 GPU UUID
   序列；它与 allocation snapshot 分离，测试模式也不会触达真实服务。已实际渲染四张图并检查 GPU
   利用率与显存图各有 8 条线；正式 App 随后重新打开并连接 CPU-only endpoint，确认 CPU/内存图在

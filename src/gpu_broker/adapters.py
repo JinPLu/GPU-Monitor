@@ -17,6 +17,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Literal, Mapping
 
 from gpu_broker.config import EndpointConfig
+from gpu_broker.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
 
 
 AdapterId = Literal["raw-ssh", "slurm-command"]
@@ -24,7 +25,7 @@ Capability = Literal["observation", "scheduler", "provisioning-preview", "operat
 OperationId = Literal["scheduler.submit", "scheduler.cancel", "scheduler.upload"]
 ParameterType = Literal["string", "path"]
 RawSSHProbe = Literal["endpoint-telemetry", "process-details"]
-ObservationProfile = Literal["linux-nvidia", "linux-host"]
+ObservationProfile = Literal["linux-nvidia", "linux-host", "server-script-v1"]
 
 
 GPU_QUERY = (
@@ -72,6 +73,10 @@ _OBSERVATION_QUERIES: Mapping[ObservationProfile, str] = MappingProxyType(
     {
         "linux-nvidia": RAW_SSH_COMBINED_QUERY,
         "linux-host": RAW_SSH_HOST_ONLY_QUERY,
+        # This is an immutable entry invocation, not an endpoint-configured
+        # shell, path, argv, or local prefix.  The remote administrator may
+        # maintain the command's local implementation behind this contract.
+        "server-script-v1": SERVER_SCRIPT_REMOTE_COMMAND,
     }
 )
 
@@ -170,6 +175,44 @@ class RawSSHResult:
     returncode: int
     stdout: str
     stderr: str
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+
+
+MAX_RAW_SSH_STDOUT_BYTES = 1_048_576
+MAX_RAW_SSH_STDERR_BYTES = 16_384
+
+
+async def _read_bounded_stream(
+    stream: asyncio.StreamReader,
+    *,
+    maximum_bytes: int,
+) -> tuple[bytes, bool]:
+    """Drain a process stream while retaining only a bounded prefix.
+
+    Continuing to drain after the limit prevents a noisy remote process from
+    deadlocking on a full SSH pipe, while retaining no unbounded output in the
+    broker process.
+    """
+
+    chunks: list[bytes] = []
+    retained = 0
+    truncated = False
+    while chunk := await stream.read(65_536):
+        remaining = maximum_bytes - retained
+        if remaining > 0:
+            chunks.append(chunk[:remaining])
+            retained += min(len(chunk), remaining)
+        if len(chunk) > remaining:
+            truncated = True
+    return b"".join(chunks), truncated
+
+
+def _decode_remote_output(value: bytes, *, stream_name: str) -> str:
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"SSH {stream_name} is not valid UTF-8") from exc
 
 
 class RawSSHObservationAdapter:
@@ -213,11 +256,27 @@ class RawSSHObservationAdapter:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        if getattr(process, "stdout", None) is None or getattr(process, "stderr", None) is None:
+            # Compatibility path for a deliberately minimal fake process. The
+            # production subprocess always supplies pipes, which take the
+            # bounded streaming path below.
+            stdout, stderr = await process.communicate()
+            stdout_truncated = len(stdout) > MAX_RAW_SSH_STDOUT_BYTES
+            stderr_truncated = len(stderr) > MAX_RAW_SSH_STDERR_BYTES
+            stdout = stdout[:MAX_RAW_SSH_STDOUT_BYTES]
+            stderr = stderr[:MAX_RAW_SSH_STDERR_BYTES]
+        else:
+            (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
+                _read_bounded_stream(process.stdout, maximum_bytes=MAX_RAW_SSH_STDOUT_BYTES),
+                _read_bounded_stream(process.stderr, maximum_bytes=MAX_RAW_SSH_STDERR_BYTES),
+            )
+            await process.wait()
         return RawSSHResult(
             returncode=process.returncode or 0,
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
+            stdout=_decode_remote_output(stdout, stream_name="stdout"),
+            stderr=_decode_remote_output(stderr, stream_name="stderr"),
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
         )
 
 

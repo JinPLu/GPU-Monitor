@@ -15,7 +15,9 @@ Registry 也是封闭的：未知 adapter 或不存在的 capability 会 fail cl
 操作；目前只为既有 Slurm contract 保留元数据，未新增通用 REST 或 MCP 执行入口。
 
 服务器连接配置只能选择代码注册的 profile，不能提供读取命令：Endpoint 的
-`observation_profile` 当前可选 `linux-nvidia` 或 `linux-host`；SchedulerTarget 的
+`observation_profile` 当前可选 `server-script-v1`、`linux-nvidia` 或 `linux-host`；其中
+`server-script-v1` 只会调用固定的 `serverpilot-collect --schema-version 1`，完整安装与 JSON
+合同见 [COLLECTOR_SCRIPT_zh.md](COLLECTOR_SCRIPT_zh.md)。SchedulerTarget 的
 `transport_profile` 是受限 profile ID，`inspection_profile` 可选
 `slurm-basic` 或 `slurm-capacity`。因此某个集群的读取差异以通用 profile 表达，由人类在
 连接时选择；新增 profile 必须同时新增固定探针、固定 parser 与测试，不能靠目标 ID、IP 或

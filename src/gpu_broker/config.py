@@ -51,7 +51,7 @@ class EndpointConfig(BaseModel):
     # A closed, code-owned profile chooses the fixed read-only probe and
     # parser.  It is deliberately not a command, shell fragment, key path, or
     # SSH option supplied by inventory.
-    observation_profile: Literal["linux-nvidia", "linux-host"] = "linux-nvidia"
+    observation_profile: Literal["linux-nvidia", "linux-host", "server-script-v1"] = "linux-nvidia"
     labels: list[str] = Field(default_factory=list)
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
@@ -75,11 +75,9 @@ class InventoryConfig(BaseModel):
 
     schema_version: Literal[1]
     collector: CollectorConfig = Field(default_factory=CollectorConfig)
-    # Routine direct-GPU claims first receive a HELD lease while the caller
-    # starts its workload out-of-band.  If no fresh compute process appears
-    # before this grace elapses, reconciliation releases the empty hold and
-    # retries the shared queue.  Keep the default short for local coordination
-    # while allowing slower startup paths to opt in explicitly.
+    # Deprecated compatibility input. HELD leases are retained until their
+    # explicit expires_at, release, or safety reconciliation outcome; this
+    # value no longer triggers an automatic startup-grace release.
     held_lease_startup_grace_seconds: int = Field(default=120, ge=1, le=3600)
     # Project policies are optional.  The broker creates a neutral record when
     # a claim first uses an otherwise unknown project_id.

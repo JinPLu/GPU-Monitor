@@ -76,6 +76,7 @@ chmod 755 "${runtime_dir}/gpu-broker"
 xcrun --sdk macosx swiftc \
   -target "${target_triple}" \
   -parse-as-library \
+  -D DESKTOP_FIXTURES \
   -framework AppKit \
   -framework SwiftUI \
   "${swift_sources[@]}" \

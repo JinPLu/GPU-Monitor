@@ -45,10 +45,15 @@ resource ownership only and never run a remote command.
 Humans supervise through ServerPilot's resource, work, queue, and history
 views. Agents should report the request/lease or scheduler job identifier,
 terminal state, and any blocked reason in the task outcome. They must not add,
-retire, drain, or reconfigure servers unless the current task explicitly gives
-that local inventory action; `owner_project_id` is attribution, not an Agent
-management permission. A server in `draining` accepts no new placement and
-never stops an existing workload.
+update, pause, resume, retire, drain, or reconfigure servers unless the current
+task explicitly gives that local inventory action. Every endpoint administration
+MCP mutation also requires a non-empty current-task `approval_ref` and a
+caller-stable, non-empty `idempotency_key`; `owner_project_id` is attribution,
+not an Agent management permission. Pause moves `active` to `draining`, blocks
+new placement, and keeps collection and current leases running. Resume moves
+`draining` to `active`. Explicit retire is allowed only from `draining` once
+active leases and endpoint-pinned queued requests are clear; it retains identity
+and evidence. Deprecated `gpu_delete_server` is pause only and never auto-retires.
 
 ## External schedulers
 
@@ -62,8 +67,12 @@ never automate VPN access or fall back to SSH.
 Connection metadata can select only a sealed transport and read-only inspection
 profile. It cannot contain an executable path, argv, shell fragment, SSH option,
 secret, or arbitrary probe. An endpoint likewise selects a sealed observation
-profile. Agents do not select or alter either profile; a human administrator
-configures them when connecting a server.
+profile. New REST/MCP endpoint creation defaults to `server-script-v1`; an
+existing inventory/profile record that omits selection remains compatible with
+`linux-nvidia`. `server-script-v1` always maps to the deployment-owned read-only
+`serverpilot-collect --schema-version 1` protocol; the endpoint record never
+accepts an executable or command configuration. Agents do not select or alter
+either profile without the explicit administration authorization above.
 
 `gpu_scheduler_submit_profile` follows the approved profile. A one-off submit
 requires the exact script/resource contract and a current-task `approval_ref`.

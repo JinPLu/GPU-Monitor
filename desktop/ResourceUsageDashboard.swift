@@ -225,11 +225,12 @@ struct ResourceUsageDashboard: View {
     @State private var scope: ResourceUsageScope = .project
     @State private var projection: ResourceUsageProjection
     @State private var selectedGroupID = ""
+    @State private var showsCompactDetail = false
     @State private var inlineMessage: String?
 
     init(store: BrokerStore) {
         self.store = store
-#if DEBUG
+#if DEBUG || DESKTOP_FIXTURES
         let requestedScope = ProcessInfo.processInfo.environment["GPU_BROKER_DESKTOP_USAGE_SCOPE"]
         let initialScope: ResourceUsageScope
         switch requestedScope {
@@ -282,30 +283,12 @@ struct ResourceUsageDashboard: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.45)
-            HStack(spacing: 0) {
-                groupNavigator
-                Divider().opacity(0.45)
-                Group {
-                    if let selectedGroup {
-                        ResourceUsageGroupDetail(
-                            store: store,
-                            group: selectedGroup,
-                            inlineMessage: inlineMessage,
-                            release: release
-                        )
-                        .id(selectedGroup.id)
-                    } else {
-                        ContentUnavailableView(
-                            "还没有项目或 Agent 申请资源",
-                            systemImage: "person.2.slash",
-                            description: Text("点击“申请 GPU”开始分配资源。")
-                        )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .spatialContentSurface()
-            }
+            PersistedMasterDetailSplit(
+                configuration: .ownership,
+                showsCompactDetail: $showsCompactDetail,
+                master: { groupNavigator.background(DesignTokens.surface) },
+                detail: { groupDetail }
+            )
         }
         .background(DesignTokens.surface)
         .onAppear { updateProjection() }
@@ -341,7 +324,7 @@ struct ResourceUsageDashboard: View {
                     .frame(width: 86)
                 ResourceUsageCountMetric(value: "\(taskCount)", label: "任务", icon: "checklist.checked")
                     .frame(width: 86)
-                ResourceUsageSummaryMetric(value: assignedQuantities.compactLabel, label: "已分配", icon: "checkmark.circle.fill")
+                ResourceUsageSummaryMetric(value: assignedQuantities.compactLabel, label: "已申领，待使用", icon: "checkmark.circle.fill")
                     .frame(maxWidth: .infinity)
                 ResourceUsageSummaryMetric(value: runningQuantities.compactLabel, label: "运行中", icon: "play.circle.fill")
                     .frame(maxWidth: .infinity)
@@ -388,6 +371,7 @@ struct ResourceUsageDashboard: View {
                         ) {
                             selectedGroupID = group.id
                             inlineMessage = nil
+                            showsCompactDetail = true
                         }
                     }
                 }
@@ -395,8 +379,27 @@ struct ResourceUsageDashboard: View {
                 .padding(.bottom, 12)
             }
         }
-        .frame(width: 292)
-        .background(DesignTokens.surface)
+    }
+
+    @ViewBuilder
+    private var groupDetail: some View {
+        if let selectedGroup {
+            ResourceUsageGroupDetail(
+                store: store,
+                group: selectedGroup,
+                inlineMessage: inlineMessage,
+                release: release
+            )
+            .id(selectedGroup.id)
+        } else {
+            ContentUnavailableView(
+                "还没有项目或 Agent 申请资源",
+                systemImage: "person.2.slash",
+                description: Text("点击“申请 GPU”开始分配资源。")
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .spatialContentSurface()
+        }
     }
 
     private func ensureSelectedGroup(reset: Bool = false) {
@@ -409,6 +412,9 @@ struct ResourceUsageDashboard: View {
     private func updateProjection(resetSelection: Bool = false) {
         projection = ResourceUsageProjection(snapshot: store.snapshot, scope: scope)
         ensureSelectedGroup(reset: resetSelection)
+        if resetSelection {
+            showsCompactDetail = false
+        }
     }
 
     private func release(_ lease: LeaseRecord) {
@@ -540,7 +546,7 @@ private struct ResourceUsageGroupRow: View {
         .onHover { hovering = $0 }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: hovering)
         .accessibilityLabel("\(group.scope.label) \(group.title)")
-        .accessibilityValue("已分配 \(group.assignedQuantities.compactLabel)，运行中 \(group.runningQuantities.compactLabel)，申请中 \(group.requestedQuantities.compactLabel)")
+        .accessibilityValue("已申领，待使用 \(group.assignedQuantities.compactLabel)，运行中 \(group.runningQuantities.compactLabel)，申请中 \(group.requestedQuantities.compactLabel)")
     }
 }
 
@@ -590,7 +596,7 @@ private struct ResourceUsageGroupDetail: View {
 
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 180, maximum: 320), spacing: 12)], spacing: 12) {
                     ResourceQuantityPanel(
-                        title: "已分配",
+                        title: "已申领，待使用",
                         subtitle: "资源已归属，尚未检测到任务进程",
                         quantities: group.assignedQuantities,
                         icon: "checkmark.circle.fill"

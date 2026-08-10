@@ -241,7 +241,7 @@ struct FleetOverview: View {
             OverviewSummaryCard(
                 title: "运行中的任务",
                 value: "\(runningTaskCount)",
-                detail: "\(assignedWaitingCount) 个已分配任务等待运行",
+                detail: "\(assignedWaitingCount) 个已申领任务等待使用",
                 icon: "key.fill",
                 color: DesignTokens.interaction
             )
@@ -260,9 +260,9 @@ struct FleetOverview: View {
     private var coordinationSignals: some View {
         LazyVGrid(columns: columns, spacing: 8) {
             CoordinationSignal(
-                title: "已分配未运行",
+                title: "已申领，待使用",
                 value: "\(assignedWaitingCount)",
-                detail: "资源已分配，但尚未检测到任务",
+                detail: "资源已申领，尚未检测到任务",
                 icon: "pause.circle",
                 color: assignedWaitingCount > 0 ? DesignTokens.warning : DesignTokens.mutedInk
             )
@@ -1289,7 +1289,7 @@ private func gibibytes(_ mebibytes: Int) -> Int {
 private func overviewGPUStateLabel(_ state: String) -> String {
     switch state {
     case "AVAILABLE": return "可用"
-    case "HELD", "LEASED_IDLE": return "已分配"
+    case "HELD", "LEASED_IDLE": return "已申领，待使用"
     case "RUNNING_MANAGED": return "运行中"
     case "BUSY_UNMANAGED": return "非托管占用"
     case "ORPHANED_BUSY": return "释放后仍占用"
@@ -1300,7 +1300,7 @@ private func overviewGPUStateLabel(_ state: String) -> String {
     case "CONFLICT": return "需要处理"
     case "DISABLED": return "已停用"
     case "MAINTENANCE": return "维护中"
-    case "DRAINING": return "排空中"
+    case "DRAINING": return "已暂停（正在排空）"
     case "RETIRED": return "已退役"
     default: return "需处理"
     }
