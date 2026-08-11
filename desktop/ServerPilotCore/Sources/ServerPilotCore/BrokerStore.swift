@@ -604,7 +604,7 @@ public final class BrokerStore: ObservableObject {
         completion: @escaping @MainActor @Sendable (Bool, String?) -> Void
     ) {
         guard supportsEndpointKeepalive else {
-            let message = endpointCompatibilityMessage("切换服务器保活", capability: "endpoint_keepalive")
+            let message = endpointCompatibilityMessage("切换空闲占卡", capability: "endpoint_keepalive")
             errorMessage = message
             completion(false, message)
             return
@@ -615,8 +615,8 @@ public final class BrokerStore: ObservableObject {
             method: "POST",
             payload: ["enabled": enabled],
             successMessage: enabled
-                ? "已请求启用 \(endpoint.displayName) 的保活，正在确认状态。"
-                : "已请求停用 \(endpoint.displayName) 的保活，正在确认状态。",
+                ? "已请求开启 \(endpoint.displayName) 的空闲占卡，正在确认各 GPU 状态。"
+                : "已请求关闭 \(endpoint.displayName) 的空闲占卡，正在确认各 GPU 状态。",
             completion: completion
         )
     }

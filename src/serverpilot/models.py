@@ -25,6 +25,8 @@ class Base(DeclarativeBase):
 
 
 LeaseKind = Literal["workload", "keepalive"]
+KeepalivePolicy = Literal["disabled", "idle_keepalive"]
+KeepaliveScope = Literal["gpu", "legacy_endpoint"]
 
 
 class Revision(Base):
@@ -54,6 +56,10 @@ class Endpoint(Base):
             "keepalive_adapter_id IS NULL OR keepalive_adapter_id = 'server-script-v1'",
             name="ck_endpoint_keepalive_adapter",
         ),
+        CheckConstraint(
+            "keepalive_policy IN ('disabled', 'idle_keepalive')",
+            name="ck_endpoint_keepalive_policy",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -65,6 +71,11 @@ class Endpoint(Base):
         String(40), nullable=False, default="linux-nvidia"
     )
     keepalive_adapter_id: Mapped[str | None] = mapped_column(String(40))
+    # This is desired state only. Per-GPU keepalive ownership lives in leases;
+    # policy changes never silently start, stop, or reclassify a remote worker.
+    keepalive_policy: Mapped[KeepalivePolicy] = mapped_column(
+        String(32), nullable=False, default="disabled"
+    )
     labels_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     storage_group: Mapped[str | None] = mapped_column(String(120))
     expected_gpu_count: Mapped[int | None] = mapped_column(Integer)
@@ -711,6 +722,10 @@ class Lease(Base):
     __table_args__ = (
         Index("ix_lease_state_expiry", "state", "expires_at"),
         CheckConstraint("kind IN ('workload', 'keepalive')", name="ck_lease_kind"),
+        CheckConstraint(
+            "keepalive_scope IS NULL OR keepalive_scope IN ('gpu', 'legacy_endpoint')",
+            name="ck_lease_keepalive_scope",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -720,6 +735,10 @@ class Lease(Base):
     actor_id: Mapped[str] = mapped_column(ForeignKey("actors.id"), nullable=False, index=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     kind: Mapped[LeaseKind] = mapped_column(String(16), nullable=False, default="workload")
+    # ``legacy_endpoint`` identifies pre-per-GPU keepalive leases. They remain
+    # fail-closed and can only be stopped; they must never be reinterpreted as
+    # independent GPU leases merely because a later schema is installed.
+    keepalive_scope: Mapped[KeepaliveScope | None] = mapped_column(String(24))
     state: Mapped[str] = mapped_column(String(40), nullable=False, default="HELD")
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

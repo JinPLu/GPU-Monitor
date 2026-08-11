@@ -410,32 +410,138 @@ public struct SchedulerTransferRecord: Identifiable, Equatable, Sendable {
 
 public struct EndpointKeepaliveSummary: Equatable, Sendable {
     public let configured: Bool
+    /// Desired endpoint policy.  Runtime coverage is deliberately reported per GPU.
+    public let policy: String
     public let state: String
+    public let activeGPUCount: Int
+    public let startingGPUCount: Int
+    public let errorGPUCount: Int
+    public let legacyGPUCount: Int
+    public let eligibleIdleGPUCount: Int
+    public let reasons: [String]
     public let message: String?
 
     public init(raw: [String: Any], fallbackConfigured: Bool) {
         configured = raw.bool("configured", default: fallbackConfigured)
         let suppliedState = (raw.string("state") ?? "OFF").uppercased()
-        state = ["OFF", "STARTING", "ACTIVE", "ERROR"].contains(suppliedState) ? suppliedState : "ERROR"
+        state = ["OFF", "IDLE", "STARTING", "PARTIAL", "ACTIVE", "ERROR", "LEGACY_STOP_REQUIRED"].contains(suppliedState)
+            ? suppliedState
+            : "ERROR"
+        let suppliedPolicy = (raw.string("policy") ?? "").lowercased()
+        // Snapshots from the whole-endpoint implementation did not carry a
+        // policy. Preserve their visible active state while newer snapshots
+        // always use one of these two explicit values.
+        policy = ["disabled", "idle_keepalive"].contains(suppliedPolicy)
+            ? suppliedPolicy
+            : (["IDLE", "ACTIVE", "STARTING", "PARTIAL", "ERROR", "LEGACY_STOP_REQUIRED"].contains(state) ? "idle_keepalive" : "disabled")
+        activeGPUCount = max(0, raw.int("active_gpu_count"))
+        startingGPUCount = max(0, raw.int("starting_gpu_count"))
+        errorGPUCount = max(0, raw.int("error_gpu_count"))
+        legacyGPUCount = max(0, raw.int("legacy_gpu_count"))
+        eligibleIdleGPUCount = max(0, raw.int("eligible_idle_gpu_count"))
+        reasons = (raw["reasons"] as? [String] ?? []).filter { !$0.isEmpty }
+            + (raw["reasons"] as? [[String: Any]] ?? []).compactMap { $0.string("reason") }
         if state == "ERROR", suppliedState != "ERROR" {
             message = "服务返回了无法识别的保活状态。"
         } else {
-            message = raw.string("message")
+            message = raw.string("message") ?? reasons.first
         }
     }
 
     public var label: String {
-        switch state {
-        case "OFF": return "已关闭"
-        case "STARTING": return "启动中"
-        case "ACTIVE": return "运行中"
-        case "ERROR": return "异常"
-        default: return "异常"
+        guard configured else { return "未配置" }
+        if legacyGPUCount > 0 || state == "LEGACY_STOP_REQUIRED" { return "需先停止旧版占卡" }
+        if policy == "disabled" { return state == "OFF" ? "已关闭" : "关闭中" }
+        if errorGPUCount > 0 || state == "ERROR" { return "异常" }
+        if startingGPUCount > 0 || ["STARTING", "PARTIAL"].contains(state) { return "启动中" }
+        return "已开启"
+    }
+
+    public var isEnabled: Bool { policy == "idle_keepalive" }
+    public var isActive: Bool { activeGPUCount > 0 || state == "ACTIVE" }
+    public var isTransitioning: Bool { startingGPUCount > 0 || ["STARTING", "PARTIAL"].contains(state) }
+
+    public func coverageSummary(totalGPUCount: Int, taskGPUCount: Int) -> String {
+        guard configured else { return "未配置空闲占卡" }
+        if legacyGPUCount > 0 { return "需先停止旧版占卡" }
+        guard isEnabled else {
+            return activeGPUCount > 0 ? "关闭中 · \(activeGPUCount) 卡仍占卡" : "已关闭"
         }
+        var details: [String] = ["\(min(activeGPUCount, max(totalGPUCount, 0)))/\(totalGPUCount) 占卡"]
+        if taskGPUCount > 0 { details.append("\(taskGPUCount) 卡任务中") }
+        if startingGPUCount > 0 { details.append("\(startingGPUCount) 卡启动中") }
+        if errorGPUCount > 0 { details.append("\(errorGPUCount) 卡异常") }
+        if activeGPUCount == 0, taskGPUCount == 0, eligibleIdleGPUCount == 0, startingGPUCount == 0 {
+            details = ["等待符合条件的空闲 GPU"]
+        }
+        return "已开启 · " + details.joined(separator: "，")
+    }
+}
+
+public struct GPUKeepaliveStatus: Equatable, Sendable {
+    public let configured: Bool
+    public let policy: String
+    public let state: String
+    public let reason: String?
+    public let healthState: String?
+    public let lastVerifiedAt: String?
+    public let vramPercent: Int?
+    public let rollingUtilizationPercent: Int?
+
+    public init(raw: [String: Any], fallbackConfigured: Bool, fallbackState: String) {
+        configured = raw.bool("configured", default: fallbackConfigured)
+        let suppliedPolicy = (raw.string("policy") ?? "disabled").lowercased()
+        policy = ["disabled", "idle_keepalive"].contains(suppliedPolicy) ? suppliedPolicy : "disabled"
+        let suppliedState = (raw.string("state") ?? fallbackState).uppercased()
+        state = ["OFF", "STARTING", "ACTIVE", "ERROR", "LEGACY_STOP_REQUIRED"].contains(suppliedState)
+            ? suppliedState
+            : "ERROR"
+        let health = raw["health"] as? [String: Any] ?? [:]
+        reason = raw.string("reason") ?? raw.string("message") ?? health.string("reason")
+        healthState = health.string("state")?.uppercased()
+        lastVerifiedAt = raw.string("last_verified_at") ?? health.string("last_verified_at")
+        vramPercent = raw.optionalInt("vram_percent")
+            ?? raw.optionalInt("vram_usage_pct")
+            ?? health.optionalInt("vram_percent")
+            ?? health.optionalInt("vram_usage_pct")
+            ?? health.optionalDouble("memory_fraction").map { Int(($0 * 100).rounded()) }
+        rollingUtilizationPercent = raw.optionalInt("rolling_utilization_pct")
+            ?? raw.optionalInt("rolling_5m_utilization_pct")
+            ?? health.optionalInt("rolling_utilization_pct")
+            ?? health.optionalInt("rolling_5m_utilization_pct")
     }
 
     public var isActive: Bool { state == "ACTIVE" }
-    public var isTransitioning: Bool { state == "STARTING" }
+
+    public var presentationLabel: String {
+        switch state {
+        case "ACTIVE": return "空闲占卡"
+        case "STARTING": return "占卡启动中"
+        case "ERROR": return "占卡异常"
+        case "LEGACY_STOP_REQUIRED": return "需先停止旧版占卡"
+        default: return "未占卡"
+        }
+    }
+
+    public var healthDetail: String? {
+        var details: [String] = []
+        if healthState != nil { details.append(healthStateLabel) }
+        if let vramPercent { details.append("显存 \(vramPercent)%") }
+        if let rollingUtilizationPercent { details.append("5 分钟利用 \(rollingUtilizationPercent)%") }
+        if let lastVerifiedAt { details.append("已验证 \(lastVerifiedAt)") }
+        if let reason { details.append(reason) }
+        return details.isEmpty ? nil : details.joined(separator: " · ")
+    }
+
+    private var healthStateLabel: String {
+        switch healthState {
+        case "HEALTHY": return "占卡健康"
+        case "STARTING": return "启动宽限期"
+        case "DEGRADED": return "占卡未达标"
+        case "ERROR": return "占卡异常"
+        default: return healthState ?? ""
+        }
+    }
 }
 
 public struct EndpointRecord: Identifiable, Equatable, Sendable {
@@ -589,6 +695,7 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
     public let temperature: Int?
     public let owner: String?
     public let taskReference: String?
+    public let keepalive: GPUKeepaliveStatus
 
     public init?(raw: [String: Any]) {
         guard
@@ -619,11 +726,30 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
         let lease = raw["lease"] as? [String: Any] ?? [:]
         self.owner = lease.string("actor_id")
         self.taskReference = lease.string("task_ref")
+        self.keepalive = GPUKeepaliveStatus(
+            raw: raw["keepalive"] as? [String: Any] ?? [:],
+            fallbackConfigured: false,
+            fallbackState: self.state == "KEEPALIVE" ? "ACTIVE" : "OFF"
+        )
     }
 
     public var memoryFraction: Double {
         guard let memoryUsedMiB, totalVRAMMiB > 0 else { return 0 }
         return min(max(Double(memoryUsedMiB) / Double(totalVRAMMiB), 0), 1)
+    }
+
+    /// A held per-GPU keepalive lease is an internal startup transition, not a
+    /// user task. Keeping this derivation in Core prevents every SwiftUI view
+    /// from rediscovering that distinction from labels or row ordering.
+    public var isTaskOccupancy: Bool {
+        switch state {
+        case "HELD":
+            return keepalive.state != "STARTING"
+        case "LEASED_IDLE", "RUNNING_MANAGED", "BUSY_UNMANAGED", "ORPHANED_BUSY":
+            return true
+        default:
+            return false
+        }
     }
 
     public var memoryLabel: String {

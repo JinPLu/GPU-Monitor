@@ -700,14 +700,34 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(BrokerStore.apiErrorCode(from: errorPayload), "endpoint_already_retired")
     }
 
-    func testKeepaliveSnapshotUsesEndpointStateAndRedactsInternalLease() throws {
+    func testKeepaliveSnapshotUsesPerGPUCoverageAndRedactsInternalLease() throws {
         let fixture = try Self.snapshot(named: "keepalive")
         let endpoint = try XCTUnwrap(fixture.endpoints.first)
         XCTAssertTrue(endpoint.keepalive.configured)
+        XCTAssertEqual(endpoint.keepalive.policy, "idle_keepalive")
         XCTAssertEqual(endpoint.keepalive.state, "ACTIVE")
-        XCTAssertEqual(endpoint.keepalive.label, "运行中")
-        XCTAssertEqual(fixture.gpus.map(\.state), ["KEEPALIVE", "KEEPALIVE"])
+        XCTAssertEqual(endpoint.keepalive.label, "已开启")
+        XCTAssertEqual(endpoint.keepalive.coverageSummary(totalGPUCount: 2, taskGPUCount: 1), "已开启 · 1/2 占卡，1 卡任务中")
+        XCTAssertEqual(fixture.gpus.map(\.state), ["KEEPALIVE", "RUNNING_MANAGED"])
+        XCTAssertEqual(fixture.gpus.first?.keepalive.presentationLabel, "空闲占卡")
+        XCTAssertEqual(fixture.gpus.first?.keepalive.healthState, "HEALTHY")
+        XCTAssertEqual(fixture.gpus.first?.keepalive.vramPercent, 31)
+        XCTAssertEqual(fixture.gpus.first?.keepalive.rollingUtilizationPercent, 35)
+        XCTAssertEqual(fixture.gpus.last?.keepalive.reason, "managed workload is running")
         XCTAssertTrue(fixture.leases.isEmpty)
+
+        let startingKeeper = try XCTUnwrap(GPURecord(raw: [
+            "id": "fixture-1:GPU-starting-keeper",
+            "endpoint_id": "fixture-1",
+            "gpu_uuid": "GPU-starting-keeper",
+            "gpu_index": 2,
+            "name": "Fixture GPU",
+            "total_vram_mib": 81920,
+            "state": "HELD",
+            "keepalive": ["configured": true, "policy": "idle_keepalive", "state": "STARTING"],
+        ]))
+        XCTAssertFalse(startingKeeper.isTaskOccupancy)
+        XCTAssertTrue(try XCTUnwrap(fixture.gpus.last).isTaskOccupancy)
 
         let defensiveSnapshot = BrokerSnapshot(envelope: [
             "data": [

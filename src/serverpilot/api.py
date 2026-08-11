@@ -63,7 +63,7 @@ from serverpilot.schemas import (
     WorkloadProfileClaim,
     WorkloadProfileUpsert,
 )
-from serverpilot.service import ActorContext, BrokerError, BrokerService
+from serverpilot.service import SYSTEM_ACTOR_ID, ActorContext, BrokerError, BrokerService
 from serverpilot.timeutil import json_dump, utcnow
 
 
@@ -96,18 +96,61 @@ def _idempotency_key(value: str | None) -> str:
     return value
 
 
-def _public_keepalive_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Return the human-facing state without internal ownership or attestation."""
+def _public_keepalive_result(
+    endpoint_id: str,
+    keepalive: dict[str, Any],
+    *,
+    event_id: int | None = None,
+    snapshot_revision: int | None = None,
+) -> dict[str, Any]:
+    """Return policy and aggregate coverage without worker or lease identity.
 
-    keepalive = result["keepalive"]
+    The endpoint toggle is intentionally the only public write surface.  The
+    service and the sealed adapter exchange lease IDs, GPU UUIDs, and worker
+    attestations internally; none of those are meaningful or safe client
+    controls, so this projection explicitly allowlists only human-visible
+    policy and coverage fields.
+    """
+
+    policy = keepalive.get("policy")
+    if policy not in {"disabled", "idle_keepalive"}:
+        policy = "disabled"
+    state = keepalive.get("state")
+    if state not in {"OFF", "IDLE", "STARTING", "PARTIAL", "ACTIVE", "ERROR", "LEGACY_STOP_REQUIRED"}:
+        state = "ERROR"
+    public = {
+        "endpoint_id": endpoint_id,
+        # Keep the old boolean as a read-only compatibility convenience; the
+        # policy is the actual contract from this version forward.
+        "enabled": policy == "idle_keepalive",
+        "policy": policy,
+        "state": state,
+        "configured": bool(keepalive.get("configured", False)),
+        "active_gpu_count": max(0, int(keepalive.get("active_gpu_count") or 0)),
+        "starting_gpu_count": max(0, int(keepalive.get("starting_gpu_count") or 0)),
+        "error_gpu_count": max(0, int(keepalive.get("error_gpu_count") or 0)),
+        "legacy_gpu_count": max(0, int(keepalive.get("legacy_gpu_count") or 0)),
+        "eligible_idle_gpu_count": max(0, int(keepalive.get("eligible_idle_gpu_count") or 0)),
+    }
+    message = keepalive.get("message")
+    if isinstance(message, str) and message:
+        public["message"] = message
+    reasons = keepalive.get("reasons")
+    if isinstance(reasons, list):
+        public_reasons: list[str] = []
+        for item in reasons:
+            if isinstance(item, str):
+                public_reasons.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("reason"), str):
+                # Domain diagnostics may be keyed by an internal GPU ID.  The
+                # endpoint API intentionally exposes the explanation only.
+                public_reasons.append(item["reason"])
+        if public_reasons:
+            public["reasons"] = public_reasons[:16]
     return {
-        "event_id": result.get("event_id"),
-        "snapshot_revision": result.get("snapshot_revision"),
-        "keepalive": {
-            "endpoint_id": keepalive["endpoint_id"],
-            "enabled": keepalive["enabled"],
-            "state": keepalive["state"] if keepalive["enabled"] else "OFF",
-        },
+        "event_id": event_id,
+        "snapshot_revision": snapshot_revision,
+        "keepalive": public,
     }
 
 
@@ -123,6 +166,441 @@ def create_app(
     service.initialize(settings.bootstrap_token)
     shared_collector = collector or SSHCollector(inventory)
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "web" / "templates"))
+    keepalive_reconcile_locks: dict[str, asyncio.Lock] = {}
+
+    def keepalive_reconcile_lock(endpoint_id: str) -> asyncio.Lock:
+        lock = keepalive_reconcile_locks.get(endpoint_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            keepalive_reconcile_locks[endpoint_id] = lock
+        return lock
+
+    @contextlib.asynccontextmanager
+    async def keepalive_endpoint_locks(endpoint_ids: set[str]) -> AsyncIterator[None]:
+        """Hold a stable endpoint set across reclaim and the retrying claim."""
+
+        locks = [keepalive_reconcile_lock(endpoint_id) for endpoint_id in sorted(endpoint_ids)]
+        for lock in locks:
+            await lock.acquire()
+        try:
+            yield
+        finally:
+            for lock in reversed(locks):
+                lock.release()
+
+    async def collect_keepalive_endpoint(endpoint: Any) -> None:
+        """Require a post-action, endpoint-scoped fresh collection."""
+
+        try:
+            collected = await shared_collector.collect_once(
+                service,
+                endpoints=[endpoint],
+                concurrency=1,
+            )
+        except Exception:
+            raise BrokerError(
+                "keepalive_observation_failed",
+                "endpoint keepalive state could not be observed",
+                status_code=503,
+            ) from None
+        endpoint_result = collected.get(endpoint.id)
+        if not isinstance(endpoint_result, dict) or "error" in endpoint_result:
+            raise BrokerError(
+                "keepalive_observation_failed",
+                "endpoint keepalive state could not be observed",
+                status_code=503,
+            )
+
+    def result_workers_by_gpu_uuid(
+        adapter_result: Any,
+        gpu_uuids: list[str],
+        *,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        """Defend the API boundary even when a test/different adapter is injected."""
+
+        results = getattr(adapter_result, "results", None)
+        if not isinstance(results, tuple) or len(results) != len(gpu_uuids):
+            raise BrokerError(
+                "keepalive_adapter_failed",
+                "endpoint keepalive operation could not be verified",
+                status_code=503,
+            )
+        by_uuid: dict[str, Any] = {}
+        expected_status = "running" if enabled else "stopped"
+        for result in results:
+            gpu_uuid = getattr(result, "gpu_uuid", None)
+            status = getattr(result, "status", None)
+            if not isinstance(gpu_uuid, str) or gpu_uuid in by_uuid or status != expected_status:
+                raise BrokerError(
+                    "keepalive_adapter_failed",
+                    "endpoint keepalive operation could not be verified",
+                    status_code=503,
+                )
+            by_uuid[gpu_uuid] = result
+        if set(by_uuid) != set(gpu_uuids):
+            raise BrokerError(
+                "keepalive_adapter_failed",
+                "endpoint keepalive operation could not be verified",
+                status_code=503,
+            )
+        if enabled and any(getattr(result, "worker", None) is None for result in by_uuid.values()):
+            raise BrokerError(
+                "keepalive_attestation_missing",
+                "endpoint keepalive state could not be verified",
+                status_code=503,
+            )
+        return by_uuid
+
+    async def reconcile_endpoint_keepalive(
+        actor: ActorContext,
+        endpoint_id: str,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Execute a service-produced per-GPU keepalive transition plan.
+
+        Service planning and ownership writes are separated from adapter calls;
+        every remote action is followed by a fresh endpoint observation before
+        the corresponding lease is confirmed or released.  This callable is
+        intentionally endpoint-level so the collector loop and the explicit
+        API toggle use the same fail-closed orchestration path.
+        """
+
+        async with keepalive_reconcile_lock(endpoint_id):
+            endpoint = service.collector_endpoint(endpoint_id)
+            plan = service.list_keepalive_transitions(endpoint_id)
+            transitions = plan.get("transitions")
+            if not isinstance(transitions, list):
+                raise BrokerError(
+                    "keepalive_transition_plan_invalid",
+                    "endpoint keepalive reconciliation plan is invalid",
+                    status_code=503,
+                )
+            transitions = [
+                transition
+                for transition in transitions
+                if isinstance(transition, dict) and transition.get("endpoint_id") == endpoint_id
+            ]
+            legacy = [
+                transition for transition in transitions if transition.get("action") == "stop_legacy_endpoint"
+            ]
+            if legacy:
+                # A v2 exact-GPU helper cannot safely signal an unverified v1
+                # whole-endpoint worker.  Do not translate it into arbitrary
+                # target UUIDs or make it allocatable based on database state.
+                raise BrokerError(
+                    "keepalive_legacy_stop_required",
+                    "legacy endpoint keepalive requires explicit verified stop before per-GPU reconciliation",
+                    status_code=409,
+                )
+            starts = [transition for transition in transitions if transition.get("action") == "start"]
+            stops = [transition for transition in transitions if transition.get("action") == "stop"]
+            if starts and stops:
+                raise BrokerError(
+                    "keepalive_transition_plan_invalid",
+                    "endpoint keepalive plan mixes start and stop transitions",
+                    status_code=503,
+                )
+            if not starts and not stops:
+                return service.get_endpoint_keepalive_summary(endpoint_id)
+            adapter_id = endpoint.keepalive_adapter_id
+            if adapter_id is None:
+                raise BrokerError(
+                    "keepalive_not_configured",
+                    "endpoint keepalive is not configured",
+                    status_code=409,
+                )
+            try:
+                adapter = keepalive_adapter_resolver(adapter_id)
+            except (KeyError, ValueError):
+                raise BrokerError(
+                    "keepalive_not_configured",
+                    "endpoint keepalive adapter is unavailable",
+                    status_code=409,
+                ) from None
+
+            if starts:
+                prepared: list[tuple[dict[str, Any], str]] = []
+                for transition in starts:
+                    gpu_id = transition.get("gpu_id")
+                    gpu_uuid = transition.get("gpu_uuid")
+                    if not isinstance(gpu_id, str) or not isinstance(gpu_uuid, str):
+                        raise BrokerError(
+                            "keepalive_transition_plan_invalid",
+                            "endpoint keepalive start target is invalid",
+                            status_code=503,
+                        )
+                    pending = service.begin_keepalive(
+                        actor,
+                        endpoint_id,
+                        gpu_id,
+                        idempotency_key=f"{idempotency_key}:start:{gpu_id}",
+                    )
+                    lease_id = pending.get("keepalive", {}).get("lease_id")
+                    if not isinstance(lease_id, str):
+                        raise BrokerError(
+                            "keepalive_transition_plan_invalid",
+                            "endpoint keepalive reservation could not be verified",
+                            status_code=503,
+                        )
+                    prepared.append((transition, lease_id))
+                target_uuids = [transition["gpu_uuid"] for transition, _ in prepared]
+                try:
+                    adapter_result = await adapter.set_enabled(endpoint, True, target_uuids)
+                except AdapterCommandError as exc:
+                    raise BrokerError(
+                        "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed",
+                        "endpoint keepalive operation could not be verified",
+                        status_code=503,
+                    ) from None
+                except Exception:
+                    raise BrokerError(
+                        "keepalive_adapter_failed",
+                        "endpoint keepalive operation could not be verified",
+                        status_code=503,
+                    ) from None
+                workers = result_workers_by_gpu_uuid(adapter_result, target_uuids, enabled=True)
+                observation_not_before = utcnow()
+                await collect_keepalive_endpoint(endpoint)
+                for transition, lease_id in prepared:
+                    worker = getattr(workers[transition["gpu_uuid"]], "worker", None)
+                    pid = getattr(worker, "pid", None)
+                    if not isinstance(pid, int) or pid <= 0:
+                        raise BrokerError(
+                            "keepalive_attestation_missing",
+                            "endpoint keepalive state could not be verified",
+                            status_code=503,
+                        )
+                    service.confirm_keepalive(
+                        actor,
+                        endpoint_id,
+                        lease_id,
+                        attested_pid=pid,
+                        observation_not_before=observation_not_before,
+                        idempotency_key=f"{idempotency_key}:confirm:{transition['gpu_id']}",
+                    )
+            else:
+                prepared_stops: list[tuple[dict[str, Any], str]] = []
+                for transition in stops:
+                    lease_id = transition.get("lease_id")
+                    gpu_uuid = transition.get("gpu_uuid")
+                    if not isinstance(lease_id, str) or not isinstance(gpu_uuid, str):
+                        raise BrokerError(
+                            "keepalive_transition_plan_invalid",
+                            "endpoint keepalive stop target is invalid",
+                            status_code=503,
+                        )
+                    # Resolve the lease through the service before remote I/O;
+                    # a stale plan must never ask the helper to stop a GPU.
+                    pending = service.prepare_keepalive_stop(
+                        actor,
+                        endpoint_id,
+                        transition.get("gpu_id"),
+                    )
+                    resolved_lease_id = pending.get("keepalive", {}).get("lease_id")
+                    if resolved_lease_id != lease_id:
+                        raise BrokerError(
+                            "keepalive_transition_plan_invalid",
+                            "endpoint keepalive stop reservation changed before execution",
+                            status_code=409,
+                        )
+                    prepared_stops.append((transition, lease_id))
+                target_uuids = [transition["gpu_uuid"] for transition, _ in prepared_stops]
+                try:
+                    adapter_result = await adapter.set_enabled(endpoint, False, target_uuids)
+                except AdapterCommandError as exc:
+                    raise BrokerError(
+                        "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed",
+                        "endpoint keepalive operation could not be verified",
+                        status_code=503,
+                    ) from None
+                except Exception:
+                    raise BrokerError(
+                        "keepalive_adapter_failed",
+                        "endpoint keepalive operation could not be verified",
+                        status_code=503,
+                    ) from None
+                result_workers_by_gpu_uuid(adapter_result, target_uuids, enabled=False)
+                observation_not_before = utcnow()
+                await collect_keepalive_endpoint(endpoint)
+                for transition, lease_id in prepared_stops:
+                    service.finalize_keepalive_stop(
+                        actor,
+                        endpoint_id,
+                        lease_id,
+                        observation_not_before=observation_not_before,
+                        idempotency_key=f"{idempotency_key}:stop:{transition['gpu_id']}",
+                    )
+            return service.get_endpoint_keepalive_summary(endpoint_id)
+
+    async def reclaim_keepalive_for_claim(
+        actor: ActorContext,
+        request_data_for_attempt: Callable[[], RequestCreate],
+        retry_claim: Callable[[], dict[str, Any]],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        """Make only a fully matching, verified keeper placement claimable.
+
+        This is not generic preemption: the service's regular allocator first
+        computes one complete placement made solely from ACTIVE per-GPU
+        keepalive leases.  The API then stops exactly that physical set,
+        verifies it empty, and retries the ordinary immediate claim.  Any
+        stale plan, partial match, legacy worker, foreign process, or remote
+        uncertainty leaves the claim blocked rather than broadening the set.
+        """
+
+        for _attempt in range(3):
+            request_data = request_data_for_attempt()
+            plan = service.plan_keepalive_reclaim(request_data)
+            transitions = plan.get("transitions")
+            if plan.get("complete") is not True or not isinstance(transitions, list) or not transitions:
+                return None
+            targets: list[dict[str, str]] = []
+            for transition in transitions:
+                if not isinstance(transition, dict) or transition.get("action") != "reclaim":
+                    return None
+                endpoint_id = transition.get("endpoint_id")
+                gpu_id = transition.get("gpu_id")
+                gpu_uuid = transition.get("gpu_uuid")
+                lease_id = transition.get("lease_id")
+                if not all(isinstance(value, str) and value for value in (endpoint_id, gpu_id, gpu_uuid, lease_id)):
+                    return None
+                targets.append(
+                    {
+                        "endpoint_id": endpoint_id,
+                        "gpu_id": gpu_id,
+                        "gpu_uuid": gpu_uuid,
+                        "lease_id": lease_id,
+                    }
+                )
+            if len({target["gpu_id"] for target in targets}) != len(targets):
+                return None
+            endpoint_ids = {target["endpoint_id"] for target in targets}
+            async with keepalive_endpoint_locks(endpoint_ids):
+                # Keepalive reclamation must use the exact profile contract
+                # that will be retried.  Re-read it after taking the endpoint
+                # locks so a concurrent profile edit cannot stop workers for
+                # stale constraints.
+                if request_data_for_attempt() != request_data:
+                    continue
+                # The selected keeper set is an admission decision made by the
+                # service. Re-read it only after the endpoint reconcile locks
+                # are held; if it changed, do not infer a replacement set.
+                locked_plan = service.plan_keepalive_reclaim(request_data)
+                locked_transitions = locked_plan.get("transitions")
+                locked_targets = (
+                    {
+                        (
+                            item.get("endpoint_id"),
+                            item.get("gpu_id"),
+                            item.get("gpu_uuid"),
+                            item.get("lease_id"),
+                        )
+                        for item in locked_transitions
+                        if isinstance(item, dict) and item.get("action") == "reclaim"
+                    }
+                    if locked_plan.get("complete") is True and isinstance(locked_transitions, list)
+                    else set()
+                )
+                requested_targets = {
+                    (target["endpoint_id"], target["gpu_id"], target["gpu_uuid"], target["lease_id"])
+                    for target in targets
+                }
+                if locked_targets != requested_targets:
+                    # The next loop will acquire the (possibly different)
+                    # endpoint lock set before considering the new plan.
+                    continue
+
+                by_endpoint: dict[str, list[dict[str, str]]] = defaultdict(list)
+                for target in targets:
+                    by_endpoint[target["endpoint_id"]].append(target)
+                for endpoint_id, endpoint_targets in by_endpoint.items():
+                    endpoint = service.collector_endpoint(endpoint_id)
+                    adapter_id = endpoint.keepalive_adapter_id
+                    if adapter_id is None:
+                        return None
+                    try:
+                        adapter = keepalive_adapter_resolver(adapter_id)
+                    except (KeyError, ValueError):
+                        return None
+                    prepared: list[dict[str, str]] = []
+                    for target in endpoint_targets:
+                        pending = service.prepare_keepalive_stop(
+                            actor,
+                            endpoint_id,
+                            target["gpu_id"],
+                        )
+                        observed_lease_id = pending.get("keepalive", {}).get("lease_id")
+                        if observed_lease_id != target["lease_id"]:
+                            return None
+                        prepared.append(target)
+                    target_uuids = [target["gpu_uuid"] for target in prepared]
+                    try:
+                        adapter_result = await adapter.set_enabled(endpoint, False, target_uuids)
+                    except AdapterCommandError as exc:
+                        raise BrokerError(
+                            "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed",
+                            "keepalive release for an immediate claim could not be verified",
+                            status_code=503,
+                        ) from None
+                    except Exception:
+                        raise BrokerError(
+                            "keepalive_adapter_failed",
+                            "keepalive release for an immediate claim could not be verified",
+                            status_code=503,
+                        ) from None
+                    result_workers_by_gpu_uuid(adapter_result, target_uuids, enabled=False)
+                    observation_not_before = utcnow()
+                    await collect_keepalive_endpoint(endpoint)
+                    for target in prepared:
+                        service.finalize_keepalive_stop(
+                            actor,
+                            endpoint_id,
+                            target["lease_id"],
+                            observation_not_before=observation_not_before,
+                            idempotency_key=f"{idempotency_key}:reclaim:{target['gpu_id']}",
+                        )
+                # Keep the endpoint locks through the ordinary claim retry.
+                # Otherwise collector reconciliation could observe the fresh
+                # empty GPU and restart its keeper in the gap.
+                return retry_claim()
+        return None
+
+    async def claim_workload_profile_now(
+        actor: ActorContext,
+        profile_id: str,
+        claim: WorkloadProfileClaim,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Claim one profile through the same exact keepalive handoff as /claims."""
+
+        try:
+            return service.claim_workload_profile(
+                actor,
+                profile_id,
+                claim,
+                idempotency_key=idempotency_key,
+            )
+        except BrokerError as exc:
+            if exc.code != "no_capacity":
+                raise
+            claimed = await reclaim_keepalive_for_claim(
+                actor,
+                lambda: service.workload_profile_claim_request(actor, profile_id, claim),
+                lambda: service.claim_workload_profile(
+                    actor,
+                    profile_id,
+                    claim,
+                    idempotency_key=idempotency_key,
+                ),
+                idempotency_key=idempotency_key,
+            )
+            if claimed is None:
+                raise exc
+            return claimed
 
     async def collector_loop() -> None:
         next_prune_at = 0.0
@@ -132,11 +610,30 @@ def create_app(
             try:
                 endpoints = service.collector_endpoints()
                 stagger = interval / len(endpoints) if len(endpoints) > 1 else 0.0
-                await shared_collector.collect_once(
+                collected = await shared_collector.collect_once(
                     service,
                     endpoints=endpoints,
                     stagger_seconds=stagger,
                 )
+                system_actor = ActorContext(
+                    id=SYSTEM_ACTOR_ID,
+                    role="admin",
+                    project_ids=frozenset(),
+                )
+                async def reconcile_collected(endpoint: Any) -> None:
+                    result = collected.get(endpoint.id)
+                    if not isinstance(result, dict) or "error" in result:
+                        return
+                    revision = result.get("snapshot_revision")
+                    key_suffix = revision if isinstance(revision, int) else int(time.time())
+                    with contextlib.suppress(Exception):
+                        await reconcile_endpoint_keepalive(
+                            system_actor,
+                            endpoint.id,
+                            idempotency_key=f"keepalive-reconcile:{endpoint.id}:{key_suffix}",
+                        )
+
+                await asyncio.gather(*(reconcile_collected(endpoint) for endpoint in endpoints))
             except Exception:
                 # Per-endpoint failures are already recorded by SSHCollector. This
                 # protects the service loop from an unexpected local failure.
@@ -165,6 +662,10 @@ def create_app(
     app = FastAPI(title="ServerPilot", version=__version__, lifespan=lifespan)
     app.state.service = service
     app.state.settings = settings
+    # A narrow integration hook for the collector/recovery path.  It accepts
+    # an endpoint only; callers cannot inject a remote target or worker
+    # identity, and all execution stays behind the service transition plan.
+    app.state.reconcile_endpoint_keepalive = reconcile_endpoint_keepalive
     limiter = RateLimiter(settings.rate_limit_per_minute)
     ssh_preview_secret = secrets.token_bytes(32)
     app.add_middleware(SessionMiddleware, secret_key=settings.session_secret or secrets.token_urlsafe(32))
@@ -573,19 +1074,38 @@ def create_app(
         )
 
     @app.post("/api/v1/claims")
-    def claim_now(
+    async def claim_now(
         request_data: RequestCreate,
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        """Create a routine agent claim and auto-activate it once allocated."""
+        """Create an immediate claim, reclaiming only its selected keepers once."""
 
-        return service.create_request(
-            actor,
-            request_data,
-            idempotency_key=_idempotency_key(idempotency_key),
-            activate_if_allocated=True,
-        )
+        mutation_key = _idempotency_key(idempotency_key)
+        try:
+            return service.create_request(
+                actor,
+                request_data,
+                idempotency_key=mutation_key,
+                activate_if_allocated=True,
+            )
+        except BrokerError as exc:
+            if exc.code != "no_capacity":
+                raise
+            claimed = await reclaim_keepalive_for_claim(
+                actor,
+                lambda: request_data,
+                lambda: service.create_request(
+                    actor,
+                    request_data,
+                    idempotency_key=mutation_key,
+                    activate_if_allocated=True,
+                ),
+                idempotency_key=mutation_key,
+            )
+            if claimed is None:
+                raise exc
+            return claimed
 
     @app.post("/api/v1/resource-plan-evaluations")
     def evaluate_resource_plan(
@@ -788,17 +1308,18 @@ def create_app(
         )
 
     @app.post("/api/v1/workload-profiles/{profile_id}/claim")
-    def claim_workload_profile(
+    async def claim_workload_profile(
         profile_id: str,
         claim: WorkloadProfileClaim,
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        return service.claim_workload_profile(
+        mutation_key = _idempotency_key(idempotency_key)
+        return await claim_workload_profile_now(
             actor,
             profile_id,
             claim,
-            idempotency_key=_idempotency_key(idempotency_key),
+            idempotency_key=mutation_key,
         )
 
     @app.post("/api/v1/endpoints")
@@ -846,110 +1367,41 @@ def create_app(
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        """Set the sealed whole-endpoint keepalive state and verify it afresh."""
+        """Set endpoint desired policy, then reconcile independent GPU keepers.
+
+        ``enabled`` is deliberately the only caller input.  It maps to the
+        endpoint desired policy and never permits a client to name a worker,
+        a GPU UUID, a PID, or arbitrary remote parameters.
+        """
 
         mutation_key = _idempotency_key(idempotency_key)
-        # Resolve the sealed endpoint and adapter before creating ownership.
-        # Disable deliberately performs the same remote reconciliation even
-        # when Broker has no active keepalive lease: database absence alone is
-        # not evidence that a previously started helper is gone.
-        endpoint = service.collector_endpoint(endpoint_id)
-        adapter_id = endpoint.keepalive_adapter_id
-        if adapter_id is None:
+        policy = "idle_keepalive" if state.enabled else "disabled"
+        configured = service.configure_keepalive_policy(
+            actor,
+            endpoint_id,
+            policy,
+            idempotency_key=mutation_key,
+        )
+        reconciled = await reconcile_endpoint_keepalive(
+            actor,
+            endpoint_id,
+            idempotency_key=mutation_key,
+        )
+        keepalive = reconciled.get("keepalive")
+        if not isinstance(keepalive, dict):
             raise BrokerError(
-                "keepalive_not_configured",
-                "endpoint keepalive is not configured",
-                status_code=409,
-            )
-        try:
-            adapter = keepalive_adapter_resolver(adapter_id)
-        except (KeyError, ValueError):
-            raise BrokerError(
-                "keepalive_not_configured",
-                "endpoint keepalive adapter is unavailable",
-                status_code=409,
-            ) from None
-
-        if state.enabled:
-            pending = service.begin_keepalive(
-                actor,
-                endpoint_id,
-                idempotency_key=mutation_key,
-            )
-            lease_id = pending["keepalive"]["lease_id"]
-        else:
-            pending = service.prepare_keepalive_stop(actor, endpoint_id)
-            lease_id = pending["keepalive"]["lease_id"]
-
-        try:
-            adapter_result = await adapter.set_enabled(endpoint, state.enabled)
-        except AdapterCommandError as exc:
-            raise BrokerError(
-                "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed",
-                "endpoint keepalive operation could not be verified",
-                status_code=503,
-            ) from None
-        except Exception:
-            raise BrokerError(
-                "keepalive_adapter_failed",
-                "endpoint keepalive operation could not be verified",
-                status_code=503,
-            ) from None
-
-        observation_not_before = utcnow()
-        try:
-            collected = await shared_collector.collect_once(
-                service,
-                endpoints=[endpoint],
-                concurrency=1,
-            )
-        except Exception:
-            raise BrokerError(
-                "keepalive_observation_failed",
-                "endpoint keepalive state could not be observed",
-                status_code=503,
-            ) from None
-        endpoint_result = collected.get(endpoint_id)
-        if not isinstance(endpoint_result, dict) or "error" in endpoint_result:
-            raise BrokerError(
-                "keepalive_observation_failed",
-                "endpoint keepalive state could not be observed",
+                "keepalive_endpoint_observation_missing",
+                "endpoint keepalive state could not be projected after reconciliation",
                 status_code=503,
             )
-
-        if state.enabled:
-            worker = adapter_result.worker
-            if worker is None:
-                raise BrokerError(
-                    "keepalive_attestation_missing",
-                    "endpoint keepalive state could not be verified",
-                    status_code=503,
-                )
-            result = service.confirm_keepalive(
-                actor,
-                endpoint_id,
-                lease_id,
-                attested_pid=worker.pid,
-                observation_not_before=observation_not_before,
-                idempotency_key=mutation_key,
-            )
-        else:
-            if lease_id is None:
-                result = service.confirm_keepalive_absent(
-                    actor,
-                    endpoint_id,
-                    observation_not_before=observation_not_before,
-                    idempotency_key=mutation_key,
-                )
-            else:
-                result = service.finalize_keepalive_stop(
-                    actor,
-                    endpoint_id,
-                    lease_id,
-                    observation_not_before=observation_not_before,
-                    idempotency_key=mutation_key,
-                )
-        return _public_keepalive_result(result)
+        event_id = configured.get("event_id")
+        revision = reconciled.get("snapshot_revision")
+        return _public_keepalive_result(
+            endpoint_id,
+            keepalive,
+            event_id=event_id if isinstance(event_id, int) else None,
+            snapshot_revision=revision if isinstance(revision, int) else None,
+        )
 
     @app.delete("/api/v1/endpoints/{endpoint_id}")
     def delete_endpoint(
@@ -1642,7 +2094,7 @@ def create_app(
                     activate_if_allocated=action == "quick-claim",
                 )
             elif action == "profile-claim":
-                result = service.claim_workload_profile(
+                result = await claim_workload_profile_now(
                     actor,
                     data["profile_id"],
                     WorkloadProfileClaim.model_validate({"task_ref": data["task_ref"]}),

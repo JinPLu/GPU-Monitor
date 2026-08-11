@@ -29,6 +29,12 @@ def test_policy_merge_replaces_only_its_owned_block() -> None:
     assert merged == "before\n\n<!-- SERVERPILOT_GLOBAL_START -->\nnew\n<!-- SERVERPILOT_GLOBAL_END -->\nafter\n"
 
 
+def test_policy_merge_migrates_legacy_gpu_broker_block_in_place() -> None:
+    old = "before\n\n<!-- GPU_BROKER_GLOBAL_START -->\nlegacy\n<!-- GPU_BROKER_GLOBAL_END -->\n\nafter\n"
+    merged = merge(old, render("codex", "new"))
+    assert merged == "before\n\n<!-- SERVERPILOT_GLOBAL_START -->\nnew\n<!-- SERVERPILOT_GLOBAL_END -->\nafter\n"
+
+
 def test_policy_merge_is_idempotent() -> None:
     block = render("codex", "new")
     once = merge("before\nafter\n", block)
@@ -58,6 +64,15 @@ def test_policy_merge_into_empty_file_is_just_the_owned_block() -> None:
 )
 def test_policy_merge_rejects_invalid_markers(existing: str, message: str) -> None:
     with pytest.raises(ValueError, match=message):
+        merge(existing, render("codex", "new"))
+
+
+def test_policy_merge_rejects_mixed_legacy_and_current_blocks() -> None:
+    existing = (
+        "<!-- GPU_BROKER_GLOBAL_START -->\nlegacy\n<!-- GPU_BROKER_GLOBAL_END -->\n"
+        "<!-- SERVERPILOT_GLOBAL_START -->\ncurrent\n<!-- SERVERPILOT_GLOBAL_END -->\n"
+    )
+    with pytest.raises(ValueError, match="duplicated"):
         merge(existing, render("codex", "new"))
 
 
@@ -103,12 +118,14 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
         "server instructions",
         "tool schemas and serverpilot's server instructions remain authoritative",
         "routine owner-scoped claim",
+        ".serverpilot/resource-card.json",
         "profile_id",
         "project_id",
         "gpu_count",
         "gpu_claim_profile",
         "gpu_claim",
         "never infer missing inputs",
+        "project-resource-card setup blocker",
         "no_capacity",
         "creates no queue",
         "held",

@@ -4,15 +4,22 @@ Use the local `serverpilot` MCP for server-compute coordination. Existing
 installations may still expose the compatible `serverpilot` MCP name; its tool
 schemas and ServerPilot's server instructions remain authoritative.
 
-A routine owner-scoped claim is allowed only when the task already records its
-approved `profile_id`, or its complete explicit `project_id`, `gpu_count`, task
-reference, and resource thresholds. Never infer missing inputs.
+A routine owner-scoped claim is allowed only when its project has the checked-in
+`.serverpilot/resource-card.json` pointing to one approved `profile_id`, when the
+task already records an approved `profile_id`, or when it records its complete
+explicit `project_id`, `gpu_count`, task reference, and resource thresholds. The
+resource card is the project's only routine-GPU input: never infer a profile from
+a repository name, task title, inventory, free capacity, or profile list.
+Never infer missing inputs.
 
 ## Normal bare-metal path
 
-1. When the task already records a `profile_id`, call `gpu_claim_profile`.
-   Otherwise, when it records `project_id`, `gpu_count`, task reference, and
-   every required CPU, memory, and VRAM threshold, call `gpu_claim`.
+1. When a checked project resource card exists, use its `profile_id` with
+   `gpu_claim_profile`; otherwise use a task-recorded `profile_id`. Only when
+   neither exists but the task records `project_id`, `gpu_count`, task reference,
+   and every required CPU, memory, and VRAM threshold may it call `gpu_claim`.
+   A missing, invalid, disabled, or non-direct-GPU card/profile is an explicit
+   project-resource-card setup blocker: report it and do not guess.
 2. A claim returns a held or active lease immediately, or fails with
    `no_capacity`. `no_capacity` creates no queue and grants no permission to
    execute. Do not invent a wait/poll flow or bypass ServerPilot; report the
@@ -62,13 +69,17 @@ new placement, and keeps collection and current leases running. Resume moves
 active leases are clear; it retains identity
 and evidence. Deprecated `gpu_delete_server` is pause only and never auto-retires.
 
-Optional endpoint keepalive is another explicit administration state, not an
-automatic claim hook. When the current task authorizes use of a configured
-endpoint, call `gpu_set_keepalive(..., enabled=false)` before claiming it; after
-release, the Agent may explicitly call the same tool with `enabled=true`.
-Keepalive never listens for claims, preempts a workload, or resumes itself.
-The tool accepts only the boolean state and still requires the current-task
-`approval_ref` and caller-stable `idempotency_key` above.
+Optional endpoint keepalive is an explicit endpoint policy, executed by exact
+physical GPU rather than a whole-server worker. `gpu_set_keepalive` accepts
+only its boolean state and still requires the current-task `approval_ref` and
+caller-stable `idempotency_key` above. When enabled, it reconciles only
+eligible idle GPUs; busy, stale, conflicting, or unmanaged GPUs are left
+untouched. A ServerPilot-managed immediate claim may reclaim only the exact
+verified keepalive GPU(s) selected by the service, then retry the ordinary
+claim after a fresh empty observation. That is not generic preemption and
+does not apply to direct SSH or other unmanaged work: disable the endpoint
+policy before starting such work. Once a managed workload is released, an
+eligible idle GPU may rejoin the enabled policy after collection.
 
 ## External schedulers
 

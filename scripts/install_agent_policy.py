@@ -23,6 +23,7 @@ MARKERS = {
     "claude": ("<!-- SERVERPILOT_GLOBAL_START -->", "<!-- SERVERPILOT_GLOBAL_END -->"),
     "cursor": ("<!-- SERVERPILOT_GLOBAL_START -->", "<!-- SERVERPILOT_GLOBAL_END -->"),
 }
+LEGACY_MARKERS = ("<!-- GPU_BROKER_GLOBAL_START -->", "<!-- GPU_BROKER_GLOBAL_END -->")
 
 
 def destination(platform: str) -> Path | None:
@@ -39,14 +40,22 @@ def render(platform: str, body: str) -> str:
 
 
 def merge(existing: str, block: str) -> str:
-    start, end = MARKERS["codex"]
-    start_count = existing.count(start)
-    end_count = existing.count(end)
-    if start_count != end_count:
+    current_start, current_end = MARKERS["codex"]
+    legacy_start, legacy_end = LEGACY_MARKERS
+    current_count = existing.count(current_start)
+    current_end_count = existing.count(current_end)
+    legacy_count = existing.count(legacy_start)
+    legacy_end_count = existing.count(legacy_end)
+
+    if current_count != current_end_count or legacy_count != legacy_end_count:
         raise ValueError("existing ServerPilot policy markers are incomplete")
-    if start_count > 1:
+    if current_count > 1 or legacy_count > 1:
         raise ValueError("existing ServerPilot policy markers are duplicated")
-    if start_count == 1:
+    if current_count and legacy_count:
+        raise ValueError("existing ServerPilot policy markers are duplicated across legacy and current blocks")
+
+    if current_count or legacy_count:
+        start, end = (current_start, current_end) if current_count else (legacy_start, legacy_end)
         begin = existing.find(start)
         finish = existing.find(end)
         if finish < begin:

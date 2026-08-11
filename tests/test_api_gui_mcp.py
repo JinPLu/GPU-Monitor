@@ -872,9 +872,8 @@ def test_mcp_exposes_required_tools() -> None:
     )
     assert "purpose" not in by_name["gpu_claim"].inputSchema["required"]
     assert "hours" not in by_name["gpu_claim"].inputSchema["properties"]
-    assert {"agent_name", "profile_id", "task"}.issubset(
-        by_name["gpu_claim_profile"].inputSchema["required"]
-    )
+    assert {"profile_id", "task"}.issubset(by_name["gpu_claim_profile"].inputSchema["required"])
+    assert "agent_name" not in by_name["gpu_claim_profile"].inputSchema["required"]
     assert "reason" not in by_name["gpu_release"].inputSchema["required"]
     for name in (
         "gpu_add_server",

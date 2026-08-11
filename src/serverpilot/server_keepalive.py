@@ -1,15 +1,18 @@
-"""Reference implementation of the fixed ``serverpilot-keepalive`` helper.
+"""Reference implementation of the sealed per-GPU keepalive helper.
 
-The public helper reads one strict JSON request from stdin.  It never accepts
-a path, command, PID, environment, or GPU selector from its caller.  Its local
-state directory and CUDA policy are code-owned, and the stop path verifies the
-recorded process identity before sending any signal.
+The public helper accepts exactly one typed protocol-v2 request.  A request
+names physical GPU UUIDs already selected by ServerPilot; it never accepts an
+executable, PID, path, arbitrary environment, or CUDA selector.  Each target
+receives a separate CUDA process and private state entry, so stopping GPU A
+cannot signal GPU B (or any arbitrary host process).
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -21,25 +24,31 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
 
 from serverpilot.keepalive_protocol import (
     KEEPALIVE_SCHEMA_VERSION,
     MAX_KEEPALIVE_MESSAGE_BYTES,
+    KeepaliveGPUResult,
+    KeepaliveProtocolError,
     KeepaliveRequest,
     KeepaliveResponse,
     KeepaliveWorkerAttestation,
+    LegacyKeepaliveRequest,
+    validate_gpu_uuid,
 )
 
 
-# Protocol-v1 policy is deliberately fixed on the server.  It is not part of
-# the REST/MCP request and cannot be changed by an Agent.
+# These values are fixed server policy, never request inputs.  The worker has
+# no steady-state filesystem or network activity: state is read/written only
+# during a reconciliation call and runtime CUDA work is fully resident.
 TARGET_MEMORY_FRACTION = 0.31
-ACTIVE_DUTY_FRACTION = 0.35
-DUTY_PERIOD_SECONDS = 1.0
+ACTIVE_DUTY_FRACTION = 0.30
+DUTY_PERIOD_SECONDS = 0.1
 ALLOCATION_CHUNK_BYTES = 256 * 1024 * 1024
+COMPUTE_MATRIX_SIZE = 2048
 WORKER_READY_TIMEOUT_SECONDS = 35
 WORKER_STOP_TIMEOUT_SECONDS = 10
 NVIDIA_SMI_TIMEOUT_SECONDS = 10
@@ -47,7 +56,7 @@ MAX_NVIDIA_SMI_OUTPUT_BYTES = 64 * 1024
 
 
 def default_state_directory() -> Path:
-    """Return the code-owned per-user state path used by the remote helper."""
+    """Return the code-owned private state directory on the remote endpoint."""
 
     configured = os.environ.get("XDG_STATE_HOME")
     if configured:
@@ -59,14 +68,16 @@ def default_state_directory() -> Path:
 
 @dataclass(frozen=True, slots=True)
 class WorkerIdentity:
+    """Namespace-local process identity that is safe to signal only after verify."""
+
     pid: int
     start_ticks: int
 
 
 class KeepaliveProcessProvider(Protocol):
-    """Local implementation boundary; never exposed through Broker APIs."""
+    """Local implementation boundary; no Broker/API value reaches this layer."""
 
-    def start(self) -> WorkerIdentity: ...
+    def start(self, gpu_uuid: str) -> WorkerIdentity: ...
 
     def is_running(self, identity: WorkerIdentity) -> bool: ...
 
@@ -74,11 +85,12 @@ class KeepaliveProcessProvider(Protocol):
 
 
 class TorchSubprocessProvider:
-    """Run the fixed whole-endpoint PyTorch/CUDA worker when available."""
+    """Start exactly one fixed PyTorch/CUDA worker for one exact GPU UUID."""
 
     _worker_marker = "serverpilot.server_keepalive"
 
-    def start(self) -> WorkerIdentity:
+    def start(self, gpu_uuid: str) -> WorkerIdentity:
+        gpu_uuid = validate_gpu_uuid(gpu_uuid)
         read_fd, write_fd = os.pipe()
         try:
             process = subprocess.Popen(
@@ -93,6 +105,10 @@ class TorchSubprocessProvider:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                # The worker's CUDA selector is assigned only here, from the
+                # helper's validated typed target.  It is not an API/CLI
+                # parameter and no caller can add an environment variable.
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_uuid},
                 close_fds=True,
                 pass_fds=(write_fd,),
                 start_new_session=True,
@@ -135,8 +151,8 @@ class TorchSubprocessProvider:
         return self._worker_marker.encode() in command and b"--internal-worker" in command
 
     def stop(self, identity: WorkerIdentity) -> None:
-        # Recheck immediately before signalling.  A stale/reused PID or a
-        # foreign same-user process is never a valid stop target.
+        # A stale/reused PID, a same-user non-helper process, or an identity
+        # that was never recorded is never a valid signal target.
         if not self.is_running(identity):
             return
         os.kill(identity.pid, signal.SIGTERM)
@@ -157,86 +173,159 @@ class TorchSubprocessProvider:
 
 
 class LocalKeepaliveController:
-    """Idempotently reconcile one code-owned worker with a boolean intent."""
+    """Idempotently reconcile independent, exact-GPU workers in one call."""
 
     def __init__(
         self,
         *,
         provider: KeepaliveProcessProvider | None = None,
         state_directory: Path | None = None,
-        observed_pid_resolver: Callable[[], int] | None = None,
+        observed_pid_resolver: Callable[[str], int] | None = None,
+        known_gpu_uuids_resolver: Callable[[], set[str]] | None = None,
     ) -> None:
         self.provider = provider or TorchSubprocessProvider()
         self.state_directory = state_directory or default_state_directory()
         self.observed_pid_resolver = observed_pid_resolver or _resolve_observed_host_pid
+        self.known_gpu_uuids_resolver = known_gpu_uuids_resolver or _resolve_known_gpu_uuids
 
-    def set_enabled(self, enabled: bool) -> KeepaliveResponse:
+    def set_enabled(self, enabled: bool, gpu_uuids: list[str] | tuple[str, ...]) -> KeepaliveResponse:
+        """Reconcile only the supplied GPU UUIDs and return exact attestations.
+
+        New workers start serially.  If a later startup fails, workers started
+        by this invocation are safely rolled back while pre-existing targets
+        retain their original state; the operation never expands to other
+        endpoint GPUs.
+        """
+
         if type(enabled) is not bool:
             raise ValueError("enabled must be a boolean")
+        try:
+            requested = tuple(validate_gpu_uuid(gpu_uuid) for gpu_uuid in gpu_uuids)
+        except TypeError as exc:
+            raise ValueError("gpu_uuids must be an iterable of GPU UUID strings") from exc
+        if not requested:
+            raise ValueError("gpu_uuids cannot be empty")
+        if len(set(requested)) != len(requested):
+            raise ValueError("gpu_uuids contains duplicates")
+        known_gpu_uuids = self.known_gpu_uuids_resolver()
+        if not set(requested) <= known_gpu_uuids:
+            raise ValueError("gpu_uuids contains an unknown GPU UUID")
         self._ensure_state_directory()
         with self._lock():
-            identity = self._read_identity()
-            running = identity is not None and self.provider.is_running(identity)
+            identities = self._read_identities()
             if enabled:
-                if running:
-                    return KeepaliveResponse(
-                        enabled=True,
-                        changed=False,
-                        status="running",
-                        worker=self._attest_running_worker(identity),
+                return self._enable(requested, identities)
+            return self._disable(requested, identities)
+
+    def _enable(
+        self,
+        requested: tuple[str, ...],
+        identities: dict[str, WorkerIdentity],
+    ) -> KeepaliveResponse:
+        results: list[KeepaliveGPUResult] = []
+        started: list[tuple[str, WorkerIdentity]] = []
+        try:
+            for gpu_uuid in requested:
+                identity = identities.get(gpu_uuid)
+                if identity is not None and self.provider.is_running(identity):
+                    results.append(
+                        KeepaliveGPUResult(
+                            gpu_uuid=gpu_uuid,
+                            status="running",
+                            outcome="unchanged",
+                            worker=self._attest_running_worker(gpu_uuid, identity),
+                        )
                     )
+                    continue
                 if identity is not None:
-                    self._remove_state()
-                started = self.provider.start()
-                if not self.provider.is_running(started):
+                    # The state belongs to this helper but no longer verifies
+                    # as a current worker.  Never signal it; replace only its
+                    # own stale mapping.
+                    identities.pop(gpu_uuid)
+                    self._write_identities(identities)
+                identity = self.provider.start(gpu_uuid)
+                if not self.provider.is_running(identity):
                     raise RuntimeError("keepalive provider did not retain its worker")
+                # Persist before nvidia-smi attestation: a verification error
+                # still leaves an exact, helper-owned stop identity.
+                identities[gpu_uuid] = identity
+                self._write_identities(identities)
                 try:
-                    # Persist the namespace-local identity before host-PID
-                    # verification so a failed verification still has a safe,
-                    # exact stop target.
-                    self._write_identity(started)
-                    worker = self._attest_running_worker(started)
-                    return KeepaliveResponse(
-                        enabled=True,
-                        changed=True,
+                    worker = self._attest_running_worker(gpu_uuid, identity)
+                except Exception:
+                    self._stop_and_forget(gpu_uuid, identity, identities)
+                    raise
+                started.append((gpu_uuid, identity))
+                results.append(
+                    KeepaliveGPUResult(
+                        gpu_uuid=gpu_uuid,
                         status="running",
+                        outcome="started",
                         worker=worker,
                     )
-                except Exception:
-                    if self.provider.is_running(started):
-                        self.provider.stop(started)
-                    if not self.provider.is_running(started):
-                        self._remove_state()
-                    raise
-
-            if identity is None:
-                return KeepaliveResponse(
-                    enabled=False, changed=False, status="stopped", worker=None
                 )
-            if running:
+        except Exception:
+            # Start is deliberately serial and its rollback is limited to the
+            # identities created above.  Existing independently managed GPUs
+            # are neither stopped nor modified.
+            for gpu_uuid, identity in reversed(started):
+                self._stop_and_forget(gpu_uuid, identity, identities)
+            raise
+        return KeepaliveResponse(enabled=True, results=tuple(results))
+
+    def _disable(
+        self,
+        requested: tuple[str, ...],
+        identities: dict[str, WorkerIdentity],
+    ) -> KeepaliveResponse:
+        results: list[KeepaliveGPUResult] = []
+        for gpu_uuid in requested:
+            identity = identities.get(gpu_uuid)
+            if identity is None:
+                results.append(
+                    KeepaliveGPUResult(
+                        gpu_uuid=gpu_uuid, status="stopped", outcome="unchanged", worker=None
+                    )
+                )
+                continue
+            # Stops are scoped to an identity recovered from this helper's
+            # private mapping and re-verified immediately by the provider.
+            if self.provider.is_running(identity):
                 self.provider.stop(identity)
                 if self.provider.is_running(identity):
                     raise RuntimeError("keepalive provider left its worker running")
-            self._remove_state()
-            return KeepaliveResponse(enabled=False, changed=True, status="stopped", worker=None)
+            identities.pop(gpu_uuid)
+            self._write_identities(identities)
+            results.append(
+                KeepaliveGPUResult(
+                    gpu_uuid=gpu_uuid, status="stopped", outcome="stopped", worker=None
+                )
+            )
+        return KeepaliveResponse(enabled=False, results=tuple(results))
+
+    def _stop_and_forget(
+        self,
+        gpu_uuid: str,
+        identity: WorkerIdentity,
+        identities: dict[str, WorkerIdentity],
+    ) -> None:
+        if self.provider.is_running(identity):
+            self.provider.stop(identity)
+        if not self.provider.is_running(identity):
+            identities.pop(gpu_uuid, None)
+            self._write_identities(identities)
 
     def _attest_running_worker(
-        self, identity: WorkerIdentity
+        self, gpu_uuid: str, identity: WorkerIdentity
     ) -> KeepaliveWorkerAttestation:
-        observed_pid = self.observed_pid_resolver()
+        observed_pid = self.observed_pid_resolver(gpu_uuid)
         if not self.provider.is_running(identity):
             raise RuntimeError("keepalive worker exited during host PID verification")
-        return KeepaliveWorkerAttestation(
-            pid=observed_pid,
-            # This remains the namespace-local process start identity.  It is
-            # retained only as helper-produced lifecycle evidence; safe stop
-            # uses the complete namespace-local identity stored on disk.
-            start_ticks=identity.start_ticks,
-        )
+        return KeepaliveWorkerAttestation(pid=observed_pid, start_ticks=identity.start_ticks)
 
     @property
     def _state_path(self) -> Path:
-        return self.state_directory / "worker.json"
+        return self.state_directory / "workers.v2.json"
 
     @property
     def _lock_path(self) -> Path:
@@ -273,7 +362,7 @@ class LocalKeepaliveController:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
-    def _read_identity(self) -> WorkerIdentity | None:
+    def _read_identities(self) -> dict[str, WorkerIdentity]:
         try:
             descriptor = os.open(
                 self._state_path,
@@ -286,27 +375,60 @@ class LocalKeepaliveController:
                     or details.st_uid != os.getuid()
                     or details.st_mode & 0o077
                 ):
-                    raise RuntimeError(
-                        "keepalive worker state must be private and owned by this user"
-                    )
+                    raise RuntimeError("keepalive worker state must be private and owned by this user")
                 raw = handle.read(MAX_KEEPALIVE_MESSAGE_BYTES + 1)
             if len(raw.encode("utf-8")) > MAX_KEEPALIVE_MESSAGE_BYTES:
                 raise RuntimeError("keepalive worker state is too large")
             value = json.loads(raw)
         except FileNotFoundError:
-            return None
+            return {}
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise RuntimeError("keepalive worker state is unreadable") from exc
-        if not isinstance(value, dict) or set(value) != {"pid", "start_ticks"}:
+        if not isinstance(value, dict) or set(value) != {"schema_version", "workers"}:
             raise RuntimeError("keepalive worker state has invalid fields")
-        pid = value["pid"]
-        start_ticks = value["start_ticks"]
-        if type(pid) is not int or pid <= 0 or type(start_ticks) is not int or start_ticks <= 0:
-            raise RuntimeError("keepalive worker state has invalid identity")
-        return WorkerIdentity(pid=pid, start_ticks=start_ticks)
+        if value["schema_version"] != KEEPALIVE_SCHEMA_VERSION or not isinstance(value["workers"], list):
+            raise RuntimeError("keepalive worker state has invalid schema")
+        workers = value["workers"]
+        if len(workers) > 64:
+            raise RuntimeError("keepalive worker state has too many workers")
+        identities: dict[str, WorkerIdentity] = {}
+        for worker in workers:
+            if not isinstance(worker, dict) or set(worker) != {"gpu_uuid", "pid", "start_ticks"}:
+                raise RuntimeError("keepalive worker state has invalid worker")
+            try:
+                gpu_uuid = validate_gpu_uuid(worker["gpu_uuid"])
+            except KeepaliveProtocolError as exc:
+                raise RuntimeError("keepalive worker state has invalid GPU UUID") from exc
+            pid = worker["pid"]
+            start_ticks = worker["start_ticks"]
+            if (
+                gpu_uuid in identities
+                or type(pid) is not int
+                or pid <= 0
+                or type(start_ticks) is not int
+                or start_ticks <= 0
+            ):
+                raise RuntimeError("keepalive worker state has invalid identity")
+            identities[gpu_uuid] = WorkerIdentity(pid=pid, start_ticks=start_ticks)
+        return identities
 
-    def _write_identity(self, identity: WorkerIdentity) -> None:
-        temporary = self.state_directory / f"worker.{os.getpid()}.tmp"
+    def _write_identities(self, identities: dict[str, WorkerIdentity]) -> None:
+        if not identities:
+            self._state_path.unlink(missing_ok=True)
+            return
+        workers = [
+            {"gpu_uuid": gpu_uuid, "pid": identity.pid, "start_ticks": identity.start_ticks}
+            for gpu_uuid, identity in sorted(identities.items())
+        ]
+        payload = json.dumps(
+            {"schema_version": KEEPALIVE_SCHEMA_VERSION, "workers": workers},
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if len(payload.encode("utf-8")) > MAX_KEEPALIVE_MESSAGE_BYTES:
+            raise RuntimeError("keepalive worker state is too large")
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        temporary = self.state_directory / f"workers.{os.getpid()}.{digest}.tmp"
         descriptor = os.open(
             temporary,
             os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -314,15 +436,12 @@ class LocalKeepaliveController:
         )
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(asdict(identity), handle, separators=(",", ":"))
+                handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self._state_path)
         finally:
             temporary.unlink(missing_ok=True)
-
-    def _remove_state(self) -> None:
-        self._state_path.unlink(missing_ok=True)
 
 
 def handle_request(
@@ -331,7 +450,11 @@ def handle_request(
     controller: LocalKeepaliveController | None = None,
 ) -> KeepaliveResponse:
     request = KeepaliveRequest.decode(payload)
-    return (controller or LocalKeepaliveController()).set_enabled(request.enabled)
+    if isinstance(request, LegacyKeepaliveRequest):
+        raise KeepaliveProtocolError(
+            "keepalive schema v1 cannot control per-GPU workers; deploy schema v2 helper"
+        )
+    return (controller or LocalKeepaliveController()).set_enabled(request.enabled, request.gpu_uuids)
 
 
 def _process_start_ticks(pid: int) -> int | None:
@@ -346,11 +469,7 @@ def _process_start_ticks(pid: int) -> int | None:
 def _run_nvidia_smi_query(query_argument: str) -> str:
     try:
         result = subprocess.run(
-            [
-                "nvidia-smi",
-                query_argument,
-                "--format=csv,noheader,nounits",
-            ],
+            ["nvidia-smi", query_argument, "--format=csv,noheader,nounits"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -370,34 +489,24 @@ def _run_nvidia_smi_query(query_argument: str) -> str:
     return result.stdout
 
 
-def _resolve_observed_host_pid() -> int:
-    """Return the one NVIDIA-driver PID covering every visible GPU.
+def _resolve_observed_host_pid(gpu_uuid: str) -> int:
+    """Return one target GPU's sole host-visible CUDA PID.
 
-    The helper runs the same fixed nvidia-smi view as the collector.  READY is
-    emitted only after the worker has allocated and synchronized on every
-    visible GPU, so exactly one compute PID with full coverage is the worker's
-    collector-domain (host) PID.  Anything less exact is refused.
+    Worker processes are intentionally one-GPU processes.  Other GPU rows are
+    irrelevant; any missing, duplicate, or competing process on *this* target
+    makes attribution ambiguous and is rejected.
     """
 
-    gpu_lines = [
-        line.strip()
-        for line in _run_nvidia_smi_query("--query-gpu=uuid").splitlines()
-        if line.strip()
-    ]
-    visible_gpu_uuids = set(gpu_lines)
-    if not visible_gpu_uuids or len(visible_gpu_uuids) != len(gpu_lines):
-        raise RuntimeError("visible GPU identity verification failed")
-
-    observed_gpu_uuids: set[str] = set()
-    observed_pids: set[int] = set()
+    gpu_uuid = validate_gpu_uuid(gpu_uuid)
     process_lines = [
         line.strip()
         for line in _run_nvidia_smi_query("--query-compute-apps=gpu_uuid,pid").splitlines()
         if line.strip()
     ]
+    target_pids: list[int] = []
     for line in process_lines:
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 2 or not fields[0] or fields[0] not in visible_gpu_uuids:
+        if len(fields) != 2 or not fields[0]:
             raise RuntimeError("GPU process identity verification failed")
         try:
             pid = int(fields[1])
@@ -405,52 +514,65 @@ def _resolve_observed_host_pid() -> int:
             raise RuntimeError("GPU process identity verification failed") from exc
         if pid <= 0:
             raise RuntimeError("GPU process identity verification failed")
-        observed_gpu_uuids.add(fields[0])
-        observed_pids.add(pid)
+        if fields[0] == gpu_uuid:
+            target_pids.append(pid)
+    if len(target_pids) != 1:
+        raise RuntimeError("keepalive worker is not the unique compute PID for target GPU")
+    return target_pids[0]
 
-    if observed_gpu_uuids != visible_gpu_uuids or len(observed_pids) != 1:
-        raise RuntimeError(
-            "keepalive worker is not the unique compute PID covering every visible GPU"
-        )
-    return next(iter(observed_pids))
+
+def _resolve_known_gpu_uuids() -> set[str]:
+    """Return the helper host's complete physical GPU UUID set for one action."""
+
+    gpu_uuids = {
+        validate_gpu_uuid(line.strip())
+        for line in _run_nvidia_smi_query("--query-gpu=uuid").splitlines()
+        if line.strip()
+    }
+    if not gpu_uuids:
+        raise RuntimeError("keepalive helper could not verify any physical GPU UUIDs")
+    return gpu_uuids
 
 
 def _run_cuda_worker(ready_fd: int) -> None:
+    """Run one fixed worker against the single GPU made visible by its provider."""
+
     ready = os.fdopen(ready_fd, "wb", buffering=0)
     try:
-        if "CUDA_VISIBLE_DEVICES" in os.environ:
-            raise RuntimeError("CUDA_VISIBLE_DEVICES must be unset for whole-endpoint keepalive")
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_visible_devices is None:
+            raise RuntimeError("CUDA_VISIBLE_DEVICES must be set only by the keepalive provider")
+        validate_gpu_uuid(cuda_visible_devices)
         try:
             import torch
         except ImportError as exc:
             raise RuntimeError("PyTorch with CUDA support is required") from exc
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-            raise RuntimeError("no CUDA GPU is visible")
+        torch.set_num_threads(1)
+        with contextlib.suppress(RuntimeError):
+            torch.set_num_interop_threads(1)
+        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+            raise RuntimeError("exactly one CUDA GPU must be visible")
 
-        held_allocations: list[list[Any]] = []
-        compute_inputs: list[tuple[Any, Any]] = []
-        for index in range(torch.cuda.device_count()):
-            device = torch.device(f"cuda:{index}")
-            properties = torch.cuda.get_device_properties(device)
-            target_bytes = math.ceil(properties.total_memory * TARGET_MEMORY_FRACTION)
-            free_bytes, _ = torch.cuda.mem_get_info(device)
-            if free_bytes < target_bytes + 128 * 1024 * 1024:
-                raise RuntimeError(f"GPU {index} lacks memory for fixed keepalive target")
-            allocations: list[Any] = []
-            remaining = target_bytes
-            while remaining > 0:
-                size = min(remaining, ALLOCATION_CHUNK_BYTES)
-                allocations.append(torch.empty(size, dtype=torch.uint8, device=device))
-                remaining -= size
-            held_allocations.append(allocations)
-            compute_inputs.append(
-                (
-                    torch.randn((2048, 2048), dtype=torch.float16, device=device),
-                    torch.randn((2048, 2048), dtype=torch.float16, device=device),
-                )
-            )
-        for index in range(torch.cuda.device_count()):
-            torch.cuda.synchronize(index)
+        device = torch.device("cuda:0")
+        properties = torch.cuda.get_device_properties(device)
+        target_bytes = math.ceil(properties.total_memory * TARGET_MEMORY_FRACTION)
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        # Reserve fixed VRAM separately from the resident compute buffers so
+        # the duty loop itself does not allocate or write/cache on each tick.
+        if free_bytes < target_bytes + 128 * 1024 * 1024:
+            raise RuntimeError("target GPU lacks memory for fixed keepalive target")
+        held_allocations: list[Any] = []
+        remaining = target_bytes
+        while remaining > 0:
+            size = min(remaining, ALLOCATION_CHUNK_BYTES)
+            held_allocations.append(torch.empty(size, dtype=torch.uint8, device=device))
+            remaining -= size
+        resident_compute_buffers = (
+            torch.randn((COMPUTE_MATRIX_SIZE, COMPUTE_MATRIX_SIZE), dtype=torch.float16, device=device),
+            torch.randn((COMPUTE_MATRIX_SIZE, COMPUTE_MATRIX_SIZE), dtype=torch.float16, device=device),
+            torch.empty((COMPUTE_MATRIX_SIZE, COMPUTE_MATRIX_SIZE), dtype=torch.float16, device=device),
+        )
+        torch.cuda.synchronize(device)
         ready.write(b"READY\n")
     except Exception as exc:
         ready.write(f"ERROR:{type(exc).__name__}: {exc}\n".encode("utf-8", errors="replace")[:500])
@@ -467,42 +589,21 @@ def _run_cuda_worker(ready_fd: int) -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-
-    worker_errors: list[BaseException] = []
-
-    def exercise_gpu(index: int, left: Any, right: Any) -> None:
-        import torch
-
-        try:
-            torch.cuda.set_device(index)
-            while not stop_event.is_set():
-                period_started = time.monotonic()
-                active_until = period_started + DUTY_PERIOD_SECONDS * ACTIVE_DUTY_FRACTION
-                while time.monotonic() < active_until and not stop_event.is_set():
-                    torch.mm(left, right)
-                    torch.cuda.synchronize(index)
-                stop_event.wait(max(0.0, period_started + DUTY_PERIOD_SECONDS - time.monotonic()))
-        except BaseException as exc:
-            worker_errors.append(exc)
-            stop_event.set()
-
-    workers = [
-        threading.Thread(target=exercise_gpu, args=(index, *inputs), daemon=True)
-        for index, inputs in enumerate(compute_inputs)
-    ]
-    for worker in workers:
-        worker.start()
-    stop_event.wait()
-    for worker in workers:
-        worker.join(timeout=2)
-    # Keep the allocation lists live through orderly worker shutdown.
-    del held_allocations
-    if worker_errors:
-        raise SystemExit(1) from worker_errors[0]
+    left, right, output = resident_compute_buffers
+    while not stop_event.is_set():
+        period_started = time.monotonic()
+        active_until = period_started + DUTY_PERIOD_SECONDS * ACTIVE_DUTY_FRACTION
+        while time.monotonic() < active_until and not stop_event.is_set():
+            torch.mm(left, right, out=output)
+            torch.cuda.synchronize(device)
+        # A 100ms duty cycle avoids busy spin during the remaining 70ms and
+        # caps host scheduling pressure without disk/network polling.
+        stop_event.wait(max(0.0, period_started + DUTY_PERIOD_SECONDS - time.monotonic()))
+    del held_allocations, resident_compute_buffers
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="reconcile the sealed ServerPilot keepalive worker")
+    parser = argparse.ArgumentParser(description="reconcile sealed ServerPilot per-GPU keepalive workers")
     parser.add_argument("--schema-version", type=int)
     parser.add_argument("--internal-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--ready-fd", type=int, help=argparse.SUPPRESS)

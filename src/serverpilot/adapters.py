@@ -22,8 +22,10 @@ from serverpilot.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
 from serverpilot.keepalive_protocol import (
     KEEPALIVE_REMOTE_COMMAND,
     MAX_KEEPALIVE_MESSAGE_BYTES,
+    KeepaliveGPUResult,
     KeepaliveRequest,
     KeepaliveResponse,
+    validate_gpu_uuid,
 )
 
 
@@ -328,7 +330,7 @@ def _clean_output(value: str) -> str:
 
 
 class ServerScriptKeepaliveAdapter:
-    """Mutating adapter with one sealed, whole-endpoint boolean operation."""
+    """Mutating adapter with one sealed, exact-GPU reconciliation operation."""
 
     id: AdapterId = "server-script-v1"
     connect_timeout_seconds = 8
@@ -338,10 +340,30 @@ class ServerScriptKeepaliveAdapter:
         self,
         endpoint: EndpointConfig,
         enabled: bool,
+        gpu_uuids: list[str],
     ) -> KeepaliveResponse:
+        """Set only ``gpu_uuids`` using the fixed v2 helper command.
+
+        The UUID set is derived by BrokerService from its current endpoint
+        lease, never supplied by REST/MCP callers.  The adapter validates the
+        request before starting SSH and requires the remote response to map
+        exactly back to that set, preventing a helper from widening a request
+        to another GPU on the same host.
+        """
+
         if type(enabled) is not bool:
             raise ValueError("enabled must be a boolean")
-        payload = KeepaliveRequest(enabled=enabled).encode()
+        if not isinstance(gpu_uuids, list):
+            raise ValueError("gpu_uuids must be a list")
+        try:
+            requested = tuple(validate_gpu_uuid(gpu_uuid) for gpu_uuid in gpu_uuids)
+        except ValueError as exc:
+            raise ValueError("gpu_uuids contains malformed UUIDs") from exc
+        if not requested:
+            raise ValueError("gpu_uuids cannot be empty")
+        if len(set(requested)) != len(requested):
+            raise ValueError("gpu_uuids contains duplicates")
+        payload = KeepaliveRequest(enabled=enabled, gpu_uuids=requested).encode()
         process = await asyncio.create_subprocess_exec(
             "ssh",
             "-o",
@@ -385,7 +407,29 @@ class ServerScriptKeepaliveAdapter:
             raise AdapterCommandError(
                 "endpoint keepalive returned the wrong desired state", uncertain=True
             )
+        self._validate_exact_result_mapping(response.results, requested, enabled)
         return response
+
+    @staticmethod
+    def _validate_exact_result_mapping(
+        results: tuple[KeepaliveGPUResult, ...],
+        requested: tuple[str, ...],
+        enabled: bool,
+    ) -> None:
+        """Reject reordered-safe but widened, partial, or ambiguous helper output."""
+
+        result_uuids = tuple(result.gpu_uuid for result in results)
+        if len(result_uuids) != len(set(result_uuids)) or set(result_uuids) != set(requested):
+            raise AdapterCommandError(
+                "endpoint keepalive response does not map exactly to requested GPUs",
+                uncertain=True,
+            )
+        expected_status = "running" if enabled else "stopped"
+        if any(result.status != expected_status for result in results):
+            raise AdapterCommandError(
+                "endpoint keepalive response contains inconsistent GPU state",
+                uncertain=True,
+            )
 
 
 class SlurmCommandSchedulerAdapter:

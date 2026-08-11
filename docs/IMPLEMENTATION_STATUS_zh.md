@@ -17,6 +17,7 @@
 
 - 裸机申请只会立即返回 `HELD` / `ACTIVE` lease，或返回 `no_capacity`。`no_capacity` 不创建等待队列，也不授权执行。
 - 成功 lease 返回 `resources[]`、endpoint、GPU 和 `cuda_visible_devices`。Agent 只能使用这些落点。
+- GPU 项目可将一个已启用的 direct-GPU 预设任务写入 `.serverpilot/resource-card.json`；Agent 从这张项目资源卡获得 routine claim 的 `profile_id` 和入口名称，不从任务标题、库存或空闲卡猜配置。卡在落盘和 CI 中可用 `serverpilot project resource-card check` 校验。
 - ServerPilot 只协调归属。任务由项目已有且获授权的执行路径启动和停止；任务可观测后绑定，完成或启动失败后释放 lease。
 - mutation 重试复用调用方生成的 `idempotency_key`。管理动作还需要当前任务明确授权和 `approval_ref`。
 - Codex MCP 从 `CODEX_THREAD_ID` 派生独立 actor 与 `codex://threads/<uuid>`。该 URI 只用于 Agent 间发现，不授予认证或调度权限；公开 GUI 不展示 Agent、owner 或协调 URI。
@@ -26,7 +27,9 @@
 - Collector 只执行代码封闭的只读探针。`server-script-v1` 固定调用 `serverpilot-collect --schema-version 1`，并严格校验受限 JSON。
 - 数据采集间隔为持久化的 5 / 10 / 30 秒设置。数据库提交成功后才更新内存和 GUI；提交失败保留原值。
 - 服务器在应有观测缺失时显示连接或采集问题，对应资源停止分配。GUI 刷新只重新读取控制面状态，不伪造一次服务器观测。
-- 可选占卡 adapter 只在 endpoint 显式配置后启用。它使用固定 helper 管理自己的 worker，不监听 claim 自动启停，不抢占项目任务，也不接受任意 shell、路径或 GPU selector。
+- 可选空闲占卡 adapter 只在 endpoint 显式配置后启用。服务器只有一个期望策略开关，但它为每张合格的空闲 GPU 管理独立 worker / lease / 健康状态；忙碌、未托管、冲突和 stale GPU 不会被占用。helper 只接受 ServerPilot 已知的物理 GPU UUID，不接受任意 shell、路径、PID、环境或调用方 selector。
+- 受管即时 claim 先按原有分配；仅在无容量且服务能给出完整精确的逐卡 keepalive 回收计划时，才停止目标 GPU、做新鲜空观测并在同一 endpoint 锁内重试普通 claim。它不抢占直接 SSH 或未托管任务；后者必须先由管理员关闭该 endpoint 策略。旧整机 keepalive lease 被迁移标记为 legacy，保持 fail closed，不能猜测转换为新逐卡 lease。
+- helper 固定约 31% 显存、30% GPU duty cycle、单 PyTorch CPU 线程和 100ms 节流；稳态没有磁盘或网络轮询。五分钟宽限期后，读模型要求至少 30% 显存和 30% 滚动 GPU 利用率，否则标记为 `DEGRADED`；实际主机 CPU / RSS 与 GPU 效果仍需现场对照。
 - Slurm adapter 使用封闭的 transport / inspection profile。VPN 只检测，不自动操作；取消作业需要单独授权。
 
 ### macOS App
@@ -42,23 +45,24 @@
 
 ## 已完成验证
 
-当前候选已经通过独立 Strict Review，结论为 `ACCEPT`。直接证据如下：
+当前 1.5.0 候选（含逐 GPU 空闲占卡和项目资源卡）已经通过独立 Strict Review，结论为 `ACCEPT`；下表只记录已完成的直接验证。
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `334 passed` |
+| Python 全量测试 | `375` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过 |
 | Ruff | 通过 |
 | Swift desktop/core 全量类型检查 | 通过 |
-| Alembic | 单头 `20260812_0018` |
+| Alembic | 单头 `20260812_0019` |
 | macOS App 构建 | `desktop/build-macos-app.sh` 通过 |
 | standalone 验证 | `desktop/verify-macos-app.sh` 通过 |
 | 文本与补丁完整性 | `git diff --check` 通过 |
 | App 落盘 | 根目录唯一 `ServerPilot.app` |
 
-GUI 验收覆盖 1024、1280 和 1440 宽度，以及服务器表格、排序、搜索、键盘焦点、详情返回、使用情况、设置、错误、空状态和多 GPU 历史图。证据位于：
+既有 GUI 验收覆盖 1024、1280 和 1440 宽度，以及服务器表格、排序、搜索、键盘焦点、详情返回、使用情况、设置、错误、空状态和多 GPU 历史图。本次逐 GPU 空闲占卡还以 `keepalive` 假夹具实际生成了服务器列表的三个固定尺寸截图；显示为单一 endpoint 开关、逐卡占卡覆盖和普通运行任务并存。证据位于：
 
 - `build/plan-closeout/native-ui-acceptance-final3/manifest.json`
 - `build/plan-closeout/evidence/`
+- `build/per-gpu-keepalive-final-ui-20260812/`
 - `docs/teamwork/cases/c-34f04361fc1a544e483dfee0bc8eb4343cd5b920bc1ffaa43cbb2b7ff2436e88/reviews/a48055759c63b956adfcd3f7502726a0dc1f79d540ef67d5b505c447f5de8d30.md`
 
 这些证据证明当前本机构建和夹具路径符合验收合同，不代表任意时刻的现场 GPU 容量。
@@ -71,6 +75,7 @@ GUI 验收覆盖 1024、1280 和 1440 宽度，以及服务器表格、排序、
 2. VoiceOver 自动化。
 3. 高对比度和 Reduce Motion 的行为级验证。
 4. error ScrollView、详情与确认框的完整 XCUITest 证据。
+5. 本次逐 GPU 占卡详情中的健康信息与启动中卡不计作任务的 XCUITest / 详情截图。
 
 这些是明确的环境补验，不应写成已有结果。提供完整 Xcode 后可直接补跑，不改变当前资源合同。
 

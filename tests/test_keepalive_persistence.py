@@ -9,7 +9,7 @@ from alembic.config import Config
 from pydantic import ValidationError
 from sqlalchemy import inspect, select, text
 
-from serverpilot.config import EndpointConfig
+from serverpilot.config import EndpointConfig, InventoryConfig
 from serverpilot.database import Database
 from serverpilot.models import Actor, AllocationRequest, ApiToken, Lease, Project
 from serverpilot.schemas import ActorCreate, EndpointCreate, EndpointUpdate, RequestCreate
@@ -67,6 +67,50 @@ def test_keepalive_adapter_is_sealed_and_round_trips_endpoint_surfaces(service, 
         idempotency_key="keepalive-endpoint-disable",
     )
     assert disabled["endpoint"]["keepalive_adapter_id"] is None
+
+    with pytest.raises(ValidationError):
+        EndpointConfig(
+            id="invalid-policy",
+            host="127.0.0.1",
+            port=2300,
+            ssh_user="gpu",
+            keepalive_policy="always-on",  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValidationError):
+        EndpointUpdate(keepalive_policy="idle_keepalive")  # type: ignore[call-arg]
+
+    with pytest.raises(ValidationError):
+        EndpointCreate(
+            id="invalid-idle-policy",
+            host="127.0.0.1",
+            port=2301,
+            ssh_user="gpu",
+            keepalive_policy="idle_keepalive",
+        )
+
+
+def test_runtime_keepalive_policy_survives_static_inventory_restart_when_not_explicit(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    configured = inventory.model_copy(deep=True)
+    configured.endpoints[0].keepalive_adapter_id = "server-script-v1"
+    assert "keepalive_policy" not in configured.endpoints[0].model_fields_set
+    root = Path(__file__).resolve().parents[1]
+    database = Database(f"sqlite:///{tmp_path / 'policy-restart.sqlite3'}", root)
+    first = BrokerService(database, configured)
+    first.initialize("a" * 32)
+    admin = first.authenticate("a" * 32)
+    first.configure_keepalive_policy(
+        admin,
+        "endpoint-a",
+        "idle_keepalive",
+        idempotency_key="runtime-policy",
+    )
+
+    restarted = BrokerService(database, configured)
+    restarted.initialize("a" * 32, sync_inventory=True)
+    assert restarted.get_endpoint_keepalive_summary("endpoint-a")["keepalive"]["policy"] == "idle_keepalive"
 
 
 def test_system_identity_is_tokenless_hidden_and_reserved(service, admin) -> None:
@@ -277,3 +321,34 @@ def test_0015_upgrades_a_legacy_0014_database(tmp_path: Path) -> None:
         assert connection.execute(text("SELECT kind FROM leases")).all() == []
         with pytest.raises(Exception):
             connection.execute(text("INSERT INTO leases (id, kind) VALUES ('bad', 'arbitrary')"))
+
+
+def test_0019_defaults_endpoint_policy_and_marks_old_keepalive_scope(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    database = Database(f"sqlite:///{tmp_path / 'legacy-0018.sqlite3'}", root)
+    with database.engine.begin() as connection:
+        connection.execute(text("CREATE TABLE endpoints (id VARCHAR(128) PRIMARY KEY)"))
+        connection.execute(
+            text("CREATE TABLE leases (id VARCHAR(64) PRIMARY KEY, kind VARCHAR(16) NOT NULL)")
+        )
+        connection.execute(text("INSERT INTO leases (id, kind) VALUES ('old-keepalive', 'keepalive')"))
+        connection.execute(text("INSERT INTO leases (id, kind) VALUES ('ordinary', 'workload')"))
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('20260812_0018')"))
+
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "src" / "serverpilot" / "migrations"))
+    config.set_main_option("sqlalchemy.url", database.url)
+    command.upgrade(config, "20260812_0019")
+
+    inspector = inspect(database.engine)
+    assert "keepalive_policy" in {column["name"] for column in inspector.get_columns("endpoints")}
+    assert "keepalive_scope" in {column["name"] for column in inspector.get_columns("leases")}
+    with database.engine.begin() as connection:
+        assert connection.execute(
+            text("SELECT id, keepalive_scope FROM leases ORDER BY id")
+        ).all() == [("old-keepalive", "legacy_endpoint"), ("ordinary", None)]
+        with pytest.raises(Exception):
+            connection.execute(
+                text("INSERT INTO endpoints (id, keepalive_policy) VALUES ('bad', 'always-on')")
+            )

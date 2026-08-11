@@ -23,7 +23,13 @@
           "keepalive_adapter_id": "server-script-v1",
           "keepalive": {
             "configured": true,
-            "state": "ACTIVE"
+            "policy": "idle_keepalive",
+            "state": "ACTIVE",
+            "active_gpu_count": 1,
+            "starting_gpu_count": 0,
+            "error_gpu_count": 0,
+            "legacy_gpu_count": 0,
+            "eligible_idle_gpu_count": 0
           },
           "enabled": true,
           "lifecycle_state": "active",
@@ -49,6 +55,17 @@
           "total_vram_mib": 81920,
           "enabled": true,
           "state": "KEEPALIVE",
+          "keepalive": {
+            "configured": true,
+            "policy": "idle_keepalive",
+            "state": "ACTIVE",
+            "health": {
+              "state": "HEALTHY",
+              "last_verified_at": "2026-08-11T11:59:58Z",
+              "memory_fraction": 0.31,
+              "rolling_utilization_pct": 35
+            }
+          },
           "telemetry": {
             "memory_used_mib": 25395,
             "gpu_utilization_pct": 35,
@@ -64,7 +81,16 @@
           "name": "NVIDIA A100-SXM4-80GB",
           "total_vram_mib": 81920,
           "enabled": true,
-          "state": "KEEPALIVE",
+          "state": "RUNNING_MANAGED",
+          "keepalive": {
+            "configured": true,
+            "policy": "idle_keepalive",
+            "state": "OFF",
+            "health": {
+              "state": "OFF",
+              "reason": "managed workload is running"
+            }
+          },
           "telemetry": {
             "memory_used_mib": 25395,
             "gpu_utilization_pct": 35,

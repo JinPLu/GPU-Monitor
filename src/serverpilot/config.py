@@ -16,6 +16,7 @@ class ConfigurationError(ValueError):
 
 
 KeepaliveAdapterId = Literal["server-script-v1"]
+KeepalivePolicy = Literal["disabled", "idle_keepalive"]
 RESERVED_SYSTEM_ID = "serverpilot-system"
 
 
@@ -58,6 +59,9 @@ class EndpointConfig(BaseModel):
     observation_profile: Literal["linux-nvidia", "linux-host", "server-script-v1"] = "linux-nvidia"
     # Optional sealed lifecycle adapter. None means keepalive is completely off.
     keepalive_adapter_id: KeepaliveAdapterId | None = None
+    # Desired policy only; actual ownership remains a per-GPU lease and starts
+    # disabled for both new and migrated endpoints.
+    keepalive_policy: KeepalivePolicy = "disabled"
     labels: list[str] = Field(default_factory=list)
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
@@ -74,6 +78,12 @@ class EndpointConfig(BaseModel):
         if len(values) != len(set(values)):
             raise ValueError("list values must not contain duplicates")
         return values
+
+    @model_validator(mode="after")
+    def idle_keepalive_requires_adapter(self) -> "EndpointConfig":
+        if self.keepalive_policy == "idle_keepalive" and self.keepalive_adapter_id is None:
+            raise ValueError("idle_keepalive requires a sealed keepalive adapter")
+        return self
 
 
 class InventoryConfig(BaseModel):

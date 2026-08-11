@@ -50,9 +50,10 @@ MCP_INSTRUCTIONS = (
     "Endpoints are shared loopback inventory; project ownership is optional attribution. Authorized "
     "actors may administer them only with a current-task approval_ref and caller-stable idempotency_key. "
     "A server can be removed after its active leases are released. Removing it never stops an existing workload. "
-    "Endpoint keepalive is an explicit optional state, never an automatic claim hook: before claiming a "
-    "configured server, call gpu_set_keepalive with enabled=false; after release, the agent may explicitly "
-    "call it with enabled=true. "
+    "Endpoint keepalive is an explicit opt-in policy, controlled once per server but executed independently "
+    "per idle GPU. gpu_set_keepalive enabled=true reconciles eligible idle GPUs now; ServerPilot-managed "
+    "claims may reclaim only their selected verified keepalive GPU and released idle GPUs can rejoin the "
+    "policy. Direct SSH work is outside that handoff and requires disabling the endpoint policy first. "
     "External Slurm clusters are SchedulerTargets, never raw SSH endpoints. Use "
     "gpu_scheduler_targets and gpu_scheduler_access_status to discover a target, then use owner-scoped "
     "submit, status, and cancel operations. "
@@ -595,10 +596,10 @@ def gpu_bind_workload(
 
 @mcp.tool()
 def gpu_bind_observed_workload(
-    agent_name: str,
     lease_id: str,
     run_id: str | None = None,
     idempotency_key: str | None = None,
+    agent_name: str | None = None,
 ) -> dict[str, Any]:
     """Record fresh observed processes for an already-started workload on the caller's lease.
 
@@ -794,10 +795,10 @@ def gpu_claim(
 
 @mcp.tool()
 def gpu_claim_profile(
-    agent_name: str,
     profile_id: str,
     task: str,
     idempotency_key: str | None = None,
+    agent_name: str | None = None,
 ) -> dict[str, Any]:
     """Claim a workload profile now; the profile fixes its resource contract."""
 
@@ -812,10 +813,10 @@ def gpu_claim_profile(
 
 @mcp.tool()
 def gpu_release(
-    agent_name: str,
     lease_id: str,
     reason: str = "workload_completed",
     idempotency_key: str | None = None,
+    agent_name: str | None = None,
 ) -> dict[str, Any]:
     """Release a prior claim; this never stops a process on the remote server."""
 
@@ -972,10 +973,12 @@ def gpu_set_keepalive(
     approval_ref: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
-    """Explicitly set optional endpoint keepalive after current-task human approval.
+    """Set the endpoint's explicit idle-GPU keepalive policy after approval.
 
-    This is not automatic scheduling: switch it off before claiming the server;
-    after releasing the workload, the agent may explicitly switch it back on.
+    This endpoint switch is not a whole-server worker: it reconciles eligible
+    GPUs independently and does not accept caller-supplied GPU targets, PIDs,
+    shell fragments, or helper settings. Disable it before direct SSH work;
+    ServerPilot-managed claim/recovery follows its verified per-GPU handoff.
     """
 
     _require_endpoint_admin_contract(approval_ref, idempotency_key)

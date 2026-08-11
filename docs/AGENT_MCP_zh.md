@@ -78,13 +78,36 @@ SERVERPILOT_URL = "http://127.0.0.1:8787"
 一次性安装、readiness 失败或响应服务的 daemon identity 与固定数据路径不一致，
 则调用 fail closed，不会接受手工旧进程，也不会创建备用数据库。
 
+## 项目资源卡：把日常申请变成开箱即用
+
+全局安装让 Agent 知道 ServerPilot 的规则；每个需要 GPU 的项目再保存一张很小的
+“资源卡” `.serverpilot/resource-card.json`。它只指向一个已创建、启用的 direct-GPU
+预设任务和项目自己的入口名称，**不**包含服务器、IP、GPU 编号、CUDA selector、路径、命令或 SSH
+内容。项目管理员只在接入项目时配置一次；以后的 Agent 不再填写或猜测 profile、显存、服务器或卡号。
+
+先通过既有 ServerPilot 管理界面/受控管理接口创建该项目的 direct-GPU 预设任务，再在项目根目录运行：
+
+```bash
+serverpilot project resource-card write project-default-gpu \
+  --entrypoint project-gpu-run
+serverpilot project resource-card check
+```
+
+`write` 只会在预设任务存在、已启用且确实是 direct-GPU 时落盘；`check` 在安装、升级和 CI
+中重复校验。资源卡缺失、格式错误、预设任务不存在/禁用，都会明确报为“项目资源卡未配置”，
+不是 Agent 去扫描 inventory 或补参数的问题。项目的 `AGENTS.md` 只需写一行：
+
+```text
+GPU 任务使用 .serverpilot/resource-card.json 和全局 ServerPilot MCP policy。
+```
+
 ## Agent 调度行为准则
 
 ServerPilot 的分工很明确：Agent 按明确合同申请、执行和归还；人类通过服务器、使用情况和历史图监督利用率与归属。Agent 不自行计算“还有多少可用资源”——服务端的 `available` 投影才是准入真相；stale、unknown、unmanaged、conflict 或 maintenance 一律不可分配，不能以 `capacity - used` 替代。
 
 日常裸机任务只走一条路径：**claim → execute → bind → release**。
 
-1. 合同已含 `profile_id` 时调用 `gpu_claim_profile`；否则必须已有 `project_id`、任务名、`gpu_count` 与 CPU / 内存 / 显存等绝对阈值，才调用 `gpu_claim`。
+1. 项目有 `.serverpilot/resource-card.json` 时，读取其中唯一的 `profile_id` 并调用 `gpu_claim_profile`；否则合同已含 `profile_id` 时同样调用它。只有两者都没有且任务完整给出 `project_id`、任务名、`gpu_count` 与 CPU / 内存 / 显存绝对阈值时，才调用 `gpu_claim`。
 2. claim 只会立即返回 `HELD` / `ACTIVE` lease，或以 `no_capacity` 失败。`no_capacity` 不创建队列、不授权执行；不得自行发明等待/轮询流程或绕过 ServerPilot。
 3. 只使用返回的 `lease.resources[]` 落点；不从 inventory、IP、旧快照或进程列表推断 host、GPU、CUDA selector 或可用容量。
 4. Agent 只通过项目既有、已获授权的执行路径启动 workload；观测到后 bind，完成或启动失败后 release。每次重试 mutation 均复用同一个 `idempotency_key`。
@@ -94,11 +117,12 @@ Codex 启动 MCP 时，adapter 会自动从当前 task 派生独立 actor 和
 `codex://threads/<uuid>` 协调 URI；协调投影可将该 URI 返回给其他 Agent，用于发现资源的当前任务。
 该元数据不授予租约权限，App 也不展示消息或协调链接。
 
-若当前任务明确授权 Agent 使用已配置保活的 endpoint，Agent 在 claim 前调用
-`gpu_set_keepalive(..., enabled=false)`；任务 release 后可再显式调用
-`gpu_set_keepalive(..., enabled=true)`。这只是多一个显式状态：ServerPilot 不会监听 claim
-自动关闭，不会抢占 workload，也不会在 release 后自动恢复。此操作属于 endpoint
-管理，必须带当前任务的非空 `approval_ref` 和调用方生成、重试复用的
+`gpu_set_keepalive` 是 endpoint 级的显式策略开关，但实际保活、健康和停止按每张 GPU 独立
+执行。开启后只调和当前已验证的空闲 GPU；有任务、未托管、冲突或 stale 的 GPU 不受影响，稍后
+重新空闲时可加入。普通 ServerPilot 受管即时 claim 在无容量时，可仅回收服务规划出的精确、
+已验证保活 GPU，随后以新鲜空观测重试原有 claim；这不会触碰同机其他 GPU，也不会成为直接 SSH
+任务的抢占机制。直接 SSH / 非受管任务必须在启动前显式关闭该 endpoint 的空闲占卡策略。此操作
+属于 endpoint 管理，必须带当前任务的非空 `approval_ref` 和调用方生成、重试复用的
 `idempotency_key`。
 
 端点添加、更新、pause、resume、retire、保活切换、取消外部作业等属于管理动作。只有当前任务给出明确人类授权时才调用；每个端点管理 MCP 写操作还必须提供非空的当前任务 `approval_ref` 和调用方生成、可重试复用的非空 `idempotency_key`；`owner_project_id` 仅供归属展示，不构成管理权限。
@@ -106,7 +130,7 @@ Codex 启动 MCP 时，adapter 会自动从当前 task 派生独立 actor 和
 默认工作流：
 
 - `control_plane_state`、`gpu_coordination`、`gpu_status`、`gpu_list`、`gpu_who` 与 `gpu_list_profiles` 可读取 ServerPilot 状态和可用资源合同；普通预批准 profile 或显式合同 claim 不要求先读协调看板。
-- 当前任务已给出 `profile_id`，或已给出 `project_id`、`gpu_count` 与必要阈值时，直接用 `gpu_claim_profile` 或 `gpu_claim`。成功时立即获得 `HELD` 或 `ACTIVE` lease；`no_capacity` 表示当次未分配且没有队列，应回报阻塞原因并停止当次执行。
+- 当前项目有有效资源卡时直接用它的 `profile_id` 调用 `gpu_claim_profile`；否则当前任务已给出 `profile_id`，或已给出 `project_id`、`gpu_count` 与必要阈值时，直接用 `gpu_claim_profile` 或 `gpu_claim`。成功时立即获得 `HELD` 或 `ACTIVE` lease；`no_capacity` 表示当次未分配且没有队列，应回报阻塞原因并停止当次执行。资源卡/预设任务不完整时明确报告“项目资源卡未配置”，不扫描可用卡来兜底。
 - 成功 lease 的具体落点只读返回的 `lease.resources[]`。每个 resource 提供 `endpoint`（`id`、`host`、`port`、`ssh_user`）、`gpus`（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 和 `commitment`；Agent 不自行拼接或推断 placement。随后它通过项目既有执行路径启动或停止获授权的 workload；ServerPilot 不代为启动或停止。启动后调用 `gpu_bind_observed_workload`，完成或启动失败后调用 `gpu_release`。
 - 所有会重试的写操作都传入并复用同一个调用方生成的 `idempotency_key`。
 
@@ -137,8 +161,9 @@ Cursor MCP 示例：
 
 ## 日常任务输入
 
-Agent 不需要复制本仓库工作流，也不需要在其他项目写 GPU 说明。任务只给以下两种输入之一：
+Agent 不需要复制本仓库工作流，也不需要在每个任务里重新写 GPU 参数。日常项目优先用资源卡；只有没有资源卡的临时任务才给下列输入之一：
 
+- 项目资源卡：项目根目录 `.serverpilot/resource-card.json` 指向唯一已启用预设任务；Agent 读取 `profile_id` 和项目入口名，再调用 `gpu_claim_profile`。
 - 预设任务：明确 `profile_id` 和任务名，Agent 调用 `gpu_claim_profile`。
 - 一次性 GPU 认领：明确任意非空 `project_id`、任务名、`gpu_count`，以及需要的 CPU 核数、系统内存 MiB、显存 MiB 等绝对值下限，Agent 调用 `gpu_claim`。
 - CPU / 内存-only 或混合算力任务：提供从小到大的显式候选合同，先调用 `resource_evaluate_plan`，再以选定合同 `resource_claim`；可令 `gpu_count=0`，完成后调用 `resource_record_actual` 和 `resource_release`。
@@ -149,7 +174,7 @@ Agent 不需要复制本仓库工作流，也不需要在其他项目写 GPU 说
 
 资源下限应尽量贴近任务真实需求；租约分配后，Agent 只从 `lease.resources[]` 取得 placement：每项都有 endpoint（`id`、`host`、`port`、`ssh_user`）、GPU（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 与 `commitment`。它在 workload 支持时充分使用这些资源，例如把相互独立的 job 并行分布到租约内的 GPU 上，但不得启动 dummy 占卡进程或做不安全并发。Agent 通过项目已有执行路径启动或停止已获授权的 workload，而不是让 ServerPilot 执行命令。
 
-远端 workload 已经启动后，Agent 调用 `gpu_bind_observed_workload(agent_name, lease_id)`；任务结束或启动失败后调用 `gpu_release(agent_name, lease_id)`。这些动作只记录归属，不启动、不停止、不抢占远端进程。
+远端 workload 已经启动后，Agent 调用 `gpu_bind_observed_workload(lease_id)`；任务结束或启动失败后调用 `gpu_release(lease_id)`。Codex 会自动使用当前 task 的身份；其他客户端可保留传入自己的稳定 `agent_name`。这些动作只记录归属，不启动、不停止、不抢占远端进程。
 
 ## 其他项目
 
@@ -159,7 +184,7 @@ Agent 不需要复制本仓库工作流，也不需要在其他项目写 GPU 说
 python3 scripts/install_agent_policy.py codex --install
 ```
 
-项目本地说明只记录该项目自己的资源合同，例如固定 `profile_id`，或一次性任务需要的 `project_id`、`gpu_count`、CPU / 内存 / 显存下限和任务名。若某项目已有旧的“直接 `ssh` / `sbatch`”Agent 规则，应删除具体登录节点、端口、脚本和手工 fallback，替换为短指针：
+项目本地说明优先只记录 `.serverpilot/resource-card.json` 的短指针；资源卡本身指向固定预设任务和入口名。一次性任务才记录完整 `project_id`、`gpu_count`、CPU / 内存 / 显存下限和任务名。若某项目已有旧的“直接 `ssh` / `sbatch`”Agent 规则，应删除具体登录节点、端口、脚本和手工 fallback，替换为短指针：
 
 ```text
 GPU 和外部调度任务使用全局 ServerPilot MCP policy。外部集群是 SchedulerTarget；
@@ -201,6 +226,7 @@ profile，也不按任何服务器名称编写分支。
 serverpilot-mcp --help
 codex mcp get serverpilot --json
 python3 scripts/install_agent_policy.py all --print
+serverpilot project resource-card check
 ```
 
 MCP 自动 ensure 仍失败或本机服务不兼容时，Agent 应报告不可用并停止；不得改读

@@ -445,9 +445,9 @@ func confirmLeaseRelease(_ lease: LeaseRecord) -> Bool {
 private func confirmKeepaliveEnd() -> Bool {
     let alert = NSAlert()
     alert.alertStyle = .warning
-    alert.messageText = "结束占卡？"
-    alert.informativeText = "将释放这张 GPU。"
-    alert.addButton(withTitle: "结束占卡")
+    alert.messageText = "关闭空闲占卡？"
+    alert.informativeText = "将让出这台服务器上正在空闲占卡的 GPU；正在运行的任务不会被停止。"
+    alert.addButton(withTitle: "关闭空闲占卡")
     alert.addButton(withTitle: "取消")
     return alert.runModal() == .alertFirstButtonReturn
 }
@@ -2215,6 +2215,10 @@ private struct SpatialServerDetail: View {
                     )
                 }
 
+                if endpoint.keepalive.configured {
+                    keepaliveCoverage
+                }
+
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 8)], spacing: 8) {
                     SpatialMetric(
                         icon: "cpu",
@@ -2374,6 +2378,38 @@ private struct SpatialServerDetail: View {
         return "\(utilization) · 显存 \(gpuMemoryDetail)"
     }
 
+    private var taskGPUCount: Int {
+        gpus.filter(\.isTaskOccupancy).count
+    }
+
+    private var keepaliveCoverage: some View {
+        HStack(spacing: 8) {
+            Image(systemName: keepaliveStatusIcon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(keepaliveStatusColor)
+                .frame(width: 24, height: 24)
+                .background(keepaliveStatusColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("空闲占卡")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                Text(keepalive.coverageSummary(totalGPUCount: gpus.count, taskGPUCount: taskGPUCount))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(keepaliveStatusColor)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(DesignTokens.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+        .help(keepaliveStatusHelp)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("空闲占卡")
+        .accessibilityValue(keepalive.coverageSummary(totalGPUCount: gpus.count, taskGPUCount: taskGPUCount))
+    }
+
     private var cpuDetail: String? {
         guard let count = endpoint.cpuCount, let load = endpoint.load1m else { return nil }
         return "\(String(format: "%.1f", load)) / \(count) 核"
@@ -2416,26 +2452,19 @@ private struct SpatialServerDetail: View {
 
     private var keepaliveStatusHelp: String {
         guard keepalive.configured else { return "这台服务器尚未配置占卡方式。" }
-        switch keepalive.state {
-        case "ACTIVE": return "占卡任务正在使用整台服务器的 GPU；这些 GPU 不可分配。"
-        case "STARTING": return "正在确认占卡任务。可选择结束占卡。"
-        case "ERROR": return "占卡状态异常；请先结束占卡并确认状态恢复。"
-        default: return "当前未占卡。"
+        if keepalive.legacyGPUCount > 0 { return "检测到旧版整机占卡；需显式关闭后才能按 GPU 恢复。" }
+        if keepalive.isEnabled {
+            return "已开启：空闲 GPU 将独立占卡；有任务的 GPU 不会被停止或占用。"
         }
+        return "已关闭：ServerPilot 不会再为新空闲 GPU 启动占卡。"
     }
 
     private var keepaliveActionEnables: Bool {
-        switch keepalive.state {
-        case "ACTIVE", "STARTING", "ERROR": return false
-        default: return true
-        }
+        !keepalive.isEnabled
     }
 
     private var keepaliveActionLabel: String {
-        switch keepalive.state {
-        case "ACTIVE", "STARTING", "ERROR": return "结束占卡"
-        default: return "开始占卡"
-        }
+        keepaliveActionEnables ? "开启空闲占卡" : "关闭空闲占卡"
     }
 
     private var keepaliveActionIcon: String {
@@ -2445,8 +2474,8 @@ private struct SpatialServerDetail: View {
     private var keepaliveActionHelp: String {
         guard store.allowsEndpointLifecycleMutations else { return store.endpointLifecycleMutationUnavailableReason }
         return keepaliveActionEnables
-            ? "开始占卡"
-            : "结束占卡"
+            ? "开启这台服务器上空闲 GPU 的独立占卡"
+            : "关闭这台服务器上空闲 GPU 的占卡；不会停止运行中的任务"
     }
 
     private func metricPercent(_ value: Double?) -> String {
@@ -3585,7 +3614,7 @@ private func gpuStateLabel(_ state: String) -> String {
     switch state {
     case "AVAILABLE": return "空闲"
     case "HELD", "LEASED_IDLE", "RUNNING_MANAGED": return "使用中"
-    case "KEEPALIVE": return "任务占用"
+    case "KEEPALIVE": return "空闲占卡"
     case "BUSY_UNMANAGED", "ORPHANED_BUSY": return "任务占用"
     case "RESERVED": return "不可分配"
     case "UNKNOWN_RECOVERING": return "正在连接"
@@ -3606,7 +3635,10 @@ private func gpuPresentationLabel(_ gpu: GPURecord) -> String {
         guard let task, !task.isEmpty else { return "使用中" }
         return task
     }
-    if ["KEEPALIVE", "BUSY_UNMANAGED", "ORPHANED_BUSY"].contains(gpu.state) {
+    if gpu.state == "KEEPALIVE" {
+        return gpu.keepalive.presentationLabel
+    }
+    if ["BUSY_UNMANAGED", "ORPHANED_BUSY"].contains(gpu.state) {
         return "任务占用"
     }
     return gpuStateLabel(gpu.state)
@@ -4971,6 +5003,13 @@ private struct GPUDetailSheet: View {
             }
             if let reason = gpu.stateReason {
                 DetailCallout(icon: "info.circle.fill", color: stateColor, message: localizedStateReason(reason))
+            }
+            if let healthDetail = gpu.keepalive.healthDetail {
+                DetailCallout(
+                    icon: gpu.keepalive.isActive ? "shield.checkered" : "shield.lefthalf.filled",
+                    color: stateColor,
+                    message: healthDetail
+                )
             }
             if let task = gpu.taskReference?.trimmingCharacters(in: .whitespacesAndNewlines), !task.isEmpty {
                 VStack(alignment: .leading, spacing: 5) {

@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from serverpilot.config import KeepaliveAdapterId
+from serverpilot.config import KeepaliveAdapterId, KeepalivePolicy
 
 
 DEFAULT_LEASE_WINDOW_SECONDS = 8 * 60 * 60
@@ -544,6 +544,7 @@ class EndpointCreate(StrictModel):
     ssh_alias: str | None = Field(default=None, min_length=1, max_length=120)
     observation_profile: Literal["linux-nvidia", "linux-host", "server-script-v1"] = "server-script-v1"
     keepalive_adapter_id: KeepaliveAdapterId | None = None
+    keepalive_policy: KeepalivePolicy = "disabled"
     labels: list[str] = Field(default_factory=list)
     storage_group: str | None = Field(default=None, max_length=120)
     expected_gpu_count: int | None = Field(default=None, ge=1, le=1024)
@@ -568,6 +569,8 @@ class EndpointCreate(StrictModel):
             raise ValueError("project_ids may only repeat owner_project_id for legacy imports")
         if self.owner_project_id is None and len(self.project_ids) == 1:
             self.owner_project_id = self.project_ids[0]
+        if self.keepalive_policy == "idle_keepalive" and self.keepalive_adapter_id is None:
+            raise ValueError("idle_keepalive requires a sealed keepalive adapter")
         return self
 
 
@@ -613,7 +616,7 @@ class EndpointEnabled(StrictModel):
 
 
 class EndpointKeepaliveRequest(StrictModel):
-    """The only caller-controlled keepalive setting."""
+    """The endpoint control accepts one explicit boolean, never a GPU target."""
 
     enabled: bool
 

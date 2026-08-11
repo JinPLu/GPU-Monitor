@@ -112,7 +112,7 @@ final class FixtureModeUITests: XCTestCase {
         XCTAssertTrue(status.waitForExistence(timeout: 2), "Server detail must expose the user-facing occupancy state")
         let action = app.buttons["endpoint-keepalive-action"]
         XCTAssertTrue(action.exists, "Configured keepalive must expose exactly one endpoint action")
-        XCTAssertEqual(action.label, "结束占卡")
+        XCTAssertEqual(action.label, "关闭空闲占卡")
     }
 
     func testResourceTableHeadersToggleSortDirection() {
