@@ -31,7 +31,13 @@ except ImportError:  # pragma: no cover - the first implementation is macOS-only
 
 DAEMON_LABEL = "local.serverpilot.daemon"
 LEGACY_DAEMON_LABEL = "local.gpu-broker.daemon"
-EXPECTED_CAPABILITY = "coordination_board"
+# A daemon can keep the same semantic version while still running an older
+# in-memory module after ``uv tool install --force`` or an app rebuild.  Keep a
+# small capability floor for the lifecycle probe so ``ensure`` treats that
+# process as stale and restarts the owned LaunchAgent.  This is deliberately a
+# feature capability (rather than a timestamp or package version): it is
+# stable across installs and cannot be spoofed by an unchanged semver.
+EXPECTED_CAPABILITIES = frozenset({"coordination_board", "endpoint_conflict_cleanup"})
 DAEMON_PROTOCOL = "macos-launchagent-v1"
 
 
@@ -170,7 +176,7 @@ def probe_live(config: DaemonConfig) -> dict[str, Any] | None:
         payload.get("status") != "live"
         or payload.get("schema_version") != "v1"
         or not isinstance(capabilities, list)
-        or EXPECTED_CAPABILITY not in capabilities
+        or not EXPECTED_CAPABILITIES.issubset(capabilities)
     ):
         raise DaemonError(
             f"{config.base_url} is occupied by an incompatible ServerPilot service"

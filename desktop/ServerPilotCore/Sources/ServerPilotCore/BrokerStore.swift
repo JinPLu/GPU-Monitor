@@ -209,6 +209,10 @@ public final class BrokerStore: ObservableObject {
         serviceInfo?.supportsEndpointKeepalive == true
     }
 
+    public var supportsEndpointConflictCleanup: Bool {
+        serviceInfo?.supportsEndpointConflictCleanup == true
+    }
+
     public var supportsCollectorSettings: Bool {
         serviceInfo?.supportsCollectorSettings == true
     }
@@ -525,19 +529,68 @@ public final class BrokerStore: ObservableObject {
             completion(false, message)
             return
         }
+        var payload: [String: Any] = [
+            "id": draft.id,
+            "host": draft.host,
+            "port": draft.port,
+            "ssh_user": draft.sshUser,
+            "observation_profile": draft.observationProfile.rawValue,
+            "labels": ["desktop-app"],
+        ]
+        if draft.observationProfile == .serverScript {
+            // The helper is a sealed ServerPilot capability, not a user-supplied
+            // command or profile.  New GUI servers should be ready for the
+            // explicit Start occupancy action without a second setup screen.
+            payload["keepalive_adapter_id"] = "server-script-v1"
+        }
         performMutation(
             path: "api/v1/endpoints",
-            payload: [
-                "id": draft.id,
-                "host": draft.host,
-                "port": draft.port,
-                "ssh_user": draft.sshUser,
-                "observation_profile": draft.observationProfile.rawValue,
-                "labels": ["desktop-app"]
-            ],
+            payload: payload,
             successMessage: "已添加服务器 \(draft.id)，正在确认状态。",
             completion: completion
         )
+    }
+
+    public func clearEmptyConflictedLease(
+        endpointID: String,
+        leaseID: String,
+        completion: @escaping @MainActor @Sendable (Bool, String?) -> Void
+    ) {
+        guard supportsEndpointConflictCleanup else {
+            let message = endpointCompatibilityMessage("释放空闲占用", capability: "endpoint_conflict_cleanup")
+            errorMessage = message
+            completion(false, message)
+            return
+        }
+        guard allowsEndpointLifecycleMutations else {
+            let message = endpointLifecycleMutationUnavailableReason
+            errorMessage = message
+            completion(false, message)
+            return
+        }
+        guard !mutatingEndpointIDs.contains(endpointID) else {
+            let message = "这台服务器的设置正在更新，请稍候。"
+            errorMessage = message
+            completion(false, message)
+            return
+        }
+        mutatingEndpointIDs.insert(endpointID)
+        performMutationWithPayload(
+            path: "api/v1/endpoints/\(endpointID)/leases/\(leaseID)/release-empty",
+            method: "POST",
+            payload: [:]
+        ) { [weak self] _, error in
+            guard let self else { return }
+            self.mutatingEndpointIDs.remove(endpointID)
+            if let error {
+                completion(false, error)
+                return
+            }
+            self.notice = "已提交释放空闲占用，正在确认 GPU 状态。"
+            self.errorMessage = nil
+            self.reload()
+            completion(true, nil)
+        }
     }
 
     public func updateEndpoint(

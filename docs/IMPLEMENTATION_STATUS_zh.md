@@ -17,17 +17,20 @@
 
 - 裸机申请只会立即返回 `HELD` / `ACTIVE` lease，或返回 `no_capacity`。`no_capacity` 不创建等待队列，也不授权执行。
 - 成功 lease 返回 `resources[]`、endpoint、GPU 和 `cuda_visible_devices`。Agent 只能使用这些落点。
-- GPU 项目可将一个已启用的 direct-GPU 预设任务写入 `.serverpilot/resource-card.json`；Agent 从这张项目资源卡获得 routine claim 的 `profile_id` 和入口名称，不从任务标题、库存或空闲卡猜配置。卡在落盘和 CI 中可用 `serverpilot project resource-card check` 校验。
-- ServerPilot 只协调归属。任务由项目已有且获授权的执行路径启动和停止；任务可观测后绑定，完成或启动失败后释放 lease。
+- 日常 GPU Agent 直接调用 `gpu_apply`；只有需要查看可用性或诊断 placement 时才调用 `gpu_status`，旧的 `gpu_list` 只在 advanced profile 提供。`server_id` 可选，默认一张 GPU；ServerPilot 自动记录例行申请的归属并选择实际可分配的 GPU，Agent 只使用返回的资源并在完成后释放。
+- MCP 的默认状态读面只返回摘要、服务器容量和紧凑 GPU 列表；`gpu_list` 直接使用窄 REST 投影，不把 scheduler、通用资源和历史集合带回 Agent 上下文。完整控制面仍由 REST `control_plane_state` 保留给显式诊断。
+- 默认 stdio MCP 只暴露日常 GPU 工具；scheduler、通用资源、端点管理和低层 lease 兼容函数仍可通过 `SERVERPILOT_MCP_PROFILE=advanced` 显式启用。
+- ServerPilot 只协调归属。任务由项目已有且获授权的执行路径启动和停止；启动后 Agent 用该 lease 的 `gpu_bind_observed_workload` 确认可观测进程归属，完成或启动失败后释放 lease。
 - mutation 重试复用调用方生成的 `idempotency_key`。管理动作还需要当前任务明确授权和 `approval_ref`。
-- Codex MCP 从 `CODEX_THREAD_ID` 派生独立 actor 与 `codex://threads/<uuid>`。该 URI 只用于 Agent 间发现，不授予认证或调度权限；公开 GUI 不展示 Agent、owner 或协调 URI。
+- Codex MCP 从 `CODEX_THREAD_ID` 派生独立 actor 与 `codex://threads/<uuid>`。该 URI 只用于 Agent 间发现，不授予认证或调度权限，也不是 ServerPilot 会打开或解析的 URL；公开 GUI 不展示 Agent、owner 或协调 URI。客户端若维护 MCP allowlist，升级后必须同步新 routine 工具。
 
 ### 采集与 Adapter
 
 - Collector 只执行代码封闭的只读探针。`server-script-v1` 固定调用 `serverpilot-collect --schema-version 1`，并严格校验受限 JSON。
 - 数据采集间隔为持久化的 5 / 10 / 30 秒设置。数据库提交成功后才更新内存和 GUI；提交失败保留原值。
 - 服务器在应有观测缺失时显示连接或采集问题，对应资源停止分配。GUI 刷新只重新读取控制面状态，不伪造一次服务器观测。
-- 可选空闲占卡 adapter 只在 endpoint 显式配置后启用。服务器只有一个期望策略开关，但它为每张合格的空闲 GPU 管理独立 worker / lease / 健康状态；忙碌、未托管、冲突和 stale GPU 不会被占用。helper 只接受 ServerPilot 已知的物理 GPU UUID，不接受任意 shell、路径、PID、环境或调用方 selector。
+- 可选空闲占卡 adapter 在用户明确点击“开始占卡”时由 ServerPilot 自动挂载。服务器只有一个期望策略开关，但它为每张合格的空闲 GPU 管理独立 worker / lease / 健康状态；忙碌、未托管、冲突和 stale GPU 不会被占用。helper 只接受 ServerPilot 已知的物理 GPU UUID，不接受任意 shell、路径、PID、环境或调用方 selector。
+- 逐卡隔离已覆盖工作负载冲突：一张 GPU 的遗留归属不会阻断同一服务器其它空闲 GPU 的占卡启动；详情页提供“清理遗留归属”，先做新鲜采集并确认没有进程后才释放。
 - 受管即时 claim 先按原有分配；仅在无容量且服务能给出完整精确的逐卡 keepalive 回收计划时，才停止目标 GPU、做新鲜空观测并在同一 endpoint 锁内重试普通 claim。它不抢占直接 SSH 或未托管任务；后者必须先由管理员关闭该 endpoint 策略。旧整机 keepalive lease 被迁移标记为 legacy，保持 fail closed，不能猜测转换为新逐卡 lease。
 - helper 固定约 31% 显存、30% GPU duty cycle、单 PyTorch CPU 线程和 100ms 节流；稳态没有磁盘或网络轮询。五分钟宽限期后，读模型要求至少 30% 显存和 30% 滚动 GPU 利用率，否则标记为 `DEGRADED`；实际主机 CPU / RSS 与 GPU 效果仍需现场对照。
 - Slurm adapter 使用封闭的 transport / inspection profile。VPN 只检测，不自动操作；取消作业需要单独授权。
@@ -39,17 +42,17 @@
 - 服务器页使用 Beszel 式紧凑表格。表头为`服务器 / 项目与当前任务 / GPU 配置 / 空闲 / GPU / 显存 / CPU / 内存`；数字使用中性色，压力颜色只用于状态点与进度柱。
 - 所有表头可排序。只有当前排序列显示单个方向箭头；搜索、筛选、表头和服务器行可键盘到达。
 - 详情页显示 SSH、当前资源、GPU 型号与状态、项目 / 当前任务，以及 1h / 6h / 24h 历史。多 GPU 序列使用稳定的不同颜色；采样间断不补线。
-- 宽窗口使用右侧 inspector，窄窗口进入完整详情并保留可见的`返回资源列表`。
+- 服务器行统一打开独立详情弹窗，列表不会因展开详情而压缩；详情页保留 GPU 状态、归属说明与 1h / 6h / 24h 历史。
 - 使用情况页只展示项目、当前任务与 GPU；不提供 Agent、聊天、消息或 Codex 链接。
 - 设置页只展示本机服务地址、数据采集间隔和版本。
 
 ## 已完成验证
 
-当前 1.5.0 候选（含逐 GPU 空闲占卡和项目资源卡）已经通过独立 Strict Review，结论为 `ACCEPT`；下表只记录已完成的直接验证。
+逐 GPU 空闲占卡候选已经通过独立 Strict Review。当前工作将日常 Agent GPU 申请收敛为服务端自动归属的 `gpu_apply`，并修正服务器详情与归属状态的呈现；在完成复核前，不声明新的发布结论。下表只记录已完成的直接验证。
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `375` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过 |
+| Python 全量测试 | `339` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过 |
 | Ruff | 通过 |
 | Swift desktop/core 全量类型检查 | 通过 |
 | Alembic | 单头 `20260812_0019` |

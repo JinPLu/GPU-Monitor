@@ -110,96 +110,73 @@ def test_cursor_print_is_paste_ready(
     assert output.startswith(MARKERS["cursor"][0])
 
 
-def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_questions() -> None:
+def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
     adapter = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
     for boundary in (
         "use the local serverpilot mcp",
-        "compatible serverpilot mcp name",
         "server instructions",
-        "tool schemas and serverpilot's server instructions remain authoritative",
-        "routine owner-scoped claim",
-        ".serverpilot/resource-card.json",
-        "profile_id",
-        "project_id",
+        "gpu_status",
+        "gpu_list",
+        "gpu_apply",
         "gpu_count",
-        "gpu_claim_profile",
-        "gpu_claim",
-        "never infer missing inputs",
-        "project-resource-card setup blocker",
         "no_capacity",
-        "creates no queue",
-        "held",
-        "active",
         "lease.resources[]",
         "cuda_visible_devices",
-        "project's normal execution path",
         "gpu_bind_observed_workload",
         "gpu_release",
-        "advanced compatibility tools",
-        "idempotency_key",
-        "owner_project_id",
-        "draining",
-        "resource_evaluate_plan",
-        "resource_record_actual",
-        "codex://threads/<uuid>",
-        "grants no lease authority",
-        "humans supervise",
         "ssh",
         "sqlite",
         "inventory",
         "nvidia-smi",
+        "approval_ref",
+        "scheduler",
     ):
         assert boundary in adapter
 
-    assert "gpu_wait_for_claim" not in adapter
-    assert "queued or null" not in adapter
+    assert len(adapter.split()) < 350
+    for retired_routine_input in (
+        "resource-card",
+        "profile_id",
+        "project_id",
+        "task_ref",
+        "gpu_claim_profile",
+        "gpu_claim",
+    ):
+        assert retired_routine_input not in adapter
 
     mcp_instructions = _plain_policy_text(mcp.instructions).lower()
     for runtime_contract in (
-        "ordinary pre-approved profile claims",
-        "explicit-contract claims",
-        "gpu_claim_profile",
-        "gpu_claim",
-        "fails without creating a queue",
+        "gpu_apply",
+        "optionally selecting a server",
+        "one gpu by default",
+        "records routine project/task attribution",
+        "chooses the actual allocatable gpus",
+        "fails with no_capacity",
+        "creates no queue",
         "held or active lease",
         "lease.resources[]",
         "cuda_visible_devices",
-        "project's normal execution path",
         "gpu_bind_observed_workload",
         "gpu_release",
-        "advanced compatibility tools",
+        "advanced compatibility surfaces",
         "idempotency_key",
-            "endpoints are shared loopback inventory",
-        "removed after its active leases are released",
+        "serverpilot never launches or stops workloads",
     ):
         assert runtime_contract in mcp_instructions
+    assert "gpu_claim_profile" not in mcp_instructions
     assert "gpu_grant_server_project" not in adapter
     assert "gpu_grant_server_project" not in mcp.instructions
     assert "approval_ref" in adapter
     assert "approval_ref" in mcp_instructions
 
 
-def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
+def test_global_policy_defers_scheduler_detail_to_mcp_instructions() -> None:
     global_policy = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
     for boundary in (
-        "external slurm clusters",
-        "never raw ssh endpoints",
-        "gpu_scheduler_targets",
-        "gpu_scheduler_access_status",
-        "current-task approval_ref",
-        "cancellation is a separate, explicit user-authorized action",
-        "slurm pending",
-        "alloctres",
-        "access_required",
-        "never automate vpn access",
-        "stop rather than bypassing serverpilot",
-        "sqlite",
-        "inventory",
-        "remote probes",
-        "nvidia-smi",
-        "sealed transport",
-        "read-only inspection profile",
-        "executable path, argv, shell fragment, ssh option",
+        "external clusters are schedulertargets",
+        "not ssh endpoints",
+        "access is required",
+        "report that state and stop",
     ):
         assert boundary in global_policy
     for site_specific_identifier in ("hanhai", "瀚海", "hh22"):
@@ -207,13 +184,10 @@ def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
 
     mcp_instructions = _plain_policy_text(mcp.instructions).lower()
     for runtime_detail in (
-        "gpu_scheduler_targets",
-        "gpu_scheduler_access_status",
         "access_required",
-        "owner-scoped submit, status, and cancel",
+        "scheduler tools",
         "slurm pending job",
-        "alloctres",
-        "serverpilot does not launch or stop",
+        "serverpilot never launches or stops",
     ):
         assert runtime_detail in mcp_instructions
     assert "approval_ref" in global_policy

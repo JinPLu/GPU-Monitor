@@ -143,7 +143,7 @@ def test_wait_for_claim_is_not_exposed_as_mcp_tool() -> None:
     by_name = {tool.name: tool for tool in tools}
 
     assert "gpu_wait_for_claim" not in by_name
-    claim_description = by_name["gpu_claim"].description.lower()
+    claim_description = by_name["gpu_apply"].description.lower()
     assert "no_capacity" in claim_description
     assert "no queue" in claim_description
     assert " or queue" not in claim_description

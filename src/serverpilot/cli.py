@@ -24,12 +24,6 @@ from serverpilot.daemon import (
 )
 from serverpilot.database import Database
 from serverpilot.importer import import_servers_files, write_inventory
-from serverpilot.project_resource_card import (
-    ProjectResourceCard,
-    ProjectResourceCardError,
-    dump_project_resource_card,
-    load_project_resource_card,
-)
 from serverpilot.schemas import (
     RequestCreate,
     RequestCreateFlat,
@@ -56,14 +50,6 @@ resource_app = typer.Typer(
     no_args_is_help=True,
     help="Cross-project, cross-agent CPU/memory/GPU/scheduler resource contracts.",
 )
-project_app = typer.Typer(
-    no_args_is_help=True,
-    help="Project-local ServerPilot resource cards for routine Agent GPU work.",
-)
-project_card_app = typer.Typer(
-    no_args_is_help=True,
-    help="Create and verify a project resource card; it never selects a host or GPU.",
-)
 collect_app = typer.Typer(no_args_is_help=True)
 daemon_app = typer.Typer(
     no_args_is_help=True,
@@ -73,8 +59,6 @@ app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(gpu_app, name="gpu")
 app.add_typer(lease_app, name="lease")
 app.add_typer(resource_app, name="resource")
-app.add_typer(project_app, name="project")
-project_app.add_typer(project_card_app, name="resource-card")
 app.add_typer(collect_app, name="collect")
 app.add_typer(daemon_app, name="daemon")
 
@@ -449,105 +433,6 @@ def _mapping_from_file(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise typer.BadParameter(f"{label} YAML must be a mapping")
     return raw
-
-
-def _verified_project_resource_card_profile(
-    card: ProjectResourceCard,
-    *,
-    url: str | None,
-    actor: str | None,
-) -> dict[str, Any]:
-    """Verify that a card still points to one enabled direct-GPU profile."""
-
-    response = _call(lambda: _client(url, actor).workload_profiles())
-    profiles = response.get("data")
-    if not isinstance(profiles, list):
-        raise typer.BadParameter("ServerPilot returned an invalid workload profile list")
-    profile = next(
-        (item for item in profiles if isinstance(item, dict) and item.get("id") == card.profile_id),
-        None,
-    )
-    if profile is None:
-        raise typer.BadParameter(
-            f"resource card profile {card.profile_id!r} does not exist; create and enable it first"
-        )
-    if profile.get("enabled") is not True:
-        raise typer.BadParameter(f"resource card profile {card.profile_id!r} is disabled")
-    if profile.get("runtime_kind") != "direct-gpu":
-        raise typer.BadParameter(
-            f"resource card profile {card.profile_id!r} is not a direct-GPU profile"
-        )
-    return profile
-
-
-@project_card_app.command("write")
-def project_resource_card_write(
-    profile_id: str,
-    execution_entrypoint: Annotated[str, typer.Option("--entrypoint")],
-    path: Annotated[Path, typer.Option("--path")] = Path(".serverpilot/resource-card.json"),
-    as_json: Annotated[bool, typer.Option("--json")] = False,
-    url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")] = None,
-    actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")] = None,
-) -> None:
-    """Save a project card only after its pre-created GPU profile validates."""
-
-    try:
-        card = ProjectResourceCard(
-            schema_version=1,
-            profile_id=profile_id,
-            execution_entrypoint=execution_entrypoint,
-        )
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    profile = _verified_project_resource_card_profile(card, url=url, actor=actor)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        dump_project_resource_card(card, path)
-    except ProjectResourceCardError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    _print(
-        {
-            "resource_card": card.model_dump(mode="json"),
-            "profile": {
-                "id": profile["id"],
-                "project_id": profile.get("project_id"),
-                "runtime_kind": profile["runtime_kind"],
-            },
-            "path": str(path),
-        },
-        as_json,
-    )
-
-
-@project_card_app.command("check")
-def project_resource_card_check(
-    path: Annotated[Path, typer.Option("--path", exists=True, readable=True)] = Path(
-        ".serverpilot/resource-card.json"
-    ),
-    as_json: Annotated[bool, typer.Option("--json")] = False,
-    url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")] = None,
-    actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")] = None,
-) -> None:
-    """Check a card's syntax and its current enabled direct-GPU profile."""
-
-    try:
-        card = load_project_resource_card(path)
-    except ProjectResourceCardError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    profile = _verified_project_resource_card_profile(card, url=url, actor=actor)
-    _print(
-        {
-            "status": "ready",
-            "resource_card": card.model_dump(mode="json"),
-            "profile": {
-                "id": profile["id"],
-                "project_id": profile.get("project_id"),
-                "runtime_kind": profile["runtime_kind"],
-            },
-            "path": str(path),
-        },
-        as_json,
-    )
 
 
 @request_app.command("create")

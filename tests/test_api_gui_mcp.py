@@ -14,7 +14,7 @@ from serverpilot import API_CAPABILITIES, cli as cli_module, mcp_server
 from serverpilot.api import create_app
 from serverpilot.cli import app as cli_app
 from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
-from serverpilot.mcp_server import mcp
+from serverpilot.mcp_server import ROUTINE_MCP_TOOL_NAMES, mcp, routine_mcp
 from serverpilot.models import Endpoint
 from serverpilot.schemas import EndpointUpsert, RequestCreate
 from tests.helpers import observation, process_for_gpu
@@ -833,7 +833,7 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_coordination",
         "gpu_list",
         "gpu_who",
-        "gpu_list_profiles",
+        "gpu_apply",
         "gpu_scheduler_targets",
         "gpu_scheduler_access_status",
         "gpu_scheduler_profiles",
@@ -847,8 +847,6 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_bind_workload",
         "gpu_bind_observed_workload",
         "gpu_history",
-        "gpu_claim",
-        "gpu_claim_profile",
         "gpu_release",
         "gpu_add_server",
         "gpu_update_server",
@@ -866,14 +864,25 @@ def test_mcp_exposes_required_tools() -> None:
     assert "gpu_grant_server_project" not in names
     assert "gpu_scheduler_upload" not in names
     assert "gpu_scheduler_transfer_status" not in names
-    assert "project_id" in by_name["gpu_claim"].inputSchema["required"]
-    assert {"agent_name", "project_id", "task", "gpu_count"}.issubset(
-        by_name["gpu_claim"].inputSchema["required"]
+    for retired_routine_tool in (
+        "gpu_list_profiles",
+        "gpu_claim",
+        "gpu_claim_profile",
+    ):
+        assert retired_routine_tool not in names
+    apply_schema = by_name["gpu_apply"].inputSchema
+    assert "required" not in apply_schema
+    assert {"server_id", "gpu_count", "idempotency_key"} == set(apply_schema["properties"])
+    assert apply_schema["properties"]["gpu_count"]["default"] == 1
+    assert "project_id" not in apply_schema["properties"]
+    assert "task" not in apply_schema["properties"]
+    assert "profile_id" not in apply_schema["properties"]
+    assert "gpu_ids" not in apply_schema["properties"]
+    bind_schema = by_name["gpu_bind_observed_workload"].inputSchema
+    assert set(bind_schema["required"]) == {"lease_id"}
+    assert {"lease_id", "run_id", "idempotency_key", "agent_name"} == set(
+        bind_schema["properties"]
     )
-    assert "purpose" not in by_name["gpu_claim"].inputSchema["required"]
-    assert "hours" not in by_name["gpu_claim"].inputSchema["properties"]
-    assert {"profile_id", "task"}.issubset(by_name["gpu_claim_profile"].inputSchema["required"])
-    assert "agent_name" not in by_name["gpu_claim_profile"].inputSchema["required"]
     assert "reason" not in by_name["gpu_release"].inputSchema["required"]
     for name in (
         "gpu_add_server",
@@ -882,6 +891,19 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_delete_server",
     ):
         assert {"approval_ref", "idempotency_key"}.issubset(by_name[name].inputSchema["required"])
+
+
+def test_default_stdio_mcp_uses_intent_first_routine_surface() -> None:
+    tools = asyncio.run(routine_mcp.list_tools())
+    names = {tool.name for tool in tools}
+
+    assert names == set(ROUTINE_MCP_TOOL_NAMES)
+    assert "control_plane_state" not in names
+    assert "resource_claim" not in names
+    assert "gpu_add_server" not in names
+    assert "gpu_claim" not in names
+    assert "gpu_list" not in names
+    assert not any(name.startswith("gpu_scheduler_") for name in names)
 
 
 def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -983,8 +1005,149 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
     assert calls == [("STATE", "/api/v1/state")]
 
     calls.clear()
-    assert mcp_server.gpu_claim("agent", "project", "task", 1)["request"] == {}
+    assert mcp_server.gpu_apply(
+        server_id="server-a", gpu_count=2, idempotency_key="apply-stable"
+    )["request"] == {}
     assert [call[:2] for call in calls] == [("POST", "/api/v1/claims")]
+    _method, _path, body, key = calls[0]
+    assert key == "apply-stable"
+    assert body["constraints"] == {
+        "gpu_count": 2,
+        "placement": "pack",
+        "endpoint_ids": ["server-a"],
+    }
+    assert body["project_id"].startswith("agent-")
+    assert body["task_ref"].startswith("gpu-apply-")
+
+
+def test_mcp_status_and_coordination_default_to_context_safe_projections(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    coordination_uri = "codex://threads/019febd4-c455-7693-bb58-91ca9af7718e"
+
+    class FakeClient:
+        def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
+            assert kwargs == {"compact": True, "only_available": False}
+            return {
+                "schema_version": "v1",
+                "snapshot_revision": 9,
+                "server_time": "2026-08-12T00:00:00Z",
+                "data": {
+                    "summary": {"total_gpus": 2, "available_gpus": 1},
+                    "data_age_seconds": 1.2,
+                    "freshness_seconds": 30,
+                    "endpoints": [
+                        {
+                            "id": "server-a",
+                            "monitor": {"status": "ONLINE", "last_error": None},
+                            "private_detail": "must not cross MCP boundary",
+                        }
+                    ],
+                    "host_capacity": [
+                        {
+                            "endpoint": {"id": "server-a"},
+                            "capacity": {
+                                "available_cpu_cores": 12.0,
+                                "available_memory_mib": 32768,
+                                "total_memory_mib": 65536,
+                            },
+                        }
+                    ],
+                    "gpus": [
+                        {
+                            "id": "gpu-a",
+                            "endpoint_id": "server-a",
+                            "gpu_index": 0,
+                            "name": "A",
+                            "total_vram_mib": 80000,
+                            "state": "AVAILABLE",
+                            "state_reason": None,
+                            "process_count": 0,
+                            "owner": None,
+                            "task_ref": None,
+                            "expires_at": None,
+                            "telemetry": {"memory_used_mib": 0, "private": "drop"},
+                            "processes": ["drop"],
+                        }
+                    ],
+                    "resource_claims": [{"id": "drop"}],
+                    "scheduler_jobs": [{"id": "drop"}],
+                },
+            }
+
+        def coordination(self):  # type: ignore[no-untyped-def]
+            return {
+                "schema_version": "v1",
+                "snapshot_revision": 10,
+                "server_time": "2026-08-12T00:00:01Z",
+                "data": {
+                    "summary": {"active_agents": 1},
+                    "agents": [
+                        {
+                            "agent_name": "codex-agent",
+                            "coordination_uri": coordination_uri,
+                            "active_leases": 1,
+                            "leased_gpus": 1,
+                            "managed_running_gpus": 1,
+                            "idle_leased_gpus": 0,
+                            "projects": ["project-a"],
+                            "servers": ["server-a"],
+                            "private_detail": "drop",
+                        }
+                    ],
+                    "leases": [
+                        {
+                            "lease_id": "lease-a",
+                            "agent_name": "codex-agent",
+                            "coordination_uri": coordination_uri,
+                            "project_id": "project-a",
+                            "task": "task-a",
+                            "state": "ACTIVE",
+                            "activity": "running",
+                            "gpu_count": 1,
+                            "servers": ["server-a"],
+                            "observed_process_count": 1,
+                            "expires_at": "2026-08-12T01:00:00Z",
+                            "workloads": [{"process_keys": ["drop"]}],
+                        }
+                    ],
+                    "servers": [],
+                    "queue": [],
+                    "signals": [],
+                    "scheduler_jobs": [],
+                    "guidance": "read-only",
+                },
+            }
+
+    monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
+
+    status = mcp_server.gpu_status()
+    assert set(status["data"]) == {
+        "summary",
+        "data_age_seconds",
+        "freshness_seconds",
+        "servers",
+        "gpus",
+    }
+    assert status["data"]["servers"] == [
+        {
+            "server_id": "server-a",
+            "monitor_status": "ONLINE",
+            "gpu_count": 1,
+            "available_gpu_count": 1,
+            "available_cpu_cores": 12.0,
+            "available_memory_mib": 32768,
+            "total_memory_mib": 65536,
+            "last_error": None,
+        }
+    ]
+    assert "resource_claims" not in status["data"]
+    assert "private" not in status["data"]["gpus"][0]["telemetry"]
+    assert "processes" not in status["data"]["gpus"][0]
+
+    board = mcp_server.gpu_coordination()
+    assert board["data"]["agents"][0]["coordination_uri"] == coordination_uri
+    assert "workloads" not in board["data"]["leases"][0]
 
 
 def test_mcp_general_resource_tools_delegate_and_enforce_marginal_policy(monkeypatch) -> None:  # type: ignore[no-untyped-def]

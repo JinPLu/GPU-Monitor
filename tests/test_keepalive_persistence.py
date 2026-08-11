@@ -113,6 +113,22 @@ def test_runtime_keepalive_policy_survives_static_inventory_restart_when_not_exp
     assert restarted.get_endpoint_keepalive_summary("endpoint-a")["keepalive"]["policy"] == "idle_keepalive"
 
 
+def test_enabling_keepalive_attaches_the_sealed_helper_to_legacy_endpoints(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+
+    configured = service.configure_keepalive_policy(
+        admin,
+        "endpoint-a",
+        "idle_keepalive",
+        idempotency_key="legacy-endpoint-enable",
+    )
+
+    assert configured["keepalive"]["configured"] is True
+    assert configured["keepalive"]["policy"] == "idle_keepalive"
+    endpoint = service.list_endpoints(admin)["data"][0]
+    assert endpoint["keepalive_adapter_id"] == "server-script-v1"
+
+
 def test_system_identity_is_tokenless_hidden_and_reserved(service, admin) -> None:
     with service.database.session() as session:
         assert session.get(Actor, SYSTEM_ACTOR_ID) is not None

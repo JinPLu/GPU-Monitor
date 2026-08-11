@@ -23,7 +23,7 @@ public struct ServiceInfo: Equatable, Sendable {
     public static let fixture = ServiceInfo(
         schemaVersion: "v1",
         version: "fixture",
-        capabilities: ["instant_claims", "endpoint_update", "endpoint_retirement", "endpoint_keepalive", "collector_settings"]
+        capabilities: ["instant_claims", "endpoint_update", "endpoint_retirement", "endpoint_keepalive", "endpoint_conflict_cleanup", "collector_settings"]
     )
 
     public var supportsEndpointDeletion: Bool {
@@ -48,6 +48,10 @@ public struct ServiceInfo: Equatable, Sendable {
 
     public var supportsEndpointKeepalive: Bool {
         supports("endpoint_keepalive")
+    }
+
+    public var supportsEndpointConflictCleanup: Bool {
+        supports("endpoint_conflict_cleanup")
     }
 
     public var supportsCollectorSettings: Bool {
@@ -695,6 +699,7 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
     public let temperature: Int?
     public let owner: String?
     public let taskReference: String?
+    public let leaseID: String?
     public let keepalive: GPUKeepaliveStatus
 
     public init?(raw: [String: Any]) {
@@ -724,6 +729,7 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
         self.utilization = telemetry.optionalInt("gpu_utilization_pct")
         self.temperature = telemetry.optionalInt("temperature_c")
         let lease = raw["lease"] as? [String: Any] ?? [:]
+        self.leaseID = lease.string("id")
         self.owner = lease.string("actor_id")
         self.taskReference = lease.string("task_ref")
         self.keepalive = GPUKeepaliveStatus(

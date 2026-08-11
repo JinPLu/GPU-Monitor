@@ -17,5 +17,6 @@ API_CAPABILITIES = (
     "endpoint_update",
     "endpoint_retirement",
     "endpoint_keepalive",
+    "endpoint_conflict_cleanup",
     "collector_settings",
 )

@@ -287,13 +287,18 @@ class BrokerClient:
         only_available: bool = False,
         compact: bool = False,
     ) -> dict[str, Any]:
-        snapshot = self.snapshot(
-            compact=compact,
-            endpoint_id=endpoint_id,
-            state=state,
-            only_available=only_available,
-        )
-        return self._state_projection("gpus", data=snapshot["data"]["gpus"], state=snapshot, current=snapshot["data"])
+        params: dict[str, Any] = {
+            "compact": compact,
+            "only_available": only_available,
+        }
+        if state:
+            params["state"] = state
+        if endpoint_id:
+            params["endpoint_id"] = endpoint_id
+        # The REST GPU projection is already revision-consistent and returns
+        # only the requested GPU list.  Do not fetch /api/v1/state and then
+        # discard scheduler/resource/history collections in the MCP client.
+        return self.get("/api/v1/gpus", params=params)
 
     def leases(self, *, project_id: str | None = None) -> dict[str, Any]:
         payload, current = self._state_current()

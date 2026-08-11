@@ -2509,15 +2509,19 @@ class BrokerService:
             if endpoint is None:
                 raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
             self._require_endpoint_manager(actor, endpoint)
-            if policy == "idle_keepalive" and endpoint.keepalive_adapter_id is None:
-                raise BrokerError(
-                    "keepalive_not_configured",
-                    "idle keepalive requires a sealed endpoint adapter",
-                    status_code=409,
-                )
             now = utcnow()
             before = endpoint.keepalive_policy
-            changed = before != policy
+            before_adapter = endpoint.keepalive_adapter_id
+            # ``server-script-v1`` is a sealed, code-owned helper.  Enabling
+            # the user-facing occupancy action is the explicit authorization
+            # to attach that helper; callers never supply an adapter, command,
+            # path, or remote arguments.  This also repairs endpoints created
+            # by older GUI builds that selected server-script-v1 observation
+            # but left the adapter column empty.
+            adapter_changed = policy == "idle_keepalive" and endpoint.keepalive_adapter_id is None
+            if adapter_changed:
+                endpoint.keepalive_adapter_id = "server-script-v1"
+            changed = before != policy or adapter_changed
             if changed:
                 endpoint.keepalive_policy = policy
                 endpoint.updated_at = now
@@ -2529,8 +2533,11 @@ class BrokerService:
                     resource_type="endpoint",
                     resource_id=endpoint.id,
                     result="success",
-                    before={"policy": before},
-                    after={"policy": policy},
+                    before={"policy": before, "keepalive_adapter_id": before_adapter},
+                    after={
+                        "policy": policy,
+                        "keepalive_adapter_id": endpoint.keepalive_adapter_id,
+                    },
                     now=now,
                 )
                 event_id: int | None = event.id
@@ -7519,6 +7526,182 @@ class BrokerService:
                 session,
                 actor=actor,
                 action="lease.release",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def release_empty_conflicted_lease(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        lease_id: str,
+        *,
+        observation_not_before: datetime,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Release one empty workload lease after a fresh empty observation.
+
+        A conflict is deliberately not auto-cleared by collection: it means a
+        prior lease/process binding diverged, and the original actor may have
+        left a real workload behind.  Endpoint operators get this narrow
+        recovery path only after the REST layer has collected the endpoint and
+        this method verifies a complete, fresh, process-free observation for
+        every GPU still owned by the lease. GPU utilization alone is never
+        treated as proof of emptiness.
+        """
+
+        self._require_role(actor, MUTATING_ROLES)
+        barrier = ensure_utc(observation_not_before)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session,
+                actor=actor,
+                action="lease.empty.release",
+                key=idempotency_key,
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            lease = session.get(Lease, lease_id)
+            if lease is None:
+                raise BrokerError("lease_not_found", "lease does not exist", status_code=404)
+            if lease.kind != "workload" or lease.state not in {"HELD", "ACTIVE", "CONFLICT"}:
+                raise BrokerError(
+                    "empty_workload_lease_required",
+                    "only a held, active, or conflicted workload lease can be cleared here",
+                    status_code=409,
+                )
+            resources = session.scalars(
+                select(LeaseResource).where(
+                    LeaseResource.lease_id == lease.id,
+                    LeaseResource.active.is_(True),
+                )
+            ).all()
+            if not resources:
+                raise BrokerError(
+                    "workload_lease_has_no_resources",
+                    "the workload lease has no active GPU resources",
+                    status_code=409,
+                )
+            gpu_ids = {resource.gpu_id for resource in resources}
+            gpus = [session.get(GPUDevice, gpu_id) for gpu_id in gpu_ids]
+            if any(gpu is None or gpu.endpoint_id != endpoint_id for gpu in gpus):
+                raise BrokerError(
+                    "workload_lease_endpoint_mismatch",
+                    "the workload lease does not belong entirely to this server",
+                    status_code=409,
+                )
+
+            now = utcnow()
+            cutoff = now - timedelta(seconds=self.inventory.collector.stale_after_seconds)
+            host = session.get(EndpointTelemetryCurrent, endpoint_id)
+            provider_state = session.scalar(
+                select(ProviderState).where(
+                    ProviderState.provider == "raw-ssh",
+                    ProviderState.endpoint_id == endpoint_id,
+                )
+            )
+            host_collected_at = _as_utc(host.collected_at) if host is not None else None
+            last_success_at = (
+                _as_utc(provider_state.last_success_at) if provider_state is not None else None
+            )
+            if (
+                host_collected_at is None
+                or host_collected_at < barrier
+                or host_collected_at < cutoff
+                or provider_state is None
+                or provider_state.last_error is not None
+                or last_success_at is None
+                or last_success_at < barrier
+            ):
+                raise BrokerError(
+                    "conflict_observation_stale",
+                    "需要一次完整且最新的服务器采集后才能释放空闲占用",
+                    status_code=409,
+                )
+
+            for gpu in gpus:
+                assert gpu is not None
+                telemetry = session.get(TelemetryCurrent, gpu.id)
+                telemetry_collected_at = (
+                    _as_utc(telemetry.collected_at) if telemetry is not None else None
+                )
+                observed_at = _as_utc(telemetry.observed_at) if telemetry is not None else None
+                if (
+                    not gpu.present
+                    or telemetry_collected_at is None
+                    or telemetry_collected_at < barrier
+                    or observed_at is None
+                    or observed_at < cutoff
+                ):
+                    raise BrokerError(
+                        "conflict_observation_incomplete",
+                        "最新采集没有完整覆盖这张 GPU，暂不释放占用",
+                        status_code=409,
+                        details={"gpu_id": gpu.id},
+                    )
+                processes = self._current_processes(session, gpu.id, now)
+                if processes:
+                    raise BrokerError(
+                        "conflict_process_present",
+                        "仍观察到运行中的进程，不能释放这张 GPU 的占用",
+                        status_code=409,
+                        details={"gpu_id": gpu.id, "process_count": len(processes)},
+                    )
+
+            revision = self._bump_revision(session, now)
+            before = self._lease_dict(session, lease)
+            lease.state = "RELEASED"
+            lease.released_at = now
+            lease.release_reason = "empty fresh observation cleared workload ownership"
+            for resource in resources:
+                resource.active = False
+                resource.released_at = now
+            request = session.get(AllocationRequest, lease.request_id)
+            if request is not None:
+                request.state = "RELEASED"
+                request.updated_at = now
+            for alert in session.scalars(
+                select(Alert).where(
+                    Alert.alert_type == "lease_process_conflict",
+                    Alert.resource_type == "lease",
+                    Alert.resource_id == lease.id,
+                    Alert.active.is_(True),
+                )
+            ).all():
+                alert.active = False
+                alert.last_seen_at = now
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="lease.empty_cleared",
+                resource_type="lease",
+                resource_id=lease.id,
+                result="success",
+                before=before,
+                after=self._lease_dict(session, lease),
+                summary={"source": "endpoint_operator", "endpoint_id": endpoint_id},
+                now=now,
+            )
+            self._allocate_queued(session, now, revision)
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "released": True,
+                "lease": self._lease_dict(session, lease),
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="lease.empty.release",
                 key=idempotency_key,
                 response=result,
                 now=now,

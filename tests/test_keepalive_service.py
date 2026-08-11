@@ -13,7 +13,7 @@ from serverpilot.models import (
     TelemetryCurrent,
     TelemetrySnapshot,
 )
-from serverpilot.schemas import EndpointUpdate, RequestCreate
+from serverpilot.schemas import EndpointUpdate, LeaseObservedBind, RequestCreate
 from serverpilot.service import SYSTEM_ACTOR_ID, SYSTEM_PROJECT_ID, BrokerError
 from serverpilot.timeutil import json_dump, utcnow
 from tests.helpers import observation, process_for_gpu
@@ -136,6 +136,47 @@ def test_one_gpu_keepalive_does_not_block_sibling_gpu_or_hide_public_state(servi
         ],
     }
     assert all(item["kind"] != "keepalive" for item in snapshot["data"]["leases"])
+    assert [item["gpu_id"] for item in service.desired_keepalive_candidates("endpoint-a")["candidates"]] == [
+        "endpoint-a:GPU-endpoint-a-1"
+    ]
+
+
+def test_workload_conflict_on_one_gpu_does_not_block_sibling_keepalive_candidate(service, admin) -> None:
+    """A stale workload ownership record must be isolated to its own GPU."""
+
+    _configure_idle_policy(service, admin)
+    claimed = service.create_request(
+        admin,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "conflict-on-one-gpu",
+                "purpose": "test independent keepalive placement",
+                "duration_seconds": 600,
+                "constraints": {"gpu_count": 1, "placement": "pack"},
+            }
+        ),
+        idempotency_key="conflict-on-one-gpu-claim",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    started_at = utcnow() - timedelta(minutes=3)
+    initial = process_for_gpu(gpu_uuid).model_copy(update={"process_started_at": started_at})
+    service.ingest_observation(observation(count=2, processes=[initial]))
+    service.bind_observed_workload(
+        admin,
+        lease_id,
+        LeaseObservedBind(run_id="conflict-on-one-gpu-run"),
+        idempotency_key="conflict-on-one-gpu-bind",
+    )
+    replacement = initial.model_copy(update={"process_started_at": started_at + timedelta(seconds=10)})
+    service.ingest_observation(observation(count=2, processes=[replacement]))
+    service.ingest_observation(observation(count=2, processes=[replacement]))
+
+    gpus = _gpus(service.snapshot(admin))
+    assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "CONFLICT"
+    assert gpus["endpoint-a:GPU-endpoint-a-1"]["state"] == "AVAILABLE"
     assert [item["gpu_id"] for item in service.desired_keepalive_candidates("endpoint-a")["candidates"]] == [
         "endpoint-a:GPU-endpoint-a-1"
     ]

@@ -1191,6 +1191,39 @@ def create_app(
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
+    @app.post("/api/v1/endpoints/{endpoint_id}/leases/{lease_id}/release-empty")
+    @app.post("/api/v1/endpoints/{endpoint_id}/conflicted-leases/{lease_id}/release-empty")
+    async def release_empty_conflicted_lease(
+        endpoint_id: str,
+        lease_id: str,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        """Clear an empty workload lease only after a fresh collection."""
+
+        mutation_key = _idempotency_key(idempotency_key)
+        observation_not_before = utcnow()
+        endpoint = service.collector_endpoint(endpoint_id)
+        collected = await shared_collector.collect_once(
+            service,
+            endpoints=[endpoint],
+            concurrency=1,
+        )
+        result = collected.get(endpoint_id)
+        if not isinstance(result, dict) or "error" in result:
+            raise BrokerError(
+                "conflict_observation_failed",
+                "服务器采集失败，暂不释放空闲占用",
+                status_code=503,
+            )
+        return service.release_empty_conflicted_lease(
+            actor,
+            endpoint_id,
+            lease_id,
+            observation_not_before=observation_not_before,
+            idempotency_key=mutation_key,
+        )
+
     @app.post("/api/v1/leases/{lease_id}/bind-workload")
     def bind_workload(
         lease_id: str,

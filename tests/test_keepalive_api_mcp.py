@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,6 +19,7 @@ from serverpilot.keepalive_protocol import (
     KeepaliveWorkerAttestation,
 )
 from serverpilot.mcp_server import mcp
+from serverpilot.schemas import LeaseObservedBind, RequestCreate
 from tests.helpers import observation, process_for_gpu
 
 
@@ -217,6 +218,76 @@ def test_keepalive_api_sets_desired_policy_and_reconciles_each_eligible_gpu(
     }
     assert adapter.calls[-1] == ("endpoint-a", False, (GPU_UUIDS[0],))
     assert collector.calls[-1] == (["endpoint-a"], 1)
+
+
+def test_keepalive_api_starts_sibling_when_one_gpu_has_workload_conflict(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    adapter = FakeKeepaliveAdapter()
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+    service = app.state.service
+    actor = service.local_actor("agent-a")
+    claimed = service.create_request(
+        actor,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "conflict-before-keepalive",
+                "purpose": "test one-GPU isolation",
+                "duration_seconds": 600,
+                "constraints": {"gpu_count": 1, "placement": "pack"},
+            }
+        ),
+        idempotency_key="conflict-before-keepalive-claim",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+    started_at = datetime.now(UTC)
+    initial = process_for_gpu(GPU_UUIDS[0]).model_copy(update={"process_started_at": started_at})
+    service.ingest_observation(
+        observation(
+            count=len(GPU_UUIDS),
+            gpu_uuids=list(GPU_UUIDS),
+            processes=[initial],
+            observed_at=datetime.now(UTC),
+        )
+    )
+    service.bind_observed_workload(
+        actor,
+        lease_id,
+        LeaseObservedBind(run_id="conflict-before-keepalive-run"),
+        idempotency_key="conflict-before-keepalive-bind",
+    )
+    replacement = initial.model_copy(update={"process_started_at": started_at + timedelta(seconds=10)})
+    # A materially changed process identity on the same GPU is observed twice,
+    # which is the service's conflict threshold.
+    service.ingest_observation(
+        observation(
+            count=len(GPU_UUIDS),
+            gpu_uuids=list(GPU_UUIDS),
+            processes=[replacement],
+            observed_at=datetime.now(UTC),
+        )
+    )
+    service.ingest_observation(
+        observation(
+            count=len(GPU_UUIDS),
+            gpu_uuids=list(GPU_UUIDS),
+            processes=[replacement],
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    enabled = TestClient(app).post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("conflict-sibling-keepalive"),
+    )
+
+    assert enabled.status_code == 200, enabled.text
+    assert adapter.calls == [("endpoint-a", True, (GPU_UUIDS[1],))]
+    assert enabled.json()["keepalive"]["active_gpu_count"] == 1
 
 
 def test_keepalive_api_disable_without_managed_coverage_never_targets_foreign_gpu(
@@ -509,4 +580,6 @@ def test_keepalive_capability_and_mcp_schema_and_delegation(monkeypatch) -> None
             "stable-key",
         )
     ]
-    assert "per idle gpu" in mcp_server.MCP_INSTRUCTIONS.lower()
+    instructions = mcp_server.MCP_INSTRUCTIONS.lower()
+    assert "routine gpu work" in instructions
+    assert "keepalive" in instructions

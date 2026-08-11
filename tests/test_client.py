@@ -170,6 +170,18 @@ def test_operational_read_aliases_project_from_state(monkeypatch) -> None:  # ty
 
     def request(method, url, **kwargs):  # type: ignore[no-untyped-def]
         calls.append((method, url))
+        if url.endswith("/api/v1/gpus"):
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "v1",
+                    "snapshot_revision": 11,
+                    "server_time": "2026-08-06T00:00:00Z",
+                    "data": [
+                        {"id": "gpu-a", "endpoint_id": "server-a", "state": "AVAILABLE"}
+                    ],
+                },
+            )
         return httpx.Response(200, json=_state(11, current))
 
     monkeypatch.setattr("serverpilot.client.httpx.request", request)
@@ -185,4 +197,5 @@ def test_operational_read_aliases_project_from_state(monkeypatch) -> None:  # ty
     monitor = client.resource_monitor(project_id="project-a")["data"]
     assert monitor["host_capacity"][0]["endpoint"]["id"] == "server-a"
     assert monitor["allocations"] == [{"id": "allocation-a", "claim_id": "claim-a"}]
-    assert all(path == "http://127.0.0.1:8787/api/v1/state" for _, path in calls)
+    assert calls.count(("GET", "http://127.0.0.1:8787/api/v1/gpus")) == 1
+    assert calls.count(("GET", "http://127.0.0.1:8787/api/v1/state")) == 5

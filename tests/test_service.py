@@ -963,6 +963,112 @@ def test_observed_binding_recovers_an_attribution_conflict_without_remote_contro
     assert gpu["lease"]["state"] == "ACTIVE"
 
 
+def test_endpoint_operator_can_release_empty_conflicted_lease_after_fresh_observation(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("clear-empty-conflict"),
+        idempotency_key="clear-empty-conflict-claim",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    started_at = utcnow() - timedelta(minutes=3)
+    initial_process = process_for_gpu(gpu_uuid).model_copy(update={"process_started_at": started_at})
+    service.ingest_observation(observation(count=1, processes=[initial_process]))
+    service.bind_observed_workload(
+        admin,
+        lease_id,
+        LeaseObservedBind(run_id="clear-empty-conflict-run"),
+        idempotency_key="clear-empty-conflict-bind",
+    )
+    replacement = initial_process.model_copy(
+        update={"process_started_at": started_at + timedelta(seconds=10)}
+    )
+    service.ingest_observation(observation(count=1, processes=[replacement]))
+    service.ingest_observation(observation(count=1, processes=[replacement]))
+    assert service.list_gpus(admin)["data"][0]["state"] == "CONFLICT"
+
+    barrier = utcnow()
+    service.ingest_observation(observation(count=1, processes=[]))
+    released = service.release_empty_conflicted_lease(
+        admin,
+        "endpoint-a",
+        lease_id,
+        observation_not_before=barrier,
+        idempotency_key="clear-empty-conflict-release",
+    )
+
+    assert released["released"] is True
+    assert released["lease"]["state"] == "RELEASED"
+    assert service.list_gpus(admin)["data"][0]["state"] == "AVAILABLE"
+
+
+def test_endpoint_operator_cannot_clear_conflict_while_process_is_observed(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("keep-conflict"),
+        idempotency_key="keep-conflict-claim",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    started_at = utcnow() - timedelta(minutes=3)
+    initial_process = process_for_gpu(gpu_uuid).model_copy(update={"process_started_at": started_at})
+    service.ingest_observation(observation(count=1, processes=[initial_process]))
+    service.bind_observed_workload(
+        admin,
+        lease_id,
+        LeaseObservedBind(run_id="keep-conflict-run"),
+        idempotency_key="keep-conflict-bind",
+    )
+    replacement = initial_process.model_copy(
+        update={"process_started_at": started_at + timedelta(seconds=10)}
+    )
+    service.ingest_observation(observation(count=1, processes=[replacement]))
+    service.ingest_observation(observation(count=1, processes=[replacement]))
+    barrier = utcnow() - timedelta(seconds=1)
+
+    with pytest.raises(BrokerError) as error:
+        service.release_empty_conflicted_lease(
+            admin,
+            "endpoint-a",
+            lease_id,
+            observation_not_before=barrier,
+            idempotency_key="keep-conflict-release",
+        )
+
+    assert error.value.code == "conflict_process_present"
+    assert service.list_gpus(admin)["data"][0]["state"] == "CONFLICT"
+
+
+def test_endpoint_operator_can_release_empty_idle_workload_lease(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("clear-idle-lease"),
+        idempotency_key="clear-idle-lease-claim",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+    assert service.list_gpus(admin)["data"][0]["state"] == "HELD"
+
+    barrier = utcnow()
+    service.ingest_observation(observation(count=1, processes=[]))
+    released = service.release_empty_conflicted_lease(
+        admin,
+        "endpoint-a",
+        lease_id,
+        observation_not_before=barrier,
+        idempotency_key="clear-idle-lease-release",
+    )
+
+    assert released["released"] is True
+    assert released["lease"]["state"] == "RELEASED"
+    assert service.list_gpus(admin)["data"][0]["state"] == "AVAILABLE"
+
+
 def test_process_and_stale_telemetry_block_admission(service, admin) -> None:
     service.ingest_observation(observation(count=1, processes=[process_for_gpu("GPU-endpoint-a-0")]))
     # A compute process blocks immediately; a second sample is only needed to label a lease conflict.

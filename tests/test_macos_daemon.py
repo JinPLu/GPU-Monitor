@@ -15,6 +15,7 @@ from serverpilot.daemon import (
     DaemonError,
     MacOSDaemonManager,
     daemon_instance_id,
+    probe_live,
     probe_ready,
     render_launch_agent,
     resolve_daemon_config,
@@ -135,6 +136,25 @@ def test_ready_probe_requires_exact_daemon_instance(
 
     payload["daemon_instance_id"] = daemon_instance_id(config)
     assert probe_ready(config) == payload
+
+
+def test_live_probe_rejects_daemon_missing_current_runtime_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    monkeypatch.setattr(
+        daemon,
+        "_probe_json",
+        lambda *_args, **_kwargs: {
+            "status": "live",
+            "schema_version": "v1",
+            "capabilities": ["coordination_board"],
+        },
+    )
+
+    with pytest.raises(DaemonError, match="incompatible ServerPilot service"):
+        probe_live(config)
 
 
 def test_install_migrates_inventory_and_database_once(
@@ -292,7 +312,7 @@ def test_ensure_is_noop_when_compatible_service_is_ready(
         lambda _config: {
             "status": "live",
             "schema_version": "v1",
-            "capabilities": ["coordination_board"],
+            "capabilities": ["coordination_board", "endpoint_conflict_cleanup"],
         },
     )
     monkeypatch.setattr(
@@ -336,7 +356,7 @@ def test_ensure_rejects_matching_identity_from_non_launchd_process(
         lambda _config: {
             "status": "live",
             "schema_version": "v1",
-            "capabilities": ["coordination_board"],
+            "capabilities": ["coordination_board", "endpoint_conflict_cleanup"],
         },
     )
     monkeypatch.setattr(

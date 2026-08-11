@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import os
 import re
 import secrets
 import time
@@ -20,49 +22,31 @@ TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
 RESOURCE_MARGINAL_MIN_SAVED_RATIO = 0.10
 RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
 
-MCP_INSTRUCTIONS = (
-    "Use serverpilot for GPU, CPU, memory, scheduler work, and read-only resource discovery. The ServerPilot is the only "
-    "allocation and freshness/probing authority: do not bypass it through SSH, SQLite, inventory, remote "
-    "probes, or nvidia-smi. A request or accepted plan to run, continue, or monitor a resource task makes its "
-    "owner-scoped claim routine once a profile_id, or project_id, resource quantities, and needed thresholds "
-    "are recorded. Reuse that contract without asking again; never infer missing inputs from a repository, "
-    "task title, free capacity, or defaults. "
-    "For cross-project and cross-agent resource scheduling, prefer resource_providers and resource_monitor for "
-    "discovery, then resource_evaluate_plan with explicit candidate forecasts, then resource_claim for the "
-    "selected smallest useful plan. Start from the smallest feasible CPU, memory, GPU, node, or scheduler "
-    "quantity and expand only when the next candidate is forecast to save at least 10% remaining time and "
-    "at least 120 seconds. Record rejected expansions and actual runtime with resource_record_actual so humans "
-    "can monitor decisions and outcomes in real time. A zero-GPU CPU/memory or scheduler plan is valid when "
-    "its resource quantities are explicit. "
-    "The normal bare-metal path is gpu_claim_profile or gpu_claim. A claim either returns resources now or fails without creating a queue, "
-    "then project execution on the returned held or active lease.resources[], then "
-    "gpu_bind_observed_workload, then gpu_release. Use gpu_coordination when shared state would help, but "
-    "ordinary pre-approved profile claims and explicit-contract claims do not require a separate "
-    "coordination read first. When a held or active lease "
-    "is returned, take the placement only from its structured lease.resources[]: each resource provides an "
-    "endpoint, gpus, cuda_visible_devices, and commitment. Use the project's normal execution path to start "
-    "or stop its workload there. The ServerPilot does not launch or stop that workload. "
-    "After it starts, gpu_bind_observed_workload records fresh observed processes; release when it stops "
-    "or startup fails. Use the full requested allocation when the workload safely supports it. "
-    "Provide an idempotency_key for a mutation when retrying it, and reuse that same caller-chosen key. "
-    "The low-level activate, release-lease, and bind-workload tools remain advanced "
-    "compatibility tools; prefer the normal path. "
-    "Endpoints are shared loopback inventory; project ownership is optional attribution. Authorized "
-    "actors may administer them only with a current-task approval_ref and caller-stable idempotency_key. "
-    "A server can be removed after its active leases are released. Removing it never stops an existing workload. "
-    "Endpoint keepalive is an explicit opt-in policy, controlled once per server but executed independently "
-    "per idle GPU. gpu_set_keepalive enabled=true reconciles eligible idle GPUs now; ServerPilot-managed "
-    "claims may reclaim only their selected verified keepalive GPU and released idle GPUs can rejoin the "
-    "policy. Direct SSH work is outside that handoff and requires disabling the endpoint policy first. "
-    "External Slurm clusters are SchedulerTargets, never raw SSH endpoints. Use "
-    "gpu_scheduler_targets and gpu_scheduler_access_status to discover a target, then use owner-scoped "
-    "submit, status, and cancel operations. "
-    "A Slurm PENDING job is not a bare-metal lease; scheduler status and AllocTRES establish its allocation. "
-    "VPN access is detection only: access_required means ask the user to connect the approved VPN, then retry. "
-    "On macOS this adapter automatically ensures the shared headless loopback daemon before REST calls; "
-    "it does not depend on the GUI. If MCP or the service is unavailable, report that state and do not fall "
-    "back to a bypass."
-)
+MCP_INSTRUCTIONS = """ServerPilot is the allocation and freshness authority. Do not bypass it through SSH, SQLite,
+inventory, remote probes, or nvidia-smi.
+
+ROUTE BY INTENT
+- Routine GPU work: use the route below; do not construct a resource contract first.
+- Routine GPU: call gpu_apply directly. It supports optionally selecting a server and requests one GPU by default.
+  ServerPilot records routine project/task attribution and chooses the actual allocatable GPUs.
+- Inspect or diagnose: use gpu_status only when needed; its default response is compact. The legacy gpu_list read is
+  available only in the advanced profile.
+- Start/stop: a successful apply returns a held or active lease; it fails with no_capacity and creates no queue. Use only
+  lease.resources[], including cuda_visible_devices. After start, call gpu_bind_observed_workload (lease_id;
+  run_id is optional). Call gpu_release when the workload stops or fails to start.
+- Coordinate: use gpu_coordination when you need other agents or leases. A codex://threads/<uuid>
+  coordination_uri is an opaque handoff reference, not a URL to open.
+- External scheduler: set `SERVERPILOT_MCP_PROFILE=advanced`, then use scheduler tools. External Slurm clusters are
+  SchedulerTargets, not SSH endpoints. A Slurm PENDING job is not a bare-metal lease; access_required means ask the
+  user to connect the approved VPN.
+
+BOUNDARIES
+- ServerPilot never launches or stops workloads. Reuse the same idempotency_key when retrying a mutation.
+- Generic-resource, low-level lease/workload, profile, endpoint, and scheduler-profile operations are advanced
+  compatibility surfaces, not routine inputs. Endpoint administration and scheduler-job cancellation require
+  current-task authorization, a non-empty approval_ref, and a stable idempotency_key. Keepalive policy is per idle GPU.
+- On macOS this adapter ensures the shared loopback daemon before REST calls. If it or the service is unavailable,
+  report that state; do not fall back to a bypass."""
 
 
 mcp = FastMCP(
@@ -81,6 +65,16 @@ def _client(actor_name: str | None = None) -> BrokerClient:
         # tasks onto a shared label such as ``agent`` or ``codex-root``.
         actor_name = coordination_identity[0]
     return BrokerClient.from_env(actor=actor_name)
+
+
+def _routine_gpu_claim_identifiers(client: BrokerClient, idempotency_key: str) -> tuple[str, str]:
+    """Derive bounded, Agent-scoped attribution for the no-setup routine claim."""
+
+    actor = getattr(client, "actor", "agent")
+    actor_text = actor if isinstance(actor, str) and actor else "agent"
+    project_digest = hashlib.sha256(actor_text.encode("utf-8")).hexdigest()[:24]
+    task_digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:24]
+    return f"agent-{project_digest}", f"gpu-apply-{task_digest}"
 
 
 def _require_request_fields(request: dict[str, Any]) -> None:
@@ -170,6 +164,259 @@ def _matching_lease(payload: dict[str, Any], request_id: str) -> dict[str, Any] 
     return next((item for item in payload.get("data", []) if item.get("request_id") == request_id), None)
 
 
+def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep the placement facts needed by an Agent and drop unrelated state.
+
+    ``/api/v1/snapshot`` is intentionally the desktop's full revision-consistent
+    read model.  MCP status calls should not echo its scheduler, generic-resource,
+    history, and profile collections into the model context.
+    """
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return payload
+    if not data:
+        return payload
+    summary = data.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+    gpus = data.get("gpus")
+    if not isinstance(gpus, list):
+        gpus = []
+    host_capacity = data.get("host_capacity")
+    if not isinstance(host_capacity, list):
+        host_capacity = []
+    capacity_by_endpoint = {
+        item.get("endpoint", {}).get("id"): item
+        for item in host_capacity
+        if isinstance(item, dict) and isinstance(item.get("endpoint"), dict)
+    }
+    gpu_counts: dict[str, dict[str, int]] = {}
+    for gpu in gpus:
+        if not isinstance(gpu, dict):
+            continue
+        endpoint_id = gpu.get("endpoint_id")
+        if not endpoint_id:
+            continue
+        counts = gpu_counts.setdefault(endpoint_id, {"total": 0, "available": 0})
+        counts["total"] += 1
+        if gpu.get("state") == "AVAILABLE":
+            counts["available"] += 1
+
+    compact_gpus = []
+    for gpu in gpus:
+        if not isinstance(gpu, dict):
+            continue
+        telemetry = gpu.get("telemetry")
+        if isinstance(telemetry, dict):
+            telemetry = {
+                key: telemetry.get(key)
+                for key in (
+                    "observed_at",
+                    "memory_used_mib",
+                    "memory_free_mib",
+                    "gpu_utilization_pct",
+                    "temperature_c",
+                )
+            }
+        compact_gpus.append(
+            {
+                key: gpu.get(key)
+                for key in (
+                    "id",
+                    "endpoint_id",
+                    "gpu_index",
+                    "name",
+                    "total_vram_mib",
+                    "state",
+                    "state_reason",
+                    "process_count",
+                    "owner",
+                    "task_ref",
+                    "expires_at",
+                )
+            }
+            | {"telemetry": telemetry}
+        )
+
+    servers = []
+    for endpoint in data.get("endpoints", []):
+        if not isinstance(endpoint, dict):
+            continue
+        endpoint_id = endpoint.get("id")
+        monitor = endpoint.get("monitor") if isinstance(endpoint.get("monitor"), dict) else {}
+        host = capacity_by_endpoint.get(endpoint_id, {})
+        capacity = host.get("capacity") if isinstance(host, dict) else {}
+        capacity = capacity if isinstance(capacity, dict) else {}
+        counts = gpu_counts.get(endpoint_id, {"total": 0, "available": 0})
+        servers.append(
+            {
+                "server_id": endpoint_id,
+                "monitor_status": monitor.get("status"),
+                "gpu_count": counts["total"],
+                "available_gpu_count": counts["available"],
+                "available_cpu_cores": capacity.get("available_cpu_cores"),
+                "available_memory_mib": capacity.get("available_memory_mib"),
+                "total_memory_mib": capacity.get("total_memory_mib"),
+                "last_error": monitor.get("last_error"),
+            }
+        )
+
+    compact_data = {
+        "summary": summary,
+        "data_age_seconds": data.get("data_age_seconds"),
+        "freshness_seconds": data.get("freshness_seconds"),
+        "servers": servers,
+        "gpus": compact_gpus,
+    }
+    return {
+        "schema_version": payload.get("schema_version", "v1"),
+        "snapshot_revision": payload.get("snapshot_revision"),
+        "server_time": payload.get("server_time"),
+        "data": compact_data,
+    }
+
+
+def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project the shared board without dropping actor contact references."""
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return payload
+    if not data:
+        return payload
+
+    def project_agent(agent: Any) -> dict[str, Any]:
+        if not isinstance(agent, dict):
+            return {}
+        return {
+            key: agent.get(key)
+            for key in (
+                "agent_name",
+                "coordination_uri",
+                "active_leases",
+                "leased_gpus",
+                "managed_running_gpus",
+                "idle_leased_gpus",
+                "projects",
+                "servers",
+            )
+        }
+
+    def project_lease(lease: Any) -> dict[str, Any]:
+        if not isinstance(lease, dict):
+            return {}
+        return {
+            key: lease.get(key)
+            for key in (
+                "lease_id",
+                "agent_name",
+                "coordination_uri",
+                "project_id",
+                "task",
+                "state",
+                "activity",
+                "gpu_count",
+                "servers",
+                "observed_process_count",
+                "expires_at",
+            )
+        }
+
+    def project_server(server: Any) -> dict[str, Any]:
+        if not isinstance(server, dict):
+            return {}
+        capacity = server.get("capacity")
+        capacity = capacity if isinstance(capacity, dict) else {}
+        return {
+            "server_id": server.get("server_id"),
+            "monitor_status": server.get("monitor_status"),
+            "capacity": {
+                key: capacity.get(key)
+                for key in (
+                    "total_gpus",
+                    "available_gpus",
+                    "leased_gpus",
+                    "managed_running_gpus",
+                    "idle_leased_gpus",
+                    "unattributed_compute_gpus",
+                    "gpu_states",
+                    "available_cpu_cores",
+                    "available_memory_mib",
+                    "total_system_memory_mib",
+                    "observed_gpu_utilization_pct",
+                )
+            },
+            "consumers": [project_lease(item) for item in server.get("consumers", [])],
+        }
+
+    def project_queue(request: Any) -> dict[str, Any]:
+        if not isinstance(request, dict):
+            return {}
+        constraints = request.get("constraints")
+        constraints = constraints if isinstance(constraints, dict) else {}
+        return {
+            "id": request.get("id"),
+            "project_id": request.get("project_id"),
+            "task_ref": request.get("task_ref"),
+            "state": request.get("state"),
+            "blocked_reason": request.get("blocked_reason"),
+            "gpu_count": constraints.get("gpu_count"),
+        }
+
+    def project_signal(signal: Any) -> dict[str, Any]:
+        if not isinstance(signal, dict):
+            return {}
+        return {
+            key: signal.get(key)
+            for key in (
+                "kind",
+                "severity",
+                "lease_id",
+                "agent_name",
+                "request_id",
+                "scheduler_job_id",
+                "state",
+                "message",
+            )
+        }
+
+    def project_scheduler_job(job: Any) -> dict[str, Any]:
+        if not isinstance(job, dict):
+            return {}
+        return {
+            key: job.get(key)
+            for key in (
+                "id",
+                "target_id",
+                "project_id",
+                "task_ref",
+                "state",
+                "scheduler_job_id",
+                "allocated_tres",
+                "node_list",
+                "error_message",
+            )
+        }
+
+    compact_data: dict[str, Any] = {
+        "summary": data.get("summary", {}),
+        "agents": [project_agent(item) for item in data.get("agents", [])],
+        "leases": [project_lease(item) for item in data.get("leases", [])],
+        "servers": [project_server(item) for item in data.get("servers", [])],
+        "queue": [project_queue(item) for item in data.get("queue", [])],
+        "signals": [project_signal(item) for item in data.get("signals", [])],
+        "scheduler_jobs": [project_scheduler_job(item) for item in data.get("scheduler_jobs", [])],
+        "guidance": data.get("guidance"),
+    }
+    return {
+        "schema_version": payload.get("schema_version", "v1"),
+        "snapshot_revision": payload.get("snapshot_revision"),
+        "server_time": payload.get("server_time"),
+        "data": compact_data,
+    }
+
+
 @mcp.tool()
 def control_plane_state(
     agent_name: str | None = None,
@@ -193,26 +440,28 @@ def gpu_status(
     state: str | None = None,
     only_available: bool = False,
 ) -> dict[str, Any]:
-    """Return shared state, including per-server CPU load and available system memory for placement decisions."""
+    """Return the compact placement view; use control_plane_state for explicit full diagnostics."""
 
     params: dict[str, Any] = {"compact": compact, "only_available": only_available}
     if server_id:
         params["endpoint_id"] = server_id
     if state:
         params["state"] = state
-    return _client().snapshot(**params)
+    payload = _client().snapshot(**params)
+    return _compact_gpu_status(payload) if compact else payload
 
 
 @mcp.tool()
-def gpu_coordination() -> dict[str, Any]:
-    """Return the shared broker coordination board for all visible agents and servers.
+def gpu_coordination(compact: bool = True) -> dict[str, Any]:
+    """Return the compact coordination board for visible agents, leases, and servers.
 
     The board identifies each lease owner and task, real process attribution,
     per-server capacity, observed GPU use, queued demand, and factual signals
     such as an idle lease or unbound compute process. It is read-only.
     """
 
-    return _client().coordination()
+    payload = _client().coordination()
+    return _compact_coordination(payload) if compact else payload
 
 
 @mcp.tool()
@@ -222,13 +471,8 @@ def gpu_list(
     only_available: bool = False,
     compact: bool = True,
 ) -> dict[str, Any]:
-    """List project-visible GPUs. Availability is derived by the control plane, not inferred by the agent."""
+    """Advanced read: list project-visible GPUs from the narrow REST projection."""
 
-    params: dict[str, Any] = {"compact": compact, "only_available": only_available}
-    if state:
-        params["state"] = state
-    if server_id:
-        params["endpoint_id"] = server_id
     return _client().gpus(
         state=state,
         endpoint_id=server_id,
@@ -242,13 +486,6 @@ def gpu_who(project_id: str | None = None) -> dict[str, Any]:
     """List project-visible leases and workload bindings; returns no SSH or task secrets."""
 
     return _client().leases(project_id=project_id)
-
-
-@mcp.tool()
-def gpu_list_profiles(project_id: str | None = None) -> dict[str, Any]:
-    """List project-visible workload profiles approved for routine GPU claims."""
-
-    return _client().workload_profiles(project_id=project_id)
 
 
 @mcp.tool()
@@ -622,10 +859,12 @@ def gpu_list_reservations() -> dict[str, Any]:
 
 
 @mcp.tool()
-def gpu_history(after_id: int = 0) -> dict[str, Any]:
+def gpu_history(after_id: int = 0, limit: int = 20) -> dict[str, Any]:
     """Read the append-only, redacted audit history for visible resources."""
 
-    return _client().get("/api/v1/events", params={"after_id": after_id})
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+        raise ValueError("limit must be an integer between 1 and 200")
+    return _client().get("/api/v1/events", params={"after_id": after_id, "limit": limit})
 
 
 @mcp.tool()
@@ -738,7 +977,6 @@ def resource_record_actual(
     )
 
 
-@mcp.tool()
 def gpu_claim(
     agent_name: str,
     project_id: str,
@@ -753,7 +991,7 @@ def gpu_claim(
     purpose: str | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Claim GPUs now or fail with no_capacity; no queue is created. Thresholds are absolute."""
+    """Advanced compatibility helper for explicit direct-GPU claim contracts."""
 
     task = task.strip()
     if gpu_count < 1 or not task:
@@ -793,14 +1031,13 @@ def gpu_claim(
     )
 
 
-@mcp.tool()
 def gpu_claim_profile(
     profile_id: str,
     task: str,
     idempotency_key: str | None = None,
     agent_name: str | None = None,
 ) -> dict[str, Any]:
-    """Claim a workload profile now; the profile fixes its resource contract."""
+    """Advanced compatibility helper for a direct-GPU workload profile."""
 
     if not profile_id.strip() or not task.strip():
         raise ValueError("profile_id and task must not be empty")
@@ -808,6 +1045,43 @@ def gpu_claim_profile(
         f"/api/v1/workload-profiles/{profile_id}/claim",
         {"task_ref": task},
         idempotency_key=idempotency_key or secrets.token_hex(16),
+    )
+
+
+@mcp.tool()
+def gpu_apply(
+    server_id: str | None = None,
+    gpu_count: int = 1,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Apply for one or more GPUs now; ServerPilot chooses the allocatable GPUs.
+
+    `server_id` is an optional server preference, never a GPU selector. On
+    success, use only the returned lease resources; `no_capacity` creates no queue
+    and does not authorize workload execution.
+    """
+
+    if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
+        raise ValueError("gpu_count must be a positive integer")
+    if server_id is not None:
+        server_id = server_id.strip()
+        if not server_id:
+            raise ValueError("server_id must not be empty when provided")
+    mutation_key = idempotency_key or secrets.token_hex(16)
+    client = _client()
+    project_id, task_ref = _routine_gpu_claim_identifiers(client, mutation_key)
+    constraints: dict[str, Any] = {"gpu_count": gpu_count, "placement": "pack"}
+    if server_id is not None:
+        constraints["endpoint_ids"] = [server_id]
+    return client.post(
+        "/api/v1/claims",
+        {
+            "project_id": project_id,
+            "task_ref": task_ref,
+            "purpose": "routine Agent GPU allocation",
+            "constraints": constraints,
+        },
+        idempotency_key=mutation_key,
     )
 
 
@@ -1021,8 +1295,52 @@ def gpu_delete_server(
     )
 
 
+ROUTINE_MCP_TOOL_NAMES = (
+    "gpu_status",
+    "gpu_coordination",
+    "gpu_apply",
+    "gpu_bind_observed_workload",
+    "gpu_renew_lease",
+    "gpu_release",
+)
+
+
+def _build_routine_mcp() -> FastMCP:
+    """Build the small default surface while retaining compatibility tools."""
+
+    routine = FastMCP(
+        "serverpilot",
+        json_response=True,
+        instructions=MCP_INSTRUCTIONS,
+    )
+    for name in ROUTINE_MCP_TOOL_NAMES:
+        tool = mcp._tool_manager._tools[name]
+        routine.add_tool(
+            tool.fn,
+            name=tool.name,
+            title=tool.title,
+            description=tool.description,
+            annotations=tool.annotations,
+            icons=tool.icons,
+            meta=tool.meta,
+        )
+    return routine
+
+
+# ``mcp`` remains the import-compatible full registry for REST/MCP tests and
+# advanced callers.  The stdio entry point uses this smaller registry by
+# default, so tool discovery is intent-first rather than compatibility-first.
+routine_mcp = _build_routine_mcp()
+
+
 def main() -> None:
-    mcp.run()
+    profile = os.environ.get("SERVERPILOT_MCP_PROFILE", "routine").strip().lower()
+    if profile == "advanced":
+        mcp.run()
+        return
+    if profile != "routine":
+        raise SystemExit("SERVERPILOT_MCP_PROFILE must be 'routine' or 'advanced'")
+    routine_mcp.run()
 
 
 if __name__ == "__main__":

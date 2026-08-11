@@ -54,16 +54,18 @@ final class FixtureModeUITests: XCTestCase {
         )
 
         serverRow.click()
+        let serverDetail = app.descendants(matching: .any)["服务器详情"]
+        XCTAssertTrue(serverDetail.waitForExistence(timeout: 2), "Selecting a server must open a separate detail sheet")
         let gpuModel = app.buttons.matching(
             NSPredicate(format: "label CONTAINS %@", "GPU 0 · Fixture GPU")
         ).firstMatch
         XCTAssertTrue(gpuModel.waitForExistence(timeout: 2), "Server detail must keep the GPU model visible")
 
-        let backButton = app.buttons["resource-detail-back"]
-        XCTAssertTrue(backButton.waitForExistence(timeout: 2), "Server detail must expose an obvious return action")
-        backButton.click()
-        XCTAssertTrue(serverRow.waitForExistence(timeout: 2), "Returning from server detail must restore the resource table")
-        XCTAssertFalse(backButton.exists, "The server detail sheet must be dismissed after returning")
+        let closeButton = app.buttons["关闭"].firstMatch
+        XCTAssertTrue(closeButton.waitForExistence(timeout: 2), "Server detail must expose an obvious close action")
+        closeButton.click()
+        XCTAssertTrue(serverRow.waitForExistence(timeout: 2), "Closing detail must preserve the resource table")
+        XCTAssertFalse(serverDetail.exists, "The separate server detail sheet must be dismissed")
     }
 
     func testResourceTableExposesProjectAndCurrentTask() {
@@ -93,7 +95,7 @@ final class FixtureModeUITests: XCTestCase {
         assertAgentIdentityIsNotExposed()
     }
 
-    func testKeepaliveIsVisibleAsNonErrorOccupancyWithoutSystemIdentity() {
+    func testOccupancyActionsAndServerOperationsRemainReachable() {
         app.terminate()
         app.launchEnvironment["SERVERPILOT_DESKTOP_FIXTURE"] = "keepalive"
         app.launch()
@@ -112,7 +114,45 @@ final class FixtureModeUITests: XCTestCase {
         XCTAssertTrue(status.waitForExistence(timeout: 2), "Server detail must expose the user-facing occupancy state")
         let action = app.buttons["endpoint-keepalive-action"]
         XCTAssertTrue(action.exists, "Configured keepalive must expose exactly one endpoint action")
-        XCTAssertEqual(action.label, "关闭空闲占卡")
+        XCTAssertEqual(action.label, "结束占卡", "Active occupancy must offer the plainly named end action")
+
+        let operations = app.buttons["服务器操作"]
+        XCTAssertTrue(operations.exists, "Server settings and deletion must remain reachable from the detail sheet")
+        operations.click()
+        XCTAssertTrue(app.menuItems["编辑服务器"].waitForExistence(timeout: 2))
+        XCTAssertTrue(app.menuItems["删除服务器"].exists)
+
+        relaunch(fixture: "keepalive-off", section: "server-pool")
+        let inactiveServer = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS %@", "ssh -p 2224 gpu@10.20.0.32")
+        ).firstMatch
+        XCTAssertTrue(inactiveServer.waitForExistence(timeout: 5))
+        inactiveServer.click()
+        let startAction = app.buttons["endpoint-keepalive-action"]
+        XCTAssertTrue(startAction.waitForExistence(timeout: 2))
+        XCTAssertEqual(startAction.label, "开始占卡", "Inactive occupancy must offer the plainly named start action")
+    }
+
+    func testConflictDoesNotHideOtherAvailableGPUs() {
+        relaunch(fixture: "conflict-with-available", section: "server-pool")
+
+        let serverRow = app.descendants(matching: .any).matching(
+            NSPredicate(format: "value CONTAINS %@", "归属待确认")
+        ).firstMatch
+        XCTAssertTrue(serverRow.waitForExistence(timeout: 5), "Conflict state must be explicit in the resource table")
+        XCTAssertTrue(
+            String(describing: serverRow.value).contains("可申请"),
+            "A conflicted GPU must not make unrelated available GPUs appear unavailable"
+        )
+        serverRow.click()
+        let recovery = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "仍可申请")
+        ).firstMatch
+        XCTAssertTrue(recovery.waitForExistence(timeout: 2), "Server detail must explain that conflict is per-GPU")
+        XCTAssertTrue(
+            app.buttons["清理遗留归属"].exists,
+            "Server detail must expose the guarded stale-conflict recovery action"
+        )
     }
 
     func testResourceTableHeadersToggleSortDirection() {

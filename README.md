@@ -77,7 +77,9 @@ codex mcp add serverpilot \
 python3 scripts/install_agent_policy.py codex --install
 ```
 
-Agent 使用完整资源合同即时申请：成功获得明确的 `lease.resources[]`，容量不足返回 `no_capacity`。Codex task URI 会自动登记，供 Agent 发现协作对象；App 不实现聊天或消息功能。
+Agent 可直接调用 `gpu_apply` 即时申请：成功获得明确的 `lease.resources[]`，容量不足返回 `no_capacity`；需要诊断时再调用 `gpu_status`。Codex task URI 会自动登记，供 Agent 发现协作对象；它只是宿主侧交接引用，App 不实现聊天或消息功能。
+
+默认 `serverpilot-mcp` 只发布日常 GPU 工具；scheduler、兼容性资源、端点管理和低层 lease 工具需显式设置 `SERVERPILOT_MCP_PROFILE=advanced`。
 
 安装、申请、绑定、释放与协调规则见 [Agent / MCP 指南](docs/AGENT_MCP_zh.md)。
 

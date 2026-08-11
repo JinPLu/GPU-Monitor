@@ -538,7 +538,7 @@ final class BrokerStoreTests: XCTestCase {
         let mutationSession = URLSession(configuration: configuration)
         let snapshot = try Self.snapshot(named: "1")
         let endpoint = try XCTUnwrap(snapshot.endpoints.first)
-        let capabilities: Set<String> = ["endpoint_update", "endpoint_pause_resume", "endpoint_retirement", "endpoint_keepalive"]
+        let capabilities: Set<String> = ["endpoint_update", "endpoint_pause_resume", "endpoint_retirement", "endpoint_keepalive", "endpoint_conflict_cleanup"]
         let serviceInfo = ServiceInfo(schemaVersion: "v1", capabilities: capabilities)
         let store = BrokerStore(
             actorID: "tester",
@@ -601,6 +601,21 @@ final class BrokerStoreTests: XCTestCase {
         let keepalivePayload = try XCTUnwrap(try JSONSerialization.jsonObject(with: keepaliveBody) as? [String: Any])
         XCTAssertEqual(keepalivePayload["enabled"] as? Bool, true)
         XCTAssertEqual(Set(keepalivePayload.keys), Set(["enabled"]))
+
+        let conflictRecorder = CompletionRecorder()
+        store.clearEmptyConflictedLease(
+            endpointID: endpoint.id,
+            leaseID: "lease-conflict"
+        ) { success, message in
+            conflictRecorder.success = success
+            conflictRecorder.message = message
+        }
+        try await waitUntil { conflictRecorder.success != nil }
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "POST")
+        XCTAssertEqual(
+            StateRouteURLProtocol.lastRequest?.url?.path,
+            "/api/v1/endpoints/fixture-1/leases/lease-conflict/release-empty"
+        )
 
         let retireRecorder = CompletionRecorder()
         store.retireEndpoint(endpoint) { success, message in
