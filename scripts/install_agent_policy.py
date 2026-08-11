@@ -19,9 +19,9 @@ from typing import Sequence
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "docs" / "AGENT_MCP_policy.en.md"
 MARKERS = {
-    "codex": ("<!-- GPU_BROKER_GLOBAL_START -->", "<!-- GPU_BROKER_GLOBAL_END -->"),
-    "claude": ("<!-- GPU_BROKER_GLOBAL_START -->", "<!-- GPU_BROKER_GLOBAL_END -->"),
-    "cursor": ("<!-- GPU_BROKER_GLOBAL_START -->", "<!-- GPU_BROKER_GLOBAL_END -->"),
+    "codex": ("<!-- SERVERPILOT_GLOBAL_START -->", "<!-- SERVERPILOT_GLOBAL_END -->"),
+    "claude": ("<!-- SERVERPILOT_GLOBAL_START -->", "<!-- SERVERPILOT_GLOBAL_END -->"),
+    "cursor": ("<!-- SERVERPILOT_GLOBAL_START -->", "<!-- SERVERPILOT_GLOBAL_END -->"),
 }
 
 

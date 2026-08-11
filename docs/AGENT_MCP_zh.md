@@ -1,6 +1,6 @@
 # ServerPilot Agent / MCP 全局安装与调度指南
 
-MCP 的完整运行契约由 ServerPilot server instructions 和工具 schema 提供；英文全局适配块见 [`AGENT_MCP_policy.en.md`](AGENT_MCP_policy.en.md)，保留“GPU 相关任务可主动调度 Broker、复用已批准资源合同、排队继续等待、禁止旁路和禁止推断缺失输入”的跨客户端规则。本文件只保留安装、注册和日常输入。
+MCP 的完整运行契约由 ServerPilot server instructions 和工具 schema 提供；英文全局适配块见 [`AGENT_MCP_policy.en.md`](AGENT_MCP_policy.en.md)，保留“GPU 相关任务可主动调度 ServerPilot、复用已批准资源合同、无容量时明确停止当次申请、禁止旁路和禁止推断缺失输入”的跨客户端规则。本文件只保留安装、注册和日常输入。
 
 ## 一次性安装
 
@@ -12,10 +12,10 @@ serverpilot daemon install --source-root "$PWD"
 serverpilot daemon status
 ```
 
-为保证升级不丢失已有 inventory、租约和历史数据，ServerPilot 继续使用兼容数据目录
-`~/Library/Application Support/GPU Broker/`；这是内部路径，不影响 App 显示名。
+ServerPilot 默认将 inventory、租约和历史数据保存在
+`~/Library/Application Support/ServerPilot/`。
 首次安装会在目标不存在时迁移仓库里的 `configs/inventory.yaml` 和
-`state/gpu-broker.sqlite3`，并保留原文件作为回滚源。源码更新后重新执行
+`state/serverpilot.sqlite3`，并保留原文件作为回滚源。源码更新后重新执行
 以下两条命令；第二条会更新并重启 LaunchAgent，不能只依赖一次健康检查完成
 版本切换：
 
@@ -40,11 +40,13 @@ serverpilot daemon uninstall  # 只移除 LaunchAgent，保留数据
 
 | 客户端 | MCP 注册 | 全局规则 |
 | --- | --- | --- |
-| Codex | `codex mcp add serverpilot --env GPU_BROKER_URL=http://127.0.0.1:8787 -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py codex --install` |
-| Claude Code | `claude mcp add --scope user serverpilot --env GPU_BROKER_URL=http://127.0.0.1:8787 -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py claude --install` |
+| Codex | `codex mcp add serverpilot --env SERVERPILOT_URL=http://127.0.0.1:8787 -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py codex --install` |
+| Claude Code | `claude mcp add --scope user serverpilot --env SERVERPILOT_URL=http://127.0.0.1:8787 -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py claude --install` |
 | Cursor | 在 `~/.cursor/mcp.json` 配置 `serverpilot` | `python3 scripts/install_agent_policy.py cursor --print` 后粘贴到 User Rules |
 
-Codex 推荐只启用日常工具，并让下面的 owner-scoped 工具不再逐次等待人工确认；不要把全局工具权限改成全放行。资源合同和项目归属仍由 MCP instructions、工具 schema 与当前任务决定。
+Codex 推荐只启用下面的日常工具，不要把全局工具权限改成全放行。
+`gpu_set_keepalive` 只在本机已配置保活时保留，否则从列表删除。工具在 allowlist 中不代表当前任务
+已获得管理授权；资源合同、项目归属和写操作仍由 MCP instructions、工具 schema 与当前任务决定。
 
 ```toml
 [mcp_servers.serverpilot]
@@ -52,8 +54,9 @@ command = "serverpilot-mcp"
 enabled_tools = [
   "control_plane_state",
   "gpu_coordination", "gpu_status", "gpu_list", "gpu_who", "gpu_list_profiles",
-  "gpu_claim_profile", "gpu_claim", "gpu_wait_for_claim",
+  "gpu_claim_profile", "gpu_claim",
   "gpu_bind_observed_workload", "gpu_release",
+  "gpu_set_keepalive",
   "gpu_scheduler_targets", "gpu_scheduler_access_status", "gpu_scheduler_profiles",
   "gpu_scheduler_submit_profile", "gpu_scheduler_submit_once",
   "gpu_scheduler_job_status",
@@ -62,7 +65,7 @@ enabled_tools = [
 ]
 
 [mcp_servers.serverpilot.env]
-GPU_BROKER_URL = "http://127.0.0.1:8787"
+SERVERPILOT_URL = "http://127.0.0.1:8787"
 ```
 
 `serverpilot-mcp` 仍然只通过 REST 调用调度服务；它不会直连 SQLite 或 SSH。
@@ -77,36 +80,47 @@ GPU_BROKER_URL = "http://127.0.0.1:8787"
 
 ## Agent 调度行为准则
 
-ServerPilot 的分工很明确：Agent 按明确合同申请、等待、执行和归还；人类通过资源、工作、队列和历史页面监督利用率与归属。Agent 不自行计算“还有多少可用资源”——服务端的 `available` 投影才是准入真相；stale、unknown、unmanaged、conflict 或 maintenance 一律不可分配，不能以 `capacity - used` 替代。
+ServerPilot 的分工很明确：Agent 按明确合同申请、执行和归还；人类通过服务器、使用情况和历史图监督利用率与归属。Agent 不自行计算“还有多少可用资源”——服务端的 `available` 投影才是准入真相；stale、unknown、unmanaged、conflict 或 maintenance 一律不可分配，不能以 `capacity - used` 替代。
 
-日常裸机任务只走一条路径：**claim → wait → execute → bind → release**。
+日常裸机任务只走一条路径：**claim → execute → bind → release**。
 
 1. 合同已含 `profile_id` 时调用 `gpu_claim_profile`；否则必须已有 `project_id`、任务名、`gpu_count` 与 CPU / 内存 / 显存等绝对阈值，才调用 `gpu_claim`。
-2. queued/null 不授权执行。对同一 request 调 `gpu_wait_for_claim`，直到 `HELD` / `ACTIVE`、终态或任务超时；已批准合同不变时不重复创建 request 或反复询问人类。
+2. claim 只会立即返回 `HELD` / `ACTIVE` lease，或以 `no_capacity` 失败。`no_capacity` 不创建队列、不授权执行；不得自行发明等待/轮询流程或绕过 ServerPilot。
 3. 只使用返回的 `lease.resources[]` 落点；不从 inventory、IP、旧快照或进程列表推断 host、GPU、CUDA selector 或可用容量。
 4. Agent 只通过项目既有、已获授权的执行路径启动 workload；观测到后 bind，完成或启动失败后 release。每次重试 mutation 均复用同一个 `idempotency_key`。
 5. 任务结论应回报 request / lease 或 scheduler job ID、最终状态与任何阻塞原因，方便人类在 ServerPilot 中继续跟踪。
 
-端点添加、更新、pause、resume、retire、取消外部作业等属于管理动作，不能进入默认 Agent 工具白名单。只有当前任务给出明确人类授权时才启用对应工具；每个端点管理 MCP 写操作还必须提供非空的当前任务 `approval_ref` 和调用方生成、可重试复用的非空 `idempotency_key`；`owner_project_id` 仅供归属展示，不构成管理权限。
+Codex 启动 MCP 时，adapter 会自动从当前 task 派生独立 actor 和
+`codex://threads/<uuid>` 协调 URI；协调投影可将该 URI 返回给其他 Agent，用于发现资源的当前任务。
+该元数据不授予租约权限，App 也不展示消息或协调链接。
+
+若当前任务明确授权 Agent 使用已配置保活的 endpoint，Agent 在 claim 前调用
+`gpu_set_keepalive(..., enabled=false)`；任务 release 后可再显式调用
+`gpu_set_keepalive(..., enabled=true)`。这只是多一个显式状态：ServerPilot 不会监听 claim
+自动关闭，不会抢占 workload，也不会在 release 后自动恢复。此操作属于 endpoint
+管理，必须带当前任务的非空 `approval_ref` 和调用方生成、重试复用的
+`idempotency_key`。
+
+端点添加、更新、pause、resume、retire、保活切换、取消外部作业等属于管理动作。只有当前任务给出明确人类授权时才调用；每个端点管理 MCP 写操作还必须提供非空的当前任务 `approval_ref` 和调用方生成、可重试复用的非空 `idempotency_key`；`owner_project_id` 仅供归属展示，不构成管理权限。
 
 默认工作流：
 
-- `control_plane_state`、`gpu_coordination`、`gpu_status`、`gpu_list`、`gpu_who` 与 `gpu_list_profiles` 可读取 Broker 状态和可用资源合同；普通预批准 profile 或显式合同 claim 不要求先读协调看板。
-- 当前任务已给出 `profile_id`，或已给出 `project_id`、`gpu_count` 与必要阈值时，直接用 `gpu_claim_profile` 或 `gpu_claim`。得到 queued/null 结果时用 `gpu_wait_for_claim(agent_name, request_id)` 继续轮询已有 request/lease，直到获得 `HELD` 或 `ACTIVE` lease、终止状态或超时；queued/null 不能据此执行；不要再为同一持续任务重复询问人工确认。
-- 成功 lease 的具体落点只读返回的 `lease.resources[]`。每个 resource 提供 `endpoint`（`id`、`host`、`port`、`ssh_user`）、`gpus`（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 和 `commitment`；Agent 不自行拼接或推断 placement。随后它通过项目既有执行路径启动或停止获授权的 workload；Broker 不代为启动或停止。启动后调用 `gpu_bind_observed_workload`，完成或启动失败后调用 `gpu_release`。
+- `control_plane_state`、`gpu_coordination`、`gpu_status`、`gpu_list`、`gpu_who` 与 `gpu_list_profiles` 可读取 ServerPilot 状态和可用资源合同；普通预批准 profile 或显式合同 claim 不要求先读协调看板。
+- 当前任务已给出 `profile_id`，或已给出 `project_id`、`gpu_count` 与必要阈值时，直接用 `gpu_claim_profile` 或 `gpu_claim`。成功时立即获得 `HELD` 或 `ACTIVE` lease；`no_capacity` 表示当次未分配且没有队列，应回报阻塞原因并停止当次执行。
+- 成功 lease 的具体落点只读返回的 `lease.resources[]`。每个 resource 提供 `endpoint`（`id`、`host`、`port`、`ssh_user`）、`gpus`（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 和 `commitment`；Agent 不自行拼接或推断 placement。随后它通过项目既有执行路径启动或停止获授权的 workload；ServerPilot 不代为启动或停止。启动后调用 `gpu_bind_observed_workload`，完成或启动失败后调用 `gpu_release`。
 - 所有会重试的写操作都传入并复用同一个调用方生成的 `idempotency_key`。
 
 通用资源工作流：
 
 - `resource_providers` 与 `resource_monitor` 用于查看 GPU、主机 CPU/内存和外部 scheduler 三类资源；调度队列或 `PENDING` 作业不是裸机可用容量。它们是观察面，不替代服务端 `available` 准入投影。
-- Agent 对当前任务提供由自身基准或历史运行得出的、从小到大的候选资源合同，先调用 `resource_evaluate_plan`。Broker 只在相邻扩容同时节省至少 10% 剩余时间且至少 120 秒时选择更大合同；首个收益不足的候选会终止扩容。
+- Agent 对当前任务提供由自身基准或历史运行得出的、从小到大的候选资源合同，先调用 `resource_evaluate_plan`。ServerPilot 只在相邻扩容同时节省至少 10% 剩余时间且至少 120 秒时选择更大合同；首个收益不足的候选会终止扩容。
 - CPU/内存-only 合同允许 `gpu_count=0`。已获配的主机容量通过 `resource_claim` 认领，完成后 `resource_release`；实际耗时用 `resource_record_actual` 追加记录。这些工具不会启动远端命令、绕过 owner、配额或新鲜 telemetry 校验。
 
-端点是本机服务器清单。端点返回可选的 `owner_project_id` 归属说明和 `lifecycle_state`，但归属不构成管理权限。`gpu_add_server`、`gpu_update_server`、`gpu_pause_server`、`gpu_resume_server` 和 `gpu_retire_server` 只能在当前任务有明确人类授权、并带 `approval_ref` 与稳定 `idempotency_key` 时使用。pause 是 `active → draining`：不再接收新 placement，但采集和已有 lease/workload 继续；resume 是 `draining → active`；retire 只能在 draining 且关联活跃 lease、端点 pinned 队列均已清空后执行，历史证据保留。兼容工具 `gpu_delete_server` 已弃用且只等同于 pause，不会通过重复调用自动退役。
+端点是本机服务器清单。端点返回可选的 `owner_project_id` 归属说明和 `lifecycle_state`，但归属不构成管理权限。`gpu_add_server`、`gpu_update_server`、`gpu_pause_server`、`gpu_resume_server` 和 `gpu_retire_server` 只能在当前任务有明确人类授权、并带 `approval_ref` 与稳定 `idempotency_key` 时使用。pause 是 `active → draining`：不再接收新 placement，但采集和已有 lease/workload 继续；resume 是 `draining → active`；retire 只能在 draining 且关联活跃 lease 已清空后执行，历史证据保留。兼容工具 `gpu_delete_server` 已弃用且只等同于 pause，不会通过重复调用自动退役。
 
 端点的 `observation_profile` 只能选择代码封闭的只读协议，不能携带命令、argv、shell、SSH 选项或秘密。新 REST/MCP 创建端点默认使用 `server-script-v1`；既有 inventory/档案中未指定 profile 的端点保持兼容的 `linux-nvidia`。`server-script-v1` 固定对应部署拥有的 `serverpilot-collect --schema-version 1` 只读协议；记录里不会保存或接受可执行命令配置。
 
-`gpu_request`、`gpu_request_status`、`gpu_cancel_request`、`gpu_activate_lease`、`gpu_release_lease` 与 `gpu_bind_workload` 是兼容性高级低层工具，不放在默认路径；新 Agent 优先采用上面的 claim / wait / execute / bind / release 流程。
+旧版 request / lease 低层工具只为兼容保留，不属于公开日常路径。新 Agent 只采用上面的 claim / execute / bind / release 流程；不得从兼容工具推导等待或排队语义。
 
 Cursor MCP 示例：
 
@@ -115,7 +129,7 @@ Cursor MCP 示例：
   "mcpServers": {
     "serverpilot": {
       "command": "serverpilot-mcp",
-      "env": {"GPU_BROKER_URL": "http://127.0.0.1:8787"}
+      "env": {"SERVERPILOT_URL": "http://127.0.0.1:8787"}
     }
   }
 }
@@ -129,11 +143,11 @@ Agent 不需要复制本仓库工作流，也不需要在其他项目写 GPU 说
 - 一次性 GPU 认领：明确任意非空 `project_id`、任务名、`gpu_count`，以及需要的 CPU 核数、系统内存 MiB、显存 MiB 等绝对值下限，Agent 调用 `gpu_claim`。
 - CPU / 内存-only 或混合算力任务：提供从小到大的显式候选合同，先调用 `resource_evaluate_plan`，再以选定合同 `resource_claim`；可令 `gpu_count=0`，完成后调用 `resource_record_actual` 和 `resource_release`。
 
-不要让 Agent 按工作目录、任务标题、空闲 GPU、profile 列表或 inventory 自己挑配置。CPU、内存和显存需求要按绝对值表达，例如 `min_available_cpu_cores=16`、`min_available_memory_mib=65536`、`min_free_vram_mib=61440`。除非任务明确指定服务器或 GPU，否则不传 placement，让 Broker 自己排队和选址。
+不要让 Agent 按工作目录、任务标题、空闲 GPU、profile 列表或 inventory 自己挑配置。CPU、内存和显存需求要按绝对值表达，例如 `min_available_cpu_cores=16`、`min_available_memory_mib=65536`、`min_free_vram_mib=61440`。除非任务明确指定服务器或 GPU，否则不传 placement，让 ServerPilot 自己选址。
 
-同一个持续任务里已经明确过 `profile_id`，或已经明确过 `project_id` 与 `gpu_count` 时，Agent 应复用这份资源合同，不应重复询问。通过运行时 preflight 后，Agent 应主动调用 `gpu_claim_profile` 或 `gpu_claim`；如果进入队列，应调用 `gpu_wait_for_claim` 监控直到获配、终止或任务取消。
+同一个持续任务里已经明确过 `profile_id`，或已经明确过 `project_id` 与 `gpu_count` 时，Agent 应复用这份资源合同，不应重复询问。通过运行时 preflight 后，Agent 应主动调用 `gpu_claim_profile` 或 `gpu_claim`；如果返回 `no_capacity`，当次申请立即结束，不得将其视为排队授权。
 
-资源下限应尽量贴近任务真实需求；租约分配后，Agent 只从 `lease.resources[]` 取得 placement：每项都有 endpoint（`id`、`host`、`port`、`ssh_user`）、GPU（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 与 `commitment`。它在 workload 支持时充分使用这些资源，例如把相互独立的 job 并行分布到租约内的 GPU 上，但不得启动 dummy 占卡进程或做不安全并发。Agent 通过项目已有执行路径启动或停止已获授权的 workload，而不是让 Broker 执行命令。
+资源下限应尽量贴近任务真实需求；租约分配后，Agent 只从 `lease.resources[]` 取得 placement：每项都有 endpoint（`id`、`host`、`port`、`ssh_user`）、GPU（`id`、`gpu_uuid`、`gpu_index`）、`cuda_visible_devices` 与 `commitment`。它在 workload 支持时充分使用这些资源，例如把相互独立的 job 并行分布到租约内的 GPU 上，但不得启动 dummy 占卡进程或做不安全并发。Agent 通过项目已有执行路径启动或停止已获授权的 workload，而不是让 ServerPilot 执行命令。
 
 远端 workload 已经启动后，Agent 调用 `gpu_bind_observed_workload(agent_name, lease_id)`；任务结束或启动失败后调用 `gpu_release(agent_name, lease_id)`。这些动作只记录归属，不启动、不停止、不抢占远端进程。
 
@@ -155,7 +169,7 @@ scheduler 工具，不回退到项目本地 SSH 规则。
 
 ## 外部调度型服务器
 
-任何 Slurm 集群都不是当前 Broker 的普通 SSH endpoint。目标任务明确使用外部 scheduler 时，
+任何 Slurm 集群都不是当前 ServerPilot 的普通 SSH endpoint。目标任务明确使用外部 scheduler 时，
 Agent 走同一条通用 scheduler 流程：
 
 - 不把登录节点登记为普通 GPU 服务器。
@@ -166,7 +180,7 @@ Agent 走同一条通用 scheduler 流程：
   `gpu_scheduler_submit_once`，并提供脚本与资源合同。
 - 用 `gpu_scheduler_job_status` 读取 Job ID、状态和 AllocTRES；不调用
   `gpu_bind_observed_workload`，因为裸机 Collector 不观测动态计算节点。
-- 不从 inventory、登录节点连通性或历史分区快照推断可用 GPU。
+- 不从 inventory、登录节点连通性或历史分区快照推断 GPU 容量。
 - VPN 只检测：`access_required` 时提示用户连接批准的 VPN 后重试，不自动操作。
 - `gpu_scheduler_cancel` 需要当前任务的单独、明确人类授权；取消只作用于其作业。
 

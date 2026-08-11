@@ -7,6 +7,8 @@ private enum ResourceUsageScope: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    static let visibleCases: [ResourceUsageScope] = [.project, .task]
+
     var label: String {
         switch self {
         case .project: return "项目"
@@ -112,12 +114,11 @@ private struct ResourceUsageGroup: Identifiable {
     var subtitle: String {
         switch scope {
         case .project:
-            return "\(actorIDs.count) 个 Agent · \(taskReferences.count) 个任务"
+            return "\(taskReferences.count) 个任务"
         case .agent:
             return "\(projectIDs.count) 个项目 · \(taskReferences.count) 个任务"
         case .task:
-            let project = projectIDs.first ?? "未标注项目"
-            return "\(project) · \(actorIDs.count) 个 Agent"
+            return projectIDs.first ?? "未标注项目"
         }
     }
 
@@ -125,8 +126,8 @@ private struct ResourceUsageGroup: Identifiable {
         claims.count + leases.count + visibleLegacyRequests.count + reservations.count + actuals.count
     }
 
-    var hasPendingWork: Bool {
-        !pendingClaims.isEmpty || !visibleLegacyRequests.isEmpty
+    var visibleActivityCount: Int {
+        assignedClaims.count + runningClaims.count + leases.count + actuals.count
     }
 }
 
@@ -134,6 +135,7 @@ private struct ResourceUsageProjection {
     let projectCount: Int
     let agentCount: Int
     let taskCount: Int
+    let activeTaskCount: Int
     let assignedQuantities: ResourceQuantityRecord
     let runningQuantities: ResourceQuantityRecord
     let requestedQuantities: ResourceQuantityRecord
@@ -143,6 +145,7 @@ private struct ResourceUsageProjection {
         projectCount: 0,
         agentCount: 0,
         taskCount: 0,
+        activeTaskCount: 0,
         assignedQuantities: ResourceQuantityRecord(),
         runningQuantities: ResourceQuantityRecord(),
         requestedQuantities: ResourceQuantityRecord(),
@@ -154,11 +157,14 @@ private struct ResourceUsageProjection {
         projectCount = Set(identities.map(\.projectID)).count
         agentCount = Set(identities.map(\.actorID)).count
         taskCount = Set(identities.map { "\($0.projectID)\u{1F}\($0.taskReference)" }).count
+        activeTaskCount = resourceUsageActiveTaskCount(snapshot: snapshot)
 
         let linkedLeaseIDs = Set(snapshot.resourceClaims.flatMap(\.nativeLeaseIDs))
         let linkedRequestIDs = Set(snapshot.resourceClaims.flatMap(\.nativeRequestIDs))
         let legacyLeases = snapshot.leases.filter { !linkedLeaseIDs.contains($0.id) }
-        let legacyRequests = snapshot.requests.filter { !linkedRequestIDs.contains($0.id) }
+        let legacyRequests = snapshot.requests.filter {
+            !linkedRequestIDs.contains($0.id) && resourceUsageRequestIsPending($0)
+        }
         let assignedClaims = snapshot.resourceClaims.filter {
             ["HELD", "ACTIVE"].contains($0.state) && $0.runtimeState != "RUNNING"
         }
@@ -201,6 +207,7 @@ private struct ResourceUsageProjection {
         projectCount: Int,
         agentCount: Int,
         taskCount: Int,
+        activeTaskCount: Int,
         assignedQuantities: ResourceQuantityRecord,
         runningQuantities: ResourceQuantityRecord,
         requestedQuantities: ResourceQuantityRecord,
@@ -209,6 +216,7 @@ private struct ResourceUsageProjection {
         self.projectCount = projectCount
         self.agentCount = agentCount
         self.taskCount = taskCount
+        self.activeTaskCount = activeTaskCount
         self.assignedQuantities = assignedQuantities
         self.runningQuantities = runningQuantities
         self.requestedQuantities = requestedQuantities
@@ -222,19 +230,20 @@ private struct ResourceUsageProjection {
 
 struct ResourceUsageDashboard: View {
     @ObservedObject var store: BrokerStore
+    let claimGPU: () -> Void
     @State private var scope: ResourceUsageScope = .project
     @State private var projection: ResourceUsageProjection
     @State private var selectedGroupID = ""
     @State private var showsCompactDetail = false
     @State private var inlineMessage: String?
 
-    init(store: BrokerStore) {
+    init(store: BrokerStore, claimGPU: @escaping () -> Void) {
         self.store = store
+        self.claimGPU = claimGPU
 #if DEBUG || DESKTOP_FIXTURES
-        let requestedScope = ProcessInfo.processInfo.environment["GPU_BROKER_DESKTOP_USAGE_SCOPE"]
+        let requestedScope = ProcessInfo.processInfo.environment["SERVERPILOT_DESKTOP_USAGE_SCOPE"]
         let initialScope: ResourceUsageScope
         switch requestedScope {
-        case "agent": initialScope = .agent
         case "task": initialScope = .task
         default: initialScope = .project
         }
@@ -255,33 +264,9 @@ struct ResourceUsageDashboard: View {
         groups.first { $0.id == selectedGroupID } ?? groups.first
     }
 
-    private var projectCount: Int {
-        projection.projectCount
-    }
-
-    private var agentCount: Int {
-        projection.agentCount
-    }
-
-    private var taskCount: Int {
-        projection.taskCount
-    }
-
-    private var assignedQuantities: ResourceQuantityRecord {
-        projection.assignedQuantities
-    }
-
-    private var runningQuantities: ResourceQuantityRecord {
-        projection.runningQuantities
-    }
-
-    private var requestedQuantities: ResourceQuantityRecord {
-        projection.requestedQuantities
-    }
-
     var body: some View {
         VStack(spacing: 0) {
-            header
+            overviewBar
             Divider().opacity(0.45)
             PersistedMasterDetailSplit(
                 configuration: .ownership,
@@ -294,73 +279,52 @@ struct ResourceUsageDashboard: View {
         .onAppear { updateProjection() }
         .onChange(of: scope) { _, _ in updateProjection(resetSelection: true) }
         .onChange(of: store.snapshot.snapshotRevision) { _, _ in updateProjection() }
-        .accessibilityLabel("归属与安排")
+        .accessibilityLabel("使用情况")
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("归属与安排")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundStyle(DesignTokens.ink)
-                    Text("项目与 Agent")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(DesignTokens.mutedInk)
-                    Text("按项目、Agent 或任务查看归属与安排租约、申请和预约")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(DesignTokens.mutedInk)
-                }
-                Spacer(minLength: 20)
-                Label("记录资源归属，不控制远端任务", systemImage: "hand.raised.fill")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(DesignTokens.mutedInk)
-            }
+    private var overviewBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 18) { overviewCount; Spacer(minLength: 16) }
+            .frame(height: 44)
 
-            HStack(spacing: 10) {
-                ResourceUsageCountMetric(value: "\(projectCount)", label: "项目", icon: "folder.fill")
-                    .frame(width: 86)
-                ResourceUsageCountMetric(value: "\(agentCount)", label: "Agent", icon: "person.crop.circle.fill")
-                    .frame(width: 86)
-                ResourceUsageCountMetric(value: "\(taskCount)", label: "任务", icon: "checklist.checked")
-                    .frame(width: 86)
-                ResourceUsageSummaryMetric(value: assignedQuantities.compactLabel, label: "已申领，待使用", icon: "checkmark.circle.fill")
-                    .frame(maxWidth: .infinity)
-                ResourceUsageSummaryMetric(value: runningQuantities.compactLabel, label: "运行中", icon: "play.circle.fill")
-                    .frame(maxWidth: .infinity)
-                ResourceUsageSummaryMetric(value: requestedQuantities.compactLabel, label: "申请中", icon: "hourglass")
-                    .frame(maxWidth: .infinity)
+            VStack(alignment: .leading, spacing: 7) {
+                overviewCount
             }
+            .padding(.vertical, 8)
         }
         .padding(.horizontal, 24)
-        .padding(.top, 14)
-        .padding(.bottom, 16)
         .background(DesignTokens.surface)
+    }
+
+    private var overviewCount: some View {
+        Text("\(projection.activeTaskCount) 个当前任务  ·  \(projection.assignedQuantities.gpuCount + projection.runningQuantities.gpuCount) 张 GPU")
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(DesignTokens.ink)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
     }
 
     private var groupNavigator: some View {
         VStack(alignment: .leading, spacing: 0) {
             Picker("查看方式", selection: $scope) {
-                ForEach(ResourceUsageScope.allCases) { item in
+                ForEach(ResourceUsageScope.visibleCases) { item in
                     Text(item.label).tag(item)
                 }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .padding(14)
-            .accessibilityLabel("按项目、Agent 或任务查看归属与安排")
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .accessibilityLabel("按项目或任务查看使用情况")
 
             HStack {
-                Text("\(scope.label)列表")
+                Text("\(groups.count) 个\(scope.label)")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(DesignTokens.ink)
                 Spacer()
-                Text("\(groups.count)")
-                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                    .foregroundStyle(DesignTokens.mutedInk)
             }
             .padding(.horizontal, 16)
-            .padding(.bottom, 9)
+            .padding(.bottom, 7)
 
             ScrollView {
                 LazyVStack(spacing: 4) {
@@ -392,11 +356,13 @@ struct ResourceUsageDashboard: View {
             )
             .id(selectedGroup.id)
         } else {
-            ContentUnavailableView(
-                "还没有项目或 Agent 申请资源",
-                systemImage: "person.2.slash",
-                description: Text("点击“申请 GPU”开始分配资源。")
-            )
+            VStack(spacing: 12) {
+                ContentUnavailableView("当前没有 GPU 使用记录", systemImage: "square.stack.3d.up.slash")
+                Button("申请 GPU", action: claimGPU)
+                    .buttonStyle(PrimaryActionButtonStyle())
+                    .disabled(!store.allowsMutations)
+                    .help(store.allowsMutations ? "申请空闲 GPU" : store.mutationUnavailableReason)
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .spatialContentSurface()
         }
@@ -422,74 +388,34 @@ struct ResourceUsageDashboard: View {
         inlineMessage = nil
         store.releaseLease(lease) { success, error in
             if success {
-                inlineMessage = "资源已归还。"
+                inlineMessage = "GPU 已释放。"
             } else {
-                inlineMessage = error ?? "没有归还成功，请稍后再试。"
+                inlineMessage = error ?? "释放失败，请稍后重试。"
             }
         }
     }
 }
 
-private struct ResourceUsageCountMetric: View {
+private struct ResourceUsageInlineMetric: View {
+    let title: String
     let value: String
-    let label: String
     let icon: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(DesignTokens.mutedInk)
-                Text(value)
-                    .font(.system(size: 15, weight: .semibold, design: .rounded))
-                    .foregroundStyle(DesignTokens.ink)
-            }
-            Text(label)
-                .font(.system(size: 9, weight: .medium))
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(DesignTokens.mutedInk)
+            Text(title)
+                .foregroundStyle(DesignTokens.mutedInk)
+            Text(value)
+                .foregroundStyle(DesignTokens.ink)
                 .lineLimit(1)
         }
-        .padding(.horizontal, 11)
-        .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
-        .background(DesignTokens.glassSmoke, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+        .font(.system(size: 10, weight: .semibold))
+        .help(resourceUsageStatusHelp(title))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(label)
-        .accessibilityValue(value)
-    }
-}
-
-private struct ResourceUsageSummaryMetric: View {
-    let value: String
-    let label: String
-    let icon: String
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: icon)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(DesignTokens.mutedInk)
-                .frame(width: 30, height: 30)
-                .background(DesignTokens.mutedInk.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(value)
-                    .font(.system(size: value.count > 14 ? 11 : 15, weight: .semibold, design: .rounded))
-                    .foregroundStyle(DesignTokens.ink)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-                Text(label)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(DesignTokens.mutedInk)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 11)
-        .frame(minHeight: 50)
-        .background(DesignTokens.glassSmoke, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(label)
+        .accessibilityLabel(title)
         .accessibilityValue(value)
     }
 }
@@ -524,18 +450,9 @@ private struct ResourceUsageGroupRow: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 8)
-                VStack(alignment: .trailing, spacing: 3) {
-                    Text("\(group.activityCount)")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(DesignTokens.ink)
-                    Text(group.hasPendingWork ? "有申请" : "条记录")
-                        .font(.system(size: 8, weight: .medium))
-                        .foregroundStyle(group.hasPendingWork ? DesignTokens.warning : DesignTokens.mutedInk)
-                        .lineLimit(1)
-                }
             }
             .padding(.horizontal, 10)
-            .frame(height: 58)
+            .frame(height: 52)
             .background(
                 selected ? DesignTokens.interaction.opacity(0.11) : DesignTokens.ink.opacity(hovering ? 0.04 : 0),
                 in: RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -546,7 +463,7 @@ private struct ResourceUsageGroupRow: View {
         .onHover { hovering = $0 }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: hovering)
         .accessibilityLabel("\(group.scope.label) \(group.title)")
-        .accessibilityValue("已申领，待使用 \(group.assignedQuantities.compactLabel)，运行中 \(group.runningQuantities.compactLabel)，申请中 \(group.requestedQuantities.compactLabel)")
+        .accessibilityValue("当前使用 \(combinedQuantities([group.assignedQuantities, group.runningQuantities]).compactLabel)")
     }
 }
 
@@ -558,16 +475,16 @@ private struct ResourceUsageGroupDetail: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .top, spacing: 14) {
                     Image(systemName: group.scope.icon)
-                        .font(.system(size: 19, weight: .semibold))
+                        .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(DesignTokens.interaction)
-                        .frame(width: 44, height: 44)
-                        .background(DesignTokens.interaction.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    VStack(alignment: .leading, spacing: 4) {
+                        .frame(width: 36, height: 36)
+                        .background(DesignTokens.interaction.opacity(0.10), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(group.title)
-                            .font(.system(size: 24, weight: .semibold))
+                            .font(.system(size: 20, weight: .semibold))
                             .foregroundStyle(DesignTokens.ink)
                             .lineLimit(2)
                         Text(group.subtitle)
@@ -575,50 +492,21 @@ private struct ResourceUsageGroupDetail: View {
                             .foregroundStyle(DesignTokens.mutedInk)
                     }
                     Spacer(minLength: 0)
-                    Text("\(group.activityCount) 条记录")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundStyle(DesignTokens.mutedInk)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(DesignTokens.surface, in: Capsule())
-                        .overlay(Capsule().stroke(DesignTokens.surfaceStroke, lineWidth: 1))
                 }
 
                 if let inlineMessage {
-                    Label(inlineMessage, systemImage: inlineMessage == "资源已归还。" ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    Label(inlineMessage, systemImage: inlineMessage == "GPU 已释放。" ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(inlineMessage == "资源已归还。" ? DesignTokens.success : DesignTokens.danger)
+                        .foregroundStyle(inlineMessage == "GPU 已释放。" ? DesignTokens.success : DesignTokens.danger)
                         .padding(11)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(DesignTokens.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
                 }
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 180, maximum: 320), spacing: 12)], spacing: 12) {
-                    ResourceQuantityPanel(
-                        title: "已申领，待使用",
-                        subtitle: "资源已归属，尚未检测到任务进程",
-                        quantities: group.assignedQuantities,
-                        icon: "checkmark.circle.fill"
-                    )
-                    ResourceQuantityPanel(
-                        title: "运行中",
-                        subtitle: "已检测到任务进程；数值为分配量",
-                        quantities: group.runningQuantities,
-                        icon: "play.circle.fill"
-                    )
-                    ResourceQuantityPanel(
-                        title: "申请中",
-                        subtitle: "等待分配的资源",
-                        quantities: group.requestedQuantities,
-                        icon: "hourglass"
-                    )
-                }
-
                 if !group.assignedClaims.isEmpty || !group.runningClaims.isEmpty || !group.leases.isEmpty {
                     ResourceUsageSectionTitle(
-                        title: "当前资源",
-                        detail: "\(group.assignedClaims.count + group.runningClaims.count + group.leases.count) 条"
+                        title: "当前使用"
                     )
                     VStack(spacing: 6) {
                         ForEach(group.assignedClaims) { claim in
@@ -637,26 +525,8 @@ private struct ResourceUsageGroupDetail: View {
                     }
                 }
 
-                if !group.pendingClaims.isEmpty || !group.visibleLegacyRequests.isEmpty || !group.reservations.isEmpty {
-                    ResourceUsageSectionTitle(
-                        title: "申请与预约",
-                        detail: "\(group.pendingClaims.count + group.visibleLegacyRequests.count + group.reservations.count) 条"
-                    )
-                    VStack(spacing: 6) {
-                        ForEach(group.pendingClaims) { claim in
-                            ResourceClaimDetailRow(claim: claim)
-                        }
-                        ForEach(group.visibleLegacyRequests) { request in
-                            ResourceRequestDetailRow(request: request)
-                        }
-                        ForEach(group.reservations) { reservation in
-                            ResourceReservationDetailRow(reservation: reservation)
-                        }
-                    }
-                }
-
                 if !group.actuals.isEmpty {
-                    ResourceUsageSectionTitle(title: "最近任务记录", detail: "\(group.actuals.count) 条")
+                    ResourceUsageSectionTitle(title: "任务记录")
                     VStack(spacing: 6) {
                         ForEach(group.actuals) { actual in
                             ResourceActualDetailRow(actual: actual)
@@ -664,102 +534,89 @@ private struct ResourceUsageGroupDetail: View {
                     }
                 }
 
-                if group.activityCount == 0 {
-                    ContentUnavailableView("暂无记录", systemImage: "tray")
+                if group.visibleActivityCount == 0 {
+                    ContentUnavailableView("当前没有 GPU 使用记录", systemImage: "tray")
                 }
 
-                Label("资源归属与远端任务生命周期彼此独立", systemImage: "hand.raised.fill")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(DesignTokens.mutedInk)
             }
-            .padding(24)
-            .padding(.bottom, 60)
+            .padding(20)
+            .padding(.bottom, 40)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
 
-private struct ResourceQuantityPanel: View {
+private struct ResourceStateSummary: View {
+    let assigned: ResourceQuantityRecord
+    let running: ResourceQuantityRecord
+    let requested: ResourceQuantityRecord
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if assigned.hasResources {
+                ResourceStateSummaryItem(title: "已分配", quantities: assigned, icon: "checkmark.circle.fill")
+            }
+            if assigned.hasResources && (running.hasResources || requested.hasResources) {
+                Divider().padding(.vertical, 9)
+            }
+            if running.hasResources {
+                ResourceStateSummaryItem(title: "运行", quantities: running, icon: "play.circle.fill")
+            }
+            if running.hasResources && requested.hasResources {
+                Divider().padding(.vertical, 9)
+            }
+            if requested.hasResources { EmptyView() }
+            if !assigned.hasResources && !running.hasResources && !requested.hasResources {
+                Text("暂无资源")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .padding(.horizontal, 12)
+            }
+        }
+        .frame(height: 52)
+        .background(DesignTokens.surface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+    }
+}
+
+private struct ResourceStateSummaryItem: View {
     let title: String
-    let subtitle: String
     let quantities: ResourceQuantityRecord
     let icon: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: icon)
-                    .font(.system(size: 13, weight: .semibold))
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(DesignTokens.mutedInk)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(DesignTokens.ink)
-                    Text(subtitle)
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(DesignTokens.mutedInk)
-                        .lineLimit(2)
-                }
+                Text(quantities.compactLabel)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(DesignTokens.ink)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
             }
-            HStack(spacing: 8) {
-                ResourceQuantityItem(label: "CPU", value: usageCPUText(quantities.cpuCores), icon: "cpu")
-                ResourceQuantityItem(label: "内存", value: usageMemoryText(quantities.memoryMiB), icon: "memorychip")
-                ResourceQuantityItem(label: "GPU", value: "\(quantities.gpuCount)", icon: "square.stack.3d.up.fill")
-            }
+            Spacer(minLength: 0)
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DesignTokens.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity)
+        .help(resourceUsageStatusHelp(title))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
         .accessibilityValue(quantities.compactLabel)
     }
 }
 
-private struct ResourceQuantityItem: View {
-    let label: String
-    let value: String
-    let icon: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(DesignTokens.mutedInk)
-                Text(label)
-                    .font(.system(size: 8, weight: .medium))
-                    .foregroundStyle(DesignTokens.mutedInk)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-            }
-            Text(value)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(DesignTokens.ink)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-        }
-        .padding(.horizontal, 9)
-        .frame(maxWidth: .infinity, minHeight: 45, alignment: .leading)
-        .background(DesignTokens.glassSmoke, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
 private struct ResourceUsageSectionTitle: View {
     let title: String
-    let detail: String
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(title)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(DesignTokens.ink)
-            Spacer()
-            Text(detail)
-                .font(.system(size: 9, weight: .semibold, design: .rounded))
-                .foregroundStyle(DesignTokens.mutedInk)
-        }
+        Text(title)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(DesignTokens.ink)
     }
 }
 
@@ -774,7 +631,7 @@ private struct ResourceClaimDetailRow: View {
                     Text(claim.taskReference.isEmpty ? (claim.purpose ?? "未命名任务") : claim.taskReference)
                         .font(.system(size: 11, weight: .semibold))
                         .lineLimit(1)
-                    Text("\(claim.projectID) · \(claim.actorID)")
+                    Text(claim.projectID)
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .lineLimit(1)
@@ -784,15 +641,11 @@ private struct ResourceClaimDetailRow: View {
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(DesignTokens.ink)
                     .lineLimit(1)
-                Text(claim.stateLabel)
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(claim.state == "REJECTED" ? DesignTokens.danger : DesignTokens.interaction)
-                    .frame(width: 58, alignment: .trailing)
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("资源申请 \(claim.taskReference)")
-        .accessibilityValue("\(claim.stateLabel)，\(claim.quantities.compactLabel)")
+        .accessibilityLabel("当前使用 \(claim.taskReference)")
+        .accessibilityValue("\(claim.projectID)，\(claim.quantities.compactLabel)")
     }
 }
 
@@ -809,7 +662,7 @@ private struct ResourceLeaseDetailRow: View {
                     Text(lease.taskReference ?? lease.purpose ?? "未命名任务")
                         .font(.system(size: 11, weight: .semibold))
                         .lineLimit(1)
-                    Text("\(lease.projectID) · \(lease.actorID) · 到期 \(usageTimestamp(lease.expiresAt))")
+                    Text(lease.projectID)
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .lineLimit(1)
@@ -818,16 +671,13 @@ private struct ResourceLeaseDetailRow: View {
                 Text("\(lease.gpuIDs.count) GPU")
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(DesignTokens.ink)
-                Text(lease.stateLabel)
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(DesignTokens.success)
                 Button(action: release) {
-                    Label(store.releasingLeaseIDs.contains(lease.id) ? "归还中" : "归还", systemImage: "arrow.uturn.backward")
+                    Label(store.releasingLeaseIDs.contains(lease.id) ? "释放中" : "释放", systemImage: "arrow.uturn.backward")
                         .font(.system(size: 9, weight: .semibold))
                 }
                 .buttonStyle(SecondaryActionButtonStyle())
                 .disabled(!store.allowsMutations || store.releasingLeaseIDs.contains(lease.id))
-                .help(store.allowsMutations ? "归还资源；不会停止远端任务" : store.mutationUnavailableReason)
+                .help(store.allowsMutations ? "释放 GPU；不会停止任务" : store.mutationUnavailableReason)
             }
         }
         .accessibilityElement(children: .contain)
@@ -846,7 +696,7 @@ private struct ResourceRequestDetailRow: View {
                     Text(request.taskReference)
                         .font(.system(size: 11, weight: .semibold))
                         .lineLimit(1)
-                    Text("\(request.projectID) · \(request.actorID) · \(usageTimestamp(request.createdAt))")
+                    Text("\(request.projectID) · \(usageTimestamp(request.createdAt))")
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .lineLimit(1)
@@ -877,7 +727,7 @@ private struct ResourceReservationDetailRow: View {
                     Text(reservation.purpose ?? "预约资源")
                         .font(.system(size: 11, weight: .semibold))
                         .lineLimit(1)
-                    Text("\(reservation.projectID ?? "未标注项目") · \(reservation.actorID ?? "未标注 Agent") · \(usageTimestamp(reservation.startsAt))")
+                    Text("\(reservation.projectID ?? "未标注项目") · \(usageTimestamp(reservation.startsAt))")
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .lineLimit(1)
@@ -908,7 +758,7 @@ private struct ResourceActualDetailRow: View {
                     Text(actual.taskReference.isEmpty ? actual.id : actual.taskReference)
                         .font(.system(size: 11, weight: .semibold))
                         .lineLimit(1)
-                    Text("\(actual.projectID) · \(actual.actorID)")
+                    Text(actual.projectID)
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(DesignTokens.mutedInk)
                         .lineLimit(1)
@@ -918,14 +768,14 @@ private struct ResourceActualDetailRow: View {
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(DesignTokens.ink)
                     .lineLimit(1)
-                Text("实际 \(usageDuration(actual.actualDurationSeconds))")
+                Text("时长 \(usageDuration(actual.actualDurationSeconds))")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
             }
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("任务记录 \(actual.taskReference)")
-        .accessibilityValue("\(actual.quantities.compactLabel)，实际耗时 \(usageDuration(actual.actualDurationSeconds))")
+        .accessibilityValue("\(actual.quantities.compactLabel)，时长 \(usageDuration(actual.actualDurationSeconds))")
     }
 }
 
@@ -934,10 +784,10 @@ private struct ResourceUsageRecordShell<Content: View>: View {
 
     var body: some View {
         content
-            .padding(.horizontal, 12)
-            .frame(minHeight: 50)
-            .background(DesignTokens.surface, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+            .padding(.horizontal, 11)
+            .frame(minHeight: 44)
+            .background(DesignTokens.surface, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
     }
 }
 
@@ -946,10 +796,10 @@ private struct ResourceRecordIcon: View {
 
     var body: some View {
         Image(systemName: systemName)
-            .font(.system(size: 11, weight: .semibold))
+            .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(DesignTokens.mutedInk)
-            .frame(width: 28, height: 28)
-            .background(DesignTokens.mutedInk.opacity(0.09), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .frame(width: 25, height: 25)
+            .background(DesignTokens.mutedInk.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 }
 
@@ -957,6 +807,56 @@ private struct ResourceUsageIdentity {
     let projectID: String
     let actorID: String
     let taskReference: String
+}
+
+private extension ResourceQuantityRecord {
+    var hasResources: Bool {
+        cpuCores > 0 || memoryMiB > 0 || gpuCount > 0 || nodeCount > 0 || schedulerUnits > 0
+    }
+}
+
+private func resourceUsageStatusHelp(_ title: String) -> String {
+    switch title {
+    case "已分配": return "资源已归属，尚未检测到任务"
+    case "运行": return "已检测到任务"
+    default: return title
+    }
+}
+
+private func resourceUsageRequestIsPending(_ request: AllocationRequestRecord) -> Bool {
+    ["BLOCKED", "QUEUED", "PENDING_APPROVAL", "REQUESTED"].contains(request.state.uppercased())
+}
+
+private func resourceUsageReservationIsPending(_ reservation: ReservationRecord) -> Bool {
+    reservation.state.uppercased() == "PENDING"
+}
+
+private func resourceUsageClaimStatus(_ claim: ResourceClaimRecord) -> String {
+    if claim.runtimeState == "RUNNING" || claim.state == "RUNNING" { return "运行" }
+    if ["HELD", "ACTIVE"].contains(claim.state) { return "已分配" }
+    return claim.stateLabel
+}
+
+private func resourceUsageLeaseStatus(_ lease: LeaseRecord) -> String {
+    if lease.runtimeState == "RUNNING" { return "运行" }
+    if ["HELD", "ACTIVE"].contains(lease.state) { return "已分配" }
+    return lease.stateLabel
+}
+
+private func resourceUsageActiveTaskCount(snapshot: BrokerSnapshot) -> Int {
+    let linkedLeaseIDs = Set(snapshot.resourceClaims.flatMap(\.nativeLeaseIDs))
+    let activeClaims = snapshot.resourceClaims.filter {
+        ["HELD", "ACTIVE", "RUNNING"].contains($0.state) || $0.runtimeState == "RUNNING"
+    }
+    let claimTasks = activeClaims.map {
+        "\($0.projectID)\u{1F}\(normalizedTask($0.taskReference, purpose: $0.purpose))"
+    }
+    let legacyLeaseTasks = snapshot.leases
+        .filter { !linkedLeaseIDs.contains($0.id) }
+        .map {
+            "\($0.projectID)\u{1F}\(normalizedTask($0.taskReference, purpose: $0.purpose))"
+        }
+    return Set(claimTasks + legacyLeaseTasks).count
 }
 
 private func resourceUsageIdentities(snapshot: BrokerSnapshot) -> [ResourceUsageIdentity] {
@@ -978,7 +878,11 @@ private func resourceUsageIdentities(snapshot: BrokerSnapshot) -> [ResourceUsage
         )
     })
     identities.append(contentsOf: snapshot.requests.filter { !linkedRequestIDs.contains($0.id) }.map {
-        ResourceUsageIdentity(projectID: $0.projectID, actorID: $0.actorID, taskReference: normalizedTask($0.taskReference))
+        ResourceUsageIdentity(
+            projectID: $0.projectID,
+            actorID: $0.actorID,
+            taskReference: normalizedTask($0.taskReference)
+        )
     })
     identities.append(contentsOf: snapshot.reservations.map {
         ResourceUsageIdentity(
@@ -1076,9 +980,11 @@ private func makeResourceUsageGroups(snapshot: BrokerSnapshot, scope: ResourceUs
             actuals: bucket.actuals.sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
         )
     }
+    .filter { $0.visibleActivityCount > 0 }
     .sorted {
-        if $0.hasPendingWork != $1.hasPendingWork { return $0.hasPendingWork }
-        if $0.activityCount != $1.activityCount { return $0.activityCount > $1.activityCount }
+        if $0.visibleActivityCount != $1.visibleActivityCount {
+            return $0.visibleActivityCount > $1.visibleActivityCount
+        }
         return $0.title.localizedStandardCompare($1.title) == .orderedAscending
     }
 }

@@ -1,7 +1,7 @@
 # ServerPilot — Global Agent Scheduling Policy
 
 Use the local `serverpilot` MCP for server-compute coordination. Existing
-installations may still expose the compatible `gpu-broker` MCP name; its tool
+installations may still expose the compatible `serverpilot` MCP name; its tool
 schemas and ServerPilot's server instructions remain authoritative.
 
 A routine owner-scoped claim is allowed only when the task already records its
@@ -13,10 +13,11 @@ reference, and resource thresholds. Never infer missing inputs.
 1. When the task already records a `profile_id`, call `gpu_claim_profile`.
    Otherwise, when it records `project_id`, `gpu_count`, task reference, and
    every required CPU, memory, and VRAM threshold, call `gpu_claim`.
-2. A `queued` or null result grants nothing. Continue the *same* request with
-   `gpu_wait_for_claim` until it reaches `HELD` or `ACTIVE`, a terminal state,
-   or the task's timeout. Do not create duplicate requests or ask the human
-   again for an unchanged, already-approved contract.
+2. A claim returns a held or active lease immediately, or fails with
+   `no_capacity`. `no_capacity` creates no queue and grants no permission to
+   execute. Do not invent a wait/poll flow or bypass ServerPilot; report the
+   blocked result and retry only when the task's existing authorization and
+   execution policy call for a later attempt.
 3. Use only returned `lease.resources[]` for placement, including its
    `cuda_visible_devices` selector. Never infer a host, GPU index, CUDA
    selector, or free capacity from inventory, IP addresses, process lists, or a
@@ -33,6 +34,12 @@ service's availability projection is authoritative: stale, unknown, unmanaged,
 conflicting, or maintained resources are not allocatable. Agents must not turn
 `capacity - used` into a placement decision.
 
+When launched by Codex, the MCP adapter automatically derives the current task
+identity and `codex://threads/<uuid>` coordination URI. Coordination projections
+may return those URIs so other Agents can discover the owning Codex task. This
+metadata grants no lease authority and is not an App messaging or contact-link
+surface.
+
 ## CPU, memory, and human oversight
 
 For CPU/memory-only or mixed compute work, state the smallest explicit resource
@@ -42,7 +49,7 @@ candidates and use `resource_evaluate_plan` before `resource_claim`. A
 and observed demand; `resource_release` ends the claim. These tools coordinate
 resource ownership only and never run a remote command.
 
-Humans supervise through ServerPilot's resource, work, queue, and history
+Humans supervise through ServerPilot's resource, work, and history
 views. Agents should report the request/lease or scheduler job identifier,
 terminal state, and any blocked reason in the task outcome. They must not add,
 update, pause, resume, retire, drain, or reconfigure servers unless the current
@@ -52,8 +59,16 @@ caller-stable, non-empty `idempotency_key`; `owner_project_id` is attribution,
 not an Agent management permission. Pause moves `active` to `draining`, blocks
 new placement, and keeps collection and current leases running. Resume moves
 `draining` to `active`. Explicit retire is allowed only from `draining` once
-active leases and endpoint-pinned queued requests are clear; it retains identity
+active leases are clear; it retains identity
 and evidence. Deprecated `gpu_delete_server` is pause only and never auto-retires.
+
+Optional endpoint keepalive is another explicit administration state, not an
+automatic claim hook. When the current task authorizes use of a configured
+endpoint, call `gpu_set_keepalive(..., enabled=false)` before claiming it; after
+release, the Agent may explicitly call the same tool with `enabled=true`.
+Keepalive never listens for claims, preempts a workload, or resumes itself.
+The tool accepts only the boolean state and still requires the current-task
+`approval_ref` and caller-stable `idempotency_key` above.
 
 ## External schedulers
 
@@ -82,5 +97,5 @@ than bypassing ServerPilot via SSH, SQLite, inventory, remote probes, or
 `nvidia-smi`.
 
 The low-level request, activate, release-lease, and bind-workload tools are
-advanced compatibility tools. New work follows claim → wait → execute → bind →
-release.
+advanced compatibility tools. New work follows claim → execute → bind →
+release; a `no_capacity` claim stops that attempt without creating a queue.

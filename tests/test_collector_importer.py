@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from gpu_broker.collector import (
+from serverpilot.adapters import RAW_SSH_OBSERVATION_ADAPTER, RawSSHResult
+from serverpilot.collector import (
     COMBINED_QUERY,
     CollectionError,
     GPU_UNAVAILABLE,
@@ -20,10 +21,11 @@ from gpu_broker.collector import (
     parse_host_resources,
     parse_process_csv,
     parse_server_script_snapshot,
+    default_runner,
 )
-from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig
-from gpu_broker.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
-from gpu_broker.importer import import_servers_files, parse_ssh_command
+from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig
+from serverpilot.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
+from serverpilot.importer import import_servers_files, parse_ssh_command
 
 
 def test_gpu_and_process_csv_parser() -> None:
@@ -44,17 +46,56 @@ def test_gpu_and_process_csv_parser() -> None:
     assert parse_process_csv("No running processes found\n") == []
 
 
+def test_process_details_treats_invisible_pids_as_missing_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    inventory: InventoryConfig,
+) -> None:
+    async def fake_run_probe(*_args, **_kwargs) -> RawSSHResult:  # type: ignore[no-untyped-def]
+        return RawSSHResult(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(RAW_SSH_OBSERVATION_ADAPTER, "run_probe", fake_run_probe)
+
+    result = asyncio.run(
+        default_runner(
+            inventory.endpoints[0],
+            "process-details",
+            process_ids=(123,),
+        )
+    )
+
+    assert result == ""
+
+
+def test_process_details_keeps_other_nonzero_results_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    inventory: InventoryConfig,
+) -> None:
+    async def fake_run_probe(*_args, **_kwargs) -> RawSSHResult:  # type: ignore[no-untyped-def]
+        return RawSSHResult(returncode=1, stdout="", stderr="permission denied")
+
+    monkeypatch.setattr(RAW_SSH_OBSERVATION_ADAPTER, "run_probe", fake_run_probe)
+
+    with pytest.raises(CollectionError, match="permission denied"):
+        asyncio.run(
+            default_runner(
+                inventory.endpoints[0],
+                "process-details",
+                process_ids=(123,),
+            )
+        )
+
+
 def test_fake_collector_never_needs_a_shell(service, inventory) -> None:
     async def fake_runner(endpoint, command):  # type: ignore[no-untyped-def]
         assert endpoint.id == "endpoint-a"
         if command == COMBINED_QUERY:
             return (
-                "__GPU_BROKER_GPU__\n"
+                "__SERVERPILOT_GPU__\n"
                 "0, GPU-endpoint-a-0, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0\n"
-                "__GPU_BROKER_PROCESSES__\n"
-                "__GPU_BROKER_IDENTITY__\n"
+                "__SERVERPILOT_PROCESSES__\n"
+                "__SERVERPILOT_IDENTITY__\n"
                 "host-a\nboot-a\n"
-                "__GPU_BROKER_HOST_RESOURCES__\n"
+                "__SERVERPILOT_HOST_RESOURCES__\n"
                 "64\n262144 196608\n4.25\n1000 750\n"
             )
         raise AssertionError(f"unexpected command {command}")
@@ -70,6 +111,31 @@ def test_fake_collector_never_needs_a_shell(service, inventory) -> None:
     assert result["endpoint-b"]["error"] == "AssertionError"
 
 
+def test_hung_probe_timeout_is_recorded_as_endpoint_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    service,
+    inventory: InventoryConfig,
+) -> None:
+    async def fake_run_probe(*_args, **_kwargs) -> RawSSHResult:  # type: ignore[no-untyped-def]
+        raise TimeoutError("SSH observation timed out after 8 seconds for endpoint-a")
+
+    monkeypatch.setattr(RAW_SSH_OBSERVATION_ADAPTER, "run_probe", fake_run_probe)
+    collector = SSHCollector(inventory)
+
+    result = asyncio.run(
+        collector.collect_once(service, endpoints=[inventory.endpoints[0]], concurrency=1)
+    )
+    endpoint = service.snapshot(service.local_actor("human"))["data"]["endpoints"][0]
+
+    assert result == {"endpoint-a": {"error": "TimeoutError"}}
+    assert endpoint["monitor"]["status"] == "ERROR"
+    assert endpoint["monitor"]["last_attempt_at"] is not None
+    assert endpoint["monitor"]["last_success_at"] is None
+    assert endpoint["monitor"]["last_error"] == (
+        "TimeoutError: SSH observation timed out after 8 seconds for endpoint-a"
+    )
+
+
 def test_collector_keeps_cpu_only_endpoint_online_without_nvidia_runtime(
     service, inventory
 ) -> None:
@@ -77,12 +143,12 @@ def test_collector_keeps_cpu_only_endpoint_online_without_nvidia_runtime(
         assert endpoint.id == "endpoint-a"
         assert command == COMBINED_QUERY
         return (
-            "__GPU_BROKER_GPU__\n"
+            "__SERVERPILOT_GPU__\n"
             f"{GPU_UNAVAILABLE}\n"
-            "__GPU_BROKER_PROCESSES__\n"
-            "__GPU_BROKER_IDENTITY__\n"
+            "__SERVERPILOT_PROCESSES__\n"
+            "__SERVERPILOT_IDENTITY__\n"
             "cpu-host\ncpu-boot\n"
-            "__GPU_BROKER_HOST_RESOURCES__\n"
+            "__SERVERPILOT_HOST_RESOURCES__\n"
             "32\n131072 98304\n2.5\n"
         )
 
@@ -111,11 +177,11 @@ def test_collector_keeps_cpu_only_endpoint_online_when_nvidia_smi_returns_no_row
         assert endpoint.id == "endpoint-a"
         assert command == COMBINED_QUERY
         return (
-            "__GPU_BROKER_GPU__\n"
-            "__GPU_BROKER_PROCESSES__\n"
-            "__GPU_BROKER_IDENTITY__\n"
+            "__SERVERPILOT_GPU__\n"
+            "__SERVERPILOT_PROCESSES__\n"
+            "__SERVERPILOT_IDENTITY__\n"
             "cpu-host\ncpu-boot\n"
-            "__GPU_BROKER_HOST_RESOURCES__\n"
+            "__SERVERPILOT_HOST_RESOURCES__\n"
             "16\n65536 49152\n1.25\n"
         )
 

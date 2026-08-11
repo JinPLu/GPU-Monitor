@@ -3,7 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from gpu_broker.client import BrokerClient, BrokerClientError
+from serverpilot.client import BrokerClient, BrokerClientError
 
 
 def test_client_retries_a_transient_gateway_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -19,8 +19,8 @@ def test_client_retries_a_transient_gateway_error(monkeypatch) -> None:  # type:
         calls.append((args, kwargs))
         return next(responses)
 
-    monkeypatch.setattr("gpu_broker.client.httpx.request", request)
-    monkeypatch.setattr("gpu_broker.client.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("serverpilot.client.httpx.request", request)
+    monkeypatch.setattr("serverpilot.client.time.sleep", lambda _seconds: None)
 
     assert BrokerClient("http://127.0.0.1:8787").get("/api/v1/snapshot") == {
         "schema_version": "v1",
@@ -37,7 +37,7 @@ def test_client_patch_sends_endpoint_update_over_rest(monkeypatch) -> None:  # t
         calls.append((method, url, kwargs))
         return httpx.Response(200, json={"schema_version": "v1", "endpoint": {"id": "server-a"}})
 
-    monkeypatch.setattr("gpu_broker.client.httpx.request", request)
+    monkeypatch.setattr("serverpilot.client.httpx.request", request)
     response = BrokerClient("http://127.0.0.1:8787", actor="endpoint-admin").patch(
         "/api/v1/endpoints/server-a",
         {"ssh_user": "gpu"},
@@ -51,7 +51,7 @@ def test_client_patch_sends_endpoint_update_over_rest(monkeypatch) -> None:  # t
             "http://127.0.0.1:8787/api/v1/endpoints/server-a",
             {
                 "headers": {
-                    "X-GPU-Broker-Actor": "endpoint-admin",
+                    "X-ServerPilot-Actor": "endpoint-admin",
                     "Idempotency-Key": "endpoint-update-key",
                 },
                 "json": {"ssh_user": "gpu"},
@@ -86,8 +86,8 @@ def test_control_plane_state_waits_for_minimum_revision(monkeypatch) -> None:  #
         paths.append((method, url, kwargs.get("params")))
         return next(responses)
 
-    monkeypatch.setattr("gpu_broker.client.httpx.request", request)
-    monkeypatch.setattr("gpu_broker.client.time.sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr("serverpilot.client.httpx.request", request)
+    monkeypatch.setattr("serverpilot.client.time.sleep", lambda seconds: sleeps.append(seconds))
 
     result = BrokerClient("http://127.0.0.1:8787").control_plane_state(
         minimum_snapshot_revision=5,
@@ -114,7 +114,7 @@ def test_control_plane_state_rejects_revision_rollback(monkeypatch) -> None:  # 
     def request(*args, **kwargs):  # type: ignore[no-untyped-def]
         return next(responses)
 
-    monkeypatch.setattr("gpu_broker.client.httpx.request", request)
+    monkeypatch.setattr("serverpilot.client.httpx.request", request)
     client = BrokerClient("http://127.0.0.1:8787")
 
     assert client.control_plane_state()["snapshot_revision"] == 7
@@ -133,7 +133,7 @@ def test_control_plane_state_retains_observed_revision_after_minimum_timeout(
     )
 
     monkeypatch.setattr(
-        "gpu_broker.client.httpx.request",
+        "serverpilot.client.httpx.request",
         lambda *args, **kwargs: next(responses),
     )
     client = BrokerClient("http://127.0.0.1:8787")
@@ -172,7 +172,7 @@ def test_operational_read_aliases_project_from_state(monkeypatch) -> None:  # ty
         calls.append((method, url))
         return httpx.Response(200, json=_state(11, current))
 
-    monkeypatch.setattr("gpu_broker.client.httpx.request", request)
+    monkeypatch.setattr("serverpilot.client.httpx.request", request)
     client = BrokerClient("http://127.0.0.1:8787")
 
     assert client.endpoints()["data"] == [{"id": "server-a"}]

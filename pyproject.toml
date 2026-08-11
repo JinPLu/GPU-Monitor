@@ -3,7 +3,7 @@ requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gpu-broker"
+name = "serverpilot"
 version = "1.4.0"
 description = "ServerPilot: agent-coordinated server compute scheduling with human supervision."
 readme = "README.md"
@@ -47,17 +47,16 @@ dev = [
 ]
 
 [project.scripts]
-gpu-broker = "gpu_broker.cli:app"
-gpu-broker-mcp = "gpu_broker.mcp_server:main"
-serverpilot = "gpu_broker.cli:app"
-serverpilot-mcp = "gpu_broker.mcp_server:main"
-serverpilot-collect = "gpu_broker.server_collector:main"
+serverpilot = "serverpilot.cli:app"
+serverpilot-mcp = "serverpilot.mcp_server:main"
+serverpilot-collect = "serverpilot.server_collector:main"
+serverpilot-keepalive = "serverpilot.server_keepalive:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-gpu_broker = [
+serverpilot = [
   "migrations/*.py",
   "migrations/*.mako",
   "migrations/versions/*.py",

@@ -10,13 +10,13 @@ import yaml
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
-from gpu_broker import API_CAPABILITIES, cli as cli_module, mcp_server
-from gpu_broker.api import create_app
-from gpu_broker.cli import app as cli_app
-from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
-from gpu_broker.mcp_server import mcp
-from gpu_broker.models import Endpoint
-from gpu_broker.schemas import EndpointUpsert, RequestCreate
+from serverpilot import API_CAPABILITIES, cli as cli_module, mcp_server
+from serverpilot.api import create_app
+from serverpilot.cli import app as cli_app
+from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
+from serverpilot.mcp_server import mcp
+from serverpilot.models import Endpoint
+from serverpilot.schemas import EndpointUpsert, RequestCreate
 from tests.helpers import observation, process_for_gpu
 
 
@@ -63,7 +63,7 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert '/ui/identities' in home.text
     assert '/ui/projects' not in home.text
     assert 'name="purpose"' not in home.text
-    headers = {"X-GPU-Broker-Actor": "test-agent", "Idempotency-Key": "api-key"}
+    headers = {"X-ServerPilot-Actor": "test-agent", "Idempotency-Key": "api-key"}
     payload = {
         "project_id": "project-a",
         "task_ref": "api-request",
@@ -76,42 +76,42 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
             "min_total_vram_mib": 80 * 1024,
         },
     }
-    first = client.post("/api/v1/requests", json=payload, headers=headers)
-    second = client.post("/api/v1/requests", json=payload, headers=headers)
+    first = client.post("/api/v1/claims", json=payload, headers=headers)
+    second = client.post("/api/v1/claims", json=payload, headers=headers)
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json()
     assert first.json()["request"]["duration_seconds"] == 8 * 60 * 60
-    snapshot = client.get("/api/v1/snapshot", headers={"X-GPU-Broker-Actor": "test-agent"})
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "test-agent"})
     assert snapshot.status_code == 200
     assert snapshot.json()["data"]["gpus"][0]["state"] == "HELD"
     capabilities = client.get("/health/live").json()["capabilities"]
     assert capabilities[: len(API_CAPABILITIES)] == list(API_CAPABILITIES)
     assert "endpoint_deletion" in capabilities
-    assert {"endpoint_update", "endpoint_pause_resume", "endpoint_retirement"}.issubset(
+    assert {"endpoint_update", "endpoint_retirement", "endpoint_keepalive"}.issubset(
         capabilities
     )
     compact = client.get(
         "/api/v1/gpus?compact=true",
-        headers={"X-GPU-Broker-Actor": "test-agent"},
+        headers={"X-ServerPilot-Actor": "test-agent"},
     )
     assert compact.status_code == 200
     assert "processes" not in compact.json()["data"][0]
     assert compact.json()["data"][0]["owner"] == "test-agent"
     history = client.get(
         f"/api/v1/gpus/{compact.json()['data'][0]['id']}/history?window_seconds=3600&points=120",
-        headers={"X-GPU-Broker-Actor": "test-agent"},
+        headers={"X-ServerPilot-Actor": "test-agent"},
     )
     assert history.status_code == 200
     assert history.json()["data"]["point_count"] <= 120
     endpoint_history = client.get(
         "/api/v1/endpoints/endpoint-a/history?window_seconds=3600&points=120",
-        headers={"X-GPU-Broker-Actor": "test-agent"},
+        headers={"X-ServerPilot-Actor": "test-agent"},
     )
     assert endpoint_history.status_code == 200
     assert endpoint_history.json()["data"]["point_count"] <= 120
     invalid_endpoint_history = client.get(
         "/api/v1/endpoints/endpoint-a/history?window_seconds=300",
-        headers={"X-GPU-Broker-Actor": "test-agent"},
+        headers={"X-ServerPilot-Actor": "test-agent"},
     )
     assert invalid_endpoint_history.status_code == 422
     requests = client.get("/ui/requests")
@@ -139,7 +139,7 @@ def test_snapshot_api_uses_latest_complete_gpu_set(tmp_path: Path, inventory) ->
     service.ingest_observation(observation(gpu_uuids=["GPU-new-0", "GPU-stays"]))
 
     client = TestClient(app)
-    snapshot = client.get("/api/v1/snapshot", headers={"X-GPU-Broker-Actor": "test-agent"})
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "test-agent"})
 
     assert snapshot.status_code == 200
     data = snapshot.json()["data"]
@@ -166,7 +166,7 @@ def test_control_plane_state_api_exposes_current_and_history_contract(
     app.state.service.ingest_observation(observation(count=1))
     client = TestClient(app)
 
-    response = client.get("/api/v1/state", headers={"X-GPU-Broker-Actor": "test-agent"})
+    response = client.get("/api/v1/state", headers={"X-ServerPilot-Actor": "test-agent"})
 
     assert response.status_code == 200
     payload = response.json()
@@ -227,7 +227,7 @@ def test_lease_api_suppresses_executable_resources_when_claimed_gpu_absent(
     service.ingest_observation(observation(gpu_uuids=["GPU-new"]))
 
     client = TestClient(app)
-    leases = client.get("/api/v1/leases", headers={"X-GPU-Broker-Actor": "test-agent"})
+    leases = client.get("/api/v1/leases", headers={"X-ServerPilot-Actor": "test-agent"})
 
     assert leases.status_code == 200
     lease = leases.json()["data"][0]
@@ -249,7 +249,7 @@ def test_workload_profile_rest_and_gui_claim(tmp_path: Path, inventory) -> None:
     service = app.state.service
     service.ingest_observation(observation(count=1))
     client = TestClient(app)
-    headers = {"X-GPU-Broker-Actor": "profile-agent", "Idempotency-Key": "profile-upsert"}
+    headers = {"X-ServerPilot-Actor": "profile-agent", "Idempotency-Key": "profile-upsert"}
     profile = {
         "id": "api-eval-1gpu",
         "project_id": "project-a",
@@ -269,7 +269,7 @@ def test_workload_profile_rest_and_gui_claim(tmp_path: Path, inventory) -> None:
 
     listed = client.get(
         "/api/v1/workload-profiles?project_id=project-a",
-        headers={"X-GPU-Broker-Actor": "profile-agent"},
+        headers={"X-ServerPilot-Actor": "profile-agent"},
     )
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["data"]] == ["api-eval-1gpu"]
@@ -316,7 +316,7 @@ def test_api_claim_starts_held_without_a_duration_estimate(tmp_path: Path, inven
             "purpose": "api-claim",
             "constraints": {"gpu_count": 1},
         },
-        headers={"X-GPU-Broker-Actor": "claim-agent", "Idempotency-Key": "api-claim"},
+        headers={"X-ServerPilot-Actor": "claim-agent", "Idempotency-Key": "api-claim"},
     )
     assert claimed.status_code == 200
     assert claimed.json()["request"]["state"] == "LEASED"
@@ -357,7 +357,7 @@ def test_api_claim_bootstraps_an_empty_project_registry(tmp_path: Path) -> None:
             "purpose": "unregistered-project",
             "constraints": {"gpu_count": 1},
         },
-        headers={"X-GPU-Broker-Actor": "claim-agent", "Idempotency-Key": "claim-empty-projects"},
+        headers={"X-ServerPilot-Actor": "claim-agent", "Idempotency-Key": "claim-empty-projects"},
     )
 
     assert claimed.status_code == 200
@@ -408,10 +408,10 @@ def test_general_resource_rest_contracts_delegate_and_fail_closed(tmp_path: Path
     service.record_resource_run_actual = record_resource_run_actual  # type: ignore[attr-defined]
 
     client = TestClient(app)
-    headers = {"X-GPU-Broker-Actor": "resource-agent", "Idempotency-Key": "resource-key"}
+    headers = {"X-ServerPilot-Actor": "resource-agent", "Idempotency-Key": "resource-key"}
     providers = client.get(
         "/api/v1/resource-providers?provider_type=host-capacity&enabled=true",
-        headers={"X-GPU-Broker-Actor": "resource-agent"},
+        headers={"X-ServerPilot-Actor": "resource-agent"},
     )
     assert providers.status_code == 200
     assert providers.json()["data"][0] == {
@@ -421,13 +421,13 @@ def test_general_resource_rest_contracts_delegate_and_fail_closed(tmp_path: Path
     }
     monitor = client.get(
         "/api/v1/resource-monitor?project_id=project-a",
-        headers={"X-GPU-Broker-Actor": "resource-agent"},
+        headers={"X-ServerPilot-Actor": "resource-agent"},
     )
     assert monitor.status_code == 200
     assert monitor.json()["data"]["project_id"] == "project-a"
     missing = client.get(
         "/api/v1/resource-claims",
-        headers={"X-GPU-Broker-Actor": "resource-agent"},
+        headers={"X-ServerPilot-Actor": "resource-agent"},
     )
     assert missing.status_code == 200
     assert missing.json()["data"] == []
@@ -513,7 +513,7 @@ def test_coordination_api_and_observed_binding(tmp_path: Path, inventory) -> Non
     service = app.state.service
     service.ingest_observation(observation(count=1))
     client = TestClient(app)
-    claim_headers = {"X-GPU-Broker-Actor": "coordination-agent", "Idempotency-Key": "coordination-claim"}
+    claim_headers = {"X-ServerPilot-Actor": "coordination-agent", "Idempotency-Key": "coordination-claim"}
     claimed = client.post(
         "/api/v1/claims",
         json={
@@ -532,20 +532,20 @@ def test_coordination_api_and_observed_binding(tmp_path: Path, inventory) -> Non
     bound = client.post(
         f"/api/v1/leases/{lease_id}/bind-observed-workload",
         json={},
-        headers={"X-GPU-Broker-Actor": "coordination-agent", "Idempotency-Key": "coordination-bind"},
+        headers={"X-ServerPilot-Actor": "coordination-agent", "Idempotency-Key": "coordination-bind"},
     )
     assert bound.status_code == 200
     assert bound.json()["lease"]["workloads"][0]["run_id"] == f"lease:{lease_id}"
     coordination = client.get(
         "/api/v1/coordination",
-        headers={"X-GPU-Broker-Actor": "coordination-agent"},
+        headers={"X-ServerPilot-Actor": "coordination-agent"},
     )
     assert coordination.status_code == 200
     capacity = coordination.json()["data"]["servers"][0]["capacity"]
     assert capacity["available_cpu_cores"] == 60.0
     assert capacity["available_memory_mib"] == 196_608
     assert capacity["total_vram_mib"] == 100_000
-    board = client.get("/api/v1/coordination", headers={"X-GPU-Broker-Actor": "coordination-agent"})
+    board = client.get("/api/v1/coordination", headers={"X-ServerPilot-Actor": "coordination-agent"})
     assert board.status_code == 200
     assert board.json()["data"]["servers"][0]["capacity"]["managed_running_gpus"] == 1
     assert board.json()["data"]["leases"][0]["activity"] == "running"
@@ -565,7 +565,7 @@ def test_endpoint_project_grant_route_is_not_exposed(tmp_path: Path, inventory) 
     response = client.post(
         "/api/v1/endpoints/endpoint-a/projects",
         json={"project_id": "storyboard"},
-        headers={"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "unused"},
+        headers={"X-ServerPilot-Actor": "endpoint-admin", "Idempotency-Key": "unused"},
     )
     assert response.status_code == 404
 
@@ -584,7 +584,7 @@ def test_collector_observation_ingestion_is_not_a_public_actor_route(tmp_path: P
     response = client.post(
         "/api/v1/internal/observations",
         json=observation(count=1).model_dump(mode="json"),
-        headers={"X-GPU-Broker-Actor": "arbitrary-actor"},
+        headers={"X-ServerPilot-Actor": "arbitrary-actor"},
     )
     assert response.status_code == 404
 
@@ -608,24 +608,24 @@ def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> 
 
     missing_key = client.delete(
         "/api/v1/endpoints/endpoint-b",
-        headers={"X-GPU-Broker-Actor": "endpoint-admin"},
+        headers={"X-ServerPilot-Actor": "endpoint-admin"},
     )
     assert missing_key.status_code == 422
     assert missing_key.json()["error"]["code"] == "idempotency_key_required"
 
-    headers = {"X-GPU-Broker-Actor": "endpoint-admin", "Idempotency-Key": "delete-endpoint-b"}
+    headers = {"X-ServerPilot-Actor": "endpoint-admin", "Idempotency-Key": "delete-endpoint-b"}
     deleted = client.delete("/api/v1/endpoints/endpoint-b", headers=headers)
     retried = client.delete("/api/v1/endpoints/endpoint-b", headers=headers)
 
     assert deleted.status_code == 200
     assert retried.json() == deleted.json()
     assert deleted.json()["endpoint_id"] == "endpoint-b"
-    listed = client.get("/api/v1/endpoints", headers={"X-GPU-Broker-Actor": "endpoint-admin"})
+    listed = client.get("/api/v1/endpoints", headers={"X-ServerPilot-Actor": "endpoint-admin"})
     endpoints = {endpoint["id"]: endpoint for endpoint in listed.json()["data"]}
     assert endpoints["endpoint-b"]["lifecycle_state"] == "draining"
 
 
-def test_endpoint_rest_lifecycle_uses_explicit_create_update_pause_resume_retire(
+def test_endpoint_rest_lifecycle_uses_explicit_create_update_and_retire(
     tmp_path: Path, inventory
 ) -> None:
     inventory_path = tmp_path / "inventory.yaml"
@@ -638,7 +638,7 @@ def test_endpoint_rest_lifecycle_uses_explicit_create_update_pause_resume_retire
         )
     )
     client = TestClient(app)
-    actor = {"X-GPU-Broker-Actor": "endpoint-admin"}
+    actor = {"X-ServerPilot-Actor": "endpoint-admin"}
     endpoint = {
         "id": "endpoint-lifecycle",
         "host": "127.0.0.1",
@@ -668,37 +668,6 @@ def test_endpoint_rest_lifecycle_uses_explicit_create_update_pause_resume_retire
     )
     assert updated.status_code == 200
     assert updated.json()["endpoint"]["ssh_alias"] == "lab-script"
-    paused = client.post(
-        "/api/v1/endpoints/endpoint-lifecycle/pause",
-        json={},
-        headers={**actor, "Idempotency-Key": "endpoint-pause"},
-    )
-    assert paused.status_code == 200
-    assert paused.json()["endpoint"]["lifecycle_state"] == "draining"
-    paused_again = client.post(
-        "/api/v1/endpoints/endpoint-lifecycle/pause",
-        json={},
-        headers={**actor, "Idempotency-Key": "endpoint-pause-again"},
-    )
-    assert paused_again.json()["changed"] is False
-    resumed = client.post(
-        "/api/v1/endpoints/endpoint-lifecycle/resume",
-        json={},
-        headers={**actor, "Idempotency-Key": "endpoint-resume"},
-    )
-    assert resumed.status_code == 200
-    assert resumed.json()["endpoint"]["lifecycle_state"] == "active"
-    active_retire = client.post(
-        "/api/v1/endpoints/endpoint-lifecycle/retire",
-        json={},
-        headers={**actor, "Idempotency-Key": "endpoint-retire-active"},
-    )
-    assert active_retire.status_code == 409
-    client.post(
-        "/api/v1/endpoints/endpoint-lifecycle/pause",
-        json={},
-        headers={**actor, "Idempotency-Key": "endpoint-pause-before-retire"},
-    )
     retired = client.post(
         "/api/v1/endpoints/endpoint-lifecycle/retire",
         json={},
@@ -714,7 +683,7 @@ def test_endpoint_rest_lifecycle_uses_explicit_create_update_pause_resume_retire
     assert retired_update.status_code == 409
 
 
-def test_endpoint_delete_rest_route_preserves_maintenance_history(tmp_path: Path, inventory) -> None:
+def test_removed_maintenance_route_and_compatible_delete_lifecycle(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -725,7 +694,7 @@ def test_endpoint_delete_rest_route_preserves_maintenance_history(tmp_path: Path
         )
     )
     client = TestClient(app)
-    headers = {"X-GPU-Broker-Actor": "human", "Idempotency-Key": "endpoint-maintenance"}
+    headers = {"X-ServerPilot-Actor": "human", "Idempotency-Key": "endpoint-maintenance"}
     created = client.post(
         "/api/v1/maintenance",
         json={
@@ -736,17 +705,14 @@ def test_endpoint_delete_rest_route_preserves_maintenance_history(tmp_path: Path
         },
         headers=headers,
     )
-    assert created.status_code == 200
+    assert created.status_code == 405
 
     drained = client.delete(
         "/api/v1/endpoints/endpoint-b",
-        headers={"X-GPU-Broker-Actor": "human", "Idempotency-Key": "delete-maintained"},
+        headers={"X-ServerPilot-Actor": "human", "Idempotency-Key": "delete-maintained"},
     )
-
     assert drained.status_code == 200
-    assert drained.json()["history_retained"] is True
     assert drained.json()["endpoint"]["lifecycle_state"] == "draining"
-    assert created.json()["maintenance"]["id"]
 
 
 def test_project_creation_route_and_gui_are_not_exposed(tmp_path: Path, inventory) -> None:
@@ -764,7 +730,7 @@ def test_project_creation_route_and_gui_are_not_exposed(tmp_path: Path, inventor
     response = client.post(
         "/api/v1/projects",
         json={"id": "storyboard", "display_name": "Storyboard"},
-        headers={"X-GPU-Broker-Actor": "project-admin", "Idempotency-Key": "unused"},
+        headers={"X-ServerPilot-Actor": "project-admin", "Idempotency-Key": "unused"},
     )
     assert response.status_code == 405
     assert client.get("/ui/projects").status_code == 404
@@ -844,7 +810,7 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
     )
     assert removed_server.status_code == 200
     endpoints = {endpoint["id"]: endpoint for endpoint in service.list_endpoints(service.local_actor("human"))["data"]}
-    assert endpoints["click-server"]["lifecycle_state"] == "draining"
+    assert endpoints["click-server"]["lifecycle_state"] == "retired"
 
     switched = client.post("/ui/actor", data={"actor_id": "click-agent"}, follow_redirects=True)
     assert switched.status_code == 200
@@ -875,26 +841,20 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_scheduler_submit_once",
         "gpu_scheduler_job_status",
         "gpu_scheduler_cancel",
-        "gpu_request",
-        "gpu_request_status",
-        "gpu_cancel_request",
         "gpu_activate_lease",
         "gpu_renew_lease",
         "gpu_release_lease",
         "gpu_bind_workload",
         "gpu_bind_observed_workload",
-        "gpu_list_reservations",
         "gpu_history",
         "gpu_claim",
         "gpu_claim_profile",
         "gpu_release",
-        "gpu_schedule",
         "gpu_add_server",
         "gpu_update_server",
-        "gpu_pause_server",
-        "gpu_resume_server",
         "gpu_retire_server",
         "gpu_delete_server",
+        "gpu_set_keepalive",
         "resource_providers",
         "resource_monitor",
         "resource_claims",
@@ -906,8 +866,7 @@ def test_mcp_exposes_required_tools() -> None:
     assert "gpu_grant_server_project" not in names
     assert "gpu_scheduler_upload" not in names
     assert "gpu_scheduler_transfer_status" not in names
-    for name in ("gpu_claim", "gpu_schedule"):
-        assert "project_id" in by_name[name].inputSchema["required"]
+    assert "project_id" in by_name["gpu_claim"].inputSchema["required"]
     assert {"agent_name", "project_id", "task", "gpu_count"}.issubset(
         by_name["gpu_claim"].inputSchema["required"]
     )
@@ -920,8 +879,6 @@ def test_mcp_exposes_required_tools() -> None:
     for name in (
         "gpu_add_server",
         "gpu_update_server",
-        "gpu_pause_server",
-        "gpu_resume_server",
         "gpu_retire_server",
         "gpu_delete_server",
     ):
@@ -976,16 +933,12 @@ def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch
     mcp_server.gpu_update_server(
         "agent", "server-a", "approved-task", "update-stable", ssh_user="gpu"
     )
-    mcp_server.gpu_pause_server("agent", "server-a", "approved-task", "pause-stable")
-    mcp_server.gpu_resume_server("agent", "server-a", "approved-task", "resume-stable")
     mcp_server.gpu_retire_server("agent", "server-a", "approved-task", "retire-stable")
     mcp_server.gpu_delete_server("agent", "server-a", "approved-task", "delete-stable")
     assert calls[1:] == [
         ("PATCH", "/api/v1/endpoints/server-a", {"ssh_user": "gpu"}, "update-stable"),
-        ("POST", "/api/v1/endpoints/server-a/pause", {}, "pause-stable"),
-        ("POST", "/api/v1/endpoints/server-a/resume", {}, "resume-stable"),
         ("POST", "/api/v1/endpoints/server-a/retire", {}, "retire-stable"),
-        ("POST", "/api/v1/endpoints/server-a/pause", {}, "delete-stable"),
+        ("POST", "/api/v1/endpoints/server-a/retire", {}, "delete-stable"),
     ]
 
 
@@ -1351,7 +1304,7 @@ def test_app_starts_with_projects_and_no_endpoints(tmp_path: Path) -> None:
     assert home.status_code == 200
     assert "添加第一台 GPU 服务器" in home.text
     assert "ssh -p 22 gpu@gpu-host.example.com" in home.text
-    response = client.get("/api/v1/endpoints", headers={"X-GPU-Broker-Actor": "agent"})
+    response = client.get("/api/v1/endpoints", headers={"X-ServerPilot-Actor": "agent"})
     assert response.status_code == 200
     assert response.json()["data"] == []
 

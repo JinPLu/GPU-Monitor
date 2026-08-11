@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from gpu_broker.schemas import EndpointObservation, ProcessInput, TelemetryInput
+from serverpilot.schemas import EndpointObservation, ProcessInput, TelemetryInput
 
 
 def observation(

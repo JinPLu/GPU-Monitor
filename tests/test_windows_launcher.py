@@ -10,7 +10,7 @@ import yaml
 
 def load_launcher():
     path = Path(__file__).resolve().parents[1] / "desktop" / "windows_launcher.py"
-    spec = importlib.util.spec_from_file_location("gpu_broker_windows_launcher", path)
+    spec = importlib.util.spec_from_file_location("serverpilot_windows_launcher", path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -25,15 +25,15 @@ def test_windows_runtime_paths_use_local_app_data(tmp_path: Path) -> None:
     paths = launcher.runtime_paths(
         {
             "LOCALAPPDATA": str(tmp_path),
-            "GPU_BROKER_INVENTORY": "",
-            "GPU_BROKER_DATABASE_URL": "",
-            "GPU_BROKER_BIND_PORT": "8899",
+            "SERVERPILOT_INVENTORY": "",
+            "SERVERPILOT_DATABASE_URL": "",
+            "SERVERPILOT_BIND_PORT": "8899",
         }
     )
 
-    assert paths.data_dir == tmp_path / "GPU Broker"
-    assert paths.inventory_path == tmp_path / "GPU Broker" / "inventory.yaml"
-    assert paths.database_url.endswith("/GPU Broker/state/gpu-broker.sqlite3")
+    assert paths.data_dir == tmp_path / "ServerPilot"
+    assert paths.inventory_path == tmp_path / "ServerPilot" / "inventory.yaml"
+    assert paths.database_url.endswith("/ServerPilot/state/serverpilot.sqlite3")
     assert paths.port == 8899
     assert paths.external_inventory is False
 
@@ -42,10 +42,10 @@ def test_windows_runtime_paths_reject_invalid_port() -> None:
     launcher = load_launcher()
 
     with pytest.raises(launcher.LauncherError):
-        launcher.runtime_paths({"GPU_BROKER_BIND_PORT": "not-a-port"})
+        launcher.runtime_paths({"SERVERPILOT_BIND_PORT": "not-a-port"})
 
     with pytest.raises(launcher.LauncherError):
-        launcher.runtime_paths({"GPU_BROKER_BIND_PORT": "70000"})
+        launcher.runtime_paths({"SERVERPILOT_BIND_PORT": "70000"})
 
 
 def test_windows_launcher_creates_default_inventory_without_overwriting(tmp_path: Path) -> None:

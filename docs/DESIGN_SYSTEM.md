@@ -1,145 +1,175 @@
-# ServerPilot — Native macOS Material Design System
+# ServerPilot 桌面设计系统
 
-## Product context
+本文是 macOS App 的唯一界面契约。目标不是展示最多字段，而是让用户在较低认知负担下完成三件事：**看清资源、申请资源、追溯归属**。
 
-- Subject: a single-user local control plane for managing compute resources across several servers, projects, and Agents.
-- Primary user: one person who needs to see available GPU/CPU capacity, decide which project or Agent receives it, and resolve blocked work.
-- Not a multi-user product: actor IDs are local audit and Agent labels, not people, seats, teams, or accounts.
-- Single job of the overview: show what compute is available and which project or Agent needs attention, then make the next safe action obvious.
-- Primary desktop experience: native macOS SwiftUI/AppKit, not a browser page and not a WKWebView skin. The loopback Web/Jinja/JavaScript surface remains a supported Windows desktop compatibility path and must keep using the same REST/domain contracts.
-- Reference: Apple Home for macOS for spatial grouping, Apple's official [Color](https://developer.apple.com/design/human-interface-guidelines/color), [Materials](https://developer.apple.com/design/human-interface-guidelines/materials), and [Sidebars](https://developer.apple.com/design/human-interface-guidelines/sidebars) guidance, plus the concrete neutral/accent/spacing tokens summarized by [Open Design's Apple system](https://open-design.ai/zh/plugins/design-system-apple/).
+## 1. 产品边界
 
-## Design decision
+- 单用户、本机控制面、多服务器、多 Agent。
+- App 是观察与操作界面，不是聊天工具，也不是任务执行器。
+- 项目与任务是公开 GUI 中唯一的工作身份。GUI 不展示 Agent、actor、owner、协调 URI、收件箱或消息入口。
+- `codex://threads/<uuid>` 只存在于 MCP 协调数据中，不进入 GUI，也不授予权限。
+- 资源真相来自同一 REST 状态；界面不得自行用“容量减用量”推算可分配资源。
 
-Preserve the attractive native direction already established: a translucent, calm, room-based Apple Home style translated to an operations console. Product fixes should mature the interaction and copy without flattening the interface into a plain engineering table. The current composition is **Spatial Operations Desk**: an Apple-neutral graphite/fog field over the warm compute-studio image, with transparent material layers for navigation, collection, and detail.
+## 2. 视觉原则
 
-### Signature
+### 仅浅色
 
-**Spatial Operations Desk** — the background keeps the source image's cool daylight and warm practical-light contrast, then softens it behind native material. Foreground panels use neutral fog-white or graphite glass so the image passes through without competing with data. Operational meaning comes from content density, semantic color, icons, and text. Do not use drifting orbs, parallax, animated gradients, or health-tinted haze as the primary state signal.
+- App 固定使用浅色外观，不跟随系统深色模式。
+- 主窗口与主要容器使用不透明表面。禁止全窗毛玻璃、实时模糊、背景图片、渐变光晕和大阴影。
+- 页面背景为低亮度中性灰，内容表面略亮；层级依靠间距、字重和细分隔线，而不是堆叠卡片。
+- 控件优先使用原生 macOS 交互与 SF Symbols，不创建另一套图标语言。
 
-## Tokens
+### Beszel 式信息密度
 
-### Palette
+- 资源总览以紧凑、可排序的表格为主，不改成大卡片阵列。
+- 正常状态让数字和短标签承担信息；解释性句子只用于错误、空状态和不可逆确认。
+- 一行显示一个服务器。列宽由整张表统一决定，不允许单行变形或局部切换布局。
+- 主要值完整优先，次要说明才可截断。悬停帮助与辅助功能名称保留完整语义。
 
-| Token | Native source | Use |
+## 3. 设计令牌
+
+### 颜色
+
+| 用途 | 颜色 | 规则 |
 | --- | --- | --- |
-| Primary label | `NSColor.labelColor` | titles and primary text |
-| Secondary label | `NSColor.secondaryLabelColor` | metadata and helper text |
-| Ambient field | Apple fog `#F5F5F7` in light appearance; neutral graphite near `#1D1D1F` in dark appearance | unified app field behind the source image |
-| Glass surface | native material plus a light neutral tint, not an opaque custom board | navigation, collections, detail, and command island |
-| Interaction | `NSColor.controlAccentColor` | app icon, selected navigation, primary button, lease/GPU icons, meters, focus, and global tint |
-| Healthy | `systemGreen` | available / healthy state |
-| Attention | `systemOrange` | waiting / stale state |
-| Destructive | `systemRed` | error, conflict, confirmed destructive action |
+| 正常 / 低压力 | `#3EB866` | 状态点与低压力进度柱 |
+| 注意 / 中压力 | `#F2B100` | 状态点与中压力进度柱 |
+| 错误 / 高压力 | `#FB2C37` | 状态点、错误与高压力进度柱 |
+| 交互 | macOS `controlAccentColor` | 选中、主按钮、焦点和链接 |
+| 主文字 | `labelColor` | 标题、SSH、项目、任务、型号和数字 |
+| 次文字 | `secondaryLabelColor` | 单位、辅助状态、时间和空值说明 |
+| 轨道 | 中性浅灰 | 所有资源进度柱的未使用部分 |
 
-Use dynamic system colors for text, interaction, and semantic states so vibrancy, contrast, dark appearance, and the user's macOS accent preference remain coherent. System blue is the default Apple-like interaction reading, while `controlAccentColor` preserves platform behavior. Green, orange, and red are narrowed to semantic state only. Do not use `controlBackgroundColor` or opaque white fills as broad desk surfaces; light appearance should read as fog-white material, while dark appearance should read as neutral graphite material rather than blue-black or tinted “tech” panels. Color is semantic support, never the only state signal.
+数字保持中性色。压力颜色只放在状态点和进度柱上。颜色必须同时配合文字、图标或数值，不能独自传达状态。
 
-### Typography
+### 字体
 
-- Display: SF Pro Display / `system`, 28–32pt semibold for page title or overview hero only.
-- Body: SF Pro Text / `system`, 13–15pt with 19–22pt leading.
-- Utility and data: SF Mono / `monospaced`, 11–13pt for SSH commands, GPU IDs, timestamps, and numeric meters.
-- Use Chinese SF system fallback (PingFang SC) naturally; no decorative or web font pairings.
-- Dense data gets tabular figures. Page titles use -0.02em visual tracking; utility text stays normal.
+- 页面标题：系统字体 20–22 pt，semibold。
+- 表头：系统字体 12 pt，semibold，必须明显高于辅助文字。
+- 行主值：系统字体 12 pt，medium 或 semibold。
+- 行辅助值：系统字体 9.5–10.5 pt，regular。
+- SSH、GPU ID、时间和数字：系统等宽字体或 tabular figures。
+- 禁止为了“丰富”而给同一概念换词。
 
-### Shape, spacing, material
+### 尺寸
 
-- 8pt base grid. Typical horizontal rhythm: 16 / 20 / 24 / 32pt.
-- 12pt radius for chips and compact controls; 16pt for cards; 20pt for major grouped surfaces.
-- Native material: navigation, collections, and details live in place on same-hue transparent material, with three depth levels: navigation is the deepest translucent layer, collections sit on a denser translucent layer, and details or destructive confirmations use the clearest/highest-contrast glass layer. Do not create a single full-board foreground plate; use `.thickMaterial` only where contrast needs support, and no blanket blur on opaque content.
-- Hairline separators are weaker than the glass fill and should read only as edge hints, not frames.
-- Outer strokes and shadows are weak. Hierarchy comes from transparency, content density, and semantic color, not from heavy outlines, white fills, or hard drop shadows.
-- The bottom command island floats inside the desk as the primary action surface. It should feel attached to the current page, not like a separate alert or another sidebar.
+- 8 pt 基础网格。
+- 页面边距 16–20 pt；区块间距 12–16 pt；行内间距 6–10 pt。
+- 表格行高紧凑，但整行点击区域不得小于 36 pt。
+- 指标进度柱约 40 pt 宽，和数字并排。
+- 容器圆角 10–12 pt，边框为 1 px 中性细线。无重阴影。
 
-### Icons
+## 4. 信息架构
 
-- Use SF Symbols only, in one rounded-outline / hierarchical rendering mode.
-- Standard icon size: 16pt in navigation, 18–20pt on cards, 22pt in primary status tiles.
-- Icon color matches the semantic state only inside a soft, rounded 32pt tile; otherwise it inherits the text hierarchy.
-- No mixed icon families, emoji, bespoke glyphs, or multi-colour illustration style.
-- Custom button styles read SwiftUI's native `isEnabled` environment so disabled controls lose emphasis instead of retaining a bright interaction fill.
+侧栏只保留三个一级页面：
 
-### Motion
+1. **服务器**
+2. **使用情况**
+3. **设置**
 
-- One coherent 160–220ms ease-out transition for selection, panel expansion, and status refresh.
-- Availability-state updates crossfade; never pulse constantly.
-- Collection rows and tiles may lift or tint subtly on hover. Respect Reduce Motion by disabling nonessential movement while keeping color/opacity feedback. No decorative animated gradients, drifting blobs, or parallax.
+窗口标题、侧栏选中项和页面标题不得重复表达同一信息。工具栏只保留当前页的必要动作。
 
-## Application architecture and layout
+## 5. 服务器页
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ macOS unified titlebar + clear page title + command controls             │
-├──────────────┬───────────────────────────────────────────────────────────┤
-│ frosted      │ unified warm gray smoke-brown field with soft texture     │
-│ sidebar      │                                                           │
-│ ServerPilot   │ 总览 [summary] [attention] [freshness]                   │
-│ 总览          │ 服务器 [server collection] → [server detail]             │
-│ 服务器        │ 项目与 Agent [allocation collection] → [detail]          │
-│ 项目与 Agent  │                                                           │
-│ 本机设置      │                                      [command island]    │
-└──────────────┴───────────────────────────────────────────────────────────┘
-```
+### 顶部
 
-- Sidebar: 236–246pt regular system material; grouped navigation for real pages only; selection uses the macOS control accent tint; the live-connection state sits compactly at the foot without another floating card.
-- Title bar: one crisp title, not a glassy low-contrast label. The local audit/Agent label is a compact control on the right; it must never read as a user switcher.
-- Window: the initial size must fit within the visible screen area, accounting for menu bar and Dock. Prefer a polished first launch over a fixed oversized window.
-- Main region: the neutral ambient background fills the whole window, and the main content shares the window boundary. Preserve the compute-studio image's blue daylight and amber practical light at restrained saturation, following Apple Home's use of real rooms behind material. There is no outer margin, 30pt full-board corner radius, full-board stroke, or large desk shadow. Background texture should pass through every foreground layer; do not place opaque white or `controlBackgroundColor` boards over it, and do not remove the atmospheric visual layer when fixing interactions.
-- Overview: a first-screen summary with available, allocated, occupied, and needs-attention counts; include concrete attention rows when action is needed instead of a duplicate quick-action strip. Show at most eight exception rows on the overview, then provide one clearly labelled jump to the server list so an exception storm cannot bury server and project context.
-- Command island: refresh, add server, and request GPU are the global command owners. Avoid repeating the same quick actions in both sidebar and overview.
-- Top state chips or hero stats: compact, rounded, icon-led status items in one line. Use real fleet state: Available, Allocated, Occupied, Needs attention.
-- Server list: use collection + detail. Treat each endpoint as a “room” group in the collection. The primary identity is the exact `ssh -p <port> <user>@<host>` command in SF Mono; the endpoint ID is secondary metadata. Selecting a server opens a clearer detail layer with metrics, GPU list, and removal state.
-- Server detail: use a real detail sheet with endpoint identity, live metrics, GPU list, and a visible remove action. Removal must stay disabled when the connected service does not advertise deletion support.
-- Project and Agent page: use collection + detail with a compact count strip. The project is the primary group, with Agent and task as alternate views. Show allocated, running, and queued resources in user language; reserve “lease” for technical detail. “归还” is confirmed and queued requests remain informational unless a dedicated cancel command exists.
-- Expanded GPU items: accessory-style cards or stable numbered controls. Each has one icon tile or number, GPU model/index, state wording, VRAM, utilization, and ownership.
-- Keep CPU, system memory, VRAM, and GPU utilization in the resource column. Each meter should pair the percentage bar with absolute values such as available CPU cores, available/total memory, or used/total VRAM; do not move those labels into the left identity cell.
-- Dense headers and selected rows can increase opacity for readability, but must stay in the same warm field. Avoid white slabs, heavy borders, and isolated cool-gray panels.
+- 页面标题：`服务器`
+- 更新时间：`更新于 HH:mm`
+- 主要动作：`添加服务器`、`申请 GPU`、`刷新`
+- 搜索占位：`搜索 SSH、GPU、项目或任务`
+- 筛选：`全部 / 空闲 / 需关注 / 高压力 / 未在线`
+- 排序菜单作为窄窗口补充入口，不能取代表头排序。
 
-## Content vocabulary
+`刷新`表示重新读取控制面的当前状态。服务器观测由设置中的 5 / 10 / 30 秒采集间隔驱动；刷新不伪造一次新观测。
 
-Use concise, user-facing Chinese based on resource action, not implementation jargon:
+### 表格列
 
-| Purpose | Preferred wording |
+列顺序固定：
+
+| 列 | 可见内容 | 表头图标 | 默认排序 |
+| --- | --- | --- | --- |
+| 服务器 | 状态点 + 完整 SSH 指令 | `server.rack` | 升序 |
+| 项目 / 当前任务 | 项目名；下一行当前任务 | `folder` | 升序 |
+| GPU 配置 | 型号；下一行卡数与单卡显存 | `square.stack.3d.up` | 升序 |
+| 空闲 | 空闲卡数 / 总卡数 | `checkmark.circle` | 降序 |
+| GPU | 利用率 + 进度柱 | `chart.bar.fill` | 降序 |
+| 显存 | 占用率 + 进度柱 | `memorychip` | 降序 |
+| CPU | 负载 + 进度柱 | `cpu` | 降序 |
+| 内存 | 占用率 + 进度柱 | `memorychip.fill` | 降序 |
+
+表头图标统一为 SF Symbols 线框或层级渲染。表头标题与图标之间保留 6 pt。未选中列不常驻上下箭头；当前排序列使用浅色圆角底和单个 `↑` 或 `↓`。再次点击同一表头切换方向。
+
+服务器列保持足够显示 SSH，但不得吞占项目 / 当前任务列。长项目或任务只在本列尾部截断。GPU、显存、CPU、内存的完整语义放在辅助功能名称与悬停帮助中。
+
+### 状态用语
+
+| 状态 | GUI 用语 |
 | --- | --- |
-| main page | 总览 / 我的计算资源 |
-| active fleet state | 可分配、已分配、运行中、需处理 |
-| server group | 服务器 |
-| server primary label | exact SSH command |
-| server secondary label | 在线 / 数据陈旧 / 连接异常 |
-| table headers | 连接、GPU 可用性、资源、操作 |
-| project and Agent page | 项目与 Agent |
-| immediate allocation request | 申请 GPU |
-| inspect detail | 查看详情 |
-| no data | 还没有服务器。添加第一台服务器开始监控。 |
-| add server | 加入本机资源池 |
-| remove server | 移除服务器 |
-| old service | 当前本机服务版本不支持移除。更新本机服务后即可使用。 |
-| local actor label | 本机操作标识 / 记录为（不是用户账号） |
-| coordination boundary | 只协调资源，不执行任务。 |
-| bad state | 当前无法读取 GPU 状态。检查服务器连接或采集状态。 |
+| 可参与新分配 | `空闲` |
+| 有项目任务 | `任务占用` |
+| 已申领但尚未观察到任务 | `占卡`，仍属于已分配资源，不等于空闲卡 |
+| 未托管进程 | `未归属占用` |
+| 明确归属冲突 | `归属冲突` |
+| 无新观测 | `无响应` 或 `无最新数据` |
+| 暂停新分配 | `已暂停` |
 
-Keep a label’s meaning stable across summary, card, dialog, and confirmation message.
-Copy should sound like local desktop product UI, not an agent log. Prefer direct nouns and actions; avoid protocol names, nested error envelopes, and English backend reason codes in visible text unless they are the only exact identifier the operator needs.
+禁止使用泛化的`待处理`、`快照过期`、`fail-closed`或`允许延迟`。正常状态不显示说明段落；异常只显示原因和可执行下一步。
 
-## Accessibility and clarity floor
+## 6. 服务器详情
 
-- Text on material meets a 4.5:1 contrast target on its composed background.
-- Every colored status also has a short text label and matching SF Symbol.
-- Keyboard focus uses Clear Cyan with a 3pt visible outline.
-- Status meters include textual percentage in the accessibility label, but visual density stays low.
-- Do not convey operational actions only with hover states; critical controls stay visible.
-- The title, SSH command, status wording, and destructive action text must remain crisp even while the ambient background blurs.
+详情按以下顺序排列：
 
-## Native implementation boundary
+1. 状态、更新时间与完整 SSH 指令
+2. 设置、暂停 / 恢复、申请 GPU
+3. CPU、内存、GPU 三个当前指标
+4. GPU 列表：编号、型号、显存和`空闲 / 任务占用 / 占卡`
+5. 项目与当前任务
+6. 历史图与 `1h / 6h / 24h`
 
-The target native shell is a SwiftUI/AppKit split view with `NSVisualEffectView` / SwiftUI materials and SF Symbols. It consumes the existing loopback REST API. Native parity may retire duplicated macOS-only presentation code, but it must not remove the browser-facing Jinja templates, JavaScript, CSS, static asset routing, or loopback Web UI while the Windows launcher owns that compatibility surface.
+宽窗口在右侧 inspector 打开；窄窗口进入完整详情，并始终提供可见的`返回资源列表`。Escape 是补充快捷键，不能替代返回按钮。
 
-## Beszel reference boundary
+历史图包括 CPU、内存、GPU 利用率和显存占用率。多张 GPU 使用稳定的不同颜色，并共享同行图例。采样中断时折线必须断开；缺值不能补成 0。悬停只显示当前时间点的必要值。
 
-ServerPilot may borrow Beszel's system-first information architecture, dense sortable tables, field visibility controls, compact endpoint information bar, on-demand history, request-generation protection, ownership markers, and its visible-only chart discipline. Native trend charts use timestamped samples, explicit gaps, no decorative animation, and a bounded selected-sample inspector; hidden details do not fetch or redraw histories. It must not import Beszel's React/PocketBase runtime, authentication and registration model, target/claim/reaper control plane, browser storage, or arbitrary command adapters. The Broker REST API remains the presentation boundary and `service.py` remains the allocation truth.
+## 7. 使用情况页
 
-The first native delivery presents current truth: resources, endpoint/GPU detail, attention, leases, requests, reservations, and current ownership arrangements. Time-series telemetry is an additive, capability-gated surface. A queue entry without a concrete GPU allocation belongs on an unassigned lane; it must never be drawn as historical ownership of a GPU.
+- 页面标题：`使用情况`
+- 默认按项目组织，只展示当前项目、当前任务和分配的 GPU。
+- 正常行用短标签和资源图标表达，不重复解释 lease 生命周期。
+- 空状态只显示：`当前没有资源分配。`，并提供`申请 GPU`。
+- 不提供 Agent 视图、消息、协调链接、聊天或历史任务流水。
 
-## Adapter presentation boundary
+## 8. 设置页
 
-Vendor adapter identities are diagnostic provenance, not an operator or Agent workflow. The native UI and MCP continue to expose unified resource monitoring, claim, queue, reservation, and scheduler concepts. Adding an adapter must not add a discovery/configuration round trip to a routine claim, create a second credential system, or permit the adapter to write lease/claim truth.
+只显示：
+
+- `本机服务地址`
+- `数据采集间隔`：`5 秒 / 10 秒 / 30 秒`
+- `版本`
+
+采集间隔是持久化设置。写入成功后才更新界面值；失败时保留旧值并显示一条具体错误。测试夹具可以展示实际值，但必须只读，不能伪装写入成功。
+
+## 9. 表单、错误与确认
+
+- 添加服务器：以 SSH 指令为主要输入，不重复展示可从指令直接读出的 host、port、user。
+- 申请 GPU：正常态只显示项目、任务、GPU 数量和可选服务器；说明文字仅跟随字段错误。
+- 错误：一句说明发生了什么，一句说明下一步。不要同时堆叠 banner、卡片和状态标签。
+- 空状态：一句事实 + 一个主动作。
+- 暂停、恢复和退役使用准确动词。退役等不可逆操作必须确认；暂停不应暗示会停止已有任务。
+
+## 10. 交互与可访问性
+
+- 搜索、筛选、所有可排序表头、服务器行、返回按钮和主要动作均可键盘到达。
+- 每个图标按钮提供可访问名称；指标提供文字值与单位。
+- 焦点环使用原生样式，不用颜色变化替代焦点。
+- 关闭装饰性动画。状态刷新使用无位移更新；Reduce Motion 下不得依赖动画解释变化。
+- 最小验收视口为 1024×640，同时检查 1280×800 与 1440×820。
+
+## 11. 数据与能力边界
+
+- App 只消费 loopback REST/domain 状态，不直连 SQLite 或 SSH。
+- stale、unknown、unmanaged、conflict 和 maintenance 资源不参与分配。
+- lease 协调归属，不启动、停止或抢占项目任务。
+- Adapter ID 只用于诊断 provenance，不成为 GUI 工作流或资源身份。
+- 外部 SchedulerTarget 与普通服务器分开；`PENDING` 作业不表示已获得裸机 GPU。
+
+任何新增页面、字段或说明，都必须回答一个问题：它是否直接帮助用户看清、申请或追溯资源。不能回答时，不加入 GUI。

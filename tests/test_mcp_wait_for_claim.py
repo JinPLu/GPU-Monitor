@@ -5,8 +5,8 @@ from typing import Any
 
 import pytest
 
-from gpu_broker import mcp_server
-from gpu_broker.mcp_server import mcp
+from serverpilot import mcp_server
+from serverpilot.mcp_server import mcp
 
 
 class FakeClient:
@@ -138,13 +138,12 @@ def test_wait_for_claim_validates_bounded_inputs(
         mcp_server.gpu_wait_for_claim(**kwargs)
 
 
-def test_wait_for_claim_is_exposed_as_mcp_tool() -> None:
+def test_wait_for_claim_is_not_exposed_as_mcp_tool() -> None:
     tools = asyncio.run(mcp.list_tools())
     by_name = {tool.name: tool for tool in tools}
 
-    assert "gpu_wait_for_claim" in by_name
-    assert {"agent_name", "request_id"}.issubset(
-        by_name["gpu_wait_for_claim"].inputSchema["required"]
-    )
-    assert "timeout_seconds" not in by_name["gpu_wait_for_claim"].inputSchema["required"]
-    assert "poll_interval_seconds" not in by_name["gpu_wait_for_claim"].inputSchema["required"]
+    assert "gpu_wait_for_claim" not in by_name
+    claim_description = by_name["gpu_claim"].description.lower()
+    assert "no_capacity" in claim_description
+    assert "no queue" in claim_description
+    assert " or queue" not in claim_description

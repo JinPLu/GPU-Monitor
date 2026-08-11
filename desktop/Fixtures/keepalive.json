@@ -1,0 +1,99 @@
+{
+  "schema_version": "v1",
+  "snapshot_revision": 208,
+  "server_time": "2026-08-11T12:00:00Z",
+  "data": {
+    "current": {
+      "summary": {
+        "online_servers": 1,
+        "total_servers": 1,
+        "total_gpus": 2,
+        "available_gpus": 0,
+        "busy_gpus": 2,
+        "claimed_gpus": 0,
+        "abnormal_gpus": 0
+      },
+      "endpoints": [
+        {
+          "id": "keepalive-node-01",
+          "host": "10.20.0.31",
+          "port": 2223,
+          "ssh_user": "gpu",
+          "observation_profile": "server-script-v1",
+          "keepalive_adapter_id": "server-script-v1",
+          "keepalive": {
+            "configured": true,
+            "state": "ACTIVE"
+          },
+          "enabled": true,
+          "lifecycle_state": "active",
+          "monitor": {
+            "status": "ONLINE",
+            "last_success_at": "2026-08-11T11:59:58Z"
+          },
+          "host_telemetry": {
+            "cpu_count": 64,
+            "load_1m": 8.0,
+            "memory_total_mib": 262144,
+            "memory_available_mib": 196608
+          }
+        }
+      ],
+      "gpus": [
+        {
+          "id": "keepalive-node-01:GPU-KEEPALIVE-0",
+          "endpoint_id": "keepalive-node-01",
+          "gpu_uuid": "GPU-KEEPALIVE-0",
+          "gpu_index": 0,
+          "name": "NVIDIA A100-SXM4-80GB",
+          "total_vram_mib": 81920,
+          "enabled": true,
+          "state": "KEEPALIVE",
+          "telemetry": {
+            "memory_used_mib": 25395,
+            "gpu_utilization_pct": 35,
+            "temperature_c": 52
+          },
+          "processes": []
+        },
+        {
+          "id": "keepalive-node-01:GPU-KEEPALIVE-1",
+          "endpoint_id": "keepalive-node-01",
+          "gpu_uuid": "GPU-KEEPALIVE-1",
+          "gpu_index": 1,
+          "name": "NVIDIA A100-SXM4-80GB",
+          "total_vram_mib": 81920,
+          "enabled": true,
+          "state": "KEEPALIVE",
+          "telemetry": {
+            "memory_used_mib": 25395,
+            "gpu_utilization_pct": 35,
+            "temperature_c": 53
+          },
+          "processes": []
+        }
+      ],
+      "leases": [],
+      "requests": [],
+      "reservations": [],
+      "data_age_seconds": 2,
+      "freshness_seconds": 30,
+      "admission_boundary": "Fixture: allocation only.",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "resource_providers": [],
+      "allocatable_units": [],
+      "resource_claims": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
+    },
+    "history": {
+      "retired_endpoints": [],
+      "resource_plan_evaluations": [],
+      "resource_run_actuals": []
+    }
+  }
+}

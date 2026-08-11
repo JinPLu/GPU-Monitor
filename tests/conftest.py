@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from gpu_broker.config import EndpointConfig, InventoryConfig, ProjectConfig
-from gpu_broker.database import Database
-from gpu_broker.service import ActorContext, BrokerService
+from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig
+from serverpilot.database import Database
+from serverpilot.service import ActorContext, BrokerService
 
 
 @pytest.fixture

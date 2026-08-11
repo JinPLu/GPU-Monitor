@@ -3,20 +3,15 @@ set -euo pipefail
 
 script_dir=${0:A:h}
 project_root=${script_dir:h}
-dist_app_entry="${project_root}/dist/ServerPilot.app"
-user_applications_dir="${GPU_BROKER_USER_APPLICATIONS_DIR:-${HOME}/Applications}"
-final_app_bundle="${user_applications_dir}/ServerPilot.app"
-staging_root="$(mktemp -d /tmp/gpu-broker-macos-app.XXXXXX)"
+final_app_bundle="${project_root}/ServerPilot.app"
+staging_root="$(mktemp -d /tmp/serverpilot-macos-app.XXXXXX)"
 trap 'rm -rf "${staging_root}"' EXIT
 app_bundle="${staging_root}/ServerPilot.app"
 macos_dir="${app_bundle}/Contents/MacOS"
 resources_dir="${app_bundle}/Contents/Resources"
-runtime_dir="${resources_dir}/BrokerRuntime"
-root_app_entry="${project_root}/ServerPilot.app"
-legacy_root_app_entry="${project_root}/GPU Broker.app"
-legacy_user_app_bundle="${user_applications_dir}/GPU Broker.app"
-core_dir="${script_dir}/GPUBrokerCore"
-core_sources=("${core_dir}/Sources/GPUBrokerCore"/*.swift(N))
+runtime_dir="${resources_dir}/ServerPilotRuntime"
+core_dir="${script_dir}/ServerPilotCore"
+core_sources=("${core_dir}/Sources/ServerPilotCore"/*.swift(N))
 swift_sources=("${core_sources[@]}" "${script_dir}"/*.swift(N))
 deployment_target="14.0"
 target_arch="$(uname -m)"
@@ -29,7 +24,7 @@ case "${target_arch}" in
     ;;
 esac
 target_triple="${target_arch}-apple-macosx${deployment_target}"
-uv_bin="${GPU_BROKER_UV:-$(command -v uv || true)}"
+uv_bin="${SERVERPILOT_UV:-$(command -v uv || true)}"
 backend_build_root="${project_root}/build/macos-backend"
 backend_dist_dir="${backend_build_root}/dist"
 backend_work_dir="${backend_build_root}/work"
@@ -60,18 +55,18 @@ mkdir -p "${backend_dist_dir}" "${backend_work_dir}" "${backend_spec_dir}"
 "${uv_bin}" run --with 'pyinstaller>=6,<7' pyinstaller \
   --noconfirm \
   --onefile \
-  --name gpu-broker \
+  --name serverpilot \
   --paths "${project_root}/src" \
   --collect-submodules uvicorn \
-  --add-data "${project_root}/src/gpu_broker/migrations:gpu_broker/migrations" \
-  --add-data "${project_root}/src/gpu_broker/web:gpu_broker/web" \
+  --add-data "${project_root}/src/serverpilot/migrations:serverpilot/migrations" \
+  --add-data "${project_root}/src/serverpilot/web:serverpilot/web" \
   --distpath "${backend_dist_dir}" \
   --workpath "${backend_work_dir}" \
   --specpath "${backend_spec_dir}" \
   "${script_dir}/backend_main.py"
-cp "${backend_dist_dir}/gpu-broker" "${runtime_dir}/gpu-broker"
-chmod 755 "${runtime_dir}/gpu-broker"
-"${runtime_dir}/gpu-broker" --help >/dev/null
+cp "${backend_dist_dir}/serverpilot" "${runtime_dir}/serverpilot"
+chmod 755 "${runtime_dir}/serverpilot"
+"${runtime_dir}/serverpilot" --help >/dev/null
 
 xcrun --sdk macosx swiftc \
   -target "${target_triple}" \
@@ -86,16 +81,11 @@ xattr -d com.apple.FinderInfo "${app_bundle}" 2>/dev/null || true
 xattr -d 'com.apple.fileprovider.fpfs#P' "${app_bundle}" 2>/dev/null || true
 codesign --force --deep --sign - "${app_bundle}"
 codesign --verify --deep --strict "${app_bundle}"
-mkdir -p "${project_root}/dist" "${user_applications_dir}"
-if [[ ! -e "${final_app_bundle}" && -d "${legacy_user_app_bundle}" ]]; then
-  legacy_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${legacy_user_app_bundle}/Contents/Info.plist" 2>/dev/null || true)"
-  if [[ "${legacy_bundle_id}" == "local.gpu-broker.desktop" ]]; then
-    mv "${legacy_user_app_bundle}" "${final_app_bundle}"
-  fi
-fi
+mkdir -p "${project_root}"
 if [[ -e "${final_app_bundle}" || -L "${final_app_bundle}" ]]; then
   existing_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${final_app_bundle}/Contents/Info.plist" 2>/dev/null || true)"
-  if [[ "${existing_bundle_id}" != "local.gpu-broker.desktop" ]]; then
+  if [[ "${existing_bundle_id}" != "local.serverpilot.desktop" &&
+        "${existing_bundle_id}" != "local.gpu-broker.desktop" ]]; then
     print -u2 "Refusing to replace an unrelated app: ${final_app_bundle}"
     exit 1
   fi
@@ -103,36 +93,42 @@ if [[ -e "${final_app_bundle}" || -L "${final_app_bundle}" ]]; then
 fi
 ditto --norsrc "${app_bundle}" "${final_app_bundle}"
 xattr -cr "${final_app_bundle}"
-codesign --force --deep --sign - "${final_app_bundle}"
-codesign --verify --deep --strict "${final_app_bundle}"
+xattr -rd com.apple.FinderInfo "${final_app_bundle}" 2>/dev/null || true
+xattr -rd 'com.apple.fileprovider.fpfs#P' "${final_app_bundle}" 2>/dev/null || true
+# Finder can immediately reattach FileProvider metadata to a bundle stored in
+# the project folder. Verify an ephemeral, metadata-free copy of the canonical
+# root bundle so signature checking remains deterministic without leaving a
+# second app behind.
+verification_bundle="${staging_root}/verified/ServerPilot.app"
+mkdir -p "${verification_bundle:h}"
+COPYFILE_DISABLE=1 ditto --norsrc "${final_app_bundle}" "${verification_bundle}"
+xattr -cr "${verification_bundle}"
+codesign --verify --deep --strict "${verification_bundle}"
 
-if [[ -e "${dist_app_entry}" || -L "${dist_app_entry}" ]]; then
-  if [[ -L "${dist_app_entry}" ]]; then
-    unlink "${dist_app_entry}"
-  else
-    existing_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${dist_app_entry}/Contents/Info.plist" 2>/dev/null || true)"
-    if [[ "${existing_bundle_id}" != "local.gpu-broker.desktop" ]]; then
-      print -u2 "Refusing to replace unrelated dist entry: ${dist_app_entry}"
-      exit 1
-    fi
-    rm -rf "${dist_app_entry}"
+remove_legacy_app() {
+  local entry="$1"
+  [[ -e "${entry}" || -L "${entry}" ]] || return 0
+  if [[ -L "${entry}" ]]; then
+    unlink "${entry}"
+    return 0
   fi
-fi
-ln -s "${final_app_bundle}" "${dist_app_entry}"
+  local bundle_id
+  bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${entry}/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ "${bundle_id}" != "local.serverpilot.desktop" &&
+        "${bundle_id}" != "local.gpu-broker.desktop" ]]; then
+    print -u2 "Refusing to remove unrelated app: ${entry}"
+    exit 1
+  fi
+  rm -rf "${entry}"
+}
 
-if [[ -L "${root_app_entry}" ]]; then
-  unlink "${root_app_entry}"
-elif [[ -e "${root_app_entry}" ]]; then
-  print -u2 "Refusing to replace non-symlink path: ${root_app_entry}"
-  exit 1
-fi
-
-ln -s "dist/ServerPilot.app" "${root_app_entry}"
-
-if [[ -L "${legacy_root_app_entry}" && "$(readlink "${legacy_root_app_entry}")" == "dist/GPU Broker.app" ]]; then
-  unlink "${legacy_root_app_entry}"
-fi
+# Before the root-bundle rule, builds installed a second copy in ~/Applications
+# and exposed aliases under dist/. Remove only verified ServerPilot bundles or
+# symlinks after the new canonical bundle has passed signature verification.
+remove_legacy_app "${HOME}/Applications/ServerPilot.app"
+legacy_dist_entries=("${project_root}/dist"/ServerPilot*.app(N))
+for legacy_entry in "${legacy_dist_entries[@]}"; do
+  remove_legacy_app "${legacy_entry}"
+done
 
 echo "Built ${final_app_bundle}"
-echo "Dist entry ${dist_app_entry}"
-echo "Project entry ${root_app_entry}"

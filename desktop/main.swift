@@ -1,7 +1,7 @@
 import AppKit
 
 @main
-struct GPUBrokerDesktopMain {
+struct ServerPilotDesktopMain {
     @MainActor
     static func main() {
         let application = NSApplication.shared

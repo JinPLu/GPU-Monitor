@@ -9,8 +9,9 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from gpu_broker.database import Database
-from gpu_broker.models import (
+from serverpilot.database import Database
+from serverpilot.models import (
+    AllocationRequest,
     Alert,
     AuditEvent,
     Endpoint,
@@ -24,7 +25,7 @@ from gpu_broker.models import (
     TelemetryCurrent,
     TelemetrySnapshot,
 )
-from gpu_broker.schemas import (
+from serverpilot.schemas import (
     ActorCreate,
     EndpointCreate,
     EndpointObservation,
@@ -37,8 +38,8 @@ from gpu_broker.schemas import (
     WorkloadProfileClaim,
     WorkloadProfileUpsert,
 )
-from gpu_broker.service import ACTIVE_LEASE_STATES, ActorContext, BrokerError, BrokerService
-from gpu_broker.timeutil import utcnow
+from serverpilot.service import ACTIVE_LEASE_STATES, ActorContext, BrokerError, BrokerService
+from serverpilot.timeutil import utcnow
 from tests.helpers import observation, process_for_gpu
 
 
@@ -55,10 +56,10 @@ def request_data(task_ref: str, *, count: int = 1, project_id: str = "project-a"
 
 
 def test_inventory_unknown_is_fail_closed(service, admin) -> None:
-    result = service.create_request(admin, request_data("unknown"), idempotency_key="unknown-1")
-    assert result["lease"] is None
-    assert result["request"]["state"] == "QUEUED"
-    assert "eligible" in result["request"]["blocked_reason"]
+    with pytest.raises(BrokerError) as error:
+        service.create_request(admin, request_data("unknown"), idempotency_key="unknown-1")
+    assert error.value.code == "no_capacity"
+    assert service.list_requests(admin)["data"] == []
 
 
 def test_bootstrap_token_is_created_once_and_never_replaced(tmp_path: Path, inventory) -> None:
@@ -152,12 +153,14 @@ def test_absent_gpu_keeps_lease_but_is_not_eligible(service, admin) -> None:
 
     service.ingest_observation(observation(gpu_uuids=["GPU-new"]))
     claim_new = service.create_request(admin, request_data("new-gpu"), idempotency_key="new-gpu")
-    queued = service.create_request(admin, request_data("no-more-gpus"), idempotency_key="no-more-gpus")
+    with pytest.raises(BrokerError) as error:
+        service.create_request(
+            admin, request_data("no-more-gpus"), idempotency_key="no-more-gpus"
+        )
     snapshot = service.snapshot(admin)["data"]
 
     assert claim_new["lease"]["gpu_ids"] == ["endpoint-a:GPU-new"]
-    assert queued["lease"] is None
-    assert "absent=1" in queued["request"]["blocked_reason"]
+    assert error.value.code == "no_capacity"
     assert snapshot["gpus"][0]["id"] == "endpoint-a:GPU-new"
     assert any("endpoint-a:GPU-old" in lease["gpu_ids"] for lease in snapshot["leases"])
 
@@ -209,13 +212,13 @@ def test_incomplete_observation_preserves_unobserved_process_and_blocks_exact_cl
             },
         }
     )
-    blocked = service.create_request(admin, exact_old, idempotency_key="old-incomplete")
+    with pytest.raises(BrokerError) as error:
+        service.create_request(admin, exact_old, idempotency_key="old-incomplete")
 
     assert result["observation_complete"] is False
     assert gpus["endpoint-a:GPU-old"]["state"] == "BUSY_UNMANAGED"
     assert len(gpus["endpoint-a:GPU-old"]["processes"]) == 1
-    assert blocked["lease"] is None
-    assert "busy_unmanaged=1" in blocked["request"]["blocked_reason"]
+    assert error.value.code == "no_capacity"
 
 
 def test_absent_gpu_reappearance_restores_presence(service, admin) -> None:
@@ -329,7 +332,9 @@ def test_workload_profile_claim_uses_approved_contract_atomically(service, admin
     assert request_event["summary"]["profile_id"] == "benchmark-2gpu"
 
 
-def test_queued_routine_claim_starts_held_when_capacity_arrives(service, admin) -> None:
+def test_routine_claim_fails_immediately_and_can_be_retried_when_capacity_arrives(
+    service, admin
+) -> None:
     service.upsert_workload_profile(
         admin,
         WorkloadProfileUpsert.model_validate(
@@ -344,20 +349,25 @@ def test_queued_routine_claim_starts_held_when_capacity_arrives(service, admin) 
         ),
         idempotency_key="queued-profile",
     )
-    queued = service.claim_workload_profile(
-        admin,
-        "queued-eval",
-        WorkloadProfileClaim(task_ref="queued-run"),
-        idempotency_key="queued-claim",
-    )
-    assert queued["lease"] is None
-    assert queued["request"]["state"] == "QUEUED"
+    with pytest.raises(BrokerError) as error:
+        service.claim_workload_profile(
+            admin,
+            "queued-eval",
+            WorkloadProfileClaim(task_ref="queued-run"),
+            idempotency_key="queued-claim",
+        )
+    assert error.value.code == "no_capacity"
+    assert service.list_requests(admin)["data"] == []
 
     service.ingest_observation(observation(count=1))
-    request = service.list_requests(admin)["data"][0]
-    lease = service.list_leases(admin)["data"][0]
-    assert request["state"] == "LEASED"
-    assert lease["state"] == "HELD"
+    claimed = service.claim_workload_profile(
+        admin,
+        "queued-eval",
+        WorkloadProfileClaim(task_ref="retried-run"),
+        idempotency_key="retried-claim",
+    )
+    assert claimed["request"]["state"] == "LEASED"
+    assert claimed["lease"]["state"] == "HELD"
 
 
 def test_unstarted_held_claim_is_retained_after_deprecated_startup_grace(
@@ -379,14 +389,14 @@ def test_unstarted_held_claim_is_retained_after_deprecated_startup_grace(
     )
     assert first["lease"] is not None
     assert first["lease"]["state"] == "HELD"
-    second = broker.create_request(
-        admin,
-        request_data("grace-second"),
-        idempotency_key="grace-second",
-        activate_if_allocated=True,
-    )
-    assert second["lease"] is None
-    assert second["request"]["state"] == "QUEUED"
+    with pytest.raises(BrokerError) as error:
+        broker.create_request(
+            admin,
+            request_data("grace-second"),
+            idempotency_key="grace-second",
+            activate_if_allocated=True,
+        )
+    assert error.value.code == "no_capacity"
 
     first_lease_id = first["lease"]["id"]
 
@@ -405,7 +415,7 @@ def test_unstarted_held_claim_is_retained_after_deprecated_startup_grace(
     assert len(leases) == 1
     requests = {request["task_ref"]: request for request in broker.list_requests(admin)["data"]}
     assert requests["grace-first"]["state"] == "LEASED"
-    assert requests["grace-second"]["state"] == "QUEUED"
+    assert "grace-second" not in requests
 
 
 def test_renewal_cannot_cross_a_future_reservation(service, admin) -> None:
@@ -466,11 +476,11 @@ def test_reservation_cancellation_is_limited_to_creating_actor(service) -> None:
 def test_gang_all_or_nothing_and_no_partial_write(service, admin) -> None:
     service.ingest_observation(observation(count=3))
     first = service.create_request(admin, request_data("gang-a", count=2), idempotency_key="gang-a")
-    second = service.create_request(admin, request_data("gang-b", count=2), idempotency_key="gang-b")
+    with pytest.raises(BrokerError) as error:
+        service.create_request(admin, request_data("gang-b", count=2), idempotency_key="gang-b")
     assert first["lease"] is not None
     assert len(first["lease"]["gpu_ids"]) == 2
-    assert second["lease"] is None
-    assert second["request"]["state"] == "QUEUED"
+    assert error.value.code == "no_capacity"
     leases = service.list_leases(admin)["data"]
     assert sum(len(lease["gpu_ids"]) for lease in leases if lease["state"] in ACTIVE_LEASE_STATES) == 2
 
@@ -486,10 +496,9 @@ def test_host_resource_constraints_are_absolute_and_fail_closed(service, admin) 
             "constraints": {"gpu_count": 1, "min_available_cpu_cores": 61},
         }
     )
-    cpu_blocked = service.create_request(admin, too_much_cpu, idempotency_key="absolute-cpu")
-    assert cpu_blocked["lease"] is None
-    assert cpu_blocked["request"]["state"] == "QUEUED"
-    assert "available_cpu" in cpu_blocked["request"]["blocked_reason"]
+    with pytest.raises(BrokerError) as cpu_error:
+        service.create_request(admin, too_much_cpu, idempotency_key="absolute-cpu")
+    assert cpu_error.value.code == "no_capacity"
 
     too_much_memory = RequestCreate.model_validate(
         {
@@ -499,9 +508,9 @@ def test_host_resource_constraints_are_absolute_and_fail_closed(service, admin) 
             "constraints": {"gpu_count": 1, "min_available_memory_mib": 200 * 1024},
         }
     )
-    memory_blocked = service.create_request(admin, too_much_memory, idempotency_key="absolute-memory")
-    assert memory_blocked["lease"] is None
-    assert "available_memory" in memory_blocked["request"]["blocked_reason"]
+    with pytest.raises(BrokerError) as memory_error:
+        service.create_request(admin, too_much_memory, idempotency_key="absolute-memory")
+    assert memory_error.value.code == "no_capacity"
 
     right_sized = RequestCreate.model_validate(
         {
@@ -521,22 +530,22 @@ def test_host_resource_constraints_are_absolute_and_fail_closed(service, admin) 
     assert allocated["lease"] is not None
 
 
-def test_fair_queue_interleaves_projects_after_fresh_telemetry(service, admin) -> None:
-    # All requests initially queue because no GPU UUID has been observed yet.
-    service.create_request(admin, request_data("story-a"), idempotency_key="story-a")
-    service.create_request(admin, request_data("story-b"), idempotency_key="story-b")
-    service.create_request(
-        admin,
-        request_data("project-b-task", project_id="project-b"),
-        idempotency_key="wr-a",
-    )
+def test_failed_claims_are_not_queued_when_capacity_arrives(service, admin) -> None:
+    for task_ref, project_id in (
+        ("story-a", "project-a"),
+        ("story-b", "project-a"),
+        ("project-b-task", "project-b"),
+    ):
+        with pytest.raises(BrokerError) as error:
+            service.create_request(
+                admin,
+                request_data(task_ref, project_id=project_id),
+                idempotency_key=task_ref,
+            )
+        assert error.value.code == "no_capacity"
     service.ingest_observation(observation(count=3))
-    allocations = [
-        event["summary"]["project_id"]
-        for event in service.list_events(admin)["data"]
-        if event["action"] == "lease.issued"
-    ]
-    assert set(allocations[:2]) == {"project-a", "project-b"}
+    assert service.list_requests(admin)["data"] == []
+    assert service.list_leases(admin)["data"] == []
 
 
 def test_endpoint_identity_is_enforced(service, admin) -> None:
@@ -592,18 +601,17 @@ def test_endpoint_delete_drains_then_retires_without_erasing_monitoring_state(se
 
     assert retried == deleted
     assert deleted["endpoint_id"] == "endpoint-a"
-    assert deleted["endpoint"]["lifecycle_state"] == "draining"
+    assert deleted["endpoint"]["lifecycle_state"] == "retired"
     assert deleted["history_retained"] is True
     repeated_compatibility_delete = service.delete_endpoint(
         admin, "endpoint-a", idempotency_key="endpoint-delete-again"
     )
-    assert repeated_compatibility_delete["endpoint"]["lifecycle_state"] == "draining"
+    assert repeated_compatibility_delete["endpoint"]["lifecycle_state"] == "retired"
     assert repeated_compatibility_delete["changed"] is False
     retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-retire")
     assert retired["endpoint"]["lifecycle_state"] == "retired"
     assert [endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]] == ["endpoint-a", "endpoint-b"]
     assert any(gpu["endpoint_id"] == "endpoint-a" for gpu in service.list_gpus(admin)["data"])
-    assert any(event["action"] == "endpoint.paused" for event in service.list_events(admin)["data"])
     assert any(event["action"] == "endpoint.retired" for event in service.list_events(admin)["data"])
     snapshot = service.snapshot(admin)["data"]
     assert all(endpoint["id"] != "endpoint-a" for endpoint in snapshot["endpoints"])
@@ -688,30 +696,24 @@ def test_endpoint_delete_waits_for_active_lease_then_retires_with_history(servic
     assert retired["endpoint"]["lifecycle_state"] == "retired"
 
 
-def test_endpoint_retirement_waits_for_queued_request_pinned_to_endpoint(service, admin) -> None:
-    queued = service.create_request(
-        admin,
-        RequestCreate.model_validate(
-            {
-                "project_id": "project-a",
-                "task_ref": "endpoint-pinned-queue",
-                "purpose": "wait for a particular endpoint",
-                "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
-            }
-        ),
-        idempotency_key="endpoint-pinned-queue",
-    )
-    assert queued["lease"] is None
+def test_failed_endpoint_pinned_claim_does_not_block_retirement(service, admin) -> None:
+    with pytest.raises(BrokerError) as claim_error:
+        service.create_request(
+            admin,
+            RequestCreate.model_validate(
+                {
+                    "project_id": "project-a",
+                    "task_ref": "endpoint-pinned-claim",
+                    "purpose": "claim a particular endpoint",
+                    "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
+                }
+            ),
+            idempotency_key="endpoint-pinned-claim",
+        )
+    assert claim_error.value.code == "no_capacity"
     drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-drain")
     assert drained["endpoint"]["lifecycle_state"] == "draining"
-
-    with pytest.raises(BrokerError) as error:
-        service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire")
-    assert error.value.code == "endpoint_has_queued_requests"
-    assert error.value.details == {"request_ids": [queued["request"]["id"]]}
-
-    service.cancel_request(admin, queued["request"]["id"], idempotency_key="endpoint-pinned-cancel")
-    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire-after-cancel")
+    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire")
     assert retired["endpoint"]["lifecycle_state"] == "retired"
 
 
@@ -836,6 +838,90 @@ def test_observed_workload_binding_survives_one_second_process_start_jitter(serv
     assert gpu["lease"]["workloads"][0]["process_keys"] == [gpu["processes"][0]["process_key"]]
 
 
+def test_observed_workload_binding_survives_continuous_invisible_pid_metadata(
+    service, admin
+) -> None:
+    """A namespace-hidden PID must not acquire a new identity every collection."""
+
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("namespace-hidden-run"),
+        idempotency_key="namespace-hidden-claim",
+        activate_if_allocated=True,
+    )
+    assert claimed["lease"] is not None
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    first_seen = utcnow() - timedelta(minutes=3)
+    initial_process = process_for_gpu(gpu_uuid).model_copy(
+        update={"username": None, "process_started_at": first_seen}
+    )
+    service.ingest_observation(observation(count=1, processes=[initial_process]))
+    service.bind_observed_workload(
+        admin,
+        claimed["lease"]["id"],
+        LeaseObservedBind(run_id="namespace-hidden-run-1"),
+        idempotency_key="namespace-hidden-bind",
+    )
+    original_key = service.list_gpus(admin)["data"][0]["processes"][0]["process_key"]
+
+    # Missing `ps` metadata makes the collector use each observation time as
+    # its fallback start time. Continuous GPU/PID/boot observations still
+    # identify the already-active process.
+    later_sample = initial_process.model_copy(
+        update={"process_started_at": first_seen + timedelta(seconds=10)}
+    )
+    service.ingest_observation(observation(count=1, processes=[later_sample]))
+
+    gpu = service.list_gpus(admin)["data"][0]
+    assert gpu["state"] == "RUNNING_MANAGED"
+    assert gpu["processes"][0]["observations"] == 2
+    assert gpu["processes"][0]["process_key"] == original_key
+    assert gpu["lease"]["workloads"][0]["process_keys"] == [original_key]
+
+
+def test_namespace_hidden_pid_reuse_after_observed_gap_remains_fail_closed(
+    service, admin
+) -> None:
+    """Continuity matching must not make a disappeared-and-reused PID managed."""
+
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("namespace-gap-run"),
+        idempotency_key="namespace-gap-claim",
+        activate_if_allocated=True,
+    )
+    assert claimed["lease"] is not None
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    first_seen = utcnow() - timedelta(minutes=3)
+    initial_process = process_for_gpu(gpu_uuid).model_copy(
+        update={"username": None, "process_started_at": first_seen}
+    )
+    service.ingest_observation(observation(count=1, processes=[initial_process]))
+    service.bind_observed_workload(
+        admin,
+        claimed["lease"]["id"],
+        LeaseObservedBind(run_id="namespace-gap-run-1"),
+        idempotency_key="namespace-gap-bind",
+    )
+
+    # One complete observation without the process closes the continuity
+    # window. The same PID after that gap must receive a new identity.
+    service.ingest_observation(observation(count=1, processes=[]))
+    replacement = initial_process.model_copy(
+        update={"process_started_at": first_seen + timedelta(seconds=30)}
+    )
+    service.ingest_observation(observation(count=1, processes=[replacement]))
+    assert service.list_gpus(admin)["data"][0]["state"] == "BUSY_UNMANAGED"
+
+    repeated_replacement = replacement.model_copy(
+        update={"process_started_at": first_seen + timedelta(seconds=40)}
+    )
+    service.ingest_observation(observation(count=1, processes=[repeated_replacement]))
+    assert service.list_gpus(admin)["data"][0]["state"] == "CONFLICT"
+
+
 def test_observed_binding_recovers_an_attribution_conflict_without_remote_control(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     claimed = service.create_request(
@@ -880,8 +966,9 @@ def test_observed_binding_recovers_an_attribution_conflict_without_remote_contro
 def test_process_and_stale_telemetry_block_admission(service, admin) -> None:
     service.ingest_observation(observation(count=1, processes=[process_for_gpu("GPU-endpoint-a-0")]))
     # A compute process blocks immediately; a second sample is only needed to label a lease conflict.
-    blocked = service.create_request(admin, request_data("process-busy"), idempotency_key="proc-busy")
-    assert blocked["lease"] is None
+    with pytest.raises(BrokerError) as error:
+        service.create_request(admin, request_data("process-busy"), idempotency_key="proc-busy")
+    assert error.value.code == "no_capacity"
     assert service.list_gpus(admin)["data"][0]["state"] == "BUSY_UNMANAGED"
 
     def age_telemetry(session) -> None:  # type: ignore[no-untyped-def]
@@ -1107,8 +1194,11 @@ def test_expired_lease_with_process_becomes_orphan_and_stays_blocked(service, ad
     service.ingest_observation(observation(count=1, processes=[process_for_gpu("GPU-endpoint-a-0")]))
     lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
     assert lease["state"] == "ORPHANED_BUSY"
-    blocked = service.create_request(admin, request_data("must-not-reuse"), idempotency_key="blocked-orphan")
-    assert blocked["lease"] is None
+    with pytest.raises(BrokerError) as error:
+        service.create_request(
+            admin, request_data("must-not-reuse"), idempotency_key="blocked-orphan"
+        )
+    assert error.value.code == "no_capacity"
 
 
 def test_allocator_can_claim_an_unregistered_project_and_token_hash_never_returned(service, admin) -> None:
@@ -1125,6 +1215,7 @@ def test_allocator_can_claim_an_unregistered_project_and_token_hash_never_return
     )
     assert created["token"]
     agent = service.authenticate(created["token"])
+    service.ingest_observation(observation(count=1))
     claimed = service.create_request(
         agent,
         request_data("unregistered-project", project_id="storyboard"),
@@ -1140,21 +1231,25 @@ def test_one_hundred_concurrent_requests_never_double_lease(service, admin) -> N
     service.ingest_observation(observation(count=4))
 
     def submit(index: int):  # type: ignore[no-untyped-def]
-        return service.create_request(
-            admin,
-            request_data(f"concurrent-{index}"),
-            idempotency_key=f"concurrent-{index}",
-        )
+        try:
+            return service.create_request(
+                admin,
+                request_data(f"concurrent-{index}"),
+                idempotency_key=f"concurrent-{index}",
+            )
+        except BrokerError as error:
+            assert error.code == "no_capacity"
+            return None
 
     results = []
     with ThreadPoolExecutor(max_workers=32) as pool:
         futures = [pool.submit(submit, index) for index in range(100)]
         for future in as_completed(futures):
             results.append(future.result())
-    leases = [result["lease"] for result in results if result["lease"] is not None]
+    leases = [result["lease"] for result in results if result is not None]
     gpu_ids = [gpu_id for lease in leases for gpu_id in lease["gpu_ids"]]
     assert len(gpu_ids) == len(set(gpu_ids)) == 4
-    assert all(result["request"]["state"] in {"LEASED", "QUEUED"} for result in results)
+    assert all(result["request"]["state"] == "LEASED" for result in results if result is not None)
 
 
 def test_database_unique_index_rejects_duplicate_active_gpu(service, admin) -> None:
@@ -1162,13 +1257,37 @@ def test_database_unique_index_rejects_duplicate_active_gpu(service, admin) -> N
     first = service.create_request(admin, request_data("first"), idempotency_key="first")
     assert first["lease"] is not None
     gpu_id = first["lease"]["gpu_ids"][0]
-    queued = service.create_request(admin, request_data("second"), idempotency_key="second")
-    assert queued["lease"] is None
+    with pytest.raises(BrokerError) as error:
+        service.create_request(admin, request_data("second"), idempotency_key="second")
+    assert error.value.code == "no_capacity"
 
     def illegal_duplicate(session) -> None:  # type: ignore[no-untyped-def]
+        now = utcnow()
+        request = AllocationRequest(
+            id="illegal-request",
+            actor_id=admin.id,
+            project_id="project-a",
+            profile_id=None,
+            auto_activate=False,
+            task_ref="illegal-duplicate",
+            purpose="verify active GPU uniqueness",
+            constraints_json="{}",
+            duration_seconds=3600,
+            expected_duration_seconds=None,
+            start_after=None,
+            deadline=None,
+            approval_ref=None,
+            state="LEASED",
+            priority_class="normal",
+            blocked_reason=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(request)
+        session.flush()
         lease = Lease(
             id="illegal",
-            request_id=queued["request"]["id"],
+            request_id=request.id,
             actor_id=admin.id,
             project_id="project-a",
             state="HELD",
@@ -1209,27 +1328,20 @@ def test_endpoint_lifecycle_retains_history_and_blocks_new_claims(service, admin
     drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="drain-a")
     assert drained["endpoint"]["lifecycle_state"] == "draining"
     assert {endpoint.id for endpoint in service.collector_endpoints()} == {"endpoint-a", "endpoint-b"}
-    blocked = service.create_request(
-        admin,
-        RequestCreate.model_validate(
-            {
-                "project_id": "project-a",
-                "task_ref": "must-not-use-draining",
-                "purpose": "lifecycle admission test",
-                "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
-            }
-        ),
-        idempotency_key="draining-claim",
-    )
-    assert blocked["lease"] is None
-    assert "endpoint_lifecycle" in blocked["request"]["blocked_reason"]
-    with pytest.raises(BrokerError, match="pinned to it"):
-        service.retire_endpoint(admin, "endpoint-a", idempotency_key="retire-a-blocked")
-    service.cancel_request(
-        admin,
-        blocked["request"]["id"],
-        idempotency_key="cancel-draining-claim",
-    )
+    with pytest.raises(BrokerError) as error:
+        service.create_request(
+            admin,
+            RequestCreate.model_validate(
+                {
+                    "project_id": "project-a",
+                    "task_ref": "must-not-use-draining",
+                    "purpose": "lifecycle admission test",
+                    "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
+                }
+            ),
+            idempotency_key="draining-claim",
+        )
+    assert error.value.code == "no_capacity"
     retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="retire-a")
     assert retired["endpoint"]["lifecycle_state"] == "retired"
     assert {endpoint.id for endpoint in service.collector_endpoints()} == {"endpoint-b"}
@@ -1261,17 +1373,17 @@ def test_direct_lease_returns_executable_resources_and_accounts_endpoint_commitm
     assert resource["gpus"][0]["gpu_uuid"].startswith("GPU-")
     assert resource["cuda_visible_devices"] == resource["gpus"][0]["gpu_uuid"]
     assert resource["commitment"] == {"cpu_cores": 40.0, "memory_mib": 200_000}
-    second = service.create_request(
-        admin,
-        RequestCreate.model_validate(
-            {
-                "project_id": "project-a",
-                "task_ref": "commitment-two",
-                "purpose": "must not overcommit endpoint",
-                "constraints": {"gpu_count": 1, "cpu_cores": 40, "memory_mib": 200_000},
-            }
-        ),
-        idempotency_key="commitment-two",
-    )
-    assert second["lease"] is None
-    assert "committed_cpu" in second["request"]["blocked_reason"]
+    with pytest.raises(BrokerError) as error:
+        service.create_request(
+            admin,
+            RequestCreate.model_validate(
+                {
+                    "project_id": "project-a",
+                    "task_ref": "commitment-two",
+                    "purpose": "must not overcommit endpoint",
+                    "constraints": {"gpu_count": 1, "cpu_cores": 40, "memory_mib": 200_000},
+                }
+            ),
+            idempotency_key="commitment-two",
+        )
+    assert error.value.code == "no_capacity"

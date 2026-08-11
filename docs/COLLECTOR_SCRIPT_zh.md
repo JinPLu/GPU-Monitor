@@ -1,6 +1,6 @@
 # 服务器采集脚本协议（schema v1）
 
-`server-script-v1` 是面向单台服务器的固定采集协议。Broker 对这个 profile 只会通过 SSH
+`server-script-v1` 是面向单台服务器的固定只读采集协议。ServerPilot 对这个 profile 只会通过 SSH
 执行下面这一条只读入口：
 
 ```text
@@ -16,17 +16,17 @@ serverpilot-collect --schema-version 1
 ServerPilot 发布包（例如组织提供的 wheel）：
 
 ```text
-python -m pip install /受控发布目录/gpu_broker-<version>-py3-none-any.whl
+python -m pip install /受控发布目录/serverpilot-<version>-py3-none-any.whl
 serverpilot-collect --schema-version 1
 ```
 
-第二条命令必须在 stdout 仅输出一行 JSON。因为 Broker 使用非交互式 SSH，入口必须位于该
+第二条命令必须在 stdout 仅输出一行 JSON。因为 ServerPilot 使用非交互式 SSH，入口必须位于该
 帐号的非交互 `PATH` 中；推荐安装到 `/usr/local/bin/serverpilot-collect`。不要把诊断信息、
 banner 或日志写到 stdout。
 
 有 Docker、厂商 runtime 或自定义工具前缀的服务器，可以在**该服务器本地**维护一个同名的
 短脚本/包装器。它仍只能接受上面的固定参数并输出完全相同的 JSON。此类本地实现是服务器
-管理员的部署责任；不要把 Docker 命令、路径或额外参数填入 Broker Endpoint。
+管理员的部署责任；不要把 Docker 命令、路径或额外参数填入 ServerPilot Endpoint。
 
 ## JSON 合同
 
@@ -58,9 +58,13 @@ number（不能使用字符串、NaN 或 Infinity）；字符串不能含控制�
 没有 NVIDIA runtime 或没有 GPU 的服务器应返回 `gpu_probe_available: false`，以及空的 `gpus`
 和 `processes`。这会保留可用的 CPU/内存观测，但不会把既有 GPU 清单标记为已完成的缺失观测。
 
-Broker 将 stdout 限制为 1 MiB、stderr 限制为 16 KiB，拒绝截断、非 UTF-8、非单个 JSON 对象、
+ServerPilot 将 stdout 限制为 1 MiB、stderr 限制为 16 KiB，拒绝截断、非 UTF-8、非单个 JSON 对象、
 重复 JSON key、未知字段、超限集合和内部不一致的数据。任何拒绝都会使该 endpoint 的本轮观测
 失败并保持 fail closed；不会降级为任意 SSH 命令。
+
+中央 Collector 按持久化的 5 / 10 / 30 秒间隔采集。App 的“刷新”只重新读取控制面状态，不会绕过
+该间隔另造一次观测。若到期仍没有新观测，ServerPilot 将其视为连接或采集问题，并停止分配对应
+资源；不会用旧数据冒充当前状态。
 
 ## 迁移
 

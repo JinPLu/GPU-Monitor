@@ -313,7 +313,7 @@ wheels = [
 ]
 
 [[package]]
-name = "gpu-broker"
+name = "serverpilot"
 version = "1.4.0"
 source = { editable = "." }
 dependencies = [

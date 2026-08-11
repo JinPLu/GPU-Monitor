@@ -9,7 +9,7 @@
     <key>CFBundleExecutable</key>
     <string>ServerPilot</string>
     <key>CFBundleIdentifier</key>
-    <string>local.gpu-broker.desktop</string>
+    <string>local.serverpilot.desktop</string>
     <key>CFBundleIconFile</key>
     <string>ServerPilot</string>
     <key>CFBundleInfoDictionaryVersion</key>

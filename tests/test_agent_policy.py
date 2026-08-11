@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gpu_broker.mcp_server import mcp
+from serverpilot.mcp_server import mcp
 from scripts.install_agent_policy import MARKERS, install, main, merge, render
 from scripts.install_agent_policy import POLICY
 
@@ -24,9 +24,9 @@ def test_policy_render_is_marked_for_each_platform() -> None:
 
 
 def test_policy_merge_replaces_only_its_owned_block() -> None:
-    old = "before\n\n<!-- GPU_BROKER_GLOBAL_START -->\nold\n<!-- GPU_BROKER_GLOBAL_END -->\n\nafter\n"
+    old = "before\n\n<!-- SERVERPILOT_GLOBAL_START -->\nold\n<!-- SERVERPILOT_GLOBAL_END -->\n\nafter\n"
     merged = merge(old, render("codex", "new"))
-    assert merged == "before\n\n<!-- GPU_BROKER_GLOBAL_START -->\nnew\n<!-- GPU_BROKER_GLOBAL_END -->\nafter\n"
+    assert merged == "before\n\n<!-- SERVERPILOT_GLOBAL_START -->\nnew\n<!-- SERVERPILOT_GLOBAL_END -->\nafter\n"
 
 
 def test_policy_merge_is_idempotent() -> None:
@@ -43,15 +43,15 @@ def test_policy_merge_into_empty_file_is_just_the_owned_block() -> None:
 @pytest.mark.parametrize(
     "existing, message",
     [
-        ("<!-- GPU_BROKER_GLOBAL_START -->\nmissing end", "incomplete"),
-        ("<!-- GPU_BROKER_GLOBAL_END -->\nmissing start", "incomplete"),
+        ("<!-- SERVERPILOT_GLOBAL_START -->\nmissing end", "incomplete"),
+        ("<!-- SERVERPILOT_GLOBAL_END -->\nmissing start", "incomplete"),
         (
-            "<!-- GPU_BROKER_GLOBAL_END -->\n<!-- GPU_BROKER_GLOBAL_START -->",
+            "<!-- SERVERPILOT_GLOBAL_END -->\n<!-- SERVERPILOT_GLOBAL_START -->",
             "malformed",
         ),
         (
-            "<!-- GPU_BROKER_GLOBAL_START -->\none\n<!-- GPU_BROKER_GLOBAL_END -->\n"
-            "<!-- GPU_BROKER_GLOBAL_START -->\ntwo\n<!-- GPU_BROKER_GLOBAL_END -->",
+            "<!-- SERVERPILOT_GLOBAL_START -->\none\n<!-- SERVERPILOT_GLOBAL_END -->\n"
+            "<!-- SERVERPILOT_GLOBAL_START -->\ntwo\n<!-- SERVERPILOT_GLOBAL_END -->",
             "duplicated",
         ),
     ],
@@ -99,7 +99,7 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
     adapter = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
     for boundary in (
         "use the local serverpilot mcp",
-        "compatible gpu-broker mcp name",
+        "compatible serverpilot mcp name",
         "server instructions",
         "tool schemas and serverpilot's server instructions remain authoritative",
         "routine owner-scoped claim",
@@ -108,9 +108,9 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
         "gpu_count",
         "gpu_claim_profile",
         "gpu_claim",
-        "gpu_wait_for_claim",
         "never infer missing inputs",
-        "queued or null",
+        "no_capacity",
+        "creates no queue",
         "held",
         "active",
         "lease.resources[]",
@@ -124,6 +124,8 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
         "draining",
         "resource_evaluate_plan",
         "resource_record_actual",
+        "codex://threads/<uuid>",
+        "grants no lease authority",
         "humans supervise",
         "ssh",
         "sqlite",
@@ -132,14 +134,16 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
     ):
         assert boundary in adapter
 
+    assert "gpu_wait_for_claim" not in adapter
+    assert "queued or null" not in adapter
+
     mcp_instructions = _plain_policy_text(mcp.instructions).lower()
     for runtime_contract in (
         "ordinary pre-approved profile claims",
         "explicit-contract claims",
         "gpu_claim_profile",
         "gpu_claim",
-        "gpu_wait_for_claim",
-        "queued or null lease",
+        "fails without creating a queue",
         "held or active lease",
         "lease.resources[]",
         "cuda_visible_devices",
@@ -149,7 +153,7 @@ def test_global_adapter_allows_routine_broker_scheduling_without_duplicate_quest
         "advanced compatibility tools",
         "idempotency_key",
             "endpoints are shared loopback inventory",
-        "draining",
+        "removed after its active leases are released",
     ):
         assert runtime_contract in mcp_instructions
     assert "gpu_grant_server_project" not in adapter
@@ -192,7 +196,7 @@ def test_global_adapter_scheduler_boundaries_match_mcp_instructions() -> None:
         "owner-scoped submit, status, and cancel",
         "slurm pending job",
         "alloctres",
-        "broker does not launch or stop",
+        "serverpilot does not launch or stop",
     ):
         assert runtime_detail in mcp_instructions
     assert "approval_ref" in global_policy

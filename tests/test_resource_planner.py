@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from gpu_broker.planner import ResourcePlanCandidate, select_smallest_useful_plan
+from serverpilot.planner import ResourcePlanCandidate, select_smallest_useful_plan
 
 
 def candidate(identifier: str, seconds: int, *, cpu: float) -> ResourcePlanCandidate:

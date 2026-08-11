@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import event, select
 
-from gpu_broker.models import ResourceAllocation, ResourceRunActual as ResourceRunActualModel
-from gpu_broker.service import ActorContext
-from gpu_broker.timeutil import json_dump
-from gpu_broker.schemas import (
+from serverpilot.models import ResourceAllocation, ResourceRunActual as ResourceRunActualModel
+from serverpilot.service import ActorContext, BrokerError
+from serverpilot.timeutil import json_dump
+from serverpilot.schemas import (
     EndpointUpsert,
     RequestCreate,
     ResourceClaim,
@@ -147,18 +148,14 @@ def test_host_capacity_claim_fails_closed_on_stale_host_telemetry(service, admin
         observation(count=0, observed_at=datetime.now(UTC) - timedelta(hours=1))
     )
 
-    result = service.create_resource_claim(
-        admin,
-        host_claim(cpu_cores=1, memory_mib=1024),
-        idempotency_key="stale-host-claim",
-    )
-
-    assert result["claim"]["state"] == "blocked"
-    assert result["allocation"] is None
-    candidate = next(
-        item for item in result["candidates"] if item["endpoint"]["id"] == "endpoint-a"
-    )
-    assert candidate["excluded_reason"] == "host telemetry is stale"
+    with pytest.raises(BrokerError) as error:
+        service.create_resource_claim(
+            admin,
+            host_claim(cpu_cores=1, memory_mib=1024),
+            idempotency_key="stale-host-claim",
+        )
+    assert error.value.code == "no_capacity"
+    assert service.list_resource_claims(admin)["data"] == []
 
 
 def test_host_capacity_accounts_existing_direct_lease_commitments(service, admin) -> None:
@@ -177,18 +174,19 @@ def test_host_capacity_accounts_existing_direct_lease_commitments(service, admin
     )
     assert lease_result["lease"] is not None
 
-    result = service.create_resource_claim(
-        admin,
-        host_claim(cpu_cores=21, memory_mib=1),
-        idempotency_key="over-direct-commitment",
+    with pytest.raises(BrokerError) as error:
+        service.create_resource_claim(
+            admin,
+            host_claim(cpu_cores=21, memory_mib=1),
+            idempotency_key="over-direct-commitment",
+        )
+    assert error.value.code == "no_capacity"
+    monitor = next(
+        item
+        for item in service.resource_monitor(admin)["data"]["host_capacity"]
+        if item["endpoint"]["id"] == "endpoint-a"
     )
-
-    assert result["claim"]["state"] == "blocked"
-    candidate = next(
-        item for item in result["candidates"] if item["endpoint"]["id"] == "endpoint-a"
-    )
-    assert candidate["excluded_reason"] == "insufficient_cpu"
-    assert candidate["capacity"]["available_cpu_cores"] == 20.0
+    assert monitor["capacity"]["available_cpu_cores"] == 20.0
 
 
 def test_snapshot_correlates_generic_claim_with_native_lease_and_request(service, admin) -> None:

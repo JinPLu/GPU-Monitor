@@ -13,11 +13,11 @@ import yaml
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from gpu_broker.api import create_app
-from gpu_broker.config import Settings
-from gpu_broker.models import SchedulerJob
-from gpu_broker.schemas import ResourceConstraints, SchedulerOneOffSubmit, SchedulerTargetUpsert
-from gpu_broker.slurm import (
+from serverpilot.api import create_app
+from serverpilot.config import Settings
+from serverpilot.models import SchedulerJob
+from serverpilot.schemas import ResourceConstraints, SchedulerOneOffSubmit, SchedulerTargetUpsert
+from serverpilot.slurm import (
     CommandSlurmProvider,
     SCHEDULER_INSPECTION_SCRIPTS,
     SlurmProviderError,
@@ -122,7 +122,7 @@ class FakeSlurmProvider:
             }
         )
         return (
-            f"{remote_directory}/gpu-broker-{transfer_id}/{local_path.name}"
+            f"{remote_directory}/serverpilot-{transfer_id}/{local_path.name}"
         )
 
 
@@ -176,10 +176,10 @@ def _run_scheduler_submit_script(
             "sbatch",
             "--parsable",
             "--job-name=gb-test-job",
-            "--comment=gpu-broker:broker-test-id",
+            "--comment=serverpilot:broker-test-id",
         ],
         job_name="gb-test-job",
-        comment="gpu-broker:broker-test-id",
+        comment="serverpilot:broker-test-id",
         script_body=script_body,
     )
     environment = dict(os.environ)
@@ -211,7 +211,7 @@ def _target() -> dict[str, Any]:
             "totp_service": "example-scheduler-totp",
         },
         "capabilities": ["access-status", "submit", "status", "cancel"],
-        "access_hint": "Connect the approved network and retry; Broker does not operate VPN.",
+        "access_hint": "Connect the approved network and retry; ServerPilot does not operate VPN.",
         "enabled": True,
     }
 
@@ -618,7 +618,7 @@ def test_command_slurm_submission_uses_only_stdin_script_and_option_argv(
     assert argv == [
         "--parsable",
         "--job-name=gb-stdin-script-job",
-        "--comment=gpu-broker:stdin-script-job",
+        "--comment=serverpilot:stdin-script-job",
         "--partition=cpu-default",
         "--nodes=1",
         "--ntasks-per-node=1",
@@ -742,14 +742,14 @@ def test_scheduler_submit_script_normalizes_supported_multiline_output(
     [
         (
             (
-                "printf '123456|gpu-broker:broker-test-id\\n"
+                "printf '123456|serverpilot:broker-test-id\\n"
                 "999999|unrelated-comment\\n'"
             ),
             "exit 0",
         ),
         (
             "printf '999999|unrelated-comment\\n'",
-            "printf '123456|gpu-broker:broker-test-id\\n'",
+            "printf '123456|serverpilot:broker-test-id\\n'",
         ),
     ],
 )
@@ -788,8 +788,8 @@ def test_scheduler_submit_script_recovers_by_unique_name_and_comment(
         (
             "printf 'site notice without an identifier\\n'",
             (
-                "printf '123456|gpu-broker:broker-test-id\\n"
-                "654321|gpu-broker:broker-test-id\\n'"
+                "printf '123456|serverpilot:broker-test-id\\n"
+                "654321|serverpilot:broker-test-id\\n'"
             ),
             86,
             "ambiguous-recovery",
@@ -1168,7 +1168,7 @@ def test_scheduler_target_is_discoverable_and_access_is_read_only(
 ) -> None:
     client, provider = _client(tmp_path, inventory)
     headers = {
-        "X-GPU-Broker-Actor": "scheduler-admin",
+        "X-ServerPilot-Actor": "scheduler-admin",
         "Idempotency-Key": "target-scheduler-a",
     }
     created = client.post("/api/v1/scheduler-targets", json=_target(), headers=headers)
@@ -1176,7 +1176,7 @@ def test_scheduler_target_is_discoverable_and_access_is_read_only(
 
     listed = client.get(
         "/api/v1/scheduler-targets",
-        headers={"X-GPU-Broker-Actor": "other-project-agent"},
+        headers={"X-ServerPilot-Actor": "other-project-agent"},
     )
     assert listed.status_code == 200
     assert listed.json()["data"][0]["id"] == "scheduler-a"
@@ -1185,13 +1185,13 @@ def test_scheduler_target_is_discoverable_and_access_is_read_only(
 
     access = client.get(
         "/api/v1/scheduler-targets/scheduler-a/access",
-        headers={"X-GPU-Broker-Actor": "other-project-agent"},
+        headers={"X-ServerPilot-Actor": "other-project-agent"},
     )
     assert access.status_code == 200
     assert access.json()["access"] == provider.access
     coordination = client.get(
         "/api/v1/coordination",
-        headers={"X-GPU-Broker-Actor": "other-project-agent"},
+        headers={"X-ServerPilot-Actor": "other-project-agent"},
     )
     cached_target = coordination.json()["data"]["scheduler_targets"][0]
     assert cached_target["id"] == "scheduler-a"
@@ -1208,7 +1208,7 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
         "/api/v1/scheduler-targets",
         json=_target(),
         headers={
-            "X-GPU-Broker-Actor": "scheduler-admin",
+            "X-ServerPilot-Actor": "scheduler-admin",
             "Idempotency-Key": "target-scheduler-a",
         },
     )
@@ -1216,7 +1216,7 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
         "/api/v1/workload-profiles",
         json=_profile(),
         headers={
-            "X-GPU-Broker-Actor": "scheduler-admin",
+            "X-ServerPilot-Actor": "scheduler-admin",
             "Idempotency-Key": "profile-scheduler-a",
         },
     )
@@ -1224,14 +1224,14 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
 
     visible = client.get(
         "/api/v1/workload-profiles?project_id=project-b",
-        headers={"X-GPU-Broker-Actor": "storyboard-agent"},
+        headers={"X-ServerPilot-Actor": "storyboard-agent"},
     )
     assert [item["id"] for item in visible.json()["data"]] == [
         "scheduler-a100-smoke"
     ]
 
     submit_headers = {
-        "X-GPU-Broker-Actor": "storyboard-agent",
+        "X-ServerPilot-Actor": "storyboard-agent",
         "Idempotency-Key": "storyboard-smoke-1",
     }
     first = client.post(
@@ -1255,7 +1255,7 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
 
     refreshed = client.get(
         f"/api/v1/scheduler-jobs/{job['id']}",
-        headers={"X-GPU-Broker-Actor": "storyboard-agent"},
+        headers={"X-ServerPilot-Actor": "storyboard-agent"},
     )
     assert refreshed.status_code == 200
     assert refreshed.json()["scheduler_job"]["state"] == "RUNNING"
@@ -1269,7 +1269,7 @@ def test_granted_project_can_submit_profile_idempotently_and_refresh(
         f"/api/v1/scheduler-jobs/{job['id']}/cancel",
         json={"reason": "user requested stop"},
         headers={
-            "X-GPU-Broker-Actor": "storyboard-agent",
+            "X-ServerPilot-Actor": "storyboard-agent",
             "Idempotency-Key": "cancel-storyboard-smoke",
         },
     )
@@ -1287,7 +1287,7 @@ def test_scheduler_refresh_drops_timezone_naive_external_time_without_500(
         "/api/v1/scheduler-targets",
         json=_target(),
         headers={
-            "X-GPU-Broker-Actor": "scheduler-admin",
+            "X-ServerPilot-Actor": "scheduler-admin",
             "Idempotency-Key": "target-naive-time",
         },
     )
@@ -1312,7 +1312,7 @@ def test_scheduler_refresh_drops_timezone_naive_external_time_without_500(
             "script_body": "true\n",
         },
         headers={
-            "X-GPU-Broker-Actor": "storyboard-agent",
+            "X-ServerPilot-Actor": "storyboard-agent",
             "Idempotency-Key": "submit-naive-time",
         },
     )
@@ -1326,7 +1326,7 @@ def test_scheduler_refresh_drops_timezone_naive_external_time_without_500(
 
     refreshed = client.get(
         f"/api/v1/scheduler-jobs/{broker_job_id}",
-        headers={"X-GPU-Broker-Actor": "storyboard-agent"},
+        headers={"X-ServerPilot-Actor": "storyboard-agent"},
     )
 
     assert refreshed.status_code == 200, refreshed.text
@@ -1347,7 +1347,7 @@ def test_cpu_only_one_off_is_valid_and_reaches_provider_without_gpu_request(
         "/api/v1/scheduler-targets",
         json=_target(),
         headers={
-            "X-GPU-Broker-Actor": "scheduler-admin",
+            "X-ServerPilot-Actor": "scheduler-admin",
             "Idempotency-Key": "target-scheduler-a",
         },
     )
@@ -1372,7 +1372,7 @@ def test_cpu_only_one_off_is_valid_and_reaches_provider_without_gpu_request(
             "script_body": "true\n",
         },
         headers={
-            "X-GPU-Broker-Actor": "storyboard-agent",
+            "X-ServerPilot-Actor": "storyboard-agent",
             "Idempotency-Key": "storyboard-cpu-staging-1",
         },
     )
@@ -1411,7 +1411,7 @@ def test_cpu_only_scheduler_rejects_gpu_type(
         "/api/v1/scheduler-jobs",
         json=request,
         headers={
-            "X-GPU-Broker-Actor": "storyboard-agent",
+            "X-ServerPilot-Actor": "storyboard-agent",
             "Idempotency-Key": "invalid-cpu-contract-1",
         },
     )
@@ -1428,7 +1428,7 @@ def test_one_off_requires_access_and_does_not_retain_script_by_default(
         "/api/v1/scheduler-targets",
         json=_target(),
         headers={
-            "X-GPU-Broker-Actor": "scheduler-admin",
+            "X-ServerPilot-Actor": "scheduler-admin",
             "Idempotency-Key": "target-scheduler-a",
         },
     )
@@ -1461,7 +1461,7 @@ def test_one_off_requires_access_and_does_not_retain_script_by_default(
         "/api/v1/scheduler-jobs",
         json=request,
         headers={
-            "X-GPU-Broker-Actor": "one-off-agent",
+            "X-ServerPilot-Actor": "one-off-agent",
             "Idempotency-Key": "one-off-1",
         },
     )
@@ -1469,7 +1469,7 @@ def test_one_off_requires_access_and_does_not_retain_script_by_default(
     assert blocked.json()["error"]["code"] == "access_required"
     assert client.get(
         "/api/v1/scheduler-jobs",
-        headers={"X-GPU-Broker-Actor": "one-off-agent"},
+        headers={"X-ServerPilot-Actor": "one-off-agent"},
     ).json()["data"] == []
 
     provider.access = {
@@ -1481,7 +1481,7 @@ def test_one_off_requires_access_and_does_not_retain_script_by_default(
         "/api/v1/scheduler-jobs",
         json=request,
         headers={
-            "X-GPU-Broker-Actor": "one-off-agent",
+            "X-ServerPilot-Actor": "one-off-agent",
             "Idempotency-Key": "one-off-1",
         },
     )
@@ -1510,7 +1510,7 @@ def test_access_failure_from_submit_is_reported_without_claiming_gpu(
         "/api/v1/scheduler-targets",
         json=_target(),
         headers={
-            "X-GPU-Broker-Actor": "scheduler-admin",
+            "X-ServerPilot-Actor": "scheduler-admin",
             "Idempotency-Key": "target-scheduler-a",
         },
     )
@@ -1543,7 +1543,7 @@ def test_access_failure_from_submit_is_reported_without_claiming_gpu(
         "/api/v1/scheduler-jobs",
         json=request,
         headers={
-            "X-GPU-Broker-Actor": "route-loss-agent",
+            "X-ServerPilot-Actor": "route-loss-agent",
             "Idempotency-Key": "route-loss-1",
         },
     )
@@ -1551,7 +1551,7 @@ def test_access_failure_from_submit_is_reported_without_claiming_gpu(
     assert response.json()["error"]["code"] == "access_required"
     jobs = client.get(
         "/api/v1/scheduler-jobs",
-        headers={"X-GPU-Broker-Actor": "route-loss-agent"},
+        headers={"X-ServerPilot-Actor": "route-loss-agent"},
     ).json()["data"]
     assert jobs[0]["state"] == "ACCESS_REQUIRED"
     assert jobs[0]["scheduler_job_id"] is None
@@ -1566,14 +1566,14 @@ def test_scheduler_upload_uses_unique_stage_and_persisted_status(
         "/api/v1/scheduler-targets",
         json=_upload_target(),
         headers={
-            "X-GPU-Broker-Actor": "scheduler-admin",
+            "X-ServerPilot-Actor": "scheduler-admin",
             "Idempotency-Key": "target-scheduler-a-upload",
         },
     )
     source = tmp_path / "dataset.bin"
     source.write_bytes(b"dataset")
     headers = {
-        "X-GPU-Broker-Actor": "storyboard-agent",
+        "X-ServerPilot-Actor": "storyboard-agent",
         "Idempotency-Key": "upload-storyboard-dataset",
     }
     started = client.post(
@@ -1592,7 +1592,7 @@ def test_scheduler_upload_uses_unique_stage_and_persisted_status(
     for _ in range(50):
         status = client.get(
             f"/api/v1/scheduler-transfers/{transfer_id}",
-            headers={"X-GPU-Broker-Actor": "storyboard-agent"},
+            headers={"X-ServerPilot-Actor": "storyboard-agent"},
         )
         if status.json()["scheduler_transfer"]["state"] != "TRANSFERRING":
             break
@@ -1600,7 +1600,7 @@ def test_scheduler_upload_uses_unique_stage_and_persisted_status(
     transfer = status.json()["scheduler_transfer"]
     assert transfer["state"] == "COMPLETED"
     assert transfer["remote_staged_path"] == (
-        f"/home/test/staging/gpu-broker-{transfer_id}/dataset.bin"
+        f"/home/test/staging/serverpilot-{transfer_id}/dataset.bin"
     )
     assert transfer["source_size_bytes"] == 7
     assert len(provider.uploads) == 1

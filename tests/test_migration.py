@@ -5,9 +5,10 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
 
-from gpu_broker.database import Database
+from serverpilot.database import Database
 
 
 def test_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
@@ -35,6 +36,12 @@ def test_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
     )
     gpu_columns = {column["name"] for column in inspect(database.engine).get_columns("gpu_devices")}
     assert {"present", "absent_at"}.issubset(gpu_columns)
+    endpoint_columns = {
+        column["name"] for column in inspect(database.engine).get_columns("endpoints")
+    }
+    lease_columns = {column["name"] for column in inspect(database.engine).get_columns("leases")}
+    assert "keepalive_adapter_id" in endpoint_columns
+    assert "kind" in lease_columns
     endpoint_telemetry_columns = {
         column["name"]
         for column in inspect(database.engine).get_columns("endpoint_telemetry_current")
@@ -45,7 +52,7 @@ def test_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
         "cpu_utilization_pct",
     }.issubset(endpoint_telemetry_columns)
     config = Config(str(root / "alembic.ini"))
-    config.set_main_option("script_location", str(root / "src" / "gpu_broker" / "migrations"))
+    config.set_main_option("script_location", str(root / "src" / "serverpilot" / "migrations"))
     config.set_main_option("sqlalchemy.url", database.url)
     command.downgrade(config, "base")
     assert "gpu_devices" not in inspect(database.engine).get_table_names()
@@ -65,7 +72,7 @@ def test_migration_upgrades_existing_schema_to_endpoint_telemetry(tmp_path: Path
     root = Path(__file__).resolve().parents[1]
     database = Database(f"sqlite:///{tmp_path / 'upgrade.sqlite3'}", root)
     config = Config(str(root / "alembic.ini"))
-    config.set_main_option("script_location", str(root / "src" / "gpu_broker" / "migrations"))
+    config.set_main_option("script_location", str(root / "src" / "serverpilot" / "migrations"))
     config.set_main_option("sqlalchemy.url", database.url)
 
     command.upgrade(config, "20260719_0002")
@@ -85,7 +92,9 @@ def test_migration_upgrades_existing_schema_to_endpoint_telemetry(tmp_path: Path
     assert {"present", "absent_at"}.issubset(gpu_columns)
     assert "lease_endpoint_commitments" in inspect(database.engine).get_table_names()
     with database.engine.connect() as connection:
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "20260810_0014"
+        assert connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == ScriptDirectory.from_config(config).get_current_head()
 
 
 def test_scheduler_transport_migration_scrubs_legacy_argv_and_disables_target(
@@ -94,7 +103,7 @@ def test_scheduler_transport_migration_scrubs_legacy_argv_and_disables_target(
     root = Path(__file__).resolve().parents[1]
     database = Database(f"sqlite:///{tmp_path / 'scheduler-upgrade.sqlite3'}", root)
     config = Config(str(root / "alembic.ini"))
-    config.set_main_option("script_location", str(root / "src" / "gpu_broker" / "migrations"))
+    config.set_main_option("script_location", str(root / "src" / "serverpilot" / "migrations"))
     config.set_main_option("sqlalchemy.url", database.url)
 
     command.upgrade(config, "20260809_0012")

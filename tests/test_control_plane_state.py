@@ -5,10 +5,10 @@ from pathlib import Path
 import yaml
 from fastapi.testclient import TestClient
 
-from gpu_broker import API_CAPABILITIES
-from gpu_broker.api import create_app
-from gpu_broker.config import Settings
-from gpu_broker.schemas import EndpointUpsert, RequestCreate
+from serverpilot import API_CAPABILITIES
+from serverpilot.api import create_app
+from serverpilot.config import Settings
+from serverpilot.schemas import EndpointUpsert, RequestCreate
 from tests.helpers import observation
 
 
@@ -62,7 +62,7 @@ def test_control_plane_state_route_groups_current_and_history(tmp_path: Path, in
 
     response = TestClient(app).get(
         "/api/v1/state",
-        headers={"X-GPU-Broker-Actor": "state-agent"},
+        headers={"X-ServerPilot-Actor": "state-agent"},
     )
 
     assert response.status_code == 200

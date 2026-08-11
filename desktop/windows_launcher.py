@@ -21,12 +21,12 @@ from urllib.request import urlopen
 
 import uvicorn
 
-from gpu_broker.api import create_app
-from gpu_broker.config import Settings
+from serverpilot.api import create_app
+from serverpilot.config import Settings
 
 
 APP_NAME = "ServerPilot"
-LEGACY_DATA_DIRECTORY_NAME = "GPU Broker"
+DATA_DIRECTORY_NAME = "ServerPilot"
 DEFAULT_PORT = 8787
 READY_TIMEOUT_SECONDS = 30.0
 DEFAULT_INVENTORY = """schema_version: 1
@@ -60,13 +60,13 @@ class RuntimePaths:
 
 def default_data_dir(environment: Mapping[str, str] | None = None) -> Path:
     environment = os.environ if environment is None else environment
-    configured = environment.get("GPU_BROKER_DATA_DIR") or None
+    configured = environment.get("SERVERPILOT_DATA_DIR") or None
     if configured:
         return Path(configured).expanduser()
     local_app_data = environment.get("LOCALAPPDATA")
     if local_app_data:
-        return Path(local_app_data) / LEGACY_DATA_DIRECTORY_NAME
-    return Path.home() / ".gpu-broker"
+        return Path(local_app_data) / DATA_DIRECTORY_NAME
+    return Path.home() / ".serverpilot"
 
 
 def sqlite_url(path: Path) -> str:
@@ -76,17 +76,17 @@ def sqlite_url(path: Path) -> str:
 def runtime_paths(environment: Mapping[str, str] | None = None) -> RuntimePaths:
     environment = os.environ if environment is None else environment
     data_dir = default_data_dir(environment)
-    inventory_config = environment.get("GPU_BROKER_INVENTORY") or None
+    inventory_config = environment.get("SERVERPILOT_INVENTORY") or None
     inventory_path = Path(inventory_config).expanduser() if inventory_config else data_dir / "inventory.yaml"
-    database_url = (environment.get("GPU_BROKER_DATABASE_URL") or None) or sqlite_url(
-        data_dir / "state" / "gpu-broker.sqlite3"
+    database_url = (environment.get("SERVERPILOT_DATABASE_URL") or None) or sqlite_url(
+        data_dir / "state" / "serverpilot.sqlite3"
     )
     try:
-        port = int(environment.get("GPU_BROKER_BIND_PORT", str(DEFAULT_PORT)))
+        port = int(environment.get("SERVERPILOT_BIND_PORT", str(DEFAULT_PORT)))
     except ValueError as exc:
-        raise LauncherError("GPU_BROKER_BIND_PORT 必须是 1 到 65535 之间的整数。") from exc
+        raise LauncherError("SERVERPILOT_BIND_PORT 必须是 1 到 65535 之间的整数。") from exc
     if not 1 <= port <= 65535:
-        raise LauncherError("GPU_BROKER_BIND_PORT 必须是 1 到 65535 之间的整数。")
+        raise LauncherError("SERVERPILOT_BIND_PORT 必须是 1 到 65535 之间的整数。")
     return RuntimePaths(
         data_dir=data_dir,
         inventory_path=inventory_path,
@@ -170,7 +170,7 @@ class BrokerServer:
             ws="none",
         )
         self._server = uvicorn.Server(config)
-        self._thread = threading.Thread(target=self._server.run, name="gpu-broker-server", daemon=True)
+        self._thread = threading.Thread(target=self._server.run, name="serverpilot-server", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:

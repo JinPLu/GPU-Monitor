@@ -3,10 +3,10 @@ set -euo pipefail
 
 script_dir=${0:A:h}
 project_root=${script_dir:h}
-app_bundle="${1:-${project_root}/dist/ServerPilot.app}"
+app_bundle="${1:-${project_root}/ServerPilot.app}"
 frontend="${app_bundle}/Contents/MacOS/ServerPilot"
-runtime_root="${app_bundle}/Contents/Resources/BrokerRuntime"
-backend="${runtime_root}/gpu-broker"
+runtime_root="${app_bundle}/Contents/Resources/ServerPilotRuntime"
+backend="${runtime_root}/serverpilot"
 inventory="${runtime_root}/configs/inventory.yaml"
 
 for required in "${frontend}" "${backend}" "${inventory}"; do
@@ -22,7 +22,14 @@ fi
 
 xattr -d com.apple.FinderInfo "${app_bundle}" 2>/dev/null || true
 xattr -d 'com.apple.fileprovider.fpfs#P' "${app_bundle}" 2>/dev/null || true
-codesign --verify --deep --strict "${app_bundle}"
+(
+  signature_check_root="$(mktemp -d /tmp/serverpilot-signature-check.XXXXXX)"
+  trap 'rm -rf "${signature_check_root}"' EXIT
+  signature_check_bundle="${signature_check_root}/ServerPilot.app"
+  COPYFILE_DISABLE=1 ditto --norsrc "${app_bundle}" "${signature_check_bundle}"
+  xattr -cr "${signature_check_bundle}"
+  codesign --verify --deep --strict "${signature_check_bundle}"
+)
 "${backend}" --help >/dev/null
 
 external_links="$(otool -L "${frontend}" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/System/|/usr/lib/)' || true)"
@@ -32,7 +39,7 @@ if [[ -n "${external_links}" ]]; then
   exit 1
 fi
 
-smoke_dir="$(mktemp -d /tmp/gpu-broker-standalone-smoke.XXXXXX)"
+smoke_dir="$(mktemp -d /tmp/serverpilot-standalone-smoke.XXXXXX)"
 smoke_pid=""
 cleanup() {
   if [[ -n "${smoke_pid}" ]] && kill -0 "${smoke_pid}" 2>/dev/null; then
@@ -47,7 +54,7 @@ smoke_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",
 (
   cd /tmp
   exec "${backend}" serve \
-    --db "${smoke_dir}/gpu-broker.sqlite3" \
+    --db "${smoke_dir}/serverpilot.sqlite3" \
     --inventory "${inventory}" \
     --host 127.0.0.1 \
     --port "${smoke_port}"
@@ -74,7 +81,7 @@ if [[ "${ready}" != true ]]; then
 fi
 
 curl --fail --silent \
-  -H 'X-GPU-Broker-Actor: standalone-smoke' \
+  -H 'X-ServerPilot-Actor: standalone-smoke' \
   "http://127.0.0.1:${smoke_port}/api/v1/snapshot" \
   >"${smoke_dir}/snapshot.json"
 python3 - "${smoke_dir}/snapshot.json" <<'PY'

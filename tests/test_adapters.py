@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from gpu_broker.adapters import (
+from serverpilot.adapters import (
     ADAPTER_REGISTRY,
     AdapterRegistryError,
     MAX_RAW_SSH_STDERR_BYTES,
@@ -16,9 +16,9 @@ from gpu_broker.adapters import (
     RawSSHObservationAdapter,
     SlurmCommandSchedulerAdapter,
 )
-from gpu_broker.config import EndpointConfig
-from gpu_broker.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
-from gpu_broker.slurm import CommandSlurmProvider, SlurmProviderError
+from serverpilot.config import EndpointConfig
+from serverpilot.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
+from serverpilot.slurm import CommandSlurmProvider, SlurmProviderError
 
 
 @pytest.fixture(autouse=True)
@@ -30,8 +30,12 @@ def approved_scheduler_helper(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_registry_is_sealed_to_known_adapters() -> None:
-    assert ADAPTER_REGISTRY.ids() == ("raw-ssh", "slurm-command")
+    assert ADAPTER_REGISTRY.ids() == ("raw-ssh", "slurm-command", "server-script-v1")
     assert ADAPTER_REGISTRY.require_capability("raw-ssh", "observation").id == "raw-ssh"
+    assert (
+        ADAPTER_REGISTRY.require_capability("server-script-v1", "endpoint_keepalive").id
+        == "server-script-v1"
+    )
     with pytest.raises(AdapterRegistryError, match="unknown adapter"):
         ADAPTER_REGISTRY.get("unknown")
     with pytest.raises(AdapterRegistryError, match="does not provide scheduler"):
@@ -248,6 +252,52 @@ def test_raw_ssh_adapter_bounds_and_drains_noisy_remote_streams(
     assert result.stderr_truncated is True
     assert len(result.stdout) == MAX_RAW_SSH_STDOUT_BYTES
     assert len(result.stderr) == MAX_RAW_SSH_STDERR_BYTES
+
+
+def test_raw_ssh_adapter_times_out_and_reaps_a_hung_connected_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        returncode: int | None = None
+        killed = False
+
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+
+        async def wait(self) -> int:
+            return self.returncode or 0
+
+    process: FakeProcess | None = None
+
+    async def fake_create_subprocess_exec(*_command: Any, **_kwargs: Any) -> FakeProcess:
+        nonlocal process
+        process = FakeProcess()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    endpoint = EndpointConfig(id="endpoint-a", host="gpu.example.test", port=22, ssh_user="gpu")
+
+    with pytest.raises(
+        TimeoutError,
+        match=r"SSH observation timed out after 0\.01 seconds for endpoint-a",
+    ):
+        asyncio.run(
+            RawSSHObservationAdapter().run_probe(
+                endpoint,
+                probe="endpoint-telemetry",
+                connect_timeout_seconds=0.01,  # type: ignore[arg-type]
+            )
+        )
+
+    assert process is not None
+    assert process.killed is True
 
 
 def test_slurm_command_adapter_preserves_runner_contract() -> None:

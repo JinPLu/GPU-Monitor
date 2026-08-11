@@ -1,1 +1,1 @@
-"""gpu-broker test package."""
+"""serverpilot test package."""

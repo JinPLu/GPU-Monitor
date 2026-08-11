@@ -16,7 +16,7 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 
 Set-Location $projectRoot
 
-uv sync --extra dev --reinstall-package gpu-broker
+uv sync --extra dev --reinstall-package serverpilot
 
 if (Test-Path $outputRoot) {
     Remove-Item -Recurse -Force $outputRoot

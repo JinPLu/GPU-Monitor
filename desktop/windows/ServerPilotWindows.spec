@@ -6,7 +6,7 @@ from PyInstaller.utils.hooks import collect_data_files
 
 
 project_root = Path(SPECPATH).resolve().parents[1]
-datas = collect_data_files("gpu_broker")
+datas = collect_data_files("serverpilot")
 datas.append((str(project_root / "desktop" / "assets" / "ServerPilot Icon.png"), "desktop/assets"))
 
 a = Analysis(

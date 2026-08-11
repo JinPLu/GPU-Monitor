@@ -18,4 +18,4 @@ import pytest
     ],
 )
 def test_runtime_package_resources_are_present(resource: str) -> None:
-    assert files("gpu_broker").joinpath(resource).is_file(), resource
+    assert files("serverpilot").joinpath(resource).is_file(), resource

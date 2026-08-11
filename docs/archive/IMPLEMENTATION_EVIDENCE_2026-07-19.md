@@ -15,7 +15,7 @@
 - CPU、内存、snapshot 延迟与体积均完成轻量冒烟；具体环境数据不进入公开仓库。
 - SSH 超时时，对应 GPU 被标记为 `UNKNOWN_STALE` 并禁止分配。
 - current telemetry 保持每 GPU 一行，历史按分钟留点；正常采样不追加审计，仅 provider 状态切换追加。
-- 桌面进程树为原生 App 与 `.venv/bin/gpu-broker` 后端。
+- 桌面进程树为原生 App 与 `.venv/bin/serverpilot` 后端。
 
 ## GUI 验收
 

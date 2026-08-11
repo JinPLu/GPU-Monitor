@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from gpu_broker import cli, daemon, mcp_server
-from gpu_broker.daemon import (
+from serverpilot import cli, daemon, mcp_server
+from serverpilot.daemon import (
     DaemonConfig,
     DaemonError,
     MacOSDaemonManager,
@@ -22,20 +22,20 @@ from gpu_broker.daemon import (
 
 
 def _config(tmp_path: Path) -> DaemonConfig:
-    executable = tmp_path / "bin" / "gpu-broker"
+    executable = tmp_path / "bin" / "serverpilot"
     executable.parent.mkdir()
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
-    data_dir = tmp_path / "Application Support" / "GPU Broker"
+    data_dir = tmp_path / "Application Support" / "ServerPilot"
     return DaemonConfig(
         base_url="http://127.0.0.1:8787",
         host="127.0.0.1",
         port=8787,
         data_dir=data_dir,
-        database_path=data_dir / "state/gpu-broker.sqlite3",
+        database_path=data_dir / "state/serverpilot.sqlite3",
         inventory_path=data_dir / "inventory.yaml",
-        plist_path=tmp_path / "Library/LaunchAgents/local.gpu-broker.daemon.plist",
-        log_dir=tmp_path / "Library/Logs/GPU Broker",
+        plist_path=tmp_path / "Library/LaunchAgents/local.serverpilot.daemon.plist",
+        log_dir=tmp_path / "Library/Logs/ServerPilot",
         lock_path=data_dir / "daemon.ensure.lock",
         executable=executable,
     )
@@ -44,23 +44,23 @@ def _config(tmp_path: Path) -> DaemonConfig:
 def test_resolve_daemon_config_uses_application_support_and_explicit_executable(
     tmp_path: Path,
 ) -> None:
-    executable = tmp_path / "gpu-broker"
+    executable = tmp_path / "serverpilot"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o755)
 
     config = resolve_daemon_config(
         {
             "HOME": str(tmp_path),
-            "GPU_BROKER_DAEMON_EXECUTABLE": str(executable),
-            "GPU_BROKER_URL": "http://127.0.0.1:8787",
-            "GPU_BROKER_DATA_DIR": str(tmp_path / "ignored-data"),
-            "GPU_BROKER_DATABASE_PATH": str(tmp_path / "ignored.sqlite3"),
-            "GPU_BROKER_INVENTORY": str(tmp_path / "ignored.yaml"),
+            "SERVERPILOT_DAEMON_EXECUTABLE": str(executable),
+            "SERVERPILOT_URL": "http://127.0.0.1:8787",
+            "SERVERPILOT_DATA_DIR": str(tmp_path / "ignored-data"),
+            "SERVERPILOT_DATABASE_PATH": str(tmp_path / "ignored.sqlite3"),
+            "SERVERPILOT_INVENTORY": str(tmp_path / "ignored.yaml"),
         }
     )
 
-    assert config.data_dir == tmp_path / "Library/Application Support/GPU Broker"
-    assert config.database_path == config.data_dir / "state/gpu-broker.sqlite3"
+    assert config.data_dir == tmp_path / "Library/Application Support/ServerPilot"
+    assert config.database_path == config.data_dir / "state/serverpilot.sqlite3"
     assert config.inventory_path == config.data_dir / "inventory.yaml"
     assert config.executable == executable
 
@@ -78,15 +78,15 @@ def test_resolve_daemon_config_rejects_non_loopback_or_ambiguous_urls(
     tmp_path: Path,
     url: str,
 ) -> None:
-    executable = tmp_path / "gpu-broker"
+    executable = tmp_path / "serverpilot"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o755)
     with pytest.raises(DaemonError):
         resolve_daemon_config(
             {
                 "HOME": str(tmp_path),
-                "GPU_BROKER_DAEMON_EXECUTABLE": str(executable),
-                "GPU_BROKER_URL": url,
+                "SERVERPILOT_DAEMON_EXECUTABLE": str(executable),
+                "SERVERPILOT_URL": url,
             }
         )
 
@@ -95,7 +95,7 @@ def test_launch_agent_owns_one_loopback_server_and_preserves_paths(tmp_path: Pat
     config = _config(tmp_path)
     payload = plistlib.loads(render_launch_agent(config))
 
-    assert payload["Label"] == "local.gpu-broker.daemon"
+    assert payload["Label"] == "local.serverpilot.daemon"
     assert payload["WorkingDirectory"] == str(config.data_dir)
     assert payload["RunAtLoad"] is True
     assert payload["KeepAlive"] == {"SuccessfulExit": False}
@@ -151,7 +151,7 @@ def test_install_migrates_inventory_and_database_once(
         inventory_text,
         encoding="utf-8",
     )
-    with sqlite3.connect(source_root / "state/gpu-broker.sqlite3") as connection:
+    with sqlite3.connect(source_root / "state/serverpilot.sqlite3") as connection:
         connection.execute("CREATE TABLE proof (value TEXT NOT NULL)")
         connection.execute("INSERT INTO proof VALUES ('preserved')")
 
@@ -169,6 +169,77 @@ def test_install_migrates_inventory_and_database_once(
         assert connection.execute("SELECT value FROM proof").fetchone() == ("preserved",)
     assert config.inventory_path.read_text(encoding="utf-8") == inventory_text
     assert config.plist_path.is_file()
+
+
+def test_install_migrates_legacy_application_support_without_removing_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daemon.sys, "platform", "darwin")
+    config = _config(tmp_path)
+    legacy_root = config.data_dir.parent / "GPU Broker"
+    (legacy_root / "state").mkdir(parents=True)
+    inventory_text = "schema_version: 1\nprojects: []\nendpoints: []\n"
+    legacy_inventory = legacy_root / "inventory.yaml"
+    legacy_inventory.write_text(inventory_text, encoding="utf-8")
+    legacy_database = legacy_root / "state/gpu-broker.sqlite3"
+    with sqlite3.connect(legacy_database) as connection:
+        connection.execute("CREATE TABLE proof (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO proof VALUES ('legacy-preserved')")
+
+    manager = MacOSDaemonManager(config)
+    monkeypatch.setattr(manager, "_loaded", lambda: False)
+
+    result = manager.install(start=False)
+
+    assert result["migrated_inventory"] is True
+    assert result["migrated_database"] is True
+    assert legacy_inventory.read_text(encoding="utf-8") == inventory_text
+    assert legacy_database.is_file()
+    with sqlite3.connect(config.database_path) as connection:
+        assert connection.execute("SELECT value FROM proof").fetchone() == (
+            "legacy-preserved",
+        )
+
+
+def test_install_boots_out_exact_legacy_launchd_label(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daemon.sys, "platform", "darwin")
+    config = _config(tmp_path)
+    source_root = tmp_path / "source"
+    (source_root / "configs").mkdir(parents=True)
+    (source_root / "configs/inventory.yaml").write_text(
+        "schema_version: 1\nprojects: []\nendpoints: []\n",
+        encoding="utf-8",
+    )
+    manager = MacOSDaemonManager(config)
+    monkeypatch.setattr(manager, "_loaded", lambda: False)
+    calls: list[tuple[str, ...]] = []
+    legacy_loaded = True
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_launchctl(*arguments: str, **_kwargs: object) -> Result:
+        nonlocal legacy_loaded
+        calls.append(arguments)
+        if arguments == ("print", manager.legacy_service_target):
+            result = Result()
+            result.returncode = 0 if legacy_loaded else 1
+            return result
+        if arguments == ("bootout", manager.legacy_service_target):
+            legacy_loaded = False
+        return Result()
+
+    monkeypatch.setattr(manager, "_launchctl", fake_launchctl)
+
+    manager.install(source_root, start=False)
+
+    assert ("bootout", f"gui/{daemon.os.getuid()}/local.gpu-broker.daemon") in calls
 
 
 def test_invalid_inventory_is_never_published(
@@ -196,6 +267,25 @@ def test_ensure_is_noop_when_compatible_service_is_ready(
     monkeypatch.setattr(daemon.sys, "platform", "darwin")
     config = _config(tmp_path)
     manager = MacOSDaemonManager(config)
+    calls: list[tuple[str, ...]] = []
+    legacy_loaded = True
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_launchctl(*arguments: str, **_kwargs: object) -> Result:
+        nonlocal legacy_loaded
+        calls.append(arguments)
+        result = Result()
+        if arguments == ("print", manager.legacy_service_target):
+            result.returncode = 0 if legacy_loaded else 1
+        elif arguments == ("bootout", manager.legacy_service_target):
+            legacy_loaded = False
+        return result
+
+    monkeypatch.setattr(manager, "_launchctl", fake_launchctl)
     monkeypatch.setattr(
         daemon,
         "probe_live",
@@ -230,6 +320,7 @@ def test_ensure_is_noop_when_compatible_service_is_ready(
     assert result["live"] is True
     assert result["ready"] is True
     assert not config.lock_path.exists()
+    assert ("bootout", f"gui/{daemon.os.getuid()}/local.gpu-broker.daemon") in calls
 
 
 def test_ensure_rejects_matching_identity_from_non_launchd_process(
@@ -399,6 +490,7 @@ def test_uninstall_preserves_plist_when_launchctl_cannot_unload(
 def test_mcp_ensures_daemon_before_constructing_rest_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     calls: list[str] = []
 
     class FakeClient:
@@ -456,7 +548,7 @@ def test_macos_gui_defaults_to_low_composition_surfaces() -> None:
     )[1].split("func applicationShouldTerminate", maxsplit=1)[0]
     assert "createdWindow.backgroundColor = .windowBackgroundColor" in launch_body
     assert "createdWindow.isOpaque = true" in launch_body
-    assert "createdWindow.appearance = NSAppearance(named: .aqua)" in launch_body
+    assert "createdWindow.appearance = NSAppearance(named: .aqua)" not in launch_body
 
     ambient_body = support_source.split("struct AmbientBackground", maxsplit=1)[
         1
@@ -475,10 +567,10 @@ def test_macos_gui_defaults_to_low_composition_surfaces() -> None:
     assert ".regularMaterial" not in toolbar_body
     assert ".background(DesignTokens.surface)" in sidebar_body
     assert ".background(DesignTokens.surface)" in toolbar_body
-    assert "GPU_BROKER_DESKTOP_VIEWPORT" in window_source
-    assert "GPU_BROKER_DESKTOP_SCREENSHOT" in window_source
-    assert "GPU_BROKER_DESKTOP_EXIT_AFTER_SCREENSHOT" in window_source
-    assert "GPU_BROKER_DESKTOP_SECTION" in window_source
+    assert "SERVERPILOT_DESKTOP_VIEWPORT" in window_source
+    assert "SERVERPILOT_DESKTOP_SCREENSHOT" in window_source
+    assert "SERVERPILOT_DESKTOP_EXIT_AFTER_SCREENSHOT" in window_source
+    assert "SERVERPILOT_DESKTOP_SECTION" in window_source
     assert "CPU 计算节点 · 当前未检测到 GPU" in overview_source
     assert "static let interaction = Color(nsColor: .controlAccentColor)" in support_source
     assert "static let cpu = mutedInk" in support_source
@@ -517,7 +609,7 @@ def test_macos_resource_split_preserves_readable_endpoint_rows_when_narrow() -> 
     assert "ViewThatFits(in: .horizontal)" in endpoint_table_body
     assert "compactRow" in endpoint_table_body
     assert "LazyVGrid(" in endpoint_table_body
-    assert 'Text("端点与资源状态")' in dashboard_source
+    assert 'Text("项目与任务")' in dashboard_source
 
 
 def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry_claims() -> None:
@@ -529,12 +621,16 @@ def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry
         encoding="utf-8"
     )
 
-    assert "ResourceUsageDashboard(store: store)" in window_source
+    assert "ResourceUsageDashboard(store: store, claimGPU: claimGPU)" in window_source
     assert 'case "resource-usage", "leases": .leases' in window_source
-    for scope in ("case project", "case agent", "case task"):
+    for scope in ("case project", "case task"):
         assert scope in usage_source
-    for status_label in ('label: "已申领，待使用"', 'label: "运行中"', 'label: "申请中"'):
-        assert status_label in usage_source
+    assert "static let visibleCases: [ResourceUsageScope] = [.project, .task]" in usage_source
+    for state, help_text in (
+        ("已分配", "资源已归属，尚未检测到任务"),
+        ("运行", "已检测到任务"),
+    ):
+        assert f'case "{state}": return "{help_text}"' in usage_source
     assert 'snapshot.resourceClaims.filter {' in usage_source
     assert '$0.runtimeState == "RUNNING" || $0.state == "RUNNING"' in usage_source
     assert '["BLOCKED", "QUEUED", "PENDING_APPROVAL", "REQUESTED"]' in usage_source
@@ -548,9 +644,9 @@ def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry
     assert ".onChange(of: store.snapshot.snapshotRevision)" in usage_source
     assert "groupsByScope = [scope: makeResourceUsageGroups" in usage_source
     assert "ResourceUsageScope.allCases.map" not in usage_source
-    assert "GPU_BROKER_DESKTOP_USAGE_SCOPE" in usage_source
-    for resource_label in ('label: "CPU"', 'label: "内存"', 'label: "GPU"'):
-        assert resource_label in usage_source
+    assert "SERVERPILOT_DESKTOP_USAGE_SCOPE" in usage_source
+    for summary_title in ('title: "已分配"', 'title: "运行"'):
+        assert summary_title in usage_source
 
 
 def test_product_copy_is_anchored_on_one_user_with_projects_and_agents() -> None:
@@ -563,22 +659,29 @@ def test_product_copy_is_anchored_on_one_user_with_projects_and_agents() -> None
         project_root / "desktop" / "ResourceUsageDashboard.swift"
     ).read_text(encoding="utf-8")
     base_template = (
-        project_root / "src" / "gpu_broker" / "web" / "templates" / "base.html"
+        project_root / "src" / "serverpilot" / "web" / "templates" / "base.html"
     ).read_text(encoding="utf-8")
     dashboard_template = (
         project_root
         / "src"
-        / "gpu_broker"
+        / "serverpilot"
         / "web"
         / "templates"
         / "dashboard.html"
     ).read_text(encoding="utf-8")
 
     assert "一个本机用户，管理多台服务器、多个项目和多个 Agent" in readme
-    assert "| 你要做什么 | ServerPilot 做什么 |\n| --- | --- |" in readme
+    assert "| 核心价值 | ServerPilot 提供什么 |\n| --- | --- |" in readme
+    for product_value in (
+        "统一零散 GPU",
+        "Agent 协作调度",
+        "人类实时监控",
+        "状态与归属追溯",
+    ):
+        assert product_value in readme
     assert "| --- | --- | --- |" not in readme
-    assert 'SidebarSelection(title: "项目与 Agent"' in window_source
-    assert 'Text("项目与 Agent")' in usage_source
+    assert 'SidebarSelection(title: "使用情况"' in window_source
+    assert 'accessibilityLabel("按项目或任务查看使用情况")' in usage_source
     assert "一个本机用户 · 同一份状态" in base_template
     assert "一个本机用户 · 多项目与 Agent" in dashboard_template
     for retired_copy in ("共享 GPU 工作区", "协作安排", "当前操作者"):
