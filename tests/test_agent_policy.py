@@ -114,86 +114,66 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
     adapter = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
     for boundary in (
         "use the local serverpilot mcp",
-        "server instructions",
         "gpu_status",
-        "gpu_list",
+        "include_busy=true",
         "gpu_apply",
         "gpu_count",
         "no_capacity",
-        "lease.resources[]",
+        "gpus[]",
         "cuda_visible_devices",
-        "gpu_bind_observed_workload",
+        "workspace_path",
         "gpu_release",
+        "codex_thread_id",
+        "codex://threads/<uuid>",
         "ssh",
         "sqlite",
         "inventory",
         "nvidia-smi",
-        "approval_ref",
-        "scheduler",
     ):
         assert boundary in adapter
 
-    assert len(adapter.split()) < 350
-    for retired_routine_input in (
-        "resource-card",
-        "profile_id",
-        "project_id",
-        "task_ref",
-        "gpu_claim_profile",
-        "gpu_claim",
+    assert len(adapter.split()) < 180
+    for removed_routine_step in (
+        "gpu_bind_observed_workload",
+        "gpu_renew_lease",
+        "gpu_coordination",
+        "idempotency_key",
+        "heartbeat",
     ):
-        assert retired_routine_input not in adapter
+        assert removed_routine_step not in adapter
 
     mcp_instructions = _plain_policy_text(mcp.instructions).lower()
     for runtime_contract in (
+        "三个工具",
+        "gpu_status",
         "gpu_apply",
-        "optionally selecting a server",
-        "one gpu by default",
-        "records routine project/task attribution",
-        "chooses the actual allocatable gpus",
-        "fails with no_capacity",
-        "creates no queue",
-        "held or active lease",
-        "lease.resources[]",
         "cuda_visible_devices",
-        "gpu_bind_observed_workload",
+        "workspace_path",
         "gpu_release",
-        "advanced compatibility surfaces",
-        "idempotency_key",
-        "serverpilot never launches or stops workloads",
+        "include_busy=true",
+        "agent_url",
+        "codex_thread_id",
+        "无容量直接失败，不排队",
     ):
         assert runtime_contract in mcp_instructions
-    assert "gpu_claim_profile" not in mcp_instructions
-    assert "gpu_grant_server_project" not in adapter
-    assert "gpu_grant_server_project" not in mcp.instructions
-    assert "approval_ref" in adapter
-    assert "approval_ref" in mcp_instructions
-
-
-def test_global_policy_defers_scheduler_detail_to_mcp_instructions() -> None:
-    global_policy = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
-    for boundary in (
-        "external clusters are schedulertargets",
-        "not ssh endpoints",
-        "access is required",
-        "report that state and stop",
+    assert len(mcp.instructions) < 512
+    for removed_routine_step in (
+        "gpu_bind_observed_workload",
+        "gpu_renew_lease",
+        "gpu_coordination",
+        "idempotency_key",
+        "approval_ref",
     ):
-        assert boundary in global_policy
-    for site_specific_identifier in ("hanhai", "瀚海", "hh22"):
-        assert site_specific_identifier not in global_policy
+        assert removed_routine_step not in mcp_instructions
+
+
+def test_global_policy_keeps_scheduler_detail_out_of_routine_mcp_help() -> None:
+    global_policy = _plain_policy_text(POLICY.read_text(encoding="utf-8")).lower()
+    assert "advanced compatibility tools are outside the routine path" in global_policy
 
     mcp_instructions = _plain_policy_text(mcp.instructions).lower()
-    for runtime_detail in (
-        "access_required",
-        "scheduler tools",
-        "slurm pending job",
-        "serverpilot never launches or stops",
-    ):
-        assert runtime_detail in mcp_instructions
-    assert "approval_ref" in global_policy
-    assert "approval_ref" in mcp_instructions
-    assert "gpu_scheduler_upload" not in global_policy
-    assert "gpu_scheduler_upload" not in mcp_instructions
+    assert "scheduler" not in mcp_instructions
+    assert "advanced" not in mcp_instructions
 
 
 def test_install_refuses_symlink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

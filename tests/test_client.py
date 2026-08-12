@@ -6,27 +6,24 @@ import pytest
 from serverpilot.client import BrokerClient, BrokerClientError
 
 
-def test_client_retries_a_transient_gateway_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    responses = iter(
-        [
-            httpx.Response(502, text="temporarily unavailable"),
-            httpx.Response(200, json={"schema_version": "v1", "data": {}}),
-        ]
-    )
+def test_client_returns_first_gateway_error_without_retry(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     calls = []
 
     def request(*args, **kwargs):  # type: ignore[no-untyped-def]
         calls.append((args, kwargs))
-        return next(responses)
+        return httpx.Response(
+            502,
+            json={"error": {"code": "gateway_unavailable", "message": "temporarily unavailable"}},
+        )
 
     monkeypatch.setattr("serverpilot.client.httpx.request", request)
-    monkeypatch.setattr("serverpilot.client.time.sleep", lambda _seconds: None)
 
-    assert BrokerClient("http://127.0.0.1:8787").get("/api/v1/snapshot") == {
-        "schema_version": "v1",
-        "data": {},
-    }
-    assert len(calls) == 2
+    with pytest.raises(
+        BrokerClientError,
+        match="broker HTTP 502: gateway_unavailable: temporarily unavailable",
+    ):
+        BrokerClient("http://127.0.0.1:8787").get("/api/v1/snapshot")
+    assert len(calls) == 1
     assert all(call[1]["trust_env"] is False for call in calls)
 
 
@@ -170,19 +167,32 @@ def test_operational_read_aliases_project_from_state(monkeypatch) -> None:  # ty
 
     def request(method, url, **kwargs):  # type: ignore[no-untyped-def]
         calls.append((method, url))
+        envelope = {
+            "schema_version": "v1",
+            "snapshot_revision": 11,
+            "server_time": "2026-08-06T00:00:00Z",
+        }
         if url.endswith("/api/v1/gpus"):
             return httpx.Response(
                 200,
-                json={
-                    "schema_version": "v1",
-                    "snapshot_revision": 11,
-                    "server_time": "2026-08-06T00:00:00Z",
-                    "data": [
-                        {"id": "gpu-a", "endpoint_id": "server-a", "state": "AVAILABLE"}
-                    ],
-                },
+                json={**envelope, "data": [
+                    {"id": "gpu-a", "endpoint_id": "server-a", "state": "AVAILABLE"}
+                ]},
             )
-        return httpx.Response(200, json=_state(11, current))
+        if url.endswith("/api/v1/endpoints"):
+            return httpx.Response(200, json={**envelope, "data": current["endpoints"]})
+        if url.endswith("/api/v1/requests"):
+            return httpx.Response(200, json={**envelope, "data": [current["requests"][0]]})
+        if url.endswith("/api/v1/resource-providers"):
+            return httpx.Response(200, json={**envelope, "data": current["resource_providers"]})
+        if url.endswith("/api/v1/resource-claims"):
+            return httpx.Response(200, json={**envelope, "data": current["resource_claims"]})
+        if url.endswith("/api/v1/resource-monitor"):
+            return httpx.Response(200, json={**envelope, "data": {
+                "host_capacity": current["host_capacity"],
+                "allocations": current["resource_claims"][0]["allocations"],
+            }})
+        raise AssertionError(url)
 
     monkeypatch.setattr("serverpilot.client.httpx.request", request)
     client = BrokerClient("http://127.0.0.1:8787")
@@ -198,4 +208,4 @@ def test_operational_read_aliases_project_from_state(monkeypatch) -> None:  # ty
     assert monitor["host_capacity"][0]["endpoint"]["id"] == "server-a"
     assert monitor["allocations"] == [{"id": "allocation-a", "claim_id": "claim-a"}]
     assert calls.count(("GET", "http://127.0.0.1:8787/api/v1/gpus")) == 1
-    assert calls.count(("GET", "http://127.0.0.1:8787/api/v1/state")) == 5
+    assert all(not url.endswith("/api/v1/state") for _method, url in calls)

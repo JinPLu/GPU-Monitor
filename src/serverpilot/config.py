@@ -53,6 +53,9 @@ class EndpointConfig(BaseModel):
     port: int = Field(ge=1, le=65535)
     ssh_user: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
     ssh_alias: str | None = Field(default=None, min_length=1, max_length=120)
+    # Nullable only while projecting a migrated legacy database row. Inventory
+    # validation below requires every configured endpoint to name the path.
+    workspace_path: str | None = Field(default=None, min_length=1, max_length=2000)
     # A closed, code-owned profile chooses the fixed read-only probe and
     # parser.  It is deliberately not a command, shell fragment, key path, or
     # SSH option supplied by inventory.
@@ -78,6 +81,15 @@ class EndpointConfig(BaseModel):
         if len(values) != len(set(values)):
             raise ValueError("list values must not contain duplicates")
         return values
+
+    @field_validator("workspace_path")
+    @classmethod
+    def valid_workspace_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.startswith("/") or "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("workspace_path must be an absolute single-line path")
+        return value
 
     @model_validator(mode="after")
     def idle_keepalive_requires_adapter(self) -> "EndpointConfig":
@@ -115,6 +127,8 @@ class InventoryConfig(BaseModel):
             raise ValueError("host:port endpoint identities must be unique")
         if any(RESERVED_SYSTEM_ID in endpoint.project_ids for endpoint in self.endpoints):
             raise ValueError("the ServerPilot internal project id is reserved")
+        if any(endpoint.workspace_path is None for endpoint in self.endpoints):
+            raise ValueError("every configured endpoint requires workspace_path")
         return self
 
 
@@ -137,7 +151,7 @@ def load_inventory(path: Path) -> InventoryConfig:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """Runtime settings. Secrets are supplied only by environment or CLI, never YAML."""
+    """Runtime settings for the loopback control plane."""
 
     database_url: str
     inventory_path: Path
@@ -145,7 +159,6 @@ class Settings:
     bind_host: str = "127.0.0.1"
     bind_port: int = 8787
     daemon_instance_id: str | None = None
-    bootstrap_token: str | None = None
     session_secret: str | None = None
     request_body_limit_bytes: int = 256_000
     rate_limit_per_minute: int = 120
@@ -156,7 +169,6 @@ class Settings:
         *,
         database_url: str | None = None,
         inventory_path: Path | None = None,
-        bootstrap_token: str | None = None,
     ) -> "Settings":
         default_root = Path.cwd()
         raw_database = database_url or os.environ.get(
@@ -181,6 +193,5 @@ class Settings:
             inventory_path=Path(raw_inventory),
             bind_host=host,
             bind_port=port,
-            bootstrap_token=bootstrap_token or os.environ.get("SERVERPILOT_BOOTSTRAP_TOKEN"),
             session_secret=os.environ.get("SERVERPILOT_SESSION_SECRET"),
         )

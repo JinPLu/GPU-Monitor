@@ -1,8 +1,7 @@
-"""UTC-only time and stable JSON/hash helpers."""
+"""UTC-only time and JSON helpers."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -24,11 +23,3 @@ def json_dump(value: Any) -> str:
 
 def json_load(value: str) -> Any:
     return json.loads(value)
-
-
-def stable_hash(value: Any) -> str:
-    return hashlib.sha256(json_dump(value).encode("utf-8")).hexdigest()
-
-
-def token_hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()

@@ -19,6 +19,7 @@
           "host": "127.0.0.1",
           "port": 2221,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -81,7 +82,6 @@
       "workload_profiles": []
     },
     "history": {
-      "retired_endpoints": [],
       "resource_plan_evaluations": [],
       "resource_run_actuals": []
     }

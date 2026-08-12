@@ -19,6 +19,7 @@
           "host": "10.20.0.11",
           "port": 22,
           "ssh_user": "compute",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "enabled": true,
           "lifecycle_state": "active",
           "labels": {
@@ -42,6 +43,7 @@
           "host": "10.20.0.21",
           "port": 2222,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "enabled": true,
           "lifecycle_state": "active",
           "labels": {
@@ -122,7 +124,6 @@
       "workload_profiles": []
     },
     "history": {
-      "retired_endpoints": [],
       "resource_plan_evaluations": [],
       "resource_run_actuals": []
     }

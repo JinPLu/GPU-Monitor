@@ -15,7 +15,6 @@ from serverpilot.api import create_app
 from serverpilot.cli import app as cli_app
 from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
 from serverpilot.mcp_server import ROUTINE_MCP_TOOL_NAMES, mcp, routine_mcp
-from serverpilot.models import Endpoint
 from serverpilot.schemas import EndpointUpsert, RequestCreate
 from tests.helpers import observation, process_for_gpu
 
@@ -24,6 +23,20 @@ def _csrf(html: str) -> str:
     match = re.search(r'name="csrf" value="([^"]+)"', html)
     assert match is not None
     return match.group(1)
+
+
+def test_web_dashboard_uses_the_canonical_public_capacity_projection() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "src/serverpilot/web/static/app.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'gpu.publicly_available === true' in source
+    assert "const publicStatus = gpu.public_status" in source
+    assert "gpu.publicly_available !== true && claimedStates.has(gpu.state)" in source
+    claimed_definition = next(
+        line for line in source.splitlines() if "const claimedStates" in line
+    )
+    assert "KEEPALIVE" not in claimed_definition
 
 
 def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
@@ -86,10 +99,9 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert snapshot.json()["data"]["gpus"][0]["state"] == "HELD"
     capabilities = client.get("/health/live").json()["capabilities"]
     assert capabilities[: len(API_CAPABILITIES)] == list(API_CAPABILITIES)
-    assert "endpoint_deletion" in capabilities
-    assert {"endpoint_update", "endpoint_retirement", "endpoint_keepalive"}.issubset(
-        capabilities
-    )
+    assert "endpoint_deletion" not in capabilities
+    assert "server_deletion" not in capabilities
+    assert {"endpoint_update", "endpoint_keepalive"}.issubset(capabilities)
     compact = client.get(
         "/api/v1/gpus?compact=true",
         headers={"X-ServerPilot-Actor": "test-agent"},
@@ -189,7 +201,6 @@ def test_control_plane_state_api_exposes_current_and_history_contract(
         "workload_profiles",
     }.issubset(current)
     assert {
-        "retired_endpoints",
         "resource_plan_evaluations",
         "resource_run_actuals",
     }.issubset(history)
@@ -324,6 +335,26 @@ def test_api_claim_starts_held_without_a_duration_estimate(tmp_path: Path, inven
     assert claimed.json()["lease"]["project_id"] == "s"
     assert claimed.json()["request"]["duration_seconds"] == 8 * 60 * 60
 
+    request_route = client.post(
+        "/api/v1/requests",
+        json={
+            "project_id": "s",
+            "task_ref": "request-route-no-capacity",
+            "purpose": "request-route-no-capacity",
+            "constraints": {"gpu_count": 1},
+        },
+        headers={"X-ServerPilot-Actor": "claim-agent", "Idempotency-Key": "request-route"},
+    )
+    assert request_route.status_code == 409
+    assert request_route.json()["error"]["code"] == "no_capacity"
+
+    cancel_route = client.post(
+        "/api/v1/requests/missing-request/cancel",
+        headers={"X-ServerPilot-Actor": "claim-agent", "Idempotency-Key": "cancel-route"},
+    )
+    assert cancel_route.status_code == 404
+    assert cancel_route.json()["error"]["code"] == "request_not_found"
+
 
 def test_api_claim_bootstraps_an_empty_project_registry(tmp_path: Path) -> None:
     inventory = InventoryConfig(
@@ -334,6 +365,7 @@ def test_api_claim_bootstraps_an_empty_project_registry(tmp_path: Path) -> None:
                 host="127.0.0.1",
                 port=2201,
                 ssh_user="gpu",
+                workspace_path="/srv/project-a",
             )
         ],
     )
@@ -589,7 +621,7 @@ def test_collector_observation_ingestion_is_not_a_public_actor_route(tmp_path: P
     assert response.status_code == 404
 
 
-def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> None:
+def test_endpoint_delete_rest_route_is_not_public(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -600,32 +632,17 @@ def test_endpoint_delete_rest_route_is_idempotent(tmp_path: Path, inventory) -> 
         )
     )
     client = TestClient(app)
-    with app.state.service.database.session() as session:
-        endpoint = session.get(Endpoint, "endpoint-b")
-        assert endpoint is not None
-        endpoint.owner_project_id = None
-        session.commit()
-
-    missing_key = client.delete(
+    deleted = client.delete(
         "/api/v1/endpoints/endpoint-b",
-        headers={"X-ServerPilot-Actor": "endpoint-admin"},
+        headers={"X-ServerPilot-Actor": "endpoint-admin", "Idempotency-Key": "unused"},
     )
-    assert missing_key.status_code == 422
-    assert missing_key.json()["error"]["code"] == "idempotency_key_required"
-
-    headers = {"X-ServerPilot-Actor": "endpoint-admin", "Idempotency-Key": "delete-endpoint-b"}
-    deleted = client.delete("/api/v1/endpoints/endpoint-b", headers=headers)
-    retried = client.delete("/api/v1/endpoints/endpoint-b", headers=headers)
-
-    assert deleted.status_code == 200
-    assert retried.json() == deleted.json()
-    assert deleted.json()["endpoint_id"] == "endpoint-b"
+    assert deleted.status_code == 405
     listed = client.get("/api/v1/endpoints", headers={"X-ServerPilot-Actor": "endpoint-admin"})
     endpoints = {endpoint["id"]: endpoint for endpoint in listed.json()["data"]}
-    assert endpoints["endpoint-b"]["lifecycle_state"] == "draining"
+    assert "endpoint-b" in endpoints
 
 
-def test_endpoint_rest_lifecycle_uses_explicit_create_update_and_retire(
+def test_endpoint_rest_uses_explicit_create_and_update_without_delete(
     tmp_path: Path, inventory
 ) -> None:
     inventory_path = tmp_path / "inventory.yaml"
@@ -644,6 +661,7 @@ def test_endpoint_rest_lifecycle_uses_explicit_create_update_and_retire(
         "host": "127.0.0.1",
         "port": 2399,
         "ssh_user": "gpu",
+        "workspace_path": "/srv/endpoint-lifecycle",
     }
     created = client.post(
         "/api/v1/endpoints", json=endpoint, headers={**actor, "Idempotency-Key": "endpoint-create"}
@@ -651,6 +669,7 @@ def test_endpoint_rest_lifecycle_uses_explicit_create_update_and_retire(
     assert created.status_code == 200
     assert created.json()["endpoint"]["lifecycle_state"] == "active"
     assert created.json()["endpoint"]["observation_profile"] == "server-script-v1"
+    assert created.json()["endpoint"]["workspace_path"] == "/srv/endpoint-lifecycle"
     duplicate = client.post(
         "/api/v1/endpoints", json=endpoint, headers={**actor, "Idempotency-Key": "endpoint-create-new"}
     )
@@ -668,22 +687,27 @@ def test_endpoint_rest_lifecycle_uses_explicit_create_update_and_retire(
     )
     assert updated.status_code == 200
     assert updated.json()["endpoint"]["ssh_alias"] == "lab-script"
-    retired = client.post(
-        "/api/v1/endpoints/endpoint-lifecycle/retire",
-        json={},
-        headers={**actor, "Idempotency-Key": "endpoint-retire"},
+    workspace_updated = client.patch(
+        "/api/v1/endpoints/endpoint-lifecycle",
+        json={"workspace_path": "/srv/endpoint-lifecycle-updated"},
+        headers={**actor, "Idempotency-Key": "endpoint-workspace-update"},
     )
-    assert retired.status_code == 200
-    assert retired.json()["endpoint"]["lifecycle_state"] == "retired"
-    retired_update = client.patch(
+    assert workspace_updated.status_code == 200
+    assert workspace_updated.json()["endpoint"]["workspace_path"] == "/srv/endpoint-lifecycle-updated"
+    deleted = client.delete(
+        "/api/v1/endpoints/endpoint-lifecycle",
+        headers={**actor, "Idempotency-Key": "endpoint-delete"},
+    )
+    assert deleted.status_code == 405
+    later_update = client.patch(
         "/api/v1/endpoints/endpoint-lifecycle",
         json={"ssh_user": "other"},
-        headers={**actor, "Idempotency-Key": "endpoint-update-retired"},
+        headers={**actor, "Idempotency-Key": "endpoint-update-later"},
     )
-    assert retired_update.status_code == 409
+    assert later_update.status_code == 200
 
 
-def test_removed_maintenance_route_and_compatible_delete_lifecycle(tmp_path: Path, inventory) -> None:
+def test_removed_maintenance_and_delete_routes(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -707,12 +731,11 @@ def test_removed_maintenance_route_and_compatible_delete_lifecycle(tmp_path: Pat
     )
     assert created.status_code == 405
 
-    drained = client.delete(
+    deleted = client.delete(
         "/api/v1/endpoints/endpoint-b",
         headers={"X-ServerPilot-Actor": "human", "Idempotency-Key": "delete-maintained"},
     )
-    assert drained.status_code == 200
-    assert drained.json()["endpoint"]["lifecycle_state"] == "draining"
+    assert deleted.status_code == 405
 
 
 def test_project_creation_route_and_gui_are_not_exposed(tmp_path: Path, inventory) -> None:
@@ -789,6 +812,7 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
             "host": "127.0.0.2",
             "port": "2203",
             "ssh_user": "gpu",
+            "workspace_path": "/srv/click-server",
             "owner_project_id": "project-a",
             "expected_gpu_count": "2",
             "enabled": "true",
@@ -810,7 +834,7 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
     )
     assert removed_server.status_code == 200
     endpoints = {endpoint["id"]: endpoint for endpoint in service.list_endpoints(service.local_actor("human"))["data"]}
-    assert endpoints["click-server"]["lifecycle_state"] == "retired"
+    assert "click-server" in endpoints
 
     switched = client.post("/ui/actor", data={"actor_id": "click-agent"}, follow_redirects=True)
     assert switched.status_code == 200
@@ -850,8 +874,6 @@ def test_mcp_exposes_required_tools() -> None:
         "gpu_release",
         "gpu_add_server",
         "gpu_update_server",
-        "gpu_retire_server",
-        "gpu_delete_server",
         "gpu_set_keepalive",
         "resource_providers",
         "resource_monitor",
@@ -872,10 +894,10 @@ def test_mcp_exposes_required_tools() -> None:
         assert retired_routine_tool not in names
     apply_schema = by_name["gpu_apply"].inputSchema
     assert "required" not in apply_schema
-    assert {"server_id", "gpu_count", "idempotency_key"} == set(apply_schema["properties"])
+    assert {"server_id", "gpu_count", "task"} == set(apply_schema["properties"])
     assert apply_schema["properties"]["gpu_count"]["default"] == 1
     assert "project_id" not in apply_schema["properties"]
-    assert "task" not in apply_schema["properties"]
+    assert "idempotency_key" not in apply_schema["properties"]
     assert "profile_id" not in apply_schema["properties"]
     assert "gpu_ids" not in apply_schema["properties"]
     bind_schema = by_name["gpu_bind_observed_workload"].inputSchema
@@ -883,12 +905,14 @@ def test_mcp_exposes_required_tools() -> None:
     assert {"lease_id", "run_id", "idempotency_key", "agent_name"} == set(
         bind_schema["properties"]
     )
-    assert "reason" not in by_name["gpu_release"].inputSchema["required"]
+    assert by_name["gpu_release"].inputSchema["required"] == ["lease_id"]
+    assert set(by_name["gpu_release"].inputSchema["properties"]) == {"lease_id"}
+    status_schema = by_name["gpu_status"].inputSchema
+    assert set(status_schema["properties"]) == {"include_busy"}
+    assert status_schema["properties"]["include_busy"]["default"] is False
     for name in (
         "gpu_add_server",
         "gpu_update_server",
-        "gpu_retire_server",
-        "gpu_delete_server",
     ):
         assert {"approval_ref", "idempotency_key"}.issubset(by_name[name].inputSchema["required"])
 
@@ -904,6 +928,7 @@ def test_default_stdio_mcp_uses_intent_first_routine_surface() -> None:
     assert "gpu_claim" not in names
     assert "gpu_list" not in names
     assert not any(name.startswith("gpu_scheduler_") for name in names)
+    assert names == {"gpu_status", "gpu_apply", "gpu_release"}
 
 
 def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -918,6 +943,10 @@ def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch
             calls.append(("PATCH", path, body, idempotency_key))
             return {"endpoint": {"id": "server-a"}}
 
+        def delete(self, path, *, idempotency_key):  # type: ignore[no-untyped-def]
+            calls.append(("DELETE", path, None, idempotency_key))
+            return {"endpoint_id": "server-a"}
+
     monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
     with pytest.raises(ValueError, match="approval_ref"):
         mcp_server.gpu_pause_server("agent", "server-a", "", "stable-key")
@@ -928,6 +957,7 @@ def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch
         "agent",
         "project-a",
         "10.0.0.8",
+        "/srv/server-a",
         "approved-task",
         "create-stable",
         server_id="server-a",
@@ -942,6 +972,7 @@ def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch
             "port": 22,
             "ssh_user": "root",
             "ssh_alias": None,
+            "workspace_path": "/srv/server-a",
             "observation_profile": "server-script-v1",
             "labels": [],
             "storage_group": None,
@@ -952,14 +983,20 @@ def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch
         "create-stable",
     )
     mcp_server.gpu_update_server(
-        "agent", "server-a", "approved-task", "update-stable", ssh_user="gpu"
+        "agent",
+        "server-a",
+        "approved-task",
+        "update-stable",
+        ssh_user="gpu",
+        workspace_path="/srv/server-a-updated",
     )
-    mcp_server.gpu_retire_server("agent", "server-a", "approved-task", "retire-stable")
-    mcp_server.gpu_delete_server("agent", "server-a", "approved-task", "delete-stable")
     assert calls[1:] == [
-        ("PATCH", "/api/v1/endpoints/server-a", {"ssh_user": "gpu"}, "update-stable"),
-        ("POST", "/api/v1/endpoints/server-a/retire", {}, "retire-stable"),
-        ("POST", "/api/v1/endpoints/server-a/retire", {}, "delete-stable"),
+        (
+            "PATCH",
+            "/api/v1/endpoints/server-a",
+            {"ssh_user": "gpu", "workspace_path": "/srv/server-a-updated"},
+            "update-stable",
+        ),
     ]
 
 
@@ -967,32 +1004,29 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
     calls = []
 
     class FakeClient:
-        def control_plane_state(self):  # type: ignore[no-untyped-def]
-            calls.append(("STATE", "/api/v1/state"))
+        def coordination(self):  # type: ignore[no-untyped-def]
+            calls.append(("GET", "/api/v1/coordination"))
             return {
                 "schema_version": "v1",
                 "snapshot_revision": 1,
                 "server_time": "2026-08-06T00:00:00Z",
-                "data": {
-                    "current": {
-                        "coordination": {},
-                    },
-                    "history": {},
-                },
+                "data": {},
             }
 
-        def coordination(self):  # type: ignore[no-untyped-def]
-            state = self.control_plane_state()
+        def post(self, path, body=None):  # type: ignore[no-untyped-def]
+            calls.append(("POST", path, body))
             return {
-                "schema_version": state["schema_version"],
-                "snapshot_revision": state["snapshot_revision"],
-                "server_time": state["server_time"],
-                "data": state["data"]["current"]["coordination"],
+                "lease": {
+                    "id": "lease-a",
+                    "resources": [
+                        {
+                            "endpoint": {"id": "server-a", "workspace_path": "/srv/server-a"},
+                            "gpus": [{"gpu_uuid": "GPU-a"}, {"gpu_uuid": "GPU-b"}],
+                            "cuda_visible_devices": "GPU-a,GPU-b",
+                        }
+                    ],
+                }
             }
-
-        def post(self, path, body=None, *, idempotency_key):  # type: ignore[no-untyped-def]
-            calls.append(("POST", path, body, idempotency_key))
-            return {"schema_version": "v1", "request": {}, "lease": None}
 
     monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
 
@@ -1002,40 +1036,62 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
         "server_time": "2026-08-06T00:00:00Z",
         "data": {},
     }
-    assert calls == [("STATE", "/api/v1/state")]
+    assert calls == [("GET", "/api/v1/coordination")]
 
     calls.clear()
-    assert mcp_server.gpu_apply(
-        server_id="server-a", gpu_count=2, idempotency_key="apply-stable"
-    )["request"] == {}
-    assert [call[:2] for call in calls] == [("POST", "/api/v1/claims")]
-    _method, _path, body, key = calls[0]
-    assert key == "apply-stable"
+    monkeypatch.setattr(
+        mcp_server,
+        "_routine_client",
+        lambda *, require_identity: FakeClient(),
+    )
+    result = mcp_server.gpu_apply(server_id="server-a", gpu_count=2, task="训练")
+    assert result == {
+        "lease_id": "lease-a",
+        "gpus": [
+            {
+                "server_id": "server-a",
+                "workspace_path": "/srv/server-a",
+                "gpu_id": "GPU-a",
+                "cuda_visible_devices": "GPU-a,GPU-b",
+            },
+            {
+                "server_id": "server-a",
+                "workspace_path": "/srv/server-a",
+                "gpu_id": "GPU-b",
+                "cuda_visible_devices": "GPU-a,GPU-b",
+            },
+        ],
+    }
+    assert [call[:2] for call in calls] == [("POST", "/api/v1/routine/claims")]
+    _method, _path, body = calls[0]
     assert body["constraints"] == {
         "gpu_count": 2,
         "placement": "pack",
         "endpoint_ids": ["server-a"],
     }
-    assert body["project_id"].startswith("agent-")
-    assert body["task_ref"].startswith("gpu-apply-")
+    assert body["project_id"] == "codex"
+    assert body["task_ref"] == "训练"
 
 
-def test_mcp_status_and_coordination_default_to_context_safe_projections(
+def test_mcp_status_defaults_to_available_and_adds_busy_contact_only_on_request(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
     coordination_uri = "codex://threads/019febd4-c455-7693-bb58-91ca9af7718e"
 
     class FakeClient:
         def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
-            assert kwargs == {"compact": True, "only_available": False}
+            assert kwargs in (
+                {"compact": False, "only_available": True},
+                {"compact": False, "only_available": False},
+            )
             return {
                 "schema_version": "v1",
                 "snapshot_revision": 9,
                 "server_time": "2026-08-12T00:00:00Z",
                 "data": {
                     "summary": {
-                        "total_gpus": 2,
-                        "available_gpus": 1,
+                            "total_gpus": 2,
+                            "available_gpus": 2,
                         "claimed_gpus": 1,
                         "workload_claimed_gpus": 0,
                         "keepalive_owned_gpus": 1,
@@ -1046,6 +1102,7 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
                     "endpoints": [
                         {
                             "id": "server-a",
+                            "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
                             "monitor": {"status": "ONLINE", "last_error": None},
                             "private_detail": "must not cross MCP boundary",
                         }
@@ -1064,6 +1121,7 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
                         {
                             "id": "gpu-a",
                             "endpoint_id": "server-a",
+                            "gpu_uuid": "GPU-a",
                             "gpu_index": 0,
                             "name": "A",
                             "total_vram_mib": 80000,
@@ -1074,11 +1132,12 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
                             "task_ref": None,
                             "expires_at": None,
                             "lease": None,
+                            "publicly_available": True,
+                            "public_status": "可用 · 未开启占卡",
                             "keepalive": {
                                 "state": "OFF",
                                 "reason": None,
                                 "lease_id": None,
-                                "health": {"state": "OFF"},
                             },
                             "telemetry": {"memory_used_mib": 0, "private": "drop"},
                             "processes": ["drop"],
@@ -1086,18 +1145,19 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
                         {
                             "id": "gpu-b",
                             "endpoint_id": "server-a",
+                            "gpu_uuid": "GPU-b",
                             "gpu_index": 1,
                             "name": "A",
                             "total_vram_mib": 80000,
-                            "state": "KEEPALIVE",
-                            "state_reason": "per-GPU keepalive is active",
-                            "lease": None,
-                            "keepalive": {
-                                "state": "ACTIVE",
-                                "reason": None,
-                                "lease_id": "internal-keepalive-id",
-                                "health": {"state": "HEALTHY"},
+                            "state": "HELD",
+                            "state_reason": "workload lease is held",
+                            "lease": {
+                                "task_ref": "训练",
+                                "coordination_uri": coordination_uri,
                             },
+                            "publicly_available": False,
+                            "public_status": "任务使用中",
+                            "keepalive": {"state": "OFF", "reason": None, "lease_id": None},
                             "telemetry": {"memory_used_mib": 25000},
                             "processes": ["drop"],
                         }
@@ -1107,91 +1167,49 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
                 },
             }
 
-        def coordination(self):  # type: ignore[no-untyped-def]
-            return {
-                "schema_version": "v1",
-                "snapshot_revision": 10,
-                "server_time": "2026-08-12T00:00:01Z",
-                "data": {
-                    "summary": {"active_agents": 1},
-                    "agents": [
-                        {
-                            "agent_name": "codex-agent",
-                            "coordination_uri": coordination_uri,
-                            "active_leases": 1,
-                            "active_workload_leases": 1,
-                            "leased_gpus": 1,
-                            "managed_running_gpus": 1,
-                            "idle_leased_gpus": 0,
-                            "projects": ["project-a"],
-                            "servers": ["server-a"],
-                            "private_detail": "drop",
-                        }
-                    ],
-                    "leases": [
-                        {
-                            "lease_id": "lease-a",
-                            "agent_name": "codex-agent",
-                            "coordination_uri": coordination_uri,
-                            "project_id": "project-a",
-                            "task": "task-a",
-                            "state": "ACTIVE",
-                            "activity": "running",
-                            "gpu_count": 1,
-                            "servers": ["server-a"],
-                            "observed_process_count": 1,
-                            "expires_at": "2026-08-12T01:00:00Z",
-                            "workloads": [{"process_keys": ["drop"]}],
-                        }
-                    ],
-                    "servers": [],
-                    "queue": [],
-                    "signals": [],
-                    "scheduler_jobs": [],
-                    "guidance": "read-only",
-                },
-            }
-
-    monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
+    monkeypatch.setattr(
+        mcp_server,
+        "_routine_client",
+        lambda *, require_identity: FakeClient(),
+    )
 
     status = mcp_server.gpu_status()
-    assert set(status["data"]) == {
-        "summary",
-        "data_age_seconds",
-        "freshness_seconds",
-        "availability_semantics",
-        "servers",
-        "gpus",
-    }
-    assert status["data"]["servers"] == [
+    assert status == {"gpus": [
         {
             "server_id": "server-a",
-            "monitor_status": "ONLINE",
-            "gpu_count": 2,
-            "available_gpu_count": 1,
-            "workload_leased_gpu_count": 0,
-            "keepalive_owned_gpu_count": 1,
-            "verified_keepalive_gpu_count": 1,
-            "available_cpu_cores": 12.0,
-            "available_memory_mib": 32768,
-            "total_memory_mib": 65536,
-            "last_error": None,
+            "gpu_id": "GPU-a",
+            "index": 0,
+            "name": "A",
+            "vram_mib": 80000,
+            "status": "可用 · 未开启占卡",
+            "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
         }
-    ]
-    assert "resource_claims" not in status["data"]
-    assert "private" not in status["data"]["gpus"][0]["telemetry"]
-    assert "processes" not in status["data"]["gpus"][0]
-    assert status["data"]["gpus"][1]["keepalive"] == {
-        "state": "ACTIVE",
-        "reason": None,
-        "health_state": "HEALTHY",
-    }
-    assert "HELD and CONFLICT remain unavailable" in status["data"]["availability_semantics"]
+    ]}
 
-    board = mcp_server.gpu_coordination()
-    assert board["data"]["agents"][0]["coordination_uri"] == coordination_uri
-    assert board["data"]["agents"][0]["active_workload_leases"] == 1
-    assert "workloads" not in board["data"]["leases"][0]
+    assert mcp_server.gpu_status(include_busy=True) == {"gpus": [
+        {
+            "server_id": "server-a",
+            "gpu_id": "GPU-a",
+            "index": 0,
+            "name": "A",
+            "vram_mib": 80000,
+            "status": "可用 · 未开启占卡",
+            "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+            "available": True,
+        },
+        {
+            "server_id": "server-a",
+            "gpu_id": "GPU-b",
+            "index": 1,
+            "name": "A",
+            "vram_mib": 80000,
+            "status": "任务使用中",
+            "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+            "available": False,
+            "task": "训练",
+            "agent_url": coordination_uri,
+        },
+    ]}
 
 
 def test_mcp_reads_distinguish_internal_keepalive_from_available_capacity(
@@ -1221,10 +1239,19 @@ def test_mcp_reads_distinguish_internal_keepalive_from_available_capacity(
         "idle_keepalive",
         idempotency_key="mcp-keepalive-policy",
     )
-    service.begin_keepalive(
+    observation_not_before = datetime.now(UTC)
+    service.ingest_observation(
+        observation(
+            count=2,
+            processes=[process_for_gpu("GPU-endpoint-a-0", pid=4_001)],
+            observed_at=datetime.now(UTC),
+        )
+    )
+    service.activate_keepalive(
         actor,
         "endpoint-a",
         "endpoint-a:GPU-endpoint-a-0",
+        observation_not_before=observation_not_before,
         idempotency_key="mcp-keepalive-begin",
     )
     rest = TestClient(app)
@@ -1232,56 +1259,28 @@ def test_mcp_reads_distinguish_internal_keepalive_from_available_capacity(
 
     class RestBackedClient:
         def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
-            assert kwargs == {"compact": True, "only_available": False}
-            response = rest.get("/api/v1/state", headers=headers)
-            assert response.status_code == 200
-            payload = response.json()
-            return {
-                "schema_version": payload["schema_version"],
-                "snapshot_revision": payload["snapshot_revision"],
-                "server_time": payload["server_time"],
-                "data": payload["data"]["current"],
-            }
-
-        def coordination(self):  # type: ignore[no-untyped-def]
-            response = rest.get("/api/v1/coordination", headers=headers)
+            assert kwargs == {"compact": False, "only_available": True}
+            response = rest.get("/api/v1/snapshot", params=kwargs, headers=headers)
             assert response.status_code == 200
             return response.json()
 
-    monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: RestBackedClient())
+    monkeypatch.setattr(
+        mcp_server,
+        "_routine_client",
+        lambda *, require_identity: RestBackedClient(),
+    )
 
     status = mcp_server.gpu_status()
-    summary = status["data"]["summary"]
-    server = next(
-        item for item in status["data"]["servers"] if item["server_id"] == "endpoint-a"
-    )
-    held = next(item for item in status["data"]["gpus"] if item["state"] == "HELD")
-    assert summary["total_gpus"] == 2
-    assert summary["available_gpus"] == 1
-    assert summary["claimed_gpus"] == 1
-    assert summary["workload_claimed_gpus"] == 0
-    assert summary["keepalive_owned_gpus"] == 1
-    assert summary["verified_keepalive_gpus"] == 0
-    assert server["available_gpu_count"] == 1
-    assert server["workload_leased_gpu_count"] == 0
-    assert server["keepalive_owned_gpu_count"] == 1
-    assert server["verified_keepalive_gpu_count"] == 0
-    assert held["keepalive"]["state"] == "STARTING"
-    assert held["owner"] is None
-
-    board = mcp_server.gpu_coordination()
-    board_summary = board["data"]["summary"]
-    board_server = next(
-        item for item in board["data"]["servers"] if item["server_id"] == "endpoint-a"
-    )
-    assert board_summary["active_leases"] == 0
-    assert board_summary["active_workload_leases"] == 0
-    assert board_summary["keepalive_owned_gpus"] == 1
-    assert board_server["capacity"]["available_gpus"] == 1
-    assert board_server["capacity"]["workload_leased_gpus"] == 0
-    assert board_server["capacity"]["keepalive_owned_gpus"] == 1
-    assert board_server["capacity"]["verified_keepalive_gpus"] == 0
-    assert "active_leases counts only visible workload leases" in board["data"]["guidance"]
+    assert len(status["gpus"]) == 2
+    assert {item["gpu_id"] for item in status["gpus"]} == {
+        "GPU-endpoint-a-0",
+        "GPU-endpoint-a-1",
+    }
+    assert all("available" not in item for item in status["gpus"])
+    assert {item["status"] for item in status["gpus"]} == {
+        "可用 · 空闲占卡",
+        "可用 · 占卡异常：未检测到占卡程序",
+    }
 
 
 def test_mcp_general_resource_tools_delegate_and_enforce_marginal_policy(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1388,7 +1387,7 @@ def test_mcp_general_resource_tools_delegate_and_enforce_marginal_policy(monkeyp
     ]
 
 
-def test_ssh_preview_commit_is_bound_non_mutating_and_requires_project_scope(tmp_path: Path, inventory) -> None:
+def test_ssh_preview_is_non_mutating_and_commit_uses_the_submitted_command(tmp_path: Path, inventory) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -1407,7 +1406,12 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_requires_project_scope(tmp
 
     preview = client.post(
         "/ui/endpoints/ssh/preview",
-        json={"command": "  ssh GPU_User@New-Host  ", "project_ids": ["project-a"], "csrf": csrf},
+        json={
+            "command": "  ssh GPU_User@New-Host  ",
+            "workspace_path": "/srv/new-host",
+            "project_ids": ["project-a"],
+            "csrf": csrf,
+        },
     )
     assert preview.status_code == 200
     data = preview.json()["data"]
@@ -1419,6 +1423,7 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_requires_project_scope(tmp
         "port": 22,
         "ssh_user": "GPU_User",
         "ssh_alias": None,
+        "workspace_path": "/srv/new-host",
         "labels": ["gpu", "direct-ssh"],
         "storage_group": None,
         "expected_gpu_count": None,
@@ -1426,39 +1431,14 @@ def test_ssh_preview_commit_is_bound_non_mutating_and_requires_project_scope(tmp
         "project_ids": ["project-a"],
         "enabled": True,
     }
-    assert len(data["preview_token"]) == 64
     assert service.list_endpoints(actor)["data"] == endpoints_before
     assert service.list_events(actor)["data"] == events_before
-
-    tampered_command = client.post(
-        "/ui/endpoints/ssh/commit",
-        json={
-            "command": "ssh GPU_User@other-host",
-            "preview_token": data["preview_token"],
-            "project_ids": ["project-a"],
-            "csrf": csrf,
-        },
-    )
-    assert tampered_command.status_code == 409
-    assert tampered_command.json()["error"]["code"] == "invalid_ssh_preview_token"
-    tampered_token = client.post(
-        "/ui/endpoints/ssh/commit",
-        json={
-            "command": "  ssh GPU_User@New-Host  ",
-            "preview_token": "0" * 64,
-            "project_ids": ["project-a"],
-            "csrf": csrf,
-        },
-    )
-    assert tampered_token.status_code == 409
-    assert tampered_token.json()["error"]["code"] == "invalid_ssh_preview_token"
-    assert service.list_endpoints(actor)["data"] == endpoints_before
 
     committed = client.post(
         "/ui/endpoints/ssh/commit",
         json={
             "command": "  ssh GPU_User@New-Host  ",
-            "preview_token": data["preview_token"],
+            "workspace_path": "/srv/new-host",
             "project_ids": ["project-a"],
             "csrf": csrf,
         },
@@ -1484,7 +1464,12 @@ def test_ssh_preview_reports_existing_address_and_id_collision(tmp_path: Path, i
 
     existing = client.post(
         "/ui/endpoints/ssh/preview",
-        json={"command": "ssh -p 2201 gpu@127.0.0.1", "project_ids": ["project-a"], "csrf": csrf},
+        json={
+            "command": "ssh -p 2201 gpu@127.0.0.1",
+            "workspace_path": "/srv/project-a",
+            "project_ids": ["project-a"],
+            "csrf": csrf,
+        },
     )
     assert existing.status_code == 200
     assert existing.json()["data"]["status"] == "existing"
@@ -1498,13 +1483,19 @@ def test_ssh_preview_reports_existing_address_and_id_collision(tmp_path: Path, i
             host="other-host",
             port=22,
             ssh_user="gpu",
+            workspace_path="/srv/collision",
             project_ids=["project-a"],
         ),
         idempotency_key="collision-setup",
     )
     collision = client.post(
         "/ui/endpoints/ssh/preview",
-        json={"command": "ssh gpu@collision-host", "project_ids": ["project-a"], "csrf": csrf},
+        json={
+            "command": "ssh gpu@collision-host",
+            "workspace_path": "/srv/collision",
+            "project_ids": ["project-a"],
+            "csrf": csrf,
+        },
     )
     assert collision.status_code == 200
     collision_data = collision.json()["data"]
@@ -1515,8 +1506,8 @@ def test_ssh_preview_reports_existing_address_and_id_collision(tmp_path: Path, i
         "/ui/endpoints/ssh/commit",
         json={
             "command": "ssh gpu@collision-host",
+            "workspace_path": "/srv/collision",
             "project_ids": ["project-a"],
-            "preview_token": collision_data["preview_token"],
             "csrf": csrf,
         },
     )
@@ -1527,8 +1518,8 @@ def test_ssh_preview_reports_existing_address_and_id_collision(tmp_path: Path, i
         json={
             "command": "ssh gpu@collision-host",
             "endpoint_id": "collision-host-explicit",
+            "workspace_path": "/srv/collision-explicit",
             "project_ids": ["project-a"],
-            "preview_token": collision_data["preview_token"],
             "csrf": csrf,
         },
     )
@@ -1557,7 +1548,12 @@ def test_ssh_batch_registers_valid_lines_and_skips_invalid_or_duplicate_lines(tm
 
     preview = client.post(
         "/ui/endpoints/ssh/batch/preview",
-        json={"commands": commands, "project_ids": ["project-a"], "csrf": csrf},
+        json={
+            "commands": commands,
+            "workspace_path": "/srv/batch-project",
+            "project_ids": ["project-a"],
+            "csrf": csrf,
+        },
     )
     assert preview.status_code == 200
     preview_data = preview.json()["data"]
@@ -1568,8 +1564,8 @@ def test_ssh_batch_registers_valid_lines_and_skips_invalid_or_duplicate_lines(tm
         "/ui/endpoints/ssh/batch/commit",
         json={
             "commands": commands,
+            "workspace_path": "/srv/batch-project",
             "project_ids": ["project-a"],
-            "preview_token": preview_data["preview_token"],
             "csrf": csrf,
         },
     )

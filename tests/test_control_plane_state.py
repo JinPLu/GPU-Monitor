@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from serverpilot import API_CAPABILITIES
 from serverpilot.api import create_app
 from serverpilot.config import Settings
-from serverpilot.schemas import EndpointUpsert, RequestCreate
+from serverpilot.schemas import RequestCreate
 from tests.helpers import observation
 
 
@@ -37,28 +37,7 @@ def test_control_plane_state_route_groups_current_and_history(tmp_path: Path, in
     actor = service.local_actor("state-agent")
     service.ingest_observation(observation(count=1))
     service.create_request(actor, _request("state-lease"), idempotency_key="state-lease")
-    service.upsert_endpoint(
-        actor,
-        EndpointUpsert(
-            id="endpoint-b",
-            host="127.0.0.1",
-            port=2202,
-            ssh_user="gpu",
-            lifecycle_state="draining",
-        ),
-        idempotency_key="endpoint-b-draining",
-    )
-    service.upsert_endpoint(
-        actor,
-        EndpointUpsert(
-            id="endpoint-b",
-            host="127.0.0.1",
-            port=2202,
-            ssh_user="gpu",
-            lifecycle_state="retired",
-        ),
-        idempotency_key="endpoint-b-retired",
-    )
+    service.pause_endpoint(actor, "endpoint-b", idempotency_key="endpoint-b-pause")
 
     response = TestClient(app).get(
         "/api/v1/state",
@@ -96,8 +75,11 @@ def test_control_plane_state_route_groups_current_and_history(tmp_path: Path, in
         "admission_boundary",
     } <= set(current)
     assert current["host_capacity"]
-    assert {endpoint["id"] for endpoint in current["endpoints"]} == {"endpoint-a"}
-    assert {endpoint["id"] for endpoint in history["retired_endpoints"]} == {"endpoint-b"}
+    assert {endpoint["id"] for endpoint in current["endpoints"]} == {
+        "endpoint-a",
+        "endpoint-b",
+    }
+    assert "retired_endpoints" not in history
     assert "resource_plan_evaluations" in history
     assert "resource_run_actuals" in history
     assert "audit" not in current

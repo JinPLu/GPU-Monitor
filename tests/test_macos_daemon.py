@@ -693,10 +693,10 @@ def test_product_copy_is_anchored_on_one_user_with_projects_and_agents() -> None
     assert "一个本机用户，管理多台服务器、多个项目和多个 Agent" in readme
     assert "| 核心价值 | ServerPilot 提供什么 |\n| --- | --- |" in readme
     for product_value in (
-        "统一零散 GPU",
-        "Agent 协作调度",
+        "信息采集",
+        "Agent 操作",
         "人类实时监控",
-        "状态与归属追溯",
+        "空闲 GPU 占卡",
     ):
         assert product_value in readme
     assert "| --- | --- | --- |" not in readme

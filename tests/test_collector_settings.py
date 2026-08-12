@@ -84,7 +84,6 @@ def test_collector_settings_api_requires_supported_value_and_idempotency(
         database_url=f"sqlite:///{tmp_path / 'api.sqlite3'}",
         inventory_path=inventory_path,
         project_root=project_root,
-        bootstrap_token="a" * 32,
         session_secret="test-secret",
     )
     app = create_app(settings)

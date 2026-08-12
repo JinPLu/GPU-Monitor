@@ -7,11 +7,11 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from pydantic import ValidationError
-from sqlalchemy import inspect, select, text
+from sqlalchemy import inspect, text
 
 from serverpilot.config import EndpointConfig, InventoryConfig
 from serverpilot.database import Database
-from serverpilot.models import Actor, AllocationRequest, ApiToken, Lease, Project
+from serverpilot.models import Actor, AllocationRequest, Lease, Project
 from serverpilot.schemas import ActorCreate, EndpointCreate, EndpointUpdate, RequestCreate
 from serverpilot.service import (
     SYSTEM_ACTOR_ID,
@@ -42,6 +42,7 @@ def test_keepalive_adapter_is_sealed_and_round_trips_endpoint_surfaces(service, 
             host="127.0.0.1",
             port=2298,
             ssh_user="gpu",
+            workspace_path="/srv/invalid-adapter",
             keepalive_adapter_id="arbitrary-shell",  # type: ignore[arg-type]
         )
 
@@ -52,6 +53,7 @@ def test_keepalive_adapter_is_sealed_and_round_trips_endpoint_surfaces(service, 
             host="127.0.0.1",
             port=2299,
             ssh_user="gpu",
+            workspace_path="/srv/keepalive",
             keepalive_adapter_id="server-script-v1",
         ),
         idempotency_key="keepalive-endpoint-create",
@@ -74,6 +76,7 @@ def test_keepalive_adapter_is_sealed_and_round_trips_endpoint_surfaces(service, 
             host="127.0.0.1",
             port=2300,
             ssh_user="gpu",
+            workspace_path="/srv/invalid-policy",
             keepalive_policy="always-on",  # type: ignore[arg-type]
         )
 
@@ -86,6 +89,7 @@ def test_keepalive_adapter_is_sealed_and_round_trips_endpoint_surfaces(service, 
             host="127.0.0.1",
             port=2301,
             ssh_user="gpu",
+            workspace_path="/srv/invalid-idle-policy",
             keepalive_policy="idle_keepalive",
         )
 
@@ -99,8 +103,8 @@ def test_runtime_keepalive_policy_survives_static_inventory_restart_when_not_exp
     root = Path(__file__).resolve().parents[1]
     database = Database(f"sqlite:///{tmp_path / 'policy-restart.sqlite3'}", root)
     first = BrokerService(database, configured)
-    first.initialize("a" * 32)
-    admin = first.authenticate("a" * 32)
+    first.initialize()
+    admin = first.local_actor("policy-agent")
     first.configure_keepalive_policy(
         admin,
         "endpoint-a",
@@ -109,18 +113,18 @@ def test_runtime_keepalive_policy_survives_static_inventory_restart_when_not_exp
     )
 
     restarted = BrokerService(database, configured)
-    restarted.initialize("a" * 32, sync_inventory=True)
+    restarted.initialize(sync_inventory=True)
     assert restarted.get_endpoint_keepalive_summary("endpoint-a")["keepalive"]["policy"] == "idle_keepalive"
 
 
-def test_enabling_keepalive_attaches_the_sealed_helper_to_legacy_endpoints(service, admin) -> None:
+def test_enabling_keepalive_attaches_the_fixed_helper_to_an_endpoint(service, admin) -> None:
     service.ingest_observation(observation(count=2))
 
     configured = service.configure_keepalive_policy(
         admin,
         "endpoint-a",
         "idle_keepalive",
-        idempotency_key="legacy-endpoint-enable",
+        idempotency_key="endpoint-enable",
     )
 
     assert configured["keepalive"]["configured"] is True
@@ -133,7 +137,7 @@ def test_system_identity_is_tokenless_hidden_and_reserved(service, admin) -> Non
     with service.database.session() as session:
         assert session.get(Actor, SYSTEM_ACTOR_ID) is not None
         assert session.get(Project, SYSTEM_PROJECT_ID) is not None
-        assert session.scalar(select(ApiToken).where(ApiToken.actor_id == SYSTEM_ACTOR_ID)) is None
+        assert "api_tokens" not in inspect(session.bind).get_table_names()
 
     assert SYSTEM_ACTOR_ID not in {item["id"] for item in service.list_actors(admin)["data"]}
     assert SYSTEM_PROJECT_ID not in {item["id"] for item in service.list_projects(admin)["data"]}
@@ -179,31 +183,39 @@ def test_system_identity_is_tokenless_hidden_and_reserved(service, admin) -> Non
     assert context_error.value.code == "reserved_system_identity"
 
 
-def test_initialize_fails_closed_if_reserved_identity_has_a_token(
+def test_initialize_ignores_legacy_tokens_because_login_is_removed(
     tmp_path: Path, inventory
 ) -> None:  # noqa: ANN001
     root = Path(__file__).resolve().parents[1]
     broker = BrokerService(Database(f"sqlite:///{tmp_path / 'identity-token.sqlite3'}", root), inventory)
     broker.initialize()
     now = utcnow()
-    with broker.database.session() as session:
-        session.add(
-            ApiToken(
-                id="legacy-system-token",
-                actor_id=SYSTEM_ACTOR_ID,
-                label="legacy",
-                token_hash="f" * 64,
-                created_at=now,
-                expires_at=None,
-                revoked_at=None,
-                last_used_at=None,
+    with broker.database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE api_tokens ("
+                "id VARCHAR(64) PRIMARY KEY, actor_id VARCHAR(128) NOT NULL, "
+                "label VARCHAR(120) NOT NULL, legacy_value VARCHAR(255) NOT NULL, "
+                "token_prefix VARCHAR(32) NOT NULL, created_at DATETIME NOT NULL)"
             )
         )
-        session.commit()
+        connection.execute(
+            text(
+                "INSERT INTO api_tokens "
+                "(id, actor_id, label, legacy_value, token_prefix, created_at) "
+                "VALUES (:id, :actor_id, :label, :legacy_value, :token_prefix, :created_at)"
+            ),
+            {
+                "id": "legacy-system-token",
+                "actor_id": SYSTEM_ACTOR_ID,
+                "label": "legacy",
+                "legacy_value": "legacy-unused-value",
+                "token_prefix": "legacy",
+                "created_at": now,
+            },
+        )
 
-    with pytest.raises(BrokerError) as conflict:
-        broker.initialize()
-    assert conflict.value.code == "reserved_system_identity_conflict"
+    broker.initialize()
 
 
 def test_initialize_fails_closed_if_reserved_identity_attributes_were_repurposed(
@@ -368,3 +380,81 @@ def test_0019_defaults_endpoint_policy_and_marks_old_keepalive_scope(tmp_path: P
             connection.execute(
                 text("INSERT INTO endpoints (id, keepalive_policy) VALUES ('bad', 'always-on')")
             )
+
+
+def test_0020_preserves_legacy_tokens_retired_endpoints_and_keepalive_rows(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    database = Database(f"sqlite:///{tmp_path / 'legacy-0020.sqlite3'}", root)
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE api_tokens (id VARCHAR(64) PRIMARY KEY, legacy_value TEXT)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE endpoints (id VARCHAR(128) PRIMARY KEY, lifecycle_state VARCHAR(32))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE allocation_requests "
+                "(id VARCHAR(64) PRIMARY KEY, priority_class VARCHAR(32))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE leases ("
+                "id VARCHAR(64) PRIMARY KEY, kind VARCHAR(16) NOT NULL, "
+                "keepalive_scope VARCHAR(24), "
+                "CONSTRAINT ck_lease_keepalive_scope CHECK ("
+                "keepalive_scope IS NULL OR keepalive_scope IN ('gpu', 'legacy_endpoint')))"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE TABLE lease_resources "
+                "(lease_id VARCHAR(64), gpu_id VARCHAR(256), active BOOLEAN)"
+            )
+        )
+        connection.execute(text("INSERT INTO api_tokens VALUES ('old-token', 'preserve-me')"))
+        connection.execute(
+            text("INSERT INTO endpoints VALUES ('retired-server', 'retired')")
+        )
+        connection.execute(
+            text("INSERT INTO allocation_requests VALUES ('keeper-request', 'keepalive')")
+        )
+        connection.execute(
+            text("INSERT INTO leases VALUES ('keeper-lease', 'keepalive', 'legacy_endpoint')")
+        )
+        connection.execute(
+            text("INSERT INTO lease_resources VALUES ('keeper-lease', 'gpu-0', 1)")
+        )
+        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"))
+        connection.execute(
+            text("INSERT INTO alembic_version VALUES ('20260812_0019')")
+        )
+
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "src" / "serverpilot" / "migrations"))
+    config.set_main_option("sqlalchemy.url", database.url)
+    command.upgrade(config, "20260812_0020")
+
+    with database.engine.begin() as connection:
+        assert connection.execute(text("SELECT * FROM api_tokens")).all() == [
+            ("old-token", "preserve-me")
+        ]
+        assert connection.execute(text("SELECT * FROM endpoints")).all() == [
+            ("retired-server", "retired")
+        ]
+        assert connection.execute(text("SELECT * FROM allocation_requests")).all() == [
+            ("keeper-request", "keepalive")
+        ]
+        assert connection.execute(text("SELECT id, kind FROM leases")).all() == [
+            ("keeper-lease", "keepalive")
+        ]
+        assert connection.execute(text("SELECT * FROM lease_resources")).all() == [
+            ("keeper-lease", "gpu-0", 1)
+        ]

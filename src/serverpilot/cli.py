@@ -57,6 +57,7 @@ daemon_app = typer.Typer(
 )
 app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(gpu_app, name="gpu")
+app.add_typer(request_app, name="request")
 app.add_typer(lease_app, name="lease")
 app.add_typer(resource_app, name="resource")
 app.add_typer(collect_app, name="collect")
@@ -103,6 +104,10 @@ def _call(operation):  # type: ignore[no-untyped-def]
     except BrokerClientError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
+
+
+def _idempotency_key(value: str | None) -> str:
+    return secrets.token_hex(16) if value is None else value
 
 
 @app.command("init")
@@ -323,26 +328,6 @@ def endpoint_list(
     _print(_call(lambda: _client(url, actor).endpoints()), as_json)
 
 
-@endpoint_app.command("delete")
-def endpoint_delete(
-    endpoint_id: str,
-    as_json: Annotated[bool, typer.Option("--json")]=False,
-    url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None,
-    actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None,
-) -> None:
-    """Deprecated compatibility alias for pause; it never retires a server."""
-
-    _print(
-        _call(
-            lambda: _client(url, actor).delete(
-                f"/api/v1/endpoints/{endpoint_id}",
-                idempotency_key=secrets.token_hex(16),
-            )
-        ),
-        as_json,
-    )
-
-
 @endpoint_app.command("pause")
 def endpoint_pause(
     endpoint_id: str,
@@ -375,25 +360,6 @@ def endpoint_resume(
         _call(
             lambda: _client(url, actor).post(
                 f"/api/v1/endpoints/{endpoint_id}/resume", {}, idempotency_key=secrets.token_hex(16)
-            )
-        ),
-        as_json,
-    )
-
-
-@endpoint_app.command("retire")
-def endpoint_retire(
-    endpoint_id: str,
-    as_json: Annotated[bool, typer.Option("--json")] = False,
-    url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")] = None,
-    actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")] = None,
-) -> None:
-    """Retire a drained endpoint after active leases and pinned queues have cleared."""
-
-    _print(
-        _call(
-            lambda: _client(url, actor).post(
-                f"/api/v1/endpoints/{endpoint_id}/retire", {}, idempotency_key=secrets.token_hex(16)
             )
         ),
         as_json,
@@ -438,6 +404,7 @@ def _mapping_from_file(path: Path, label: str) -> dict[str, Any]:
 @request_app.command("create")
 def request_create(
     file: Annotated[Path, typer.Option("--file", exists=True, readable=True)],
+    idempotency_key: Annotated[str | None, typer.Option("--idempotency-key")] = None,
     as_json: Annotated[bool, typer.Option("--json")]=False,
     url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None,
     actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None,
@@ -445,7 +412,9 @@ def request_create(
     request_data = _request_from_file(file)
     response = _call(
         lambda: _client(url, actor).post(
-            "/api/v1/requests", request_data.model_dump(mode="json"), idempotency_key=secrets.token_hex(16)
+            "/api/v1/requests",
+            request_data.model_dump(mode="json"),
+            idempotency_key=_idempotency_key(idempotency_key),
         )
     )
     _print(response, as_json)
@@ -464,31 +433,37 @@ def request_queue(
 @request_app.command("cancel")
 def request_cancel(
     request_id: str,
+    idempotency_key: Annotated[str | None, typer.Option("--idempotency-key")] = None,
     as_json: Annotated[bool, typer.Option("--json")]=False,
     url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None,
     actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None,
 ) -> None:
-    _print(_call(lambda: _client(url, actor).post(f"/api/v1/requests/{request_id}/cancel", {}, idempotency_key=secrets.token_hex(16))), as_json)
+    _print(_call(lambda: _client(url, actor).post(f"/api/v1/requests/{request_id}/cancel", {}, idempotency_key=_idempotency_key(idempotency_key))), as_json)
 
 
 @lease_app.command("activate")
-def lease_activate(lease_id: str, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
-    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/activate", {}, idempotency_key=secrets.token_hex(16))), as_json)
+def lease_activate(lease_id: str, idempotency_key: Annotated[str | None, typer.Option("--idempotency-key")] = None, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
+    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/activate", {}, idempotency_key=_idempotency_key(idempotency_key))), as_json)
 
 
 @lease_app.command("renew")
-def lease_renew(lease_id: str, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
-    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/renew", {}, idempotency_key=secrets.token_hex(16))), as_json)
+def lease_renew(lease_id: str, idempotency_key: Annotated[str | None, typer.Option("--idempotency-key")] = None, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
+    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/renew", {}, idempotency_key=_idempotency_key(idempotency_key))), as_json)
 
 
 @lease_app.command("release")
-def lease_release(lease_id: str, reason: Annotated[str, typer.Option("--reason")], as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
-    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/release", {"reason": reason}, idempotency_key=secrets.token_hex(16))), as_json)
+def lease_release(lease_id: str, reason: Annotated[str, typer.Option("--reason")], idempotency_key: Annotated[str | None, typer.Option("--idempotency-key")] = None, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
+    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/release", {"reason": reason}, idempotency_key=_idempotency_key(idempotency_key))), as_json)
 
 
 @lease_app.command("bind")
-def lease_bind(lease_id: str, run_id: Annotated[str, typer.Option("--run-id")], process_key: Annotated[list[str], typer.Option("--process-key")]=[], as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
-    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/bind-workload", {"run_id": run_id, "process_keys": process_key}, idempotency_key=secrets.token_hex(16))), as_json)
+def lease_bind(lease_id: str, run_id: Annotated[str, typer.Option("--run-id")], process_key: Annotated[list[str], typer.Option("--process-key")]=[], idempotency_key: Annotated[str | None, typer.Option("--idempotency-key")] = None, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
+    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/bind-workload", {"run_id": run_id, "process_keys": process_key}, idempotency_key=_idempotency_key(idempotency_key))), as_json)
+
+
+@lease_app.command("bind-observed")
+def lease_bind_observed(lease_id: str, run_id: Annotated[str | None, typer.Option("--run-id")] = None, idempotency_key: Annotated[str | None, typer.Option("--idempotency-key")] = None, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
+    _print(_call(lambda: _client(url, actor).post(f"/api/v1/leases/{lease_id}/bind-observed-workload", {"run_id": run_id} if run_id is not None else {}, idempotency_key=_idempotency_key(idempotency_key))), as_json)
 
 
 @reservation_app.command("list")
@@ -686,6 +661,10 @@ def collect_once(
 def import_servers(
     paths: Annotated[list[Path], typer.Argument(exists=True, readable=True)],
     project: Annotated[list[str], typer.Option("--project", help="Project id; repeat for multiple projects.")],
+    workspace_path: Annotated[
+        str,
+        typer.Option("--workspace-path", help="Absolute remote working directory for the imported endpoints."),
+    ],
     output: Annotated[Path, typer.Option("--output")] = Path("configs/inventory.yaml"),
 ) -> None:
     """Parse legacy files, deduplicate only exact host:port, and emit a new global config/report."""
@@ -694,6 +673,7 @@ def import_servers(
     report = import_servers_files(
         paths,
         project_ids=project,
+        workspace_path=workspace_path,
     )
     write_inventory(output, report, projects=projects)
     typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))

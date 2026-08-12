@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import os
 import plistlib
@@ -22,7 +21,6 @@ from urllib.parse import urlparse
 import httpx
 
 from .config import ConfigurationError, load_inventory
-
 try:
     import fcntl
 except ImportError:  # pragma: no cover - the first implementation is macOS-only
@@ -126,7 +124,7 @@ def daemon_instance_id_for_paths(
     *,
     label: str = DAEMON_LABEL,
 ) -> str:
-    identity = "\0".join(
+    identity = "|".join(
         (
             DAEMON_PROTOCOL,
             label,
@@ -134,7 +132,7 @@ def daemon_instance_id_for_paths(
             str(inventory_path.expanduser().resolve()),
         )
     )
-    return f"{DAEMON_PROTOCOL}:{hashlib.sha256(identity.encode()).hexdigest()[:24]}"
+    return identity
 
 
 def daemon_instance_id(config: DaemonConfig) -> str:

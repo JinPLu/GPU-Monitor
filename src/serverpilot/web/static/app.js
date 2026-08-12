@@ -84,28 +84,28 @@
     return payload.data;
   };
 
-  const requestSshPreview = async (command, projectIds, csrf) => {
+  const requestSshPreview = async (command, workspacePath, projectIds, csrf) => {
     const response = await fetch("/ui/endpoints/ssh/preview", {
       method: "POST",
       credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ command, project_ids: projectIds, csrf }),
+      body: JSON.stringify({ command, workspace_path: workspacePath, project_ids: projectIds, csrf }),
     });
     return parseJsonResponse(response);
   };
 
-  const requestSshBatchPreview = async (commands, projectIds, csrf) => {
+  const requestSshBatchPreview = async (commands, workspacePath, projectIds, csrf) => {
     const response = await fetch("/ui/endpoints/ssh/batch/preview", {
       method: "POST",
       credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ commands, project_ids: projectIds, csrf }),
+      body: JSON.stringify({ commands, workspace_path: workspacePath, project_ids: projectIds, csrf }),
     });
     return parseJsonResponse(response);
   };
 
-  const commitSshEndpoint = async ({ command, previewToken, endpointId, projectIds, csrf }) => {
-    const body = { command, preview_token: previewToken, csrf };
+  const commitSshEndpoint = async ({ command, endpointId, workspacePath, projectIds, csrf }) => {
+    const body = { command, workspace_path: workspacePath, csrf };
     if (endpointId) body.endpoint_id = endpointId;
     if (projectIds?.length) body.project_ids = projectIds;
     const response = await fetch("/ui/endpoints/ssh/commit", {
@@ -117,12 +117,12 @@
     return parseJsonResponse(response);
   };
 
-  const commitSshBatch = async ({ commands, previewToken, projectIds, csrf }) => {
+  const commitSshBatch = async ({ commands, workspacePath, projectIds, csrf }) => {
     const response = await fetch("/ui/endpoints/ssh/batch/commit", {
       method: "POST",
       credentials: "same-origin",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
-      body: JSON.stringify({ commands, project_ids: projectIds, preview_token: previewToken, csrf }),
+      body: JSON.stringify({ commands, workspace_path: workspacePath, project_ids: projectIds, csrf }),
     });
     return parseJsonResponse(response);
   };
@@ -130,6 +130,7 @@
   const sshForm = document.getElementById("ssh-preview-form");
   if (sshForm) {
     const commandInput = document.getElementById("ssh-command");
+    const workspaceInput = document.getElementById("ssh-workspace-path");
     const projectInput = document.getElementById("ssh-project-id");
     const previewSection = document.getElementById("ssh-preview");
     const previewFields = document.getElementById("ssh-preview-fields");
@@ -144,6 +145,7 @@
     let sshPreviewData = null;
     let sshBatchCommands = null;
     let sshProjectIds = [];
+    let sshWorkspacePath = "";
 
     const setClipboardStatus = (message) => {
       if (!clipboardStatus) return;
@@ -174,9 +176,9 @@
     };
     const previewEntries = (preview) => {
       const endpoint = preview.endpoint && typeof preview.endpoint === "object" ? preview.endpoint : preview;
-      const labels = { ssh_user: "SSH 用户", user: "SSH 用户", host: "主机", port: "端口", endpoint_id: "服务器名称", identity_file: "身份文件", proxy_jump: "跳板主机" };
+      const labels = { ssh_user: "SSH 用户", user: "SSH 用户", host: "主机", port: "端口", workspace_path: "远端工作区", endpoint_id: "服务器名称", identity_file: "身份文件", proxy_jump: "跳板主机" };
       return Object.entries(endpoint)
-        .filter(([key, value]) => !["preview_token", "command", "project_ids"].includes(key) && value !== null && value !== undefined && typeof value !== "object")
+        .filter(([key, value]) => !["command", "project_ids"].includes(key) && value !== null && value !== undefined && typeof value !== "object")
         .map(([key, value]) => [labels[key] || key.replaceAll("_", " "), value]);
     };
     const renderBatchPreview = (entries) => {
@@ -196,11 +198,13 @@
         const csrf = sshForm.elements.csrf.value;
         const commands = commandInput.value.split(/\r?\n/).map((command) => command.trim()).filter(Boolean);
         sshProjectIds = projectInput.value.trim() ? [projectInput.value.trim()] : [];
+        sshWorkspacePath = workspaceInput.value.trim();
         if (!sshProjectIds.length) throw new Error("请填写这台服务器的归属项目。");
+        if (!sshWorkspacePath.startsWith("/")) throw new Error("请填写绝对远端工作区路径。");
         sshBatchCommands = commands.length > 1 ? commands : null;
         sshPreviewData = sshBatchCommands
-          ? await requestSshBatchPreview(sshBatchCommands, sshProjectIds, csrf)
-          : await requestSshPreview(commandInput.value, sshProjectIds, csrf);
+          ? await requestSshBatchPreview(sshBatchCommands, sshWorkspacePath, sshProjectIds, csrf)
+          : await requestSshPreview(commandInput.value, sshWorkspacePath, sshProjectIds, csrf);
         const entries = previewEntries(sshPreviewData || {});
         const statusTitles = {
           new: "确认新服务器信息",
@@ -239,14 +243,12 @@
       commitButton.disabled = true;
       commitButton.textContent = "正在注册…";
       try {
-        const previewToken = sshPreviewData?.preview_token;
-        if (!previewToken) throw new Error("预览已失效，请返回重新检查命令。");
         const result = sshBatchCommands
-          ? await commitSshBatch({ commands: sshBatchCommands, previewToken, projectIds: sshProjectIds, csrf: sshForm.elements.csrf.value })
+          ? await commitSshBatch({ commands: sshBatchCommands, workspacePath: sshWorkspacePath, projectIds: sshProjectIds, csrf: sshForm.elements.csrf.value })
           : await commitSshEndpoint({
             command: commandInput.value,
-            previewToken,
             endpointId: document.getElementById("ssh-endpoint-id").value.trim(),
+            workspacePath: sshWorkspacePath,
             projectIds: sshPreviewData.endpoint?.project_ids,
             csrf: sshForm.elements.csrf.value,
           });
@@ -272,6 +274,7 @@
       sshPreviewData = null;
       sshBatchCommands = null;
       sshProjectIds = [];
+      sshWorkspacePath = "";
       endpointIdField.hidden = false;
       commitButton.disabled = false;
       commitButton.textContent = "确认注册";
@@ -302,6 +305,7 @@
     RUNNING_MANAGED: "运行中",
     HELD: "已申领，待使用",
     LEASED_IDLE: "已申领，待使用",
+    KEEPALIVE: "空闲占卡",
     RESERVED: "已安排",
     MAINTENANCE: "维护",
     DISABLED: "停用",
@@ -404,6 +408,7 @@
     const lease = gpu.lease;
     const owner = lease?.actor_id || processes[0]?.username || "—";
     const task = lease?.task_ref || processes[0]?.executable || gpu.state_reason || "未登记任务";
+    const publicStatus = gpu.public_status || stateLabels[gpu.state] || gpu.state;
     const stateIcon = gpu.state === "AVAILABLE" ? "ph-check"
       : busyStates.has(gpu.state) ? "ph-waveform"
         : claimedStates.has(gpu.state) ? "ph-user"
@@ -411,8 +416,8 @@
             : "ph-clock";
     const stateClass = gpu.state.toLowerCase();
     return `
-      <button class="gpu-tile state-${stateClass}" type="button" data-gpu-id="${escapeHTML(gpu.id)}" data-show-gpu="${escapeHTML(gpu.id)}" aria-label="查看 GPU ${gpu.gpu_index}，${escapeHTML(stateLabels[gpu.state] || gpu.state)}，详情">
-        <span class="gpu-tile-top"><span class="gpu-tile-icon"><i class="ph ${stateIcon}" aria-hidden="true"></i></span><span class="gpu-tile-state">${escapeHTML(stateLabels[gpu.state] || gpu.state)}</span></span>
+      <button class="gpu-tile state-${stateClass}" type="button" data-gpu-id="${escapeHTML(gpu.id)}" data-show-gpu="${escapeHTML(gpu.id)}" aria-label="查看 GPU ${gpu.gpu_index}，${escapeHTML(publicStatus)}，详情">
+        <span class="gpu-tile-top"><span class="gpu-tile-icon"><i class="ph ${stateIcon}" aria-hidden="true"></i></span><span class="gpu-tile-state">${escapeHTML(publicStatus)}</span></span>
         <span class="gpu-tile-title"><strong>GPU ${gpu.gpu_index}</strong><small>${escapeHTML(gpu.name)}</small></span>
         <span class="gpu-tile-metrics"><span>显存 ${formatMemory(telemetry.memory_free_mib)} 可用</span><span>利用率 ${utilization ?? "—"}%</span></span>
         <span class="gpu-tile-owner"><strong>${escapeHTML(owner)}</strong><small title="${escapeHTML(task)}">${escapeHTML(task)}</small></span>
@@ -421,9 +426,11 @@
 
   const serverBlock = (endpoint) => {
     const gpus = data.gpus.filter((gpu) => gpu.endpoint_id === endpoint.id);
-    const available = gpus.filter((gpu) => gpu.state === "AVAILABLE").length;
+    const available = gpus.filter((gpu) => gpu.publicly_available === true).length;
     const busy = gpus.filter((gpu) => busyStates.has(gpu.state)).length;
-    const claimed = gpus.filter((gpu) => claimedStates.has(gpu.state)).length;
+    const claimed = gpus.filter((gpu) => (
+      gpu.publicly_available !== true && claimedStates.has(gpu.state)
+    )).length;
     const abnormal = gpus.filter((gpu) => abnormalStates.has(gpu.state)).length;
     const telemetry = gpus.map((gpu) => gpu.telemetry).filter(Boolean);
     const used = telemetry.reduce((sum, item) => sum + Number(item.memory_used_mib || 0), 0);
@@ -446,19 +453,13 @@
     return `
       <section class="server-block" data-server-id="${escapeHTML(endpoint.id)}" data-expanded="${expanded}">
         <div class="server-summary">
-          <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong><code>${escapeHTML(sshCommand)}</code></strong><small>${escapeHTML(endpoint.id)} · ${escapeHTML(monitorLabels[status] || status)}</small></span></span>
-          <span class="server-counts" aria-label="GPU 状态：共 ${gpus.length}，可分配 ${available}，占用 ${busy}，已分配 ${claimed}，异常 ${abnormal}"><span title="总数"><strong>${gpus.length}</strong></span><span class="count-available" title="可分配"><strong>${available}</strong></span><span title="占用"><strong>${busy}</strong></span><span title="已分配"><strong>${claimed}</strong></span><span class="${abnormal ? "count-alert" : ""}" title="异常"><strong>${abnormal}</strong></span></span>
+          <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong><code>${escapeHTML(sshCommand)}</code></strong><small>${escapeHTML(endpoint.workspace_path || "工作区未设置")} · ${escapeHTML(monitorLabels[status] || status)}</small></span></span>
+          <span class="server-counts" aria-label="GPU 状态：共 ${gpus.length}，可分配 ${available}，占用 ${busy}，任务分配 ${claimed}，异常 ${abnormal}"><span title="总数"><strong>${gpus.length}</strong></span><span class="count-available" title="可分配"><strong>${available}</strong></span><span title="占用"><strong>${busy}</strong></span><span title="任务分配"><strong>${claimed}</strong></span><span class="${abnormal ? "count-alert" : ""}" title="异常"><strong>${abnormal}</strong></span></span>
           <span class="server-aggregate">${clusterMeter("CPU", cpuLoadPct, "cpu", cpuDetail)}${clusterMeter("内存", memoryUsedPct, "memory", memoryDetail)}${clusterMeter("显存", memoryPct, "memory", vramDetail)}${clusterMeter("GPU", util, "utilization", `${Math.round(util)}% 利用率`)}</span>
           <span class="server-actions">
             <button class="server-expand" type="button" data-toggle-server="${escapeHTML(endpoint.id)}" aria-expanded="${expanded}" title="${expanded ? "收起 GPU" : "展开 GPU"}">
               <span>${expanded ? "收起 GPU" : "展开 GPU"}</span><i class="ph ph-caret-down" aria-hidden="true"></i>
             </button>
-            <form class="server-delete-form" method="post" action="/ui/action/delete-endpoint" data-delete-server-form data-server-label="${escapeHTML(endpoint.id)}">
-              <input type="hidden" name="endpoint_id" value="${escapeHTML(endpoint.id)}">
-              <input type="hidden" name="csrf" value="${escapeHTML(csrfToken)}">
-              <input type="hidden" name="confirmed" value="yes">
-              <button class="icon-button server-delete" type="submit" title="移除服务器" aria-label="移除服务器 ${escapeHTML(endpoint.id)}"><i class="ph ph-trash" aria-hidden="true"></i></button>
-            </form>
           </span>
         </div>
         <div class="gpu-tiles">${expanded ? (gpus.length ? gpus.map(gpuRow).join("") : '<p class="empty-inline">尚未发现 GPU；该服务器不会参与分配。</p>') : ""}</div>
@@ -481,11 +482,13 @@
   const endpointMatches = (endpoint) => {
     const gpus = data.gpus.filter((gpu) => gpu.endpoint_id === endpoint.id);
     const status = endpoint.monitor?.status || "PENDING";
-    const searchable = `${endpoint.id} ${endpoint.ssh_user} ${endpoint.host} ${endpoint.port}`.toLowerCase();
+    const searchable = `${endpoint.id} ${endpoint.ssh_user} ${endpoint.host} ${endpoint.port} ${endpoint.workspace_path || ""}`.toLowerCase();
     if (resourceQuery && !searchable.includes(resourceQuery)) return false;
-    if (activeResourceFilter === "available") return gpus.some((gpu) => gpu.state === "AVAILABLE");
+    if (activeResourceFilter === "available") return gpus.some((gpu) => gpu.publicly_available === true);
     if (activeResourceFilter === "busy") return gpus.some((gpu) => busyStates.has(gpu.state));
-    if (activeResourceFilter === "claimed") return gpus.some((gpu) => claimedStates.has(gpu.state));
+    if (activeResourceFilter === "claimed") return gpus.some((gpu) => (
+      gpu.publicly_available !== true && claimedStates.has(gpu.state)
+    ));
     if (activeResourceFilter === "attention") {
       return ["ERROR", "STALE", "DISABLED"].includes(status)
         || gpus.some((gpu) => abnormalStates.has(gpu.state));
@@ -553,14 +556,6 @@
       dialogOpeners.set(document.getElementById("gpu-detail"), detail);
       openGpuDetail(detail.dataset.showGpu);
     }
-  });
-
-  serverGroups.addEventListener("submit", (event) => {
-    const form = event.target.closest("[data-delete-server-form]");
-    if (!form) return;
-    const label = form.dataset.serverLabel || "该服务器";
-    const confirmed = window.confirm(`移除服务器 ${label}？它将停止接收新分配，待当前资源和队列排空后退役；不会停止远端任务。`);
-    if (!confirmed) event.preventDefault();
   });
 
   document.getElementById("toggle-all-servers").addEventListener("click", (event) => {

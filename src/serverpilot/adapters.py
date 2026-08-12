@@ -21,7 +21,6 @@ from serverpilot.config import EndpointConfig
 from serverpilot.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
 from serverpilot.keepalive_protocol import (
     KEEPALIVE_REMOTE_COMMAND,
-    MAX_KEEPALIVE_MESSAGE_BYTES,
     KeepaliveGPUResult,
     KeepaliveRequest,
     KeepaliveResponse,
@@ -363,7 +362,12 @@ class ServerScriptKeepaliveAdapter:
             raise ValueError("gpu_uuids cannot be empty")
         if len(set(requested)) != len(requested):
             raise ValueError("gpu_uuids contains duplicates")
+        if endpoint.workspace_path is None:
+            raise AdapterCommandError("endpoint workspace_path is required for keepalive")
         payload = KeepaliveRequest(enabled=enabled, gpu_uuids=requested).encode()
+        remote_command = (
+            f"cd -- {shlex.quote(endpoint.workspace_path)} && {KEEPALIVE_REMOTE_COMMAND}"
+        )
         process = await asyncio.create_subprocess_exec(
             "ssh",
             "-o",
@@ -375,7 +379,7 @@ class ServerScriptKeepaliveAdapter:
             "-p",
             str(endpoint.port),
             f"{endpoint.ssh_user}@{endpoint.host}",
-            KEEPALIVE_REMOTE_COMMAND,
+            remote_command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -391,8 +395,6 @@ class ServerScriptKeepaliveAdapter:
                 "endpoint keepalive operation timed out; its remote outcome is unknown",
                 uncertain=True,
             ) from exc
-        if len(stdout) > MAX_KEEPALIVE_MESSAGE_BYTES:
-            raise AdapterCommandError("endpoint keepalive response is too large", uncertain=True)
         cleaned_stderr = _clean_output(_decode_remote_output(stderr[:16_384], stream_name="stderr"))
         if process.returncode != 0:
             message = cleaned_stderr or f"helper exited with code {process.returncode}"

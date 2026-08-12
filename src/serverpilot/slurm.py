@@ -306,10 +306,8 @@ emit_failure() {{
   cleaned_failure=$(printf '%s' "$failure_output" | clean_output)
   failure_lines=$(printf '%s' "$cleaned_failure" | awk 'NF || NR {{ lines=NR }} END {{ print lines + 0 }}')
   failure_bytes=$(printf '%s' "$cleaned_failure" | LC_ALL=C wc -c | tr -d '[:space:]')
-  failure_digest=$(printf '%s' "$cleaned_failure" | LC_ALL=C cksum | awk '{{ print $1 }}')
-  printf 'GB|scheduler-submit-error|class=%s|exit=%s|lines=%s|bytes=%s|digest=cksum:%s|recovery=%s\n' \
-    "$failure_class" "$failure_status" "$failure_lines" "$failure_bytes" \
-    "$failure_digest" "$recovery" >&2
+  printf 'GB|scheduler-submit-error|class=%s|exit=%s|lines=%s|bytes=%s|recovery=%s\n' \
+    "$failure_class" "$failure_status" "$failure_lines" "$failure_bytes" "$recovery" >&2
   emit_shape "$failure_output"
 }}
 

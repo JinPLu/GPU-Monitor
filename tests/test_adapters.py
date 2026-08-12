@@ -87,7 +87,10 @@ def test_raw_ssh_adapter_runs_fixed_ssh_invocation(
         return FakeProcess()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    endpoint = EndpointConfig(id="endpoint-a", host="gpu.example.test", port=2202, ssh_user="gpu")
+    endpoint = EndpointConfig(
+        id="endpoint-a", host="gpu.example.test", port=2202, ssh_user="gpu",
+        workspace_path="/srv/project-a",
+    )
 
     result = asyncio.run(
         RawSSHObservationAdapter().run_probe(
@@ -117,7 +120,10 @@ def test_raw_ssh_adapter_runs_fixed_ssh_invocation(
 
 def test_raw_ssh_adapter_rejects_arbitrary_or_invalid_probes() -> None:
     adapter = RawSSHObservationAdapter()
-    endpoint = EndpointConfig(id="endpoint-a", host="gpu.example.test", port=2202, ssh_user="gpu")
+    endpoint = EndpointConfig(
+        id="endpoint-a", host="gpu.example.test", port=2202, ssh_user="gpu",
+        workspace_path="/srv/project-a",
+    )
 
     with pytest.raises(ValueError, match="unknown raw SSH probe"):
         asyncio.run(adapter.run_probe(endpoint, probe="arbitrary", connect_timeout_seconds=7))  # type: ignore[arg-type]
@@ -153,6 +159,7 @@ def test_raw_ssh_adapter_uses_the_configured_sealed_observation_profile(
         host="host.example.test",
         port=22,
         ssh_user="monitor",
+        workspace_path="/srv/project-host",
         observation_profile="linux-host",
     )
 
@@ -189,6 +196,7 @@ def test_raw_ssh_adapter_uses_the_exact_server_script_entry_invocation(
         host="script.example.test",
         port=22,
         ssh_user="monitor",
+        workspace_path="/srv/project-script",
         observation_profile="server-script-v1",
     )
 
@@ -238,7 +246,10 @@ def test_raw_ssh_adapter_bounds_and_drains_noisy_remote_streams(
         return FakeProcess()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    endpoint = EndpointConfig(id="endpoint-a", host="gpu.example.test", port=22, ssh_user="gpu")
+    endpoint = EndpointConfig(
+        id="endpoint-a", host="gpu.example.test", port=22, ssh_user="gpu",
+        workspace_path="/srv/project-a",
+    )
 
     result = asyncio.run(
         RawSSHObservationAdapter().run_probe(
@@ -282,7 +293,10 @@ def test_raw_ssh_adapter_times_out_and_reaps_a_hung_connected_probe(
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    endpoint = EndpointConfig(id="endpoint-a", host="gpu.example.test", port=22, ssh_user="gpu")
+    endpoint = EndpointConfig(
+        id="endpoint-a", host="gpu.example.test", port=22, ssh_user="gpu",
+        workspace_path="/srv/project-a",
+    )
 
     with pytest.raises(
         TimeoutError,

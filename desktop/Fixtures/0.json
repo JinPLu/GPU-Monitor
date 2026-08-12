@@ -33,7 +33,6 @@
       "workload_profiles": []
     },
     "history": {
-      "retired_endpoints": [],
       "resource_plan_evaluations": [],
       "resource_run_actuals": []
     }

@@ -5,7 +5,7 @@
   "data": {
     "current": {
       "summary": {"online_servers": 1, "total_servers": 1, "total_gpus": 2, "available_gpus": 1, "busy_gpus": 1, "claimed_gpus": 1, "abnormal_gpus": 1},
-      "endpoints": [{"id": "fixture-conflict-available", "host": "127.0.0.1", "port": 2234, "ssh_user": "gpu", "labels": {"fixture": "true"}, "lifecycle_state": "active", "enabled": true, "monitor": {"status": "ONLINE"}, "host_telemetry": {"cpu_count": 64, "load_1m": 7.0, "memory_total_mib": 262144, "memory_available_mib": 188743}}],
+      "endpoints": [{"id": "fixture-conflict-available", "host": "127.0.0.1", "port": 2234, "ssh_user": "gpu", "workspace_path": "/srv/serverpilot-fixtures", "labels": {"fixture": "true"}, "lifecycle_state": "active", "enabled": true, "monitor": {"status": "ONLINE"}, "host_telemetry": {"cpu_count": 64, "load_1m": 7.0, "memory_total_mib": 262144, "memory_available_mib": 188743}}],
       "gpus": [
         {"id": "fixture-conflict-available:GPU-CONFLICT", "endpoint_id": "fixture-conflict-available", "gpu_uuid": "GPU-CONFLICT", "gpu_index": 0, "name": "Fixture GPU", "total_vram_mib": 81920, "labels": {"fixture": "true"}, "health": "ATTENTION", "enabled": true, "state": "CONFLICT", "telemetry": {"memory_used_mib": 51200, "gpu_utilization_pct": 92, "temperature_c": 34}, "processes": [{"pid": 4300, "name": "python", "owner": "other"}], "lease": {"actor_id": "fixture", "task_ref": "conflict"}, "state_reason": "lease/process attribution conflict"},
         {"id": "fixture-conflict-available:GPU-AVAILABLE", "endpoint_id": "fixture-conflict-available", "gpu_uuid": "GPU-AVAILABLE", "gpu_index": 1, "name": "Fixture GPU", "total_vram_mib": 81920, "labels": {"fixture": "true"}, "health": "OK", "enabled": true, "state": "AVAILABLE", "telemetry": {"memory_used_mib": 1024, "gpu_utilization_pct": 4, "temperature_c": 34}, "processes": []}
@@ -13,6 +13,6 @@
       "leases": [{"id": "lease-conflict", "actor_id": "fixture", "project_id": "fixture-project", "state": "CONFLICT", "gpu_ids": ["fixture-conflict-available:GPU-CONFLICT"], "task_ref": "conflict", "purpose": "fixture"}],
       "requests": [], "data_age_seconds": 3, "reservations": [], "freshness_seconds": 30, "admission_boundary": "Fixture: allocation only.", "absent_gpu_ids": [], "maintenance": [], "alerts": [], "resource_providers": [], "allocatable_units": [], "resource_claims": [], "scheduler_targets": [], "scheduler_jobs": [], "scheduler_transfers": [], "workload_profiles": []
     },
-    "history": {"retired_endpoints": [], "resource_plan_evaluations": [], "resource_run_actuals": []}
+    "history": {"resource_plan_evaluations": [], "resource_run_actuals": []}
   }
 }

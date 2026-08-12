@@ -6,6 +6,7 @@ import pytest
 
 from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig
 from serverpilot.database import Database
+from serverpilot.models import Actor
 from serverpilot.service import ActorContext, BrokerService
 
 
@@ -23,6 +24,7 @@ def inventory() -> InventoryConfig:
                 host="127.0.0.1",
                 port=2201,
                 ssh_user="gpu",
+                workspace_path="/srv/project-a",
                 labels=["direct-ssh", "test"],
                 storage_group="test-storage",
                 project_ids=["project-a", "project-b"],
@@ -32,6 +34,7 @@ def inventory() -> InventoryConfig:
                 host="127.0.0.1",
                 port=2202,
                 ssh_user="gpu",
+                workspace_path="/srv/project-b",
                 labels=["direct-ssh", "test"],
                 storage_group="test-storage",
                 project_ids=["project-a", "project-b"],
@@ -44,10 +47,20 @@ def inventory() -> InventoryConfig:
 def service(tmp_path: Path, inventory: InventoryConfig) -> BrokerService:
     project_root = Path(__file__).resolve().parents[1]
     broker = BrokerService(Database(f"sqlite:///{tmp_path / 'broker.sqlite3'}", project_root), inventory)
-    broker.initialize("a" * 32)
+    broker.initialize()
     return broker
 
 
 @pytest.fixture
 def admin(service: BrokerService) -> ActorContext:
-    return service.authenticate("a" * 32)
+    service.local_actor("test-admin")
+    with service.database.session() as session:
+        actor = session.get(Actor, "test-admin")
+        assert actor is not None
+        actor.role = "admin"
+        session.commit()
+    return ActorContext(
+        id="test-admin",
+        role="admin",
+        project_ids=frozenset({"project-a", "project-b"}),
+    )

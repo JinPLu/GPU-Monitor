@@ -140,6 +140,7 @@ public final class BrokerStore: ObservableObject {
     @Published public private(set) var collectorSettingsLoading = false
     @Published public private(set) var mutatingEndpointIDs: Set<String> = []
     @Published public private(set) var releasingLeaseIDs: Set<String> = []
+    @Published public private(set) var reassigningLeaseIDs: Set<String> = []
     @Published public private(set) var endpointTelemetryHistory: [String: EndpointTelemetryHistory] = [:]
     @Published public private(set) var endpointTelemetryHistoryLoading: Set<String> = []
     @Published public private(set) var endpointTelemetryHistoryErrors: [String: String] = [:]
@@ -197,10 +198,6 @@ public final class BrokerStore: ObservableObject {
         serviceInfo?.supportsEndpointPauseResume == true
     }
 
-    public var supportsEndpointRetirement: Bool {
-        serviceInfo?.supportsEndpointRetirement == true
-    }
-
     public var supportsEndpointTelemetryHistory: Bool {
         serviceInfo?.supportsEndpointTelemetryHistory == true && endpointTelemetryHistoryClient != nil
     }
@@ -249,9 +246,9 @@ public final class BrokerStore: ObservableObject {
 
     public var endpointLifecycleMutationUnavailableReason: String {
         if baseURL == nil {
-            return "当前为只读测试夹具或尚未连接本机服务，不能移除服务器。"
+            return "当前为只读测试夹具或尚未连接本机服务，不能修改服务器。"
         }
-        return "本机服务连接已中断，暂时不能移除服务器。请先刷新重试。"
+        return "本机服务连接已中断，暂时不能修改服务器。请先刷新重试。"
     }
 
     public func connect(to baseURL: URL, serviceInfo: ServiceInfo) {
@@ -513,7 +510,7 @@ public final class BrokerStore: ObservableObject {
                 let gpuIDs = lease?["gpu_ids"] as? [String] ?? []
                 message = "已申领，待使用：\(max(gpuIDs.count, draft.gpuCount)) 个 GPU，租约 \(leaseID) 已生效。这里只分配资源，不会启动任务。"
             } else {
-                message = "资源不足或需要等待，请求 \(requestID) 已进入队列。排队期间请先不要启动任务。"
+                message = "当前无可用容量（no_capacity），请求 \(requestID) 本次未排队。未获得租约，请勿启动任务。"
             }
             self.notice = message
             self.errorMessage = nil
@@ -534,6 +531,7 @@ public final class BrokerStore: ObservableObject {
             "host": draft.host,
             "port": draft.port,
             "ssh_user": draft.sshUser,
+            "workspace_path": draft.workspacePath,
             "observation_profile": draft.observationProfile.rawValue,
             "labels": ["desktop-app"],
         ]
@@ -610,6 +608,7 @@ public final class BrokerStore: ObservableObject {
             method: "PATCH",
             payload: [
                 "ssh_user": draft.sshUser,
+                "workspace_path": draft.workspacePath,
                 "observation_profile": draft.observationProfile.rawValue,
             ],
             successMessage: "已更新服务器设置，正在确认状态。",
@@ -668,25 +667,8 @@ public final class BrokerStore: ObservableObject {
             method: "POST",
             payload: ["enabled": enabled],
             successMessage: enabled
-                ? "已请求开启 \(endpoint.displayName) 的空闲占卡，正在确认各 GPU 状态。"
-                : "已请求关闭 \(endpoint.displayName) 的空闲占卡，正在确认各 GPU 状态。",
-            completion: completion
-        )
-    }
-
-    public func retireEndpoint(_ endpoint: EndpointRecord, completion: @escaping @MainActor @Sendable (Bool, String?) -> Void) {
-        guard supportsEndpointRetirement else {
-            let message = endpointCompatibilityMessage("彻底退役服务器", capability: "endpoint_retirement")
-            errorMessage = message
-            completion(false, message)
-            return
-        }
-        performEndpointMutation(
-            endpoint,
-            path: "api/v1/endpoints/\(endpoint.id)/retire",
-            method: "POST",
-            payload: [:],
-            successMessage: "\(endpoint.displayName) 已彻底退役；历史记录仍会保留。",
+                ? "已开启 \(endpoint.displayName) 的空闲自动占卡策略。"
+                : "已关闭 \(endpoint.displayName) 的空闲自动占卡策略。",
             completion: completion
         )
     }
@@ -797,6 +779,35 @@ public final class BrokerStore: ObservableObject {
                 completion(true, nil)
             }
         }.resume()
+    }
+
+    public func reassignLease(
+        _ lease: LeaseRecord,
+        gpuIDs: [String],
+        completion: @escaping @MainActor @Sendable (Bool, String?) -> Void
+    ) {
+        guard !reassigningLeaseIDs.contains(lease.id) else {
+            completion(false, "这项任务的 GPU 分配正在更新。")
+            return
+        }
+        reassigningLeaseIDs.insert(lease.id)
+        performMutationWithPayload(
+            path: "api/v1/leases/\(lease.id)/gpus",
+            method: "PATCH",
+            payload: ["gpu_ids": gpuIDs]
+        ) { [weak self] _, error in
+            guard let self else { return }
+            self.reassigningLeaseIDs.remove(lease.id)
+            if let error {
+                completion(false, error)
+                return
+            }
+            let message = "已把任务分配到选定 GPU；请让对应 Agent 按新分配重启任务。"
+            self.notice = message
+            self.errorMessage = nil
+            self.reload()
+            completion(true, nil)
+        }
     }
 
     private func configureSnapshotClient(
@@ -1167,7 +1178,7 @@ public final class BrokerStore: ObservableObject {
                 }
                 guard (200..<300).contains(response.statusCode) else {
                     if [404, 405, 501].contains(response.statusCode) {
-                        let message = "当前本机服务尚不支持此服务器操作。请升级 ServerPilot 服务后再试。"
+                        let message = "当前本机服务尚不支持此操作。请升级 ServerPilot 服务后再试。"
                         self.errorMessage = message
                         completion(nil, message)
                         return
@@ -1265,30 +1276,34 @@ public final class BrokerStore: ObservableObject {
 
     private func localizedAPIError(code: String, fallback: String) -> String {
         switch code {
-        case "endpoint_has_active_leases":
-            return "这台服务器仍有正在使用的租约，请先到“租约”归还 GPU。"
-        case "endpoint_has_queued_requests":
-            return "仍有排队或待批准请求指定了这台服务器，请先取消或调整请求。"
-        case "endpoint_has_lease_history":
-            return "这台服务器已有租约历史，需要保留登记记录，不能直接删除。"
-        case "endpoint_referenced_by_requests":
-            return "仍有排队请求指定了这台服务器，请先取消或调整请求。"
-        case "endpoint_referenced_by_profiles":
-            return "仍有预设任务指定了这台服务器，请先停用或调整预设。"
-        case "endpoint_referenced_by_reservations":
-            return "仍有预约使用这台服务器，请先取消预约。"
-        case "endpoint_referenced_by_maintenance":
-            return "这台服务器有维护记录，需要保留登记，不能直接删除。"
-        case "endpoint_delete_restricted":
-            return "这台服务器仍被受保护的历史记录引用，不能直接删除。"
         case "endpoint_not_found":
             return "这台服务器已经不在本机资源池中。"
         case "idempotency_key_required":
             return "本次操作缺少防重复标识，请重试。"
         case "validation_error":
             return "提交内容不完整或格式不正确，请检查后重试。"
+        case "no_capacity":
+            return "当前无可用容量（no_capacity），本次申请未排队。未获得租约，请勿启动任务。"
+        case "keepalive_outcome_uncertain":
+            return "占卡程序返回结果不确定，本次没有分配任务。"
+        case "keepalive_adapter_failed":
+            return "占卡程序启动或停止失败；下一采集周期会继续尝试。"
+        case "keepalive_cleanup_failed":
+            return "占卡异常且未能完成清理；请在 APP 中确认该 GPU 的实际状态。"
+        case "keepalive_observation_stale", "keepalive_observation_incomplete":
+            return "占卡操作后没有取得完整的新状态；下一采集周期会继续尝试。"
+        case "keepalive_process_missing":
+            return "未检测到占卡程序；该卡仍按可用显示，下一采集周期会继续尝试。"
+        case "keepalive_process_still_running":
+            return "占卡程序仍在运行，本次没有分配任务。"
+        case "keepalive_partial_stop":
+            return "部分 GPU 未能确认让位；本次没有分配任务。"
+        case "gpu_already_assigned":
+            return "选中的 GPU 已分给其他任务。"
         default:
-            return fallback
+            return fallback.range(of: "[\\u{4e00}-\\u{9fff}]", options: .regularExpression) != nil
+                ? fallback
+                : "操作未完成（\(code)）。"
         }
     }
 

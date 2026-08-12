@@ -11,7 +11,7 @@ struct FleetOverview: View {
 
     private let attentionStates = Set([
         "BUSY_UNMANAGED", "UNKNOWN_RECOVERING", "UNKNOWN_STALE",
-        "UNHEALTHY", "CONFLICT", "ORPHANED_BUSY", "DRAINING", "RETIRED",
+        "UNHEALTHY", "CONFLICT", "ORPHANED_BUSY", "DRAINING",
         "DISABLED", "MAINTENANCE"
     ])
 
@@ -50,7 +50,7 @@ struct FleetOverview: View {
 
     private var allocatableGPUCount: Int {
         snapshot.operationalGPUs.filter {
-            freshEndpointIDs.contains($0.endpointID) && $0.state == "AVAILABLE"
+            freshEndpointIDs.contains($0.endpointID) && $0.isPubliclyAvailable
         }.count
     }
 
@@ -896,7 +896,7 @@ private struct OverviewServerCard: View {
     private var sortedGPUs: [GPURecord] { gpus.sorted { $0.index < $1.index } }
     private var allocatableCount: Int {
         guard endpoint.monitorStatus == "ONLINE" else { return 0 }
-        return gpus.filter { $0.state == "AVAILABLE" }.count
+        return gpus.filter(\.isPubliclyAvailable).count
     }
     private var averageUtilization: Double? {
         guard endpoint.monitorStatus == "ONLINE" else { return nil }
@@ -930,6 +930,11 @@ private struct OverviewServerCard: View {
                             .font(.system(size: 12, weight: .semibold, design: .monospaced))
                             .lineLimit(1)
                             .truncationMode(.middle)
+                        Text(endpoint.workspacePath ?? "工作区未设置")
+                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .foregroundStyle(endpoint.workspacePath == nil ? DesignTokens.warning : DesignTokens.mutedInk)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                         Text(endpoint.monitorLabel)
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(statusColor)
@@ -951,6 +956,11 @@ private struct OverviewServerCard: View {
                 Menu {
                     Button("复制 SSH 命令", systemImage: "doc.on.doc") {
                         copyToPasteboard(endpoint.sshCommand)
+                    }
+                    if let workspacePath = endpoint.workspacePath {
+                        Button("复制工作区路径", systemImage: "folder") {
+                            copyToPasteboard(workspacePath)
+                        }
                     }
                     Button("查看详情", systemImage: "info.circle", action: open)
                 } label: {
@@ -1301,7 +1311,6 @@ private func overviewGPUStateLabel(_ state: String) -> String {
     case "DISABLED": return "已停用"
     case "MAINTENANCE": return "维护中"
     case "DRAINING": return "已暂停（正在排空）"
-    case "RETIRED": return "已退役"
     default: return "需处理"
     }
 }
@@ -1319,7 +1328,6 @@ private func overviewGPUStateIcon(_ state: String) -> String {
     case "CONFLICT": return "exclamationmark.triangle.fill"
     case "DISABLED": return "pause.circle.fill"
     case "DRAINING": return "arrow.down.forward.and.arrow.up.backward"
-    case "RETIRED": return "archivebox.fill"
     default: return "questionmark.diamond.fill"
     }
 }
@@ -1332,7 +1340,6 @@ private func endpointIcon(_ state: String) -> String {
     case "ERROR": return "exclamationmark.triangle.fill"
     case "DISABLED": return "pause.circle.fill"
     case "DRAINING": return "arrow.down.forward.and.arrow.up.backward"
-    case "RETIRED": return "archivebox.fill"
     default: return "questionmark.diamond.fill"
     }
 }

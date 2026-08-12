@@ -78,47 +78,28 @@ class BrokerClient:
             headers["X-ServerPilot-Coordination-URI"] = self.coordination_uri
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        # A loopback service can be briefly unavailable while it restarts. GET
-        # requests are safe to retry. Mutations retry only with the caller's
-        # idempotency key, so a tool caller can reuse one stable key across its
-        # own retries without creating a duplicate claim or release.
-        retryable = method.upper() == "GET" or idempotency_key is not None
-        attempts = 3 if retryable else 1
-        response: httpx.Response | None = None
-        last_transport_error: httpx.HTTPError | None = None
-        for attempt in range(attempts):
-            try:
-                response = httpx.request(
-                    method,
-                    f"{self.url}{path}",
-                    headers=headers,
-                    json=json_body,
-                    params=params,
-                    timeout=self.timeout_seconds,
-                    # ServerPilot is a local control plane.  MCP processes are
-                    # often launched with a minimal environment that omits
-                    # NO_PROXY, so httpx would otherwise send loopback calls
-                    # through an ambient HTTP proxy and surface its empty 502.
-                    trust_env=False,
-                )
-            except httpx.HTTPError as exc:
-                last_transport_error = exc
-                if attempt + 1 == attempts:
-                    raise BrokerClientError(f"broker request failed: {type(exc).__name__}") from exc
-            else:
-                if response.status_code not in {502, 503, 504} or attempt + 1 == attempts:
-                    break
-            time.sleep(0.1 * (attempt + 1))
-        if response is None:
-            assert last_transport_error is not None
-            raise BrokerClientError(f"broker request failed: {type(last_transport_error).__name__}")
+        try:
+            response = httpx.request(
+                method,
+                f"{self.url}{path}",
+                headers=headers,
+                json=json_body,
+                params=params,
+                timeout=self.timeout_seconds,
+                # ServerPilot is a local control plane.  MCP processes are
+                # often launched with a minimal environment that omits
+                # NO_PROXY, so httpx would otherwise send loopback calls
+                # through an ambient HTTP proxy and surface its empty 502.
+                trust_env=False,
+            )
+        except httpx.HTTPError as exc:
+            raise BrokerClientError(f"broker request failed: {type(exc).__name__}") from exc
         try:
             payload = response.json()
         except ValueError as exc:
             content_type = response.headers.get("content-type", "unknown")
-            suffix = " after retry" if attempts > 1 else ""
             raise BrokerClientError(
-                f"broker returned non-JSON HTTP {response.status_code}{suffix} ({content_type})"
+                f"broker returned non-JSON HTTP {response.status_code} ({content_type})"
             ) from exc
         if response.is_error:
             error = payload.get("error", {}) if isinstance(payload, dict) else {}
@@ -137,7 +118,7 @@ class BrokerClient:
         path: str,
         body: dict[str, Any] | None = None,
         *,
-        idempotency_key: str,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         return self.request("POST", path, json_body=body, idempotency_key=idempotency_key)
 
@@ -247,25 +228,18 @@ class BrokerClient:
         state: str | None = None,
         only_available: bool = False,
     ) -> dict[str, Any]:
-        payload, current = self._state_current()
-        data = dict(current)
-        gpus = list(data.get("gpus", []))
+        params: dict[str, Any] = {
+            "compact": compact,
+            "only_available": only_available,
+        }
         if endpoint_id:
-            gpus = [gpu for gpu in gpus if gpu.get("endpoint_id") == endpoint_id]
+            params["endpoint_id"] = endpoint_id
         if state:
-            gpus = [gpu for gpu in gpus if gpu.get("state") == state]
-        if only_available:
-            gpus = [gpu for gpu in gpus if gpu.get("state") == "AVAILABLE"]
-        if compact:
-            gpus = [
-                {key: value for key, value in gpu.items() if key not in {"processes", "telemetry_history"}}
-                for gpu in gpus
-            ]
-        data["gpus"] = gpus
-        return self._state_projection("current", data=data, current=current, state=payload)
+            params["state"] = state
+        return self.get("/api/v1/snapshot", params=params)
 
     def endpoints(self) -> dict[str, Any]:
-        return self._state_projection("endpoints")
+        return self.get("/api/v1/endpoints")
 
     def endpoint_history(
         self,
@@ -301,19 +275,19 @@ class BrokerClient:
         return self.get("/api/v1/gpus", params=params)
 
     def leases(self, *, project_id: str | None = None) -> dict[str, Any]:
-        payload, current = self._state_current()
-        leases = current.get("leases")
-        if leases is None:
-            raise BrokerClientError("broker state is missing current.leases")
+        payload = self.get("/api/v1/leases")
+        leases = payload.get("data")
+        if not isinstance(leases, list):
+            raise BrokerClientError("broker leases response is invalid")
         if project_id:
             leases = [lease for lease in leases if lease.get("project_id") == project_id]
-        return self._state_projection("leases", data=leases, current=current, state=payload)
+        return {**payload, "data": leases}
 
     def requests(self, *, request_id: str | None = None, queued_only: bool = False) -> dict[str, Any]:
-        payload, current = self._state_current()
-        requests = current.get("requests")
-        if requests is None:
-            raise BrokerClientError("broker state is missing current.requests")
+        payload = self.get("/api/v1/requests")
+        requests = payload.get("data")
+        if not isinstance(requests, list):
+            raise BrokerClientError("broker requests response is invalid")
         if request_id:
             requests = [request for request in requests if request.get("id") == request_id]
         if queued_only:
@@ -322,31 +296,21 @@ class BrokerClient:
                 for request in requests
                 if request.get("state") in {"QUEUED", "PENDING_APPROVAL"}
             ]
-        return self._state_projection("requests", data=requests, current=current, state=payload)
+        return {**payload, "data": requests}
 
     def reservations(self) -> dict[str, Any]:
-        return self._state_projection("reservations")
+        return self.get("/api/v1/reservations")
 
     def workload_profiles(self, *, project_id: str | None = None) -> dict[str, Any]:
-        payload, current = self._state_current()
-        profiles = current.get("workload_profiles")
-        if profiles is None:
-            raise BrokerClientError("broker state is missing current.workload_profiles")
-        if project_id:
-            profiles = [profile for profile in profiles if profile.get("project_id") == project_id]
-        return self._state_projection("workload_profiles", data=profiles, current=current, state=payload)
+        params = {"project_id": project_id} if project_id else None
+        return self.get("/api/v1/workload-profiles", params=params)
 
     def scheduler_targets(self) -> dict[str, Any]:
-        return self._state_projection("scheduler_targets")
+        return self.get("/api/v1/scheduler-targets")
 
     def scheduler_jobs(self, *, project_id: str | None = None) -> dict[str, Any]:
-        payload, current = self._state_current()
-        jobs = current.get("scheduler_jobs")
-        if jobs is None:
-            raise BrokerClientError("broker state is missing current.scheduler_jobs")
-        if project_id:
-            jobs = [job for job in jobs if job.get("project_id") == project_id]
-        return self._state_projection("scheduler_jobs", data=jobs, current=current, state=payload)
+        params = {"project_id": project_id} if project_id else None
+        return self.get("/api/v1/scheduler-jobs", params=params)
 
     def scheduler_transfers(
         self,
@@ -354,312 +318,13 @@ class BrokerClient:
         transfer_id: str | None = None,
         project_id: str | None = None,
     ) -> dict[str, Any]:
-        payload, current = self._state_current()
-        transfers = current.get("scheduler_transfers")
-        if transfers is None:
-            raise BrokerClientError("broker state is missing current.scheduler_transfers")
         if transfer_id is not None:
-            transfer = next(
-                (item for item in transfers if item.get("id") == transfer_id),
-                None,
-            )
-            if transfer is None:
-                raise BrokerClientError("scheduler transfer does not exist or is not visible")
-            return self._state_projection(
-                "scheduler_transfers",
-                data=transfer,
-                current=current,
-                state=payload,
-            )
-        if project_id:
-            transfers = [
-                transfer
-                for transfer in transfers
-                if transfer.get("project_id") == project_id
-            ]
-        return self._state_projection(
-            "scheduler_transfers",
-            data=transfers,
-            current=current,
-            state=payload,
-        )
+            return self.get(f"/api/v1/scheduler-transfers/{transfer_id}")
+        params = {"project_id": project_id} if project_id else None
+        return self.get("/api/v1/scheduler-transfers", params=params)
 
     def coordination(self) -> dict[str, Any]:
-        payload, current = self._state_current()
-        gpus = current.get("gpus")
-        endpoints = current.get("endpoints")
-        leases = current.get("leases")
-        requests = current.get("requests")
-        scheduler_targets = current.get("scheduler_targets")
-        scheduler_jobs = current.get("scheduler_jobs")
-        if not all(
-            isinstance(value, list)
-            for value in (gpus, endpoints, leases, requests, scheduler_targets, scheduler_jobs)
-        ):
-            raise BrokerClientError("broker state is missing coordination source lists")
-
-        gpus_by_id = {gpu["id"]: gpu for gpu in gpus}
-        gpus_by_endpoint: dict[str, list[dict[str, Any]]] = {}
-        for gpu in gpus:
-            gpus_by_endpoint.setdefault(gpu["endpoint_id"], []).append(gpu)
-
-        def average(values: list[int | float | None]) -> float | None:
-            present = [float(value) for value in values if value is not None]
-            return round(sum(present) / len(present), 1) if present else None
-
-        def gpu_state_counts(values: list[dict[str, Any]]) -> dict[str, int]:
-            counts: dict[str, int] = {}
-            for gpu in values:
-                state = str(gpu.get("state", "UNKNOWN"))
-                counts[state] = counts.get(state, 0) + 1
-            return dict(sorted(counts.items()))
-
-        def lease_activity(values: list[dict[str, Any]]) -> str:
-            states = {gpu.get("state") for gpu in values}
-            if states.intersection({"CONFLICT", "ORPHANED_BUSY"}):
-                return "needs_attention"
-            if "BUSY_UNMANAGED" in states:
-                return "unattributed_compute"
-            if "RUNNING_MANAGED" in states:
-                return "running"
-            if values and all(gpu.get("state") == "LEASED_IDLE" for gpu in values):
-                return "lease_idle"
-            if values and all(gpu.get("state") == "HELD" for gpu in values):
-                return "held"
-            return "starting"
-
-        lease_cards: list[dict[str, Any]] = []
-        consumers_by_endpoint: dict[str, list[dict[str, Any]]] = {}
-        agents: dict[str, dict[str, Any]] = {}
-        signals: list[dict[str, Any]] = []
-        for lease in leases:
-            lease_gpus = [gpus_by_id[gpu_id] for gpu_id in lease.get("gpu_ids", []) if gpu_id in gpus_by_id]
-            endpoint_ids = sorted({gpu["endpoint_id"] for gpu in lease_gpus})
-            state_counts = gpu_state_counts(lease_gpus)
-            telemetry = [gpu.get("telemetry") for gpu in lease_gpus if gpu.get("telemetry") is not None]
-            card = {
-                "lease_id": lease["id"],
-                "agent_name": lease.get("actor_id"),
-                "coordination_uri": lease.get("coordination_uri"),
-                "project_id": lease.get("project_id"),
-                "task": lease.get("task_ref"),
-                "state": lease.get("state"),
-                "activity": lease_activity(lease_gpus),
-                "gpu_count": len(lease_gpus),
-                "servers": endpoint_ids,
-                "gpu_states": state_counts,
-                "observed_gpu_utilization_pct": average(
-                    [item.get("gpu_utilization_pct") for item in telemetry]
-                ),
-                "observed_memory_used_mib": sum(item.get("memory_used_mib") or 0 for item in telemetry),
-                "observed_process_count": sum(len(gpu.get("processes", [])) for gpu in lease_gpus),
-                "workloads": [
-                    {
-                        "run_id": workload.get("run_id"),
-                        "process_key_count": len(workload.get("process_keys", [])),
-                    }
-                    for workload in lease.get("workloads", [])
-                ],
-                "issued_at": lease.get("issued_at"),
-                "expires_at": lease.get("expires_at"),
-            }
-            lease_cards.append(card)
-            for endpoint_id in endpoint_ids:
-                endpoint_gpu_count = sum(gpu["endpoint_id"] == endpoint_id for gpu in lease_gpus)
-                consumers_by_endpoint.setdefault(endpoint_id, []).append(
-                    {
-                        "lease_id": card["lease_id"],
-                        "agent_name": card["agent_name"],
-                        "coordination_uri": card["coordination_uri"],
-                        "project_id": card["project_id"],
-                        "task": card["task"],
-                        "gpu_count": endpoint_gpu_count,
-                        "activity": card["activity"],
-                    }
-                )
-            agent_name = str(lease.get("actor_id") or "")
-            agent = agents.setdefault(
-                agent_name,
-                {
-                    "agent_name": agent_name,
-                    "coordination_uri": lease.get("coordination_uri"),
-                    "active_leases": 0,
-                    "leased_gpus": 0,
-                    "managed_running_gpus": 0,
-                    "idle_leased_gpus": 0,
-                    "projects": set(),
-                    "servers": set(),
-                },
-            )
-            agent["active_leases"] += 1
-            agent["leased_gpus"] += len(lease_gpus)
-            agent["managed_running_gpus"] += state_counts.get("RUNNING_MANAGED", 0)
-            agent["idle_leased_gpus"] += state_counts.get("LEASED_IDLE", 0)
-            if lease.get("project_id") is not None:
-                agent["projects"].add(lease["project_id"])
-            agent["servers"].update(endpoint_ids)
-            if card["activity"] == "lease_idle":
-                signals.append(
-                    {
-                        "kind": "lease_idle",
-                        "severity": "info",
-                        "lease_id": lease["id"],
-                        "agent_name": agent_name,
-                        "message": "active lease has no observed compute process yet",
-                    }
-                )
-            elif card["activity"] == "unattributed_compute":
-                signals.append(
-                    {
-                        "kind": "unattributed_compute",
-                        "severity": "warning",
-                        "lease_id": lease["id"],
-                        "agent_name": agent_name,
-                        "message": "compute process is observed but not bound to this lease",
-                    }
-                )
-            elif card["activity"] == "needs_attention":
-                signals.append(
-                    {
-                        "kind": "lease_conflict",
-                        "severity": "critical",
-                        "lease_id": lease["id"],
-                        "agent_name": agent_name,
-                        "message": "lease has a process-attribution or expiry conflict",
-                    }
-                )
-
-        server_cards = []
-        for endpoint in endpoints:
-            endpoint_gpus = gpus_by_endpoint.get(endpoint["id"], [])
-            endpoint_telemetry = [
-                gpu.get("telemetry") for gpu in endpoint_gpus if gpu.get("telemetry") is not None
-            ]
-            state_counts = gpu_state_counts(endpoint_gpus)
-            host = endpoint.get("host_telemetry")
-            server_cards.append(
-                {
-                    "server_id": endpoint["id"],
-                    "monitor_status": endpoint.get("monitor", {}).get("status"),
-                    "host_telemetry": host,
-                    "capacity": {
-                        "total_gpus": len(endpoint_gpus),
-                        "available_gpus": state_counts.get("AVAILABLE", 0),
-                        "leased_gpus": sum(1 for gpu in endpoint_gpus if gpu.get("lease") is not None),
-                        "managed_running_gpus": state_counts.get("RUNNING_MANAGED", 0),
-                        "idle_leased_gpus": state_counts.get("LEASED_IDLE", 0),
-                        "unattributed_compute_gpus": state_counts.get("BUSY_UNMANAGED", 0),
-                        "gpu_states": state_counts,
-                        "observed_gpu_utilization_pct": average(
-                            [item.get("gpu_utilization_pct") for item in endpoint_telemetry]
-                        ),
-                        "available_cpu_cores": round(
-                            max(0.0, host["cpu_count"] - host["load_1m"]), 1
-                        )
-                        if host
-                        else None,
-                        "available_memory_mib": host["memory_available_mib"] if host else None,
-                        "total_system_memory_mib": host["memory_total_mib"] if host else None,
-                        "total_vram_mib": sum(gpu.get("total_vram_mib") or 0 for gpu in endpoint_gpus),
-                        "observed_memory_used_mib": sum(
-                            item.get("memory_used_mib") or 0 for item in endpoint_telemetry
-                        ),
-                        "observed_memory_free_mib": sum(
-                            item.get("memory_free_mib") or 0 for item in endpoint_telemetry
-                        ),
-                    },
-                    "consumers": sorted(
-                        consumers_by_endpoint.get(endpoint["id"], []),
-                        key=lambda item: (item["agent_name"] or "", item["lease_id"]),
-                    ),
-                }
-            )
-
-        for request in requests:
-            signals.append(
-                {
-                    "kind": "queued_request",
-                    "severity": "info",
-                    "request_id": request.get("id"),
-                    "project_id": request.get("project_id"),
-                    "task": request.get("task_ref"),
-                    "gpu_count": request.get("constraints", {}).get("gpu_count"),
-                    "message": request.get("blocked_reason") or "waiting for scheduler placement",
-                }
-            )
-        active_scheduler_jobs = [
-            job
-            for job in scheduler_jobs
-            if job.get("state") not in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}
-        ]
-        for job in active_scheduler_jobs:
-            signals.append(
-                {
-                    "kind": "external_scheduler_job",
-                    "severity": "warning" if job.get("state") in {"UNKNOWN", "ACCESS_REQUIRED"} else "info",
-                    "scheduler_job_id": job.get("id"),
-                    "target_id": job.get("target_id"),
-                    "project_id": job.get("project_id"),
-                    "task": job.get("task_ref"),
-                    "state": job.get("state"),
-                    "message": job.get("error_message")
-                    or "external scheduler owns placement; this is not a raw GPU lease",
-                }
-            )
-        agent_cards = [
-            {
-                **agent,
-                "projects": sorted(agent["projects"]),
-                "servers": sorted(agent["servers"]),
-            }
-            for agent in agents.values()
-        ]
-        agent_cards.sort(key=lambda item: item["agent_name"])
-        lease_cards.sort(key=lambda item: (item["agent_name"] or "", item["lease_id"]))
-        signals.sort(key=lambda item: (item["severity"], item.get("agent_name", ""), item["kind"]))
-        total_telemetry = [gpu.get("telemetry") for gpu in gpus if gpu.get("telemetry") is not None]
-        summary = {
-            **current.get("summary", {}),
-            "active_leases": len(lease_cards),
-            "active_agents": len(agent_cards),
-            "queued_requests": len(requests),
-            "queued_gpus": sum(item.get("constraints", {}).get("gpu_count") or 0 for item in requests),
-            "external_scheduler_targets": len(scheduler_targets),
-            "external_scheduler_jobs": len(active_scheduler_jobs),
-            "external_scheduler_pending_jobs": sum(
-                job.get("state") == "PENDING" for job in active_scheduler_jobs
-            ),
-            "external_scheduler_running_jobs": sum(
-                job.get("state") == "RUNNING" for job in active_scheduler_jobs
-            ),
-            "managed_running_gpus": sum(
-                item["gpu_states"].get("RUNNING_MANAGED", 0) for item in lease_cards
-            ),
-            "idle_leased_gpus": sum(item["gpu_states"].get("LEASED_IDLE", 0) for item in lease_cards),
-            "observed_gpu_utilization_pct": average(
-                [item.get("gpu_utilization_pct") for item in total_telemetry]
-            ),
-        }
-        return self._state_projection(
-            "coordination",
-            data={
-                "summary": summary,
-                "servers": server_cards,
-                "agents": agent_cards,
-                "leases": lease_cards,
-                "queue": requests,
-                "scheduler_targets": scheduler_targets,
-                "scheduler_jobs": active_scheduler_jobs,
-                "signals": signals,
-                "guidance": (
-                    "This board is read-only. Claims without a requested server are placed by the broker's "
-                    "shared scheduler; external Slurm jobs remain separate from raw GPU leases and are "
-                    "allocated only when Slurm reports RUNNING with AllocTRES."
-                ),
-            },
-            current=current,
-            state=payload,
-        )
+        return self.get("/api/v1/coordination")
 
     def resource_providers(
         self,
@@ -667,64 +332,16 @@ class BrokerClient:
         provider_type: str | None = None,
         enabled: bool | None = None,
     ) -> dict[str, Any]:
-        payload, current = self._state_current()
-        providers = current.get("resource_providers")
-        if providers is None:
-            raise BrokerClientError("broker state is missing current.resource_providers")
-        providers = [
-            provider
-            for provider in providers
-            if (provider_type is None or provider.get("provider_type") == provider_type)
-            and (enabled is None or provider.get("enabled") is enabled)
-        ]
-        return self._state_projection("resource_providers", data=providers, current=current, state=payload)
+        params: dict[str, Any] = {}
+        if provider_type is not None:
+            params["provider_type"] = provider_type
+        if enabled is not None:
+            params["enabled"] = enabled
+        return self.get("/api/v1/resource-providers", params=params or None)
 
     def resource_monitor(self, *, project_id: str | None = None) -> dict[str, Any]:
-        payload, current, history = self._state_data()
-        if isinstance(current.get("resource_monitor"), dict):
-            monitor = dict(current["resource_monitor"])
-        else:
-            claims = current.get("resource_claims", [])
-            allocations = current.get("resource_allocations", current.get("allocations"))
-            if allocations is None:
-                allocations = [
-                    allocation
-                    for claim in claims
-                    for allocation in claim.get("allocations", [])
-                ]
-            monitor = {
-                "summary": current.get("summary", {}),
-                "host_capacity": current.get("host_capacity", []),
-                "providers": current.get("resource_providers", []),
-                "claims": claims,
-                "allocations": allocations,
-                "plan_evaluations": history.get(
-                    "resource_plan_evaluations",
-                    current.get("resource_plan_evaluations", []),
-                ),
-                "actuals": history.get("resource_run_actuals", current.get("resource_run_actuals", [])),
-                "admission_boundary": current.get("admission_boundary"),
-            }
-        if project_id:
-            claims = [
-                claim for claim in monitor.get("claims", []) if claim.get("project_id") == project_id
-            ]
-            claim_ids = {claim.get("id") for claim in claims}
-            monitor["claims"] = claims
-            monitor["allocations"] = [
-                allocation
-                for allocation in monitor.get("allocations", [])
-                if allocation.get("claim_id") in claim_ids
-            ]
-            monitor["plan_evaluations"] = [
-                evaluation
-                for evaluation in monitor.get("plan_evaluations", [])
-                if evaluation.get("project_id") == project_id
-            ]
-            monitor["actuals"] = [
-                actual for actual in monitor.get("actuals", []) if actual.get("project_id") == project_id
-            ]
-        return self._state_projection("resource_monitor", data=monitor, current=current, state=payload)
+        params = {"project_id": project_id} if project_id else None
+        return self.get("/api/v1/resource-monitor", params=params)
 
     def resource_claims(
         self,
@@ -732,24 +349,20 @@ class BrokerClient:
         project_id: str | None = None,
         state: str | None = None,
     ) -> dict[str, Any]:
-        payload, current = self._state_current()
-        claims = current.get("resource_claims")
-        if claims is None:
-            raise BrokerClientError("broker state is missing current.resource_claims")
-        claims = [
-            claim
-            for claim in claims
-            if (project_id is None or claim.get("project_id") == project_id)
-            and (state is None or str(claim.get("state", "")).lower() == state.lower())
-        ]
-        return self._state_projection("resource_claims", data=claims, current=current, state=payload)
+        params: dict[str, Any] = {}
+        if project_id is not None:
+            params["project_id"] = project_id
+        if state is not None:
+            params["state"] = state
+        return self.get("/api/v1/resource-claims", params=params or None)
 
     def resource_plan_evaluations(
         self,
         *,
         project_id: str | None = None,
     ) -> dict[str, Any]:
-        return self.resource_monitor(project_id=project_id)
+        params = {"project_id": project_id} if project_id else None
+        return self.get("/api/v1/resource-plan-evaluations", params=params)
 
     def resource_run_actuals(
         self,
@@ -757,17 +370,12 @@ class BrokerClient:
         project_id: str | None = None,
         task_ref: str | None = None,
     ) -> dict[str, Any]:
-        payload, current, history = self._state_data()
-        actuals = history.get("resource_run_actuals", current.get("resource_run_actuals"))
-        if actuals is None:
-            raise BrokerClientError("broker state is missing history.resource_run_actuals")
-        actuals = [
-            actual
-            for actual in actuals
-            if (project_id is None or actual.get("project_id") == project_id)
-            and (task_ref is None or actual.get("task_ref") == task_ref)
-        ]
-        return self._state_projection("resource_run_actuals", data=actuals, current=current, state=payload)
+        params: dict[str, Any] = {}
+        if project_id is not None:
+            params["project_id"] = project_id
+        if task_ref is not None:
+            params["task_ref"] = task_ref
+        return self.get("/api/v1/resource-run-actuals", params=params or None)
 
     def evaluate_resource_plan(
         self,

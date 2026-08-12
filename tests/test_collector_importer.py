@@ -334,7 +334,11 @@ def test_importer_keeps_same_ip_different_ports_distinct(tmp_path: Path) -> None
     second = tmp_path / "second.txt"
     first.write_text("# ssh -p 1111 root@10.0.0.1\n# ssh -p 2222 root@10.0.0.1\n", encoding="utf-8")
     second.write_text("# ssh -p 1111 root@10.0.0.1\n", encoding="utf-8")
-    report = import_servers_files([first, second], project_ids=["project-a"])
+    report = import_servers_files(
+        [first, second],
+        project_ids=["project-a"],
+        workspace_path="/srv/imported-project",
+    )
     assert [endpoint.port for endpoint in report.endpoints] == [1111, 2222]
     assert report.duplicate_addresses == ["10.0.0.1:1111"]
 
@@ -417,6 +421,7 @@ def test_inventory_allows_no_projects_or_endpoint_project_scope() -> None:
                 host="127.0.0.1",
                 port=2201,
                 ssh_user="gpu",
+                workspace_path="/srv/project-a",
             )
         ],
     )

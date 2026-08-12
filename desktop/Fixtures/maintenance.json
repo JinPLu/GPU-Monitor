@@ -19,6 +19,7 @@
           "host": "127.0.0.1",
           "port": 2233,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -44,6 +45,7 @@
           "host": "127.0.0.1",
           "port": 2234,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -69,6 +71,7 @@
           "host": "127.0.0.1",
           "port": 2235,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -81,31 +84,6 @@
           "enabled": true,
           "monitor": {
             "status": "DRAINING"
-          },
-          "host_telemetry": {
-            "cpu_count": 32,
-            "load_1m": 7.0,
-            "memory_total_mib": 131072,
-            "memory_available_mib": 94371
-          }
-        },
-        {
-          "id": "fixture-retired",
-          "host": "127.0.0.1",
-          "port": 2236,
-          "ssh_user": "gpu",
-          "labels": {
-            "fixture": "true",
-            "surface": "desktop-ui"
-          },
-          "storage_group": "fixture",
-          "expected_gpu_count": 1,
-          "expected_gpu_total_vram_mib": 81920,
-          "owner_project_id": null,
-          "lifecycle_state": "retired",
-          "enabled": true,
-          "monitor": {
-            "status": "RETIRED"
           },
           "host_telemetry": {
             "cpu_count": 32,
@@ -462,28 +440,6 @@
           },
           "processes": [],
           "state_reason": "endpoint draining"
-        },
-        {
-          "id": "fixture-retired:GPU-fixture-retired-00-RETIRED",
-          "endpoint_id": "fixture-retired",
-          "gpu_uuid": "GPU-fixture-retired-00-RETIRED",
-          "gpu_index": 0,
-          "name": "Fixture GPU",
-          "total_vram_mib": 81920,
-          "labels": {
-            "fixture": "true",
-            "surface": "desktop-ui"
-          },
-          "health": "ATTENTION",
-          "enabled": false,
-          "state": "RETIRED",
-          "telemetry": {
-            "memory_used_mib": 2048,
-            "gpu_utilization_pct": 6,
-            "temperature_c": 35
-          },
-          "processes": [],
-          "state_reason": "endpoint retired"
         }
       ],
       "leases": [
@@ -531,7 +487,6 @@
       "workload_profiles": []
     },
     "history": {
-      "retired_endpoints": [],
       "resource_plan_evaluations": [],
       "resource_run_actuals": []
     }

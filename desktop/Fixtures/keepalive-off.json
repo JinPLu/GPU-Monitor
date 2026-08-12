@@ -19,6 +19,7 @@
           "host": "10.20.0.32",
           "port": 2224,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "observation_profile": "server-script-v1",
           "keepalive_adapter_id": "server-script-v1",
           "keepalive": {
@@ -26,9 +27,7 @@
             "policy": "disabled",
             "state": "OFF",
             "active_gpu_count": 0,
-            "starting_gpu_count": 0,
             "error_gpu_count": 0,
-            "legacy_gpu_count": 0,
             "eligible_idle_gpu_count": 1
           },
           "enabled": true,
@@ -86,7 +85,6 @@
       "workload_profiles": []
     },
     "history": {
-      "retired_endpoints": [],
       "resource_plan_evaluations": [],
       "resource_run_actuals": []
     }

@@ -209,7 +209,6 @@ kill "${keyboard_pid}" 2>/dev/null || true
 wait "${keyboard_pid}" 2>/dev/null || true
 
 python3 - "${project_root}" "${app_bundle}" "${result_dir}" <<'PY'
-import hashlib
 import json
 import pathlib
 import re
@@ -218,14 +217,15 @@ import sys
 
 project_root, app_bundle, result_dir = map(pathlib.Path, sys.argv[1:])
 screenshots = []
+pixels_by_name = {}
 for path in sorted((result_dir / "screenshots").glob("*.png")):
     data = path.read_bytes()
+    pixels_by_name[path.stem] = data
     size = struct.unpack(">II", data[16:24]) if data.startswith(b"\x89PNG\r\n\x1a\n") else None
     screenshots.append({
         "name": path.stem,
         "path": str(path),
         "pixels": list(size) if size else None,
-        "sha256": hashlib.sha256(data).hexdigest(),
     })
 
 expected_names = {
@@ -285,15 +285,14 @@ keyboard_focus_summaries = {line.split("\t", 1)[1] for line in keyboard_rows if 
 semantic_checks["keyboard_focus_traversal"] = len(keyboard_focus_summaries) >= 3 and "command-r=sent" in keyboard_text
 
 appearance_checks = {
-    "light_only_policy_ignores_system_dark_request": by_name.get("forced-light-1280x800", {}).get("sha256") == by_name.get("system-dark-request-1280x800", {}).get("sha256"),
-    "high_contrast_injection_changed_static_pixels": by_name.get("high-contrast-1280x800", {}).get("sha256") != by_name.get("forced-light-1280x800", {}).get("sha256"),
+    "light_only_policy_ignores_system_dark_request": pixels_by_name.get("forced-light-1280x800") == pixels_by_name.get("system-dark-request-1280x800"),
+    "high_contrast_injection_changed_static_pixels": pixels_by_name.get("high-contrast-1280x800") != pixels_by_name.get("forced-light-1280x800"),
     "reduce_motion_static_screenshot_is_not_behavioral_proof": None,
 }
 payload = {
     "artifact_integrity_ok": not missing and not dimension_errors,
     "evidence_scope": "fake desktop fixtures only",
     "app_bundle": str(app_bundle),
-    "app_executable_sha256": hashlib.sha256((app_bundle / "Contents/MacOS/ServerPilot").read_bytes()).hexdigest(),
     "fixture_contract_validation": str(result_dir / "fixture-contract-validation.json"),
     "screenshots": screenshots,
     "missing_screenshots": missing,
@@ -324,11 +323,6 @@ payload = {
 }
 (result_dir / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-hash_lines = []
-for path in sorted(result_dir.rglob("*")):
-    if path.is_file() and path.name not in {"evidence-sha256.txt"}:
-        hash_lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path}")
-(result_dir / "evidence-sha256.txt").write_text("\n".join(hash_lines) + "\n", encoding="utf-8")
 print(json.dumps({"artifact_integrity_ok": payload["artifact_integrity_ok"], "screenshots": len(screenshots), "declared_xcui_tests": len(declared_tests), "missing": missing, "dimension_errors": dimension_errors, "semantic_checks": semantic_checks, "appearance_checks": appearance_checks}, ensure_ascii=False))
 raise SystemExit(0 if payload["artifact_integrity_ok"] else 5)
 PY

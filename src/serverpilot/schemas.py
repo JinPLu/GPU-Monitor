@@ -307,6 +307,19 @@ class LeaseObservedBind(StrictModel):
     run_id: str | None = Field(default=None, min_length=1, max_length=255)
 
 
+class LeaseGPUAssignment(StrictModel):
+    """Exact GPU assignment selected by the human operator."""
+
+    gpu_ids: list[str] = Field(min_length=1, max_length=1024)
+
+    @field_validator("gpu_ids")
+    @classmethod
+    def unique_gpu_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)) or any(not value for value in values):
+            raise ValueError("gpu_ids must contain unique non-empty values")
+        return values
+
+
 class ReservationCreate(StrictModel):
     project_id: str = Field(min_length=1, max_length=64)
     gpu_ids: list[str] = Field(default_factory=list)
@@ -542,6 +555,7 @@ class EndpointCreate(StrictModel):
     port: int = Field(ge=1, le=65535)
     ssh_user: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
     ssh_alias: str | None = Field(default=None, min_length=1, max_length=120)
+    workspace_path: str = Field(min_length=1, max_length=2000)
     observation_profile: Literal["linux-nvidia", "linux-host", "server-script-v1"] = "server-script-v1"
     keepalive_adapter_id: KeepaliveAdapterId | None = None
     keepalive_policy: KeepalivePolicy = "disabled"
@@ -563,6 +577,13 @@ class EndpointCreate(StrictModel):
             raise ValueError("endpoint list values must not be empty")
         return values
 
+    @field_validator("workspace_path")
+    @classmethod
+    def valid_workspace_path(cls, value: str) -> str:
+        if not value.startswith("/") or "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("workspace_path must be an absolute single-line path")
+        return value
+
     @model_validator(mode="after")
     def resolve_owner(self) -> "EndpointCreate":
         if self.owner_project_id and self.project_ids and self.project_ids != [self.owner_project_id]:
@@ -579,6 +600,7 @@ class EndpointUpdate(StrictModel):
 
     ssh_user: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_-]{0,31}$")
     ssh_alias: str | None = Field(default=None, min_length=1, max_length=120)
+    workspace_path: str | None = Field(default=None, min_length=1, max_length=2000)
     observation_profile: Literal["linux-nvidia", "linux-host", "server-script-v1"] | None = None
     keepalive_adapter_id: KeepaliveAdapterId | None = None
     labels: list[str] | None = None
@@ -594,10 +616,21 @@ class EndpointUpdate(StrictModel):
             raise ValueError("endpoint labels must contain unique non-empty values")
         return values
 
+    @field_validator("workspace_path")
+    @classmethod
+    def valid_workspace_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value.startswith("/") or "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("workspace_path must be an absolute single-line path")
+        return value
+
     @model_validator(mode="after")
     def has_update(self) -> "EndpointUpdate":
         if not self.model_fields_set:
             raise ValueError("endpoint update must include at least one mutable field")
+        if "workspace_path" in self.model_fields_set and self.workspace_path is None:
+            raise ValueError("workspace_path cannot be cleared")
         return self
 
 
@@ -607,7 +640,7 @@ class EndpointUpsert(EndpointCreate):
     Public REST clients use EndpointCreate (POST) and EndpointUpdate (PATCH).
     """
 
-    lifecycle_state: Literal["active", "draining", "retired"] | None = None
+    lifecycle_state: Literal["active", "draining"] | None = None
     enabled: bool | None = None
 
 
@@ -626,11 +659,12 @@ class CollectorSettingsUpdate(StrictModel):
 
 
 class SSHCommandRequest(BaseModel):
-    """Raw GUI SSH input; command whitespace is preserved for token binding."""
+    """Raw GUI SSH input used by preview and import."""
 
     model_config = ConfigDict(extra="forbid")
 
     command: str = Field(min_length=1, max_length=512)
+    workspace_path: str = Field(min_length=1, max_length=2000)
     project_ids: list[str] | None = Field(default=None, min_length=1)
     csrf: str = Field(min_length=1, max_length=256)
 
@@ -641,9 +675,15 @@ class SSHCommandRequest(BaseModel):
             raise ValueError("project_ids must contain unique non-empty values")
         return values
 
+    @field_validator("workspace_path")
+    @classmethod
+    def valid_workspace_path(cls, value: str) -> str:
+        if not value.startswith("/") or "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("workspace_path must be an absolute single-line path")
+        return value
+
 
 class SSHCommandCommit(SSHCommandRequest):
-    preview_token: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
     endpoint_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9-]{1,127}$")
 
 
@@ -651,6 +691,7 @@ class SSHCommandsRequest(StrictModel):
     """Line-oriented SSH commands pasted from the GUI; each line is parsed independently."""
 
     commands: list[str] = Field(min_length=1, max_length=100)
+    workspace_path: str = Field(min_length=1, max_length=2000)
     project_ids: list[str] | None = Field(default=None, min_length=1)
     csrf: str = Field(min_length=1, max_length=256)
 
@@ -661,6 +702,13 @@ class SSHCommandsRequest(StrictModel):
             raise ValueError("each SSH command must be between 1 and 512 characters")
         return values
 
+    @field_validator("workspace_path")
+    @classmethod
+    def valid_workspace_path(cls, value: str) -> str:
+        if not value.startswith("/") or "\x00" in value or "\n" in value or "\r" in value:
+            raise ValueError("workspace_path must be an absolute single-line path")
+        return value
+
     @field_validator("project_ids")
     @classmethod
     def unique_projects(cls, values: list[str] | None) -> list[str] | None:
@@ -670,7 +718,7 @@ class SSHCommandsRequest(StrictModel):
 
 
 class SSHCommandsCommit(SSHCommandsRequest):
-    preview_token: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]{64}$")
+    pass
 
 
 class ActorCreate(StrictModel):
@@ -678,7 +726,6 @@ class ActorCreate(StrictModel):
     display_name: str = Field(min_length=1, max_length=160)
     role: Literal["viewer", "allocator", "operator", "admin", "collector"]
     project_ids: list[str] = Field(default_factory=list)
-    token_label: str = Field(default="generated", min_length=1, max_length=120)
 
 
 class TelemetryInput(StrictModel):

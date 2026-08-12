@@ -19,6 +19,7 @@
           "host": "127.0.0.1",
           "port": 2264,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -44,6 +45,7 @@
           "host": "127.0.0.1",
           "port": 2265,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -69,6 +71,7 @@
           "host": "127.0.0.1",
           "port": 2266,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -94,6 +97,7 @@
           "host": "127.0.0.1",
           "port": 2267,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -119,6 +123,7 @@
           "host": "127.0.0.1",
           "port": 2268,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -144,6 +149,7 @@
           "host": "127.0.0.1",
           "port": 2269,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -169,6 +175,7 @@
           "host": "127.0.0.1",
           "port": 2270,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -194,6 +201,7 @@
           "host": "127.0.0.1",
           "port": 2271,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "labels": {
             "fixture": "true",
             "surface": "desktop-ui"
@@ -1579,7 +1587,6 @@
       "workload_profiles": []
     },
     "history": {
-      "retired_endpoints": [],
       "resource_plan_evaluations": [],
       "resource_run_actuals": []
     }

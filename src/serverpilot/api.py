@@ -3,8 +3,6 @@
 import asyncio
 import contextlib
 import csv
-import hashlib
-import hmac
 import io
 import json
 import os
@@ -44,6 +42,7 @@ from serverpilot.schemas import (
     EndpointUpdate,
     EndpointUpsert,
     LeaseBind,
+    LeaseGPUAssignment,
     LeaseObservedBind,
     RequestCreate,
     RequestCreateFlat,
@@ -96,6 +95,31 @@ def _idempotency_key(value: str | None) -> str:
     return value
 
 
+def _public_error_message(exc: BrokerError) -> str:
+    messages = {
+        "no_capacity": "当前没有满足本次申请的可用 GPU；本次申请未排队。",
+        "keepalive_outcome_uncertain": "占卡程序返回结果不确定，本次没有分配任务。",
+        "keepalive_adapter_failed": "占卡程序启动或停止失败；下一采集周期会继续尝试。",
+        "keepalive_cleanup_failed": "占卡异常且未能完成清理；请在 APP 中确认该 GPU 的实际状态。",
+        "keepalive_observation_stale": "占卡操作后没有取得完整的新状态；下一采集周期会继续尝试。",
+        "keepalive_observation_incomplete": "占卡操作后没有取得完整的新状态；下一采集周期会继续尝试。",
+        "keepalive_process_missing": "未检测到占卡程序；该卡仍按可用显示，下一采集周期会继续尝试。",
+        "keepalive_process_still_running": "占卡程序仍在运行，本次没有分配任务。",
+        "keepalive_partial_stop": "部分 GPU 未能确认让位；本次没有分配任务。",
+        "gpu_already_assigned": "选中的 GPU 已分给其他任务。",
+        "lease_not_found": "找不到这个 GPU 租约。",
+        "lease_forbidden": "不能操作其他 Agent 的 GPU 租约。",
+        "lease_already_released": "这个 GPU 租约已经结束。",
+        "workload_process_not_observed": "每张已分配 GPU 都检测到新的任务进程后才能完成绑定。",
+        "idempotency_key_required": "本次写操作缺少 idempotency_key。",
+    }
+    if exc.code in messages:
+        return messages[exc.code]
+    if re.search(r"[\u4e00-\u9fff]", exc.message):
+        return exc.message
+    return f"操作未完成（{exc.code}）。"
+
+
 def _public_keepalive_result(
     endpoint_id: str,
     keepalive: dict[str, Any],
@@ -103,33 +127,30 @@ def _public_keepalive_result(
     event_id: int | None = None,
     snapshot_revision: int | None = None,
 ) -> dict[str, Any]:
-    """Return policy and aggregate coverage without worker or lease identity.
-
-    The endpoint toggle is intentionally the only public write surface.  The
-    service and the sealed adapter exchange lease IDs, GPU UUIDs, and worker
-    attestations internally; none of those are meaningful or safe client
-    controls, so this projection explicitly allowlists only human-visible
-    policy and coverage fields.
-    """
+    """Return the occupancy policy and current per-GPU coverage."""
 
     policy = keepalive.get("policy")
-    if policy not in {"disabled", "idle_keepalive"}:
-        policy = "disabled"
+    if not isinstance(policy, str) or policy not in {"disabled", "idle_keepalive"}:
+        raise BrokerError(
+            "invalid_keepalive_protocol",
+            "服务返回了无法识别的空闲占卡策略。",
+            status_code=500,
+        )
     state = keepalive.get("state")
-    if state not in {"OFF", "IDLE", "STARTING", "PARTIAL", "ACTIVE", "ERROR", "LEGACY_STOP_REQUIRED"}:
-        state = "ERROR"
+    if not isinstance(state, str) or state not in {"OFF", "ACTIVE", "ERROR"}:
+        raise BrokerError(
+            "invalid_keepalive_protocol",
+            "服务返回了无法识别的空闲占卡状态。",
+            status_code=500,
+        )
     public = {
         "endpoint_id": endpoint_id,
-        # Keep the old boolean as a read-only compatibility convenience; the
-        # policy is the actual contract from this version forward.
         "enabled": policy == "idle_keepalive",
         "policy": policy,
         "state": state,
         "configured": bool(keepalive.get("configured", False)),
         "active_gpu_count": max(0, int(keepalive.get("active_gpu_count") or 0)),
-        "starting_gpu_count": max(0, int(keepalive.get("starting_gpu_count") or 0)),
         "error_gpu_count": max(0, int(keepalive.get("error_gpu_count") or 0)),
-        "legacy_gpu_count": max(0, int(keepalive.get("legacy_gpu_count") or 0)),
         "eligible_idle_gpu_count": max(0, int(keepalive.get("eligible_idle_gpu_count") or 0)),
     }
     message = keepalive.get("message")
@@ -163,7 +184,7 @@ def create_app(
     inventory = load_inventory(settings.inventory_path)
     project_root = settings.project_root or _find_project_root()
     service = BrokerService(Database(settings.database_url, project_root), inventory)
-    service.initialize(settings.bootstrap_token)
+    service.initialize()
     shared_collector = collector or SSHCollector(inventory)
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "web" / "templates"))
     keepalive_reconcile_locks: dict[str, asyncio.Lock] = {}
@@ -177,7 +198,7 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def keepalive_endpoint_locks(endpoint_ids: set[str]) -> AsyncIterator[None]:
-        """Hold a stable endpoint set across reclaim and the retrying claim."""
+        """Hold a stable endpoint set across reclaim and the ordinary claim."""
 
         locks = [keepalive_reconcile_lock(endpoint_id) for endpoint_id in sorted(endpoint_ids)]
         for lock in locks:
@@ -211,13 +232,13 @@ def create_app(
                 status_code=503,
             )
 
-    def result_workers_by_gpu_uuid(
+    def result_by_gpu_uuid(
         adapter_result: Any,
         gpu_uuids: list[str],
         *,
         enabled: bool,
     ) -> dict[str, Any]:
-        """Defend the API boundary even when a test/different adapter is injected."""
+        """Read one result for every requested GPU."""
 
         results = getattr(adapter_result, "results", None)
         if not isinstance(results, tuple) or len(results) != len(gpu_uuids):
@@ -242,12 +263,6 @@ def create_app(
             raise BrokerError(
                 "keepalive_adapter_failed",
                 "endpoint keepalive operation could not be verified",
-                status_code=503,
-            )
-        if enabled and any(getattr(result, "worker", None) is None for result in by_uuid.values()):
-            raise BrokerError(
-                "keepalive_attestation_missing",
-                "endpoint keepalive state could not be verified",
                 status_code=503,
             )
         return by_uuid
@@ -282,18 +297,6 @@ def create_app(
                 for transition in transitions
                 if isinstance(transition, dict) and transition.get("endpoint_id") == endpoint_id
             ]
-            legacy = [
-                transition for transition in transitions if transition.get("action") == "stop_legacy_endpoint"
-            ]
-            if legacy:
-                # A v2 exact-GPU helper cannot safely signal an unverified v1
-                # whole-endpoint worker.  Do not translate it into arbitrary
-                # target UUIDs or make it allocatable based on database state.
-                raise BrokerError(
-                    "keepalive_legacy_stop_required",
-                    "legacy endpoint keepalive requires explicit verified stop before per-GPU reconciliation",
-                    status_code=409,
-                )
             starts = [transition for transition in transitions if transition.get("action") == "start"]
             stops = [transition for transition in transitions if transition.get("action") == "stop"]
             if starts and stops:
@@ -332,49 +335,21 @@ def create_app(
                             "endpoint keepalive start target is invalid",
                             status_code=503,
                         )
+                    start_attempted = False
                     try:
-                        pending = service.begin_keepalive(
+                        # The helper runs one GPU at a time, so one failed card
+                        # does not change a healthy sibling.
+                        start_attempted = True
+                        adapter_result = await adapter.set_enabled(endpoint, True, [gpu_uuid])
+                        result_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=True)
+                        observation_not_before = utcnow()
+                        await collect_keepalive_endpoint(endpoint)
+                        service.activate_keepalive(
                             actor,
                             endpoint_id,
                             gpu_id,
-                            idempotency_key=f"{idempotency_key}:start:{gpu_id}",
-                        )
-                        lease_id = pending.get("keepalive", {}).get("lease_id")
-                        if not isinstance(lease_id, str):
-                            raise BrokerError(
-                                "keepalive_transition_plan_invalid",
-                                "endpoint keepalive reservation could not be verified",
-                                status_code=503,
-                            )
-                    except BrokerError as exc:
-                        start_failures.append({"gpu_id": gpu_id, "code": exc.code})
-                        continue
-                    try:
-                        # The helper is explicitly per-GPU.  A failure on one
-                        # target must not turn a healthy sibling into a
-                        # failed start, nor reserve a batch that cannot be
-                        # individually attested.
-                        adapter_result = await adapter.set_enabled(endpoint, True, [gpu_uuid])
-                        workers = result_workers_by_gpu_uuid(
-                            adapter_result, [gpu_uuid], enabled=True
-                        )
-                        observation_not_before = utcnow()
-                        await collect_keepalive_endpoint(endpoint)
-                        worker = getattr(workers[gpu_uuid], "worker", None)
-                        pid = getattr(worker, "pid", None)
-                        if not isinstance(pid, int) or pid <= 0:
-                            raise BrokerError(
-                                "keepalive_attestation_missing",
-                                "endpoint keepalive state could not be verified",
-                                status_code=503,
-                            )
-                        service.confirm_keepalive(
-                            actor,
-                            endpoint_id,
-                            lease_id,
-                            attested_pid=pid,
                             observation_not_before=observation_not_before,
-                            idempotency_key=f"{idempotency_key}:confirm:{gpu_id}",
+                            idempotency_key=f"{idempotency_key}:activate:{gpu_id}",
                         )
                         started_count += 1
                     except AdapterCommandError as exc:
@@ -390,10 +365,17 @@ def create_app(
                         start_failures.append({"gpu_id": gpu_id, "code": exc.code})
                     except Exception:
                         start_failures.append({"gpu_id": gpu_id, "code": "keepalive_adapter_failed"})
+                    if start_attempted and start_failures and start_failures[-1]["gpu_id"] == gpu_id:
+                        # A failed start/collection must not leave an unrecorded
+                        # helper behind. The next normal collection retries it.
+                        try:
+                            await adapter.set_enabled(endpoint, False, [gpu_uuid])
+                        except Exception:
+                            start_failures[-1]["code"] = "keepalive_cleanup_failed"
                 if start_failures and started_count == 0:
                     raise BrokerError(
                         start_failures[0]["code"],
-                        "endpoint keepalive operation could not be verified",
+                        "空闲占卡未能启动，将在下一次采集后重试。",
                         status_code=503,
                         details={"failed_gpu_ids": [item["gpu_id"] for item in start_failures]},
                     )
@@ -439,7 +421,7 @@ def create_app(
                         # failure, so a batch response cannot safely describe
                         # which local leases were actually released.
                         adapter_result = await adapter.set_enabled(endpoint, False, [gpu_uuid])
-                        result_workers_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=False)
+                        result_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=False)
                     except AdapterCommandError as exc:
                         adapter_code = (
                             "keepalive_outcome_uncertain"
@@ -484,148 +466,155 @@ def create_app(
 
     async def reclaim_keepalive_for_claim(
         actor: ActorContext,
-        request_data_for_attempt: Callable[[], RequestCreate],
-        retry_claim: Callable[[], dict[str, Any]],
+        request_data_provider: Callable[[], RequestCreate],
+        claim: Callable[[], dict[str, Any]],
         *,
-        idempotency_key: str,
+        idempotency_key: str | None,
     ) -> dict[str, Any] | None:
         """Make only a fully matching, verified keeper placement claimable.
 
         This is not generic preemption: the service's regular allocator first
         computes one complete placement made solely from ACTIVE per-GPU
         keepalive leases.  The API then stops exactly that physical set,
-        verifies it empty, and retries the ordinary immediate claim.  Any
-        stale plan, partial match, legacy worker, foreign process, or remote
-        uncertainty leaves the claim blocked rather than broadening the set.
+        verifies it empty, and runs the ordinary immediate claim. Any partial
+        match, legacy worker, foreign process, or remote uncertainty leaves
+        the claim blocked rather than broadening the set.
         """
 
-        for _attempt in range(3):
-            request_data = request_data_for_attempt()
-            plan = service.plan_keepalive_reclaim(request_data)
-            transitions = plan.get("transitions")
-            if plan.get("complete") is not True or not isinstance(transitions, list) or not transitions:
+        request_data = request_data_provider()
+        plan = service.plan_keepalive_reclaim(request_data)
+        transitions = plan.get("transitions")
+        if plan.get("complete") is not True or not isinstance(transitions, list) or not transitions:
+            return None
+        targets: list[dict[str, str]] = []
+        for transition in transitions:
+            if not isinstance(transition, dict) or transition.get("action") != "reclaim":
                 return None
-            targets: list[dict[str, str]] = []
-            for transition in transitions:
-                if not isinstance(transition, dict) or transition.get("action") != "reclaim":
-                    return None
-                endpoint_id = transition.get("endpoint_id")
-                gpu_id = transition.get("gpu_id")
-                gpu_uuid = transition.get("gpu_uuid")
-                lease_id = transition.get("lease_id")
-                if not all(isinstance(value, str) and value for value in (endpoint_id, gpu_id, gpu_uuid, lease_id)):
-                    return None
-                targets.append(
-                    {
-                        "endpoint_id": endpoint_id,
-                        "gpu_id": gpu_id,
-                        "gpu_uuid": gpu_uuid,
-                        "lease_id": lease_id,
-                    }
-                )
-            if len({target["gpu_id"] for target in targets}) != len(targets):
+            endpoint_id = transition.get("endpoint_id")
+            gpu_id = transition.get("gpu_id")
+            gpu_uuid = transition.get("gpu_uuid")
+            lease_id = transition.get("lease_id")
+            if not all(isinstance(value, str) and value for value in (endpoint_id, gpu_id, gpu_uuid, lease_id)):
                 return None
-            endpoint_ids = {target["endpoint_id"] for target in targets}
-            async with keepalive_endpoint_locks(endpoint_ids):
-                # Keepalive reclamation must use the exact profile contract
-                # that will be retried.  Re-read it after taking the endpoint
-                # locks so a concurrent profile edit cannot stop workers for
-                # stale constraints.
-                if request_data_for_attempt() != request_data:
-                    continue
-                # The selected keeper set is an admission decision made by the
-                # service. Re-read it only after the endpoint reconcile locks
-                # are held; if it changed, do not infer a replacement set.
-                locked_plan = service.plan_keepalive_reclaim(request_data)
-                locked_transitions = locked_plan.get("transitions")
-                locked_targets = (
-                    {
-                        (
-                            item.get("endpoint_id"),
-                            item.get("gpu_id"),
-                            item.get("gpu_uuid"),
-                            item.get("lease_id"),
-                        )
-                        for item in locked_transitions
-                        if isinstance(item, dict) and item.get("action") == "reclaim"
-                    }
-                    if locked_plan.get("complete") is True and isinstance(locked_transitions, list)
-                    else set()
-                )
-                requested_targets = {
-                    (target["endpoint_id"], target["gpu_id"], target["gpu_uuid"], target["lease_id"])
-                    for target in targets
+            targets.append(
+                {
+                    "endpoint_id": endpoint_id,
+                    "gpu_id": gpu_id,
+                    "gpu_uuid": gpu_uuid,
+                    "lease_id": lease_id,
                 }
-                if locked_targets != requested_targets:
-                    # The next loop will acquire the (possibly different)
-                    # endpoint lock set before considering the new plan.
-                    continue
-
-                by_endpoint: dict[str, list[dict[str, str]]] = defaultdict(list)
-                for target in targets:
-                    by_endpoint[target["endpoint_id"]].append(target)
-                for endpoint_id, endpoint_targets in by_endpoint.items():
-                    endpoint = service.collector_endpoint(endpoint_id)
-                    adapter_id = endpoint.keepalive_adapter_id
-                    if adapter_id is None:
+            )
+        if len({target["gpu_id"] for target in targets}) != len(targets):
+            return None
+        endpoint_ids = {target["endpoint_id"] for target in targets}
+        async with keepalive_endpoint_locks(endpoint_ids):
+            by_endpoint: dict[str, list[dict[str, str]]] = defaultdict(list)
+            for target in targets:
+                by_endpoint[target["endpoint_id"]].append(target)
+            for endpoint_id, endpoint_targets in by_endpoint.items():
+                endpoint = service.collector_endpoint(endpoint_id)
+                adapter_id = endpoint.keepalive_adapter_id
+                if adapter_id is None:
+                    return None
+                try:
+                    adapter = keepalive_adapter_resolver(adapter_id)
+                except (KeyError, ValueError):
+                    return None
+                prepared: list[dict[str, str]] = []
+                for target in endpoint_targets:
+                    pending = service.prepare_keepalive_stop(
+                        actor,
+                        endpoint_id,
+                        target["gpu_id"],
+                    )
+                    observed_lease_id = pending.get("keepalive", {}).get("lease_id")
+                    if observed_lease_id != target["lease_id"]:
                         return None
+                    prepared.append(target)
+                for target in prepared:
+                    gpu_uuid = target["gpu_uuid"]
+                    adapter_code: str | None = None
                     try:
-                        adapter = keepalive_adapter_resolver(adapter_id)
-                    except (KeyError, ValueError):
-                        return None
-                    prepared: list[dict[str, str]] = []
-                    for target in endpoint_targets:
-                        pending = service.prepare_keepalive_stop(
+                        adapter_result = await adapter.set_enabled(endpoint, False, [gpu_uuid])
+                        result_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=False)
+                    except AdapterCommandError as exc:
+                        adapter_code = (
+                            "keepalive_outcome_uncertain"
+                            if exc.uncertain
+                            else "keepalive_adapter_failed"
+                        )
+                    except BrokerError as exc:
+                        adapter_code = exc.code
+                    except Exception:
+                        adapter_code = "keepalive_adapter_failed"
+                    observation_not_before = utcnow()
+                    try:
+                        await collect_keepalive_endpoint(endpoint)
+                        service.finalize_keepalive_stop(
                             actor,
                             endpoint_id,
-                            target["gpu_id"],
+                            target["lease_id"],
+                            observation_not_before=observation_not_before,
+                            idempotency_key=(
+                                f"{idempotency_key}:reclaim:{target['gpu_id']}"
+                                if idempotency_key is not None
+                                else None
+                            ),
                         )
-                        observed_lease_id = pending.get("keepalive", {}).get("lease_id")
-                        if observed_lease_id != target["lease_id"]:
-                            return None
-                        prepared.append(target)
-                    for target in prepared:
-                        gpu_uuid = target["gpu_uuid"]
-                        adapter_code: str | None = None
-                        try:
-                            # Reclaim follows the same per-GPU rule as the
-                            # endpoint stop action. Never retry the claim
-                            # until every selected keeper has independently
-                            # passed fresh, process-free finalization.
-                            adapter_result = await adapter.set_enabled(endpoint, False, [gpu_uuid])
-                            result_workers_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=False)
-                        except AdapterCommandError as exc:
-                            adapter_code = (
-                                "keepalive_outcome_uncertain"
-                                if exc.uncertain
-                                else "keepalive_adapter_failed"
-                            )
-                        except BrokerError as exc:
-                            adapter_code = exc.code
-                        except Exception:
-                            adapter_code = "keepalive_adapter_failed"
-                        observation_not_before = utcnow()
-                        try:
-                            await collect_keepalive_endpoint(endpoint)
-                            service.finalize_keepalive_stop(
-                                actor,
-                                endpoint_id,
-                                target["lease_id"],
-                                observation_not_before=observation_not_before,
-                                idempotency_key=f"{idempotency_key}:reclaim:{target['gpu_id']}",
-                            )
-                        except BrokerError as exc:
-                            raise BrokerError(
-                                adapter_code or exc.code,
-                                "keepalive release for an immediate claim could not be verified",
-                                status_code=503,
-                                details={"gpu_id": target["gpu_id"]},
-                            ) from None
-                # Keep the endpoint locks through the ordinary claim retry.
-                # Otherwise collector reconciliation could observe the fresh
-                # empty GPU and restart its keeper in the gap.
-                return retry_claim()
-        return None
+                    except BrokerError as exc:
+                        raise BrokerError(
+                            adapter_code or exc.code,
+                            "占卡 GPU 未能确认释放，本次没有分配任务。",
+                            status_code=503,
+                            details={"gpu_id": target["gpu_id"]},
+                        ) from None
+                    if adapter_code is not None:
+                        raise BrokerError(
+                            adapter_code,
+                            "占卡程序停止失败，本次没有分配任务。",
+                            status_code=503,
+                            details={"gpu_id": target["gpu_id"]},
+                        )
+            # Keep the endpoint locks through the ordinary claim.
+            # Otherwise collector reconciliation could observe the fresh
+            # empty GPU and restart its keeper in the gap.
+            return claim()
+
+    async def claim_request_now(
+        actor: ActorContext,
+        request_data: RequestCreate,
+        *,
+        idempotency_key: str | None,
+        persistent_lease: bool = False,
+    ) -> dict[str, Any]:
+        """Claim through the one shared per-GPU occupancy handoff."""
+
+        try:
+            return service.create_request(
+                actor,
+                request_data,
+                idempotency_key=idempotency_key,
+                activate_if_allocated=True,
+                persistent_lease=persistent_lease,
+            )
+        except BrokerError as exc:
+            if exc.code != "no_capacity":
+                raise
+            claimed = await reclaim_keepalive_for_claim(
+                actor,
+                lambda: request_data,
+                lambda: service.create_request(
+                    actor,
+                    request_data,
+                    idempotency_key=idempotency_key,
+                    activate_if_allocated=True,
+                    persistent_lease=persistent_lease,
+                ),
+                idempotency_key=idempotency_key,
+            )
+            if claimed is None:
+                raise exc
+            return claimed
 
     async def claim_workload_profile_now(
         actor: ActorContext,
@@ -726,7 +715,6 @@ def create_app(
     # identity, and all execution stays behind the service transition plan.
     app.state.reconcile_endpoint_keepalive = reconcile_endpoint_keepalive
     limiter = RateLimiter(settings.rate_limit_per_minute)
-    ssh_preview_secret = secrets.token_bytes(32)
     app.add_middleware(SessionMiddleware, secret_key=settings.session_secret or secrets.token_urlsafe(32))
     app.mount(
         "/static",
@@ -742,7 +730,7 @@ def create_app(
                 status_code=413,
                 content={
                     "schema_version": SCHEMA_VERSION,
-                    "error": {"code": "body_too_large", "message": "request body is too large"},
+                    "error": {"code": "body_too_large", "message": "请求内容过大。"},
                 },
             )
         return await call_next(request)
@@ -753,7 +741,11 @@ def create_app(
             status_code=exc.status_code,
             content={
                 "schema_version": SCHEMA_VERSION,
-                "error": {"code": exc.code, "message": exc.message, "details": exc.details},
+                "error": {
+                    "code": exc.code,
+                    "message": _public_error_message(exc),
+                    "details": exc.details,
+                },
             },
         )
 
@@ -765,7 +757,7 @@ def create_app(
                 "schema_version": SCHEMA_VERSION,
                 "error": {
                     "code": "validation_error",
-                    "message": "invalid request",
+                    "message": "请求内容不完整或格式不正确。",
                     "details": jsonable_encoder(exc.errors()),
                 },
             },
@@ -789,7 +781,7 @@ def create_app(
 
     def require_session_csrf(request: Request, submitted: str) -> None:
         expected = request.session.get("csrf")
-        if not expected or not hmac.compare_digest(submitted, expected):
+        if not expected or submitted != expected:
             raise BrokerError(
                 "csrf_failed",
                 "表单会话已失效，请刷新页面后重试",
@@ -800,15 +792,6 @@ def create_app(
         # Endpoint project lists are legacy metadata only.  A server is visible
         # to every claim, so SSH registration does not need a project registry.
         return project_ids or []
-
-    def ssh_preview_token(command: str | list[str], project_ids: list[str]) -> str:
-        binding = json.dumps(
-            {"command": command, "project_ids": project_ids},
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return hmac.new(ssh_preview_secret, binding, hashlib.sha256).hexdigest()
 
     def parsed_ssh_command(command: str) -> ParsedSSHCommand:
         try:
@@ -862,7 +845,7 @@ def create_app(
             "status": "live",
             "schema_version": SCHEMA_VERSION,
             "version": __version__,
-            "capabilities": list(dict.fromkeys((*API_CAPABILITIES, "endpoint_deletion"))),
+            "capabilities": list(API_CAPABILITIES),
         }
 
     @app.get("/health/ready")
@@ -1132,6 +1115,30 @@ def create_app(
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
+    @app.post("/api/v1/requests")
+    def create_request(
+        request_data: RequestCreate,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.create_request(
+            actor,
+            request_data,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/requests/{request_id}/cancel")
+    def cancel_request(
+        request_id: str,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.cancel_request(
+            actor,
+            request_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
     @app.post("/api/v1/claims")
     async def claim_now(
         request_data: RequestCreate,
@@ -1140,31 +1147,25 @@ def create_app(
     ) -> dict[str, Any]:
         """Create an immediate claim, reclaiming only its selected keepers once."""
 
-        mutation_key = _idempotency_key(idempotency_key)
-        try:
-            return service.create_request(
-                actor,
-                request_data,
-                idempotency_key=mutation_key,
-                activate_if_allocated=True,
-            )
-        except BrokerError as exc:
-            if exc.code != "no_capacity":
-                raise
-            claimed = await reclaim_keepalive_for_claim(
-                actor,
-                lambda: request_data,
-                lambda: service.create_request(
-                    actor,
-                    request_data,
-                    idempotency_key=mutation_key,
-                    activate_if_allocated=True,
-                ),
-                idempotency_key=mutation_key,
-            )
-            if claimed is None:
-                raise exc
-            return claimed
+        return await claim_request_now(
+            actor,
+            request_data,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
+    @app.post("/api/v1/routine/claims")
+    async def routine_claim_now(
+        request_data: RequestCreate,
+        actor: ApiActor,
+    ) -> dict[str, Any]:
+        """Create a persistent routine GPU claim through the shared handoff."""
+
+        return await claim_request_now(
+            actor,
+            request_data,
+            idempotency_key=None,
+            persistent_lease=True,
+        )
 
     @app.post("/api/v1/resource-plan-evaluations")
     def evaluate_resource_plan(
@@ -1249,6 +1250,56 @@ def create_app(
             reason=body.get("reason", ""),
             idempotency_key=_idempotency_key(idempotency_key),
         )
+
+    @app.post("/api/v1/routine/leases/{lease_id}/release")
+    def routine_release_lease(
+        lease_id: str,
+        actor: ApiActor,
+    ) -> dict[str, Any]:
+        return service.release_lease(
+            actor,
+            lease_id,
+            reason="workload_completed",
+            idempotency_key=None,
+        )
+
+    @app.patch("/api/v1/leases/{lease_id}/gpus")
+    async def reassign_lease_gpus(
+        lease_id: str,
+        assignment: LeaseGPUAssignment,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        mutation_key = _idempotency_key(idempotency_key)
+        try:
+            return service.reassign_lease_gpus(
+                actor,
+                lease_id,
+                assignment.gpu_ids,
+                idempotency_key=mutation_key,
+            )
+        except BrokerError as exc:
+            if exc.code != "gpu_already_assigned":
+                raise
+            reclaim_request = service.keepalive_reclaim_request_for_reassignment(
+                actor, lease_id, assignment.gpu_ids
+            )
+            if reclaim_request is None:
+                raise exc
+            reassigned = await reclaim_keepalive_for_claim(
+                actor,
+                lambda: reclaim_request,
+                lambda: service.reassign_lease_gpus(
+                    actor,
+                    lease_id,
+                    assignment.gpu_ids,
+                    idempotency_key=mutation_key,
+                ),
+                idempotency_key=mutation_key,
+            )
+            if reassigned is None:
+                raise exc
+            return reassigned
 
     @app.post("/api/v1/endpoints/{endpoint_id}/leases/{lease_id}/release-empty")
     @app.post("/api/v1/endpoints/{endpoint_id}/conflicted-leases/{lease_id}/release-empty")
@@ -1440,18 +1491,6 @@ def create_app(
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
-    @app.post("/api/v1/endpoints/{endpoint_id}/retire")
-    def retire_endpoint(
-        endpoint_id: str,
-        actor: ApiActor,
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    ) -> dict[str, Any]:
-        return service.retire_endpoint(
-            actor,
-            endpoint_id,
-            idempotency_key=_idempotency_key(idempotency_key),
-        )
-
     @app.post("/api/v1/endpoints/{endpoint_id}/keepalive")
     async def set_endpoint_keepalive(
         endpoint_id: str,
@@ -1495,20 +1534,6 @@ def create_app(
             snapshot_revision=revision if isinstance(revision, int) else None,
         )
 
-    @app.delete("/api/v1/endpoints/{endpoint_id}")
-    def delete_endpoint(
-        endpoint_id: str,
-        actor: ApiActor,
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    ) -> dict[str, Any]:
-        return service.pause_endpoint(
-            actor,
-            endpoint_id,
-            idempotency_key=_idempotency_key(idempotency_key),
-            _idempotency_action="endpoint.delete",
-            _compatibility_alias=True,
-        )
-
     @app.post("/ui/endpoints/ssh/preview")
     def preview_ssh_endpoint(
         preview: SSHCommandRequest,
@@ -1526,6 +1551,7 @@ def create_app(
             "port": parsed.port,
             "ssh_user": parsed.user,
             "ssh_alias": None,
+            "workspace_path": preview.workspace_path,
             "labels": ["gpu", "direct-ssh"],
             "storage_group": None,
             "expected_gpu_count": None,
@@ -1541,7 +1567,6 @@ def create_app(
                 "endpoint": endpoint,
                 "existing_endpoint": existing_endpoint,
                 "id_collision": id_collision,
-                "preview_token": ssh_preview_token(preview.command, project_ids),
             }
         }
 
@@ -1554,14 +1579,6 @@ def create_app(
         require_session_csrf(request, commit.csrf)
         parsed = parsed_ssh_command(commit.command)
         project_ids = ssh_projects(commit.project_ids)
-        expected_token = ssh_preview_token(commit.command, project_ids)
-        if not hmac.compare_digest(commit.preview_token, expected_token):
-            raise BrokerError(
-                "invalid_ssh_preview_token",
-                "SSH 命令或项目选择已在预览后改变，请重新检查",
-                status_code=409,
-            )
-
         existing_endpoint, _ = ssh_endpoint_state(actor, parsed)
         endpoint_id = commit.endpoint_id or (
             existing_endpoint["id"] if existing_endpoint is not None else parsed.endpoint_id
@@ -1589,6 +1606,7 @@ def create_app(
                 host=parsed.host,
                 port=parsed.port,
                 ssh_user=parsed.user,
+                workspace_path=commit.workspace_path,
                 labels=["gpu", "direct-ssh"],
                 storage_group=None,
                 expected_gpu_count=None,
@@ -1607,7 +1625,7 @@ def create_app(
     ) -> dict[str, Any]:
         actor = session_actor(request)
         require_session_csrf(request, preview.csrf)
-        project_ids = ssh_projects(preview.project_ids)
+        ssh_projects(preview.project_ids)
         endpoints = service.list_endpoints(actor)["data"]
         seen_addresses: set[tuple[str, int]] = set()
         entries: list[dict[str, Any]] = []
@@ -1616,7 +1634,7 @@ def create_app(
             try:
                 parsed = parsed_ssh_command(command)
             except BrokerError as exc:
-                entries.append({"line": line_number, "command": command, "status": "invalid", "error": exc.message})
+                entries.append({"line": line_number, "command": command, "status": "invalid", "error": _public_error_message(exc)})
                 continue
             address = (parsed.host, parsed.port)
             if address in seen_addresses:
@@ -1636,7 +1654,13 @@ def create_app(
                     "command": command,
                     "normalized_command": parsed.normalized_command,
                     "status": "existing" if existing is not None else "new",
-                    "endpoint": {"id": endpoint_id, "host": parsed.host, "port": parsed.port, "ssh_user": parsed.user},
+                    "endpoint": {
+                        "id": endpoint_id,
+                        "host": parsed.host,
+                        "port": parsed.port,
+                        "ssh_user": parsed.user,
+                        "workspace_path": preview.workspace_path,
+                    },
                 }
             )
         valid_count = sum(entry["status"] in {"new", "existing"} for entry in entries)
@@ -1644,7 +1668,6 @@ def create_app(
             "data": {
                 "entries": entries,
                 "valid_count": valid_count,
-                "preview_token": ssh_preview_token(preview.commands, project_ids),
             }
         }
 
@@ -1656,10 +1679,6 @@ def create_app(
         actor = session_actor(request)
         require_session_csrf(request, commit.csrf)
         project_ids = ssh_projects(commit.project_ids)
-        expected_token = ssh_preview_token(commit.commands, project_ids)
-        if not hmac.compare_digest(commit.preview_token, expected_token):
-            raise BrokerError("invalid_ssh_preview_token", "SSH 命令或项目选择已在预览后改变，请重新检查", status_code=409)
-
         endpoints = service.list_endpoints(actor)["data"]
         seen_addresses: set[tuple[str, int]] = set()
         results: list[dict[str, Any]] = []
@@ -1667,7 +1686,7 @@ def create_app(
             try:
                 parsed = parsed_ssh_command(command)
             except BrokerError as exc:
-                results.append({"line": line_number, "status": "invalid", "error": exc.message})
+                results.append({"line": line_number, "status": "invalid", "error": _public_error_message(exc)})
                 continue
             address = (parsed.host, parsed.port)
             if address in seen_addresses:
@@ -1688,6 +1707,7 @@ def create_app(
                         host=parsed.host,
                         port=parsed.port,
                         ssh_user=parsed.user,
+                        workspace_path=commit.workspace_path,
                         labels=["gpu", "direct-ssh"],
                         storage_group=None,
                         expected_gpu_count=None,
@@ -1698,7 +1718,7 @@ def create_app(
                     idempotency_key=secrets.token_hex(16),
                 )
             except BrokerError as exc:
-                results.append({"line": line_number, "status": "error", "error": exc.message})
+                results.append({"line": line_number, "status": "error", "error": _public_error_message(exc)})
                 continue
             endpoints.append(result["endpoint"])
             results.append({"line": line_number, "status": "updated" if existing is not None else "registered", "endpoint": result["endpoint"]})
@@ -1713,14 +1733,6 @@ def create_app(
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
         return service.create_actor(actor, actor_data, idempotency_key=_idempotency_key(idempotency_key))
-
-    @app.post("/api/v1/tokens/{token_id}/revoke")
-    def revoke_token(
-        token_id: str,
-        actor: ApiActor,
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    ) -> dict[str, Any]:
-        return service.revoke_token(actor, token_id, idempotency_key=_idempotency_key(idempotency_key))
 
     @app.post("/api/v1/retention/prune")
     def prune_telemetry(
@@ -1854,7 +1866,7 @@ def create_app(
         if page == "alerts":
             return {"alerts": service.list_alerts(actor)["data"]}
         if page == "audit":
-            return {"events": service.list_events(actor)["data"]}
+            return {"events": service.list_events(actor, latest_first=True)["data"]}
         if page == "doctor":
             return {"doctor": service.doctor(actor)["data"], "config": service.effective_config(actor)["data"]}
         raise BrokerError("page_not_found", "web page does not exist", status_code=404)
@@ -2088,7 +2100,6 @@ def create_app(
                 "id": _form_value(form, "id", required=True),
                 "display_name": _form_value(form, "display_name", required=True),
                 "role": _form_value(form, "role", required=True),
-                "token_label": _form_value(form, "token_label", required=True),
             }
         if action == "endpoint":
             host = _form_value(form, "host", required=True)
@@ -2107,6 +2118,7 @@ def create_app(
                 "host": host,
                 "port": port,
                 "ssh_user": _form_value(form, "ssh_user", required=True),
+                "workspace_path": _form_value(form, "workspace_path", required=True),
                 "labels": _csv_values(_form_value(form, "labels")),
                 "storage_group": _form_value(form, "storage_group"),
                 "expected_gpu_count": _form_int(form, "expected_gpu_count", minimum=1),
@@ -2122,10 +2134,6 @@ def create_app(
                 "endpoint_id": _form_value(form, "endpoint_id", required=True),
                 "enabled": _form_boolean(form, "enabled"),
             }
-        if action == "delete-endpoint":
-            return {"endpoint_id": _form_value(form, "endpoint_id", required=True)}
-        if action == "revoke-token":
-            return {"token_id": _form_value(form, "token_id", required=True)}
         if action == "reconcile":
             return {}
         if action == "prune-telemetry":
@@ -2158,8 +2166,6 @@ def create_app(
             "ack-alert": "/ui/alerts",
             "workload-profile": "/ui/identities",
             "actor": "/ui/identities",
-            "revoke-token": "/ui/identities",
-            "delete-endpoint": "/",
             "reconcile": "/ui/doctor",
             "prune-telemetry": "/ui/doctor",
         }
@@ -2178,12 +2184,18 @@ def create_app(
             else:
                 data = ui_form_payload(action, await request.form())
             key = secrets.token_hex(16)
-            if action in {"request", "quick-claim"}:
+            if action == "request":
                 result = service.create_request(
                     actor,
                     parse_ui_request(data),
                     idempotency_key=key,
-                    activate_if_allocated=action == "quick-claim",
+                    activate_if_allocated=False,
+                )
+            elif action == "quick-claim":
+                result = await claim_request_now(
+                    actor,
+                    parse_ui_request(data),
+                    idempotency_key=key,
                 )
             elif action == "profile-claim":
                 result = await claim_workload_profile_now(
@@ -2196,12 +2208,6 @@ def create_app(
                 result = service.upsert_endpoint(
                     actor,
                     EndpointUpsert.model_validate(data),
-                    idempotency_key=key,
-                )
-            elif action == "delete-endpoint":
-                result = service.delete_endpoint(
-                    actor,
-                    data["endpoint_id"],
                     idempotency_key=key,
                 )
             elif action == "activate-lease":
@@ -2234,8 +2240,6 @@ def create_app(
                 )
             elif action == "actor":
                 result = service.create_actor(actor, ActorCreate.model_validate(data), idempotency_key=key)
-            elif action == "revoke-token":
-                result = service.revoke_token(actor, data["token_id"], idempotency_key=key)
             elif action == "reconcile":
                 result = service.reconcile(actor)
             elif action == "prune-telemetry":
@@ -2247,27 +2251,17 @@ def create_app(
             else:
                 raise BrokerError("action_not_found", "web action does not exist", status_code=404)
         except BrokerError as exc:
-            notice = quote(f"未完成：{exc.message}")
+            notice = quote(f"未完成：{_public_error_message(exc)}")
             return RedirectResponse(url=f"{route}?notice={notice}", status_code=303)
         except (ValidationError, KeyError, TypeError, ValueError):
             notice = quote("未完成：请检查表单字段后重试")
             return RedirectResponse(url=f"{route}?notice={notice}", status_code=303)
 
-        if action == "actor" and result.get("token"):
-            response = templates.TemplateResponse(
-                request,
-                "token_created.html",
-                ui_context(request, actor, page="token-created", payload=result),
-            )
-            response.headers["Cache-Control"] = "no-store, max-age=0"
-            response.headers["Pragma"] = "no-cache"
-            return response
-
         if action in {"quick-claim", "profile-claim", "request"}:
             message = (
                 "GPU 已申领，待使用；请在项目环境启动任务。未启动不会提前释放，且不会由 ServerPilot 启动远端任务"
                 if result.get("lease")
-                else "资源请求已进入队列"
+                else "资源不足，本次申请未排队；未获得租约前请勿启动任务"
             )
         else:
             message = f"操作完成（事件 {result.get('event_id', 'no-event')}）"

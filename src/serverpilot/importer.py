@@ -104,6 +104,7 @@ def import_servers_files(
     paths: list[Path],
     *,
     project_ids: list[str],
+    workspace_path: str,
     expected_gpu_count: int | None = None,
     expected_gpu_total_vram_mib: int | None = None,
 ) -> ImportReport:
@@ -132,6 +133,7 @@ def import_servers_files(
                 host=host,
                 port=port,
                 ssh_user=user,
+                workspace_path=workspace_path,
                 labels=["direct-ssh", "gpu"],
                 storage_group=None,
                 expected_gpu_count=expected_gpu_count,

@@ -7,21 +7,16 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from serverpilot.database import Database
 from serverpilot.models import (
     AllocationRequest,
-    Alert,
     AuditEvent,
-    Endpoint,
     EndpointTelemetryCurrent,
     EndpointTelemetrySnapshot,
-    GPUDevice,
     Lease,
     LeaseResource,
-    MaintenanceWindow,
-    ProviderState,
     TelemetryCurrent,
     TelemetrySnapshot,
 )
@@ -31,7 +26,6 @@ from serverpilot.schemas import (
     EndpointObservation,
     EndpointUpdate,
     LeaseObservedBind,
-    MaintenanceCreate,
     ReservationCreate,
     RequestCreate,
     RetentionPrune,
@@ -62,19 +56,42 @@ def test_inventory_unknown_is_fail_closed(service, admin) -> None:
     assert service.list_requests(admin)["data"] == []
 
 
-def test_bootstrap_token_is_created_once_and_never_replaced(tmp_path: Path, inventory) -> None:
+def test_initialize_has_no_bootstrap_login_token(tmp_path: Path, inventory) -> None:
     broker = BrokerService(
         Database(f"sqlite:///{tmp_path / 'bootstrap.sqlite3'}", Path(__file__).resolve().parents[1]),
         inventory,
     )
-    first = "a" * 32
-    second = "b" * 32
-    assert broker.initialize(first) is True
-    assert broker.initialize(second) is False
-    assert broker.authenticate(first).is_admin
-    with pytest.raises(BrokerError) as error:
-        broker.authenticate(second)
-    assert error.value.code == "invalid_token"
+    broker.initialize()
+    broker.initialize()
+    assert broker.local_actor("local-agent").role == "allocator"
+
+
+def test_write_propagates_first_database_busy_error_without_retry(service, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class LockedSession:
+        execute_calls = 0
+        rollback_calls = 0
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+            return None
+
+        def execute(self, _statement):  # type: ignore[no-untyped-def]
+            self.execute_calls += 1
+            raise OperationalError("BEGIN IMMEDIATE", {}, Exception("database is locked"))
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+
+    locked = LockedSession()
+    monkeypatch.setattr(service.database, "session", lambda: locked)
+
+    with pytest.raises(OperationalError, match="database is locked"):
+        service._write(lambda _session: None)
+
+    assert locked.execute_calls == 1
+    assert locked.rollback_calls == 1
 
 
 def test_idempotent_request_and_stable_uuid_identity(service, admin) -> None:
@@ -377,8 +394,8 @@ def test_unstarted_held_claim_is_retained_after_deprecated_startup_grace(
         Database(f"sqlite:///{tmp_path / 'startup-grace.sqlite3'}", Path(__file__).resolve().parents[1]),
         inventory.model_copy(update={"held_lease_startup_grace_seconds": 1}),
     )
-    broker.initialize("a" * 32)
-    admin = broker.authenticate("a" * 32)
+    broker.initialize()
+    admin = broker.local_actor("grace-agent")
     broker.ingest_observation(observation(count=1))
 
     first = broker.create_request(
@@ -557,19 +574,26 @@ def test_endpoint_identity_is_enforced(service, admin) -> None:
             host="127.0.0.1",
             port=2203,
             ssh_user="gpu",
+            workspace_path="/srv/project-new",
             project_ids=["project-a"],
         ),
         idempotency_key="endpoint-new",
     )
     assert created["endpoint"]["id"] == "endpoint-new"
+    assert created["endpoint"]["workspace_path"] == "/srv/project-new"
     updated = service.update_endpoint(
         admin,
         "endpoint-new",
-        EndpointUpdate(ssh_user="gpu-updated", observation_profile="server-script-v1"),
+        EndpointUpdate(
+            ssh_user="gpu-updated",
+            workspace_path="/srv/project-new-updated",
+            observation_profile="server-script-v1",
+        ),
         idempotency_key="endpoint-update",
     )
     assert updated["endpoint"]["ssh_user"] == "gpu-updated"
     assert updated["endpoint"]["observation_profile"] == "server-script-v1"
+    assert updated["endpoint"]["workspace_path"] == "/srv/project-new-updated"
     paused = service.pause_endpoint(admin, "endpoint-new", idempotency_key="endpoint-pause")
     assert paused["endpoint"]["lifecycle_state"] == "draining"
     assert "endpoint-new" in {endpoint.id for endpoint in service.collector_endpoints()}
@@ -585,61 +609,12 @@ def test_endpoint_identity_is_enforced(service, admin) -> None:
                 host="127.0.0.1",
                 port=2299,
                 ssh_user="gpu",
+                workspace_path="/srv/project-new",
                 project_ids=["project-a"],
             ),
             idempotency_key="endpoint-move",
         )
     assert error.value.code == "endpoint_exists"
-
-
-def test_endpoint_delete_drains_then_retires_without_erasing_monitoring_state(service, admin) -> None:
-    service.ingest_observation(observation(count=2))
-    service.record_provider_failure("endpoint-a", "timeout")
-
-    deleted = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-delete")
-    retried = service.delete_endpoint(admin, "endpoint-a", idempotency_key="endpoint-delete")
-
-    assert retried == deleted
-    assert deleted["endpoint_id"] == "endpoint-a"
-    assert deleted["endpoint"]["lifecycle_state"] == "retired"
-    assert deleted["history_retained"] is True
-    repeated_compatibility_delete = service.delete_endpoint(
-        admin, "endpoint-a", idempotency_key="endpoint-delete-again"
-    )
-    assert repeated_compatibility_delete["endpoint"]["lifecycle_state"] == "retired"
-    assert repeated_compatibility_delete["changed"] is False
-    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-retire")
-    assert retired["endpoint"]["lifecycle_state"] == "retired"
-    assert [endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]] == ["endpoint-a", "endpoint-b"]
-    assert any(gpu["endpoint_id"] == "endpoint-a" for gpu in service.list_gpus(admin)["data"])
-    assert any(event["action"] == "endpoint.retired" for event in service.list_events(admin)["data"])
-    snapshot = service.snapshot(admin)["data"]
-    assert all(endpoint["id"] != "endpoint-a" for endpoint in snapshot["endpoints"])
-    assert all(gpu["endpoint_id"] != "endpoint-a" for gpu in snapshot["gpus"])
-    assert all(
-        provider["endpoint_id"] != "endpoint-a"
-        for provider in snapshot["resource_providers"]
-    )
-
-    def deleted_rows(session):  # type: ignore[no-untyped-def]
-        return (
-            session.get(Endpoint, "endpoint-a"),
-            session.scalars(select(GPUDevice).where(GPUDevice.endpoint_id == "endpoint-a")).all(),
-            session.scalars(select(ProviderState).where(ProviderState.endpoint_id == "endpoint-a")).all(),
-            session.scalars(
-                select(Alert).where(
-                    Alert.resource_type == "endpoint",
-                    Alert.resource_id == "endpoint-a",
-                )
-            ).all(),
-        )
-
-    endpoint, gpus, provider_states, alerts = service._read(deleted_rows)
-    assert endpoint is not None
-    assert endpoint.lifecycle_state == "retired"
-    assert len(gpus) == 2
-    assert len(provider_states) == 1
-    assert len(alerts) == 1
 
 
 def test_endpoint_inventory_mutations_do_not_require_project_membership(service, admin) -> None:
@@ -655,107 +630,22 @@ def test_endpoint_inventory_mutations_do_not_require_project_membership(service,
             host="127.0.0.1",
             port=2298,
             ssh_user="gpu",
+            workspace_path="/srv/desktop-ownerless",
         ),
         idempotency_key="desktop-ownerless-create",
     )
 
     assert created["endpoint"]["owner_project_id"] is None
-    drained = service.pause_endpoint(
+    updated = service.update_endpoint(
         desktop_actor,
         "endpoint-a",
-        idempotency_key="desktop-delete-without-project",
+        EndpointUpdate(labels=["desktop-updated"]),
+        idempotency_key="desktop-update-without-project",
     )
-    assert drained["endpoint"]["lifecycle_state"] == "draining"
-    retired = service.retire_endpoint(
-        desktop_actor,
-        "endpoint-a",
-        idempotency_key="desktop-retire-without-project",
-    )
-    assert retired["endpoint"]["lifecycle_state"] == "retired"
+    assert updated["endpoint"]["labels"] == ["desktop-updated"]
 
 
-def test_endpoint_delete_waits_for_active_lease_then_retires_with_history(service, admin) -> None:
-    service.ingest_observation(observation(count=1))
-    claimed = service.create_request(admin, request_data("delete-blocked"), idempotency_key="delete-blocked")
-    assert claimed["lease"] is not None
-
-    drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="delete-active")
-    assert drained["endpoint"]["lifecycle_state"] == "draining"
-
-    with pytest.raises(BrokerError) as active_error:
-        service.retire_endpoint(admin, "endpoint-a", idempotency_key="delete-active-retire")
-    assert active_error.value.code == "endpoint_has_active_leases"
-
-    service.release_lease(
-        admin,
-        claimed["lease"]["id"],
-        reason="finished",
-        idempotency_key="delete-blocked-release",
-    )
-    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="delete-history")
-    assert retired["endpoint"]["lifecycle_state"] == "retired"
-
-
-def test_failed_endpoint_pinned_claim_does_not_block_retirement(service, admin) -> None:
-    with pytest.raises(BrokerError) as claim_error:
-        service.create_request(
-            admin,
-            RequestCreate.model_validate(
-                {
-                    "project_id": "project-a",
-                    "task_ref": "endpoint-pinned-claim",
-                    "purpose": "claim a particular endpoint",
-                    "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
-                }
-            ),
-            idempotency_key="endpoint-pinned-claim",
-        )
-    assert claim_error.value.code == "no_capacity"
-    drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-drain")
-    assert drained["endpoint"]["lifecycle_state"] == "draining"
-    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="endpoint-pinned-retire")
-    assert retired["endpoint"]["lifecycle_state"] == "retired"
-
-
-def test_endpoint_delete_preserves_maintenance_history(service, admin) -> None:
-    service.ingest_observation(observation(count=1))
-    created = service.create_maintenance(
-        admin,
-        MaintenanceCreate(
-            endpoint_id="endpoint-a",
-            start_at=utcnow() - timedelta(minutes=5),
-            end_at=utcnow() + timedelta(minutes=55),
-            reason="hardware inspection",
-        ),
-        idempotency_key="endpoint-maintenance",
-    )
-
-    drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="delete-maintenance")
-    assert drained["endpoint"]["lifecycle_state"] == "draining"
-    assert service._read(lambda session: session.get(MaintenanceWindow, created["maintenance"]["id"])) is not None
-
-
-def test_endpoint_delete_preserves_enabled_workload_profile_references(service, admin) -> None:
-    service.upsert_workload_profile(
-        admin,
-        WorkloadProfileUpsert.model_validate(
-            {
-                "id": "endpoint-bound-profile",
-                "project_id": "project-a",
-                "display_name": "Endpoint bound profile",
-                "purpose": "keep endpoint reference valid",
-                "duration_seconds": 3600,
-                "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-b"]},
-            }
-        ),
-        idempotency_key="endpoint-bound-profile",
-    )
-
-    drained = service.pause_endpoint(admin, "endpoint-b", idempotency_key="delete-profile-ref")
-    assert drained["endpoint"]["lifecycle_state"] == "draining"
-
-
-def test_claim_auto_creates_project_and_ignores_legacy_endpoint_scope(service, admin) -> None:
+def test_claim_auto_creates_project_without_extra_endpoint_scope(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     claimed = service.create_request(
         admin,
@@ -803,6 +693,50 @@ def test_coordination_board_and_observed_binding_are_agent_self_service(service,
     assert board["servers"][0]["consumers"][0]["agent_name"] == admin.id
     assert board["leases"][0]["activity"] == "running"
     assert board["agents"][0]["managed_running_gpus"] == 1
+
+
+def test_collector_auto_binds_new_process_to_its_exact_workload_lease(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+    claimed = service.create_request(
+        admin,
+        request_data("auto-observed-run"),
+        idempotency_key="auto-observed-claim",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+    claimed_gpu_id = claimed["lease"]["gpu_ids"][0]
+    gpus = service.list_gpus(admin)["data"]
+    claimed_gpu_uuid = next(gpu["gpu_uuid"] for gpu in gpus if gpu["id"] == claimed_gpu_id)
+    other_gpu_uuid = next(gpu["gpu_uuid"] for gpu in gpus if gpu["id"] != claimed_gpu_id)
+
+    service.ingest_observation(
+        observation(
+            count=2,
+            processes=[
+                process_for_gpu(claimed_gpu_uuid, pid=4101),
+                process_for_gpu(other_gpu_uuid, pid=4102),
+            ],
+        )
+    )
+
+    lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
+    assert lease["state"] == "ACTIVE"
+    snapshot_lease = next(
+        item for item in service.snapshot(admin)["data"]["leases"] if item["id"] == lease_id
+    )
+    assert snapshot_lease["runtime_state"] == "RUNNING"
+    assert lease["workloads"][0]["run_id"] == f"lease:{lease_id}"
+    assert lease["workloads"][0]["process_keys"] == [
+        next(
+            gpu["processes"][0]["process_key"]
+            for gpu in service.list_gpus(admin)["data"]
+            if gpu["id"] == claimed_gpu_id
+        )
+    ]
+    states = {gpu["gpu_uuid"]: gpu["state"] for gpu in service.list_gpus(admin)["data"]}
+    assert states[claimed_gpu_uuid] == "RUNNING_MANAGED"
+    assert states[other_gpu_uuid] == "BUSY_UNMANAGED"
+    assert service.list_requests(admin)["data"][0]["state"] == "ACTIVE"
 
 
 def test_observed_workload_binding_survives_one_second_process_start_jitter(service, admin) -> None:
@@ -1285,6 +1219,21 @@ def test_provider_audit_is_written_only_on_failure_and_recovery_transitions(serv
     assert service._read(actions) == ["telemetry.failed", "telemetry.recovered"]
 
 
+def test_human_monitoring_sees_endpoint_failures_and_can_read_latest_events(service) -> None:
+    service.record_provider_failure("endpoint-a", "timeout")
+    service.record_provider_failure("endpoint-b", "connection refused")
+
+    human_events = service.list_events(service.local_actor("human"))["data"]
+    assert [event["action"] for event in human_events] == [
+        "telemetry.failed",
+        "telemetry.failed",
+    ]
+    latest = service.list_events(
+        service.local_actor("human"), latest_first=True, limit=1
+    )["data"]
+    assert latest[0]["resource_id"] == "endpoint-b"
+
+
 def test_expired_lease_with_process_becomes_orphan_and_stays_blocked(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     allocated = service.create_request(admin, request_data("will-orphan"), idempotency_key="orphan")
@@ -1307,7 +1256,7 @@ def test_expired_lease_with_process_becomes_orphan_and_stays_blocked(service, ad
     assert error.value.code == "no_capacity"
 
 
-def test_allocator_can_claim_an_unregistered_project_and_token_hash_never_returned(service, admin) -> None:
+def test_allocator_can_claim_an_unregistered_project_without_login_token(service, admin) -> None:
     created = service.create_actor(
         admin,
         ActorCreate(
@@ -1315,12 +1264,11 @@ def test_allocator_can_claim_an_unregistered_project_and_token_hash_never_return
             display_name="Project A agent",
             role="allocator",
             project_ids=["project-a"],
-            token_label="test",
         ),
         idempotency_key="new-agent",
     )
-    assert created["token"]
-    agent = service.authenticate(created["token"])
+    assert "token" not in created
+    agent = service.local_actor("story-agent")
     service.ingest_observation(observation(count=1))
     claimed = service.create_request(
         agent,
@@ -1330,7 +1278,7 @@ def test_allocator_can_claim_an_unregistered_project_and_token_hash_never_return
     assert claimed["request"]["project_id"] == "storyboard"
     assert any(item["id"] == claimed["request"]["id"] for item in service.list_requests(agent)["data"])
     actors = service.list_actors(admin)["data"]
-    assert "token_hash" not in str(actors)
+    assert "tokens" not in str(actors)
 
 
 def test_one_hundred_concurrent_requests_never_double_lease(service, admin) -> None:
@@ -1418,18 +1366,19 @@ def test_cooperative_actor_labels_are_not_admin_and_lease_ownership_is_exact(ser
     assert owner.role == "allocator"
     claimed = service.create_request(owner, request_data("owner-only"), idempotency_key="owner-only")
     assert claimed["lease"] is not None
-    with pytest.raises(BrokerError, match="another actor's lease"):
+    with pytest.raises(BrokerError) as forbidden:
         service.release_lease(
             other,
             claimed["lease"]["id"],
             reason="not the owner",
             idempotency_key="other-release",
         )
+    assert forbidden.value.code == "lease_forbidden"
     assert service.list_leases(other)["data"] == []
     assert service.list_requests(other)["data"] == []
 
 
-def test_endpoint_lifecycle_retains_history_and_blocks_new_claims(service, admin) -> None:
+def test_paused_endpoint_blocks_claims_and_can_resume(service, admin) -> None:
     service.ingest_observation(observation(endpoint_id="endpoint-a", count=1))
     drained = service.pause_endpoint(admin, "endpoint-a", idempotency_key="drain-a")
     assert drained["endpoint"]["lifecycle_state"] == "draining"
@@ -1448,10 +1397,12 @@ def test_endpoint_lifecycle_retains_history_and_blocks_new_claims(service, admin
             idempotency_key="draining-claim",
         )
     assert error.value.code == "no_capacity"
-    retired = service.retire_endpoint(admin, "endpoint-a", idempotency_key="retire-a")
-    assert retired["endpoint"]["lifecycle_state"] == "retired"
-    assert {endpoint.id for endpoint in service.collector_endpoints()} == {"endpoint-b"}
-    assert any(item["id"] == "endpoint-a" for item in service.list_endpoints(admin)["data"])
+    resumed = service.resume_endpoint(admin, "endpoint-a", idempotency_key="resume-a")
+    assert resumed["endpoint"]["lifecycle_state"] == "active"
+    assert {endpoint.id for endpoint in service.collector_endpoints()} == {
+        "endpoint-a",
+        "endpoint-b",
+    }
 
 
 def test_direct_lease_returns_executable_resources_and_accounts_endpoint_commitments(service, admin) -> None:
@@ -1475,6 +1426,7 @@ def test_direct_lease_returns_executable_resources_and_accounts_endpoint_commitm
         "host": "127.0.0.1",
         "port": 2201,
         "ssh_user": "gpu",
+        "workspace_path": "/srv/project-a",
     }
     assert resource["gpus"][0]["gpu_uuid"].startswith("GPU-")
     assert resource["cuda_visible_devices"] == resource["gpus"][0]["gpu_uuid"]
@@ -1493,3 +1445,66 @@ def test_direct_lease_returns_executable_resources_and_accounts_endpoint_commitm
             idempotency_key="commitment-two",
         )
     assert error.value.code == "no_capacity"
+
+
+def test_human_can_reassign_a_task_to_an_exact_gpu(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+    claimed = service.create_request(
+        admin,
+        request_data("manual-gpu-move"),
+        idempotency_key="manual-gpu-move-claim",
+    )
+    lease = claimed["lease"]
+    assert lease is not None
+    assert lease["gpu_ids"] == ["endpoint-a:GPU-endpoint-a-0"]
+
+    moved = service.reassign_lease_gpus(
+        admin,
+        lease["id"],
+        ["endpoint-a:GPU-endpoint-a-1"],
+        idempotency_key="manual-gpu-move-apply",
+    )
+
+    assert moved["restart_required"] is True
+    assert moved["lease"]["gpu_ids"] == ["endpoint-a:GPU-endpoint-a-1"]
+    assert moved["lease"]["resources"][0]["cuda_visible_devices"] == "GPU-endpoint-a-1"
+    gpus = {gpu["id"]: gpu for gpu in service.list_gpus(admin)["data"]}
+    assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "AVAILABLE"
+    assert gpus["endpoint-a:GPU-endpoint-a-1"]["lease"]["id"] == lease["id"]
+
+
+def test_reassigned_active_task_auto_binds_process_on_its_new_gpu(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+    claimed = service.create_request(
+        admin,
+        request_data("running-gpu-move"),
+        idempotency_key="running-gpu-move-claim",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+    service.ingest_observation(
+        observation(count=2, processes=[process_for_gpu("GPU-endpoint-a-0", pid=4201)])
+    )
+    assert service.list_leases(admin)["data"][0]["state"] == "ACTIVE"
+
+    moved = service.reassign_lease_gpus(
+        admin,
+        lease_id,
+        ["endpoint-a:GPU-endpoint-a-1"],
+        idempotency_key="running-gpu-move-apply",
+    )
+    assert moved["lease"]["state"] == "ACTIVE"
+    assert moved["lease"]["workloads"] == []
+
+    service.ingest_observation(
+        observation(count=2, processes=[process_for_gpu("GPU-endpoint-a-1", pid=4202)])
+    )
+
+    lease = service.list_leases(admin)["data"][0]
+    assert lease["state"] == "ACTIVE"
+    assert lease["workloads"][0]["run_id"] == f"lease:{lease_id}"
+    snapshot_lease = service.snapshot(admin)["data"]["leases"][0]
+    assert snapshot_lease["runtime_state"] == "RUNNING"
+    gpus = {gpu["id"]: gpu for gpu in service.list_gpus(admin)["data"]}
+    assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "AVAILABLE"
+    assert gpus["endpoint-a:GPU-endpoint-a-1"]["state"] == "RUNNING_MANAGED"

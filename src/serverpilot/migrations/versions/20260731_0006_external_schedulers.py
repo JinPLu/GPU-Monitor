@@ -99,7 +99,6 @@ def upgrade() -> None:
         sa.Column("purpose", sa.String(length=1000), nullable=False),
         sa.Column("approval_ref", sa.String(length=500), nullable=True),
         sa.Column("request_json", sa.Text(), nullable=False),
-        sa.Column("script_digest", sa.String(length=64), nullable=False),
         sa.Column("script_body", sa.Text(), nullable=True),
         sa.Column("retain_submission_body", sa.Boolean(), nullable=False),
         sa.Column("scheduler_job_id", sa.String(length=128), nullable=True),

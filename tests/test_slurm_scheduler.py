@@ -824,7 +824,6 @@ def test_scheduler_submit_script_fails_closed_without_one_unique_id(
         f"GB|scheduler-submit-error|class={expected_class}|"
         f"exit={expected_status}|" in result.stderr
     )
-    assert "|digest=cksum:" in result.stderr
     assert f"|recovery={expected_recovery}" in result.stderr
     assert "site notice" not in result.stderr
     assert "123456" not in result.stderr
@@ -869,7 +868,6 @@ def test_scheduler_submit_script_reports_sanitized_sbatch_failure(
         f"GB|scheduler-submit-error|class={expected_class}|"
         f"exit={expected_status}|" in result.stderr
     )
-    assert "|digest=cksum:" in result.stderr
     assert "|recovery=not-run" in result.stderr
     if expected_size == "empty":
         assert "|lines=0|bytes=0|" in result.stderr
@@ -1498,7 +1496,6 @@ def test_one_off_requires_access_and_does_not_retain_script_by_default(
         assert stored is not None
         assert stored.approval_ref == "thread:one-off-approved"
         assert stored.script_body is None
-        assert len(stored.script_digest) == 64
 
 
 def test_access_failure_from_submit_is_reported_without_claiming_gpu(

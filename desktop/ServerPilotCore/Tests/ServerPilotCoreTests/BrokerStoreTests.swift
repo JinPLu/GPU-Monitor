@@ -206,12 +206,14 @@ final class BrokerStoreTests: XCTestCase {
             host: "gpu.example.test",
             port: 2201,
             sshUser: "collector",
+            workspacePath: "/srv/storyboard",
             observationProfile: .serverScript,
             suppliedID: ""
         )
 
         XCTAssertEqual(draft.id, "gpu-example-test-p2201")
         XCTAssertEqual(draft.host, "gpu.example.test")
+        XCTAssertEqual(draft.workspacePath, "/srv/storyboard")
         XCTAssertEqual(draft.observationProfile, .serverScript)
         XCTAssertEqual(draft.observationProfile.label, "服务器采集脚本")
         XCTAssertFalse(draft.observationProfile.scriptInfo.contains("Docker"))
@@ -220,6 +222,7 @@ final class BrokerStoreTests: XCTestCase {
                 host: "",
                 port: 0,
                 sshUser: "collector",
+                workspacePath: "relative/path",
                 observationProfile: .linuxNvidia,
                 suppliedID: "bad id"
             )
@@ -448,7 +451,6 @@ final class BrokerStoreTests: XCTestCase {
                     "admission_boundary": "test"
                 ],
                 "history": [
-                    "retired_endpoints": [],
                     "resource_plan_evaluations": [],
                     "resource_run_actuals": [
                         [
@@ -538,7 +540,7 @@ final class BrokerStoreTests: XCTestCase {
         let mutationSession = URLSession(configuration: configuration)
         let snapshot = try Self.snapshot(named: "1")
         let endpoint = try XCTUnwrap(snapshot.endpoints.first)
-        let capabilities: Set<String> = ["endpoint_update", "endpoint_pause_resume", "endpoint_retirement", "endpoint_keepalive", "endpoint_conflict_cleanup"]
+        let capabilities: Set<String> = ["endpoint_update", "endpoint_pause_resume", "endpoint_keepalive", "endpoint_conflict_cleanup"]
         let serviceInfo = ServiceInfo(schemaVersion: "v1", capabilities: capabilities)
         let store = BrokerStore(
             actorID: "tester",
@@ -558,7 +560,11 @@ final class BrokerStoreTests: XCTestCase {
         let updateRecorder = CompletionRecorder()
         store.updateEndpoint(
             endpoint,
-            draft: try EndpointUpdateDraft(sshUser: "collector", observationProfile: .serverScript)
+            draft: try EndpointUpdateDraft(
+                sshUser: "collector",
+                workspacePath: "/srv/storyboard",
+                observationProfile: .serverScript
+            )
         ) { success, message in
             updateRecorder.success = success
             updateRecorder.message = message
@@ -569,6 +575,7 @@ final class BrokerStoreTests: XCTestCase {
         let updateBody = try XCTUnwrap(StateRouteURLProtocol.lastRequest?.httpBody)
         let updatePayload = try XCTUnwrap(try JSONSerialization.jsonObject(with: updateBody) as? [String: Any])
         XCTAssertEqual(updatePayload["ssh_user"] as? String, "collector")
+        XCTAssertEqual(updatePayload["workspace_path"] as? String, "/srv/storyboard")
         XCTAssertEqual(updatePayload["observation_profile"] as? String, "server-script-v1")
 
         let pauseRecorder = CompletionRecorder()
@@ -617,15 +624,57 @@ final class BrokerStoreTests: XCTestCase {
             "/api/v1/endpoints/fixture-1/leases/lease-conflict/release-empty"
         )
 
-        let retireRecorder = CompletionRecorder()
-        store.retireEndpoint(endpoint) { success, message in
-            retireRecorder.success = success
-            retireRecorder.message = message
+    }
+
+    func testHumanTaskGPUReassignmentUsesExactPatchRoute() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StateRouteURLProtocol.self]
+        let mutationSession = URLSession(configuration: configuration)
+        let snapshot = try Self.snapshot(named: "1")
+        let lease = try XCTUnwrap(LeaseRecord(raw: [
+            "id": "lease-manual-move",
+            "actor_id": "agent-a",
+            "project_id": "project-a",
+            "kind": "workload",
+            "state": "HELD",
+            "gpu_ids": ["fixture-1:GPU-old"],
+        ]))
+        let store = BrokerStore(
+            actorID: "human",
+            refreshTimeoutSeconds: 1,
+            refreshIntervalSeconds: 0,
+            mutationSession: mutationSession
+        )
+        StateRouteURLProtocol.responseData = try JSONSerialization.data(
+            withJSONObject: ["snapshot_revision": 103]
+        )
+        defer { StateRouteURLProtocol.reset() }
+        store.connectForTesting(
+            snapshotClient: ScriptedClient(results: [.success(snapshot), .success(snapshot)]),
+            serviceInfo: ServiceInfo(schemaVersion: "v1", capabilities: []),
+            baseURL: URL(string: "http://broker.test/")!
+        )
+        try await waitUntil { store.freshness == .fresh && !store.isRefreshing }
+
+        let recorder = CompletionRecorder()
+        store.reassignLease(lease, gpuIDs: ["fixture-1:GPU-new"]) { success, message in
+            recorder.success = success
+            recorder.message = message
         }
-        try await waitUntil { retireRecorder.success != nil }
-        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "POST")
-        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/fixture-1/retire")
-        XCTAssertTrue(store.notice?.contains("彻底退役") == true)
+
+        try await waitUntil { recorder.success != nil }
+        XCTAssertEqual(recorder.success, true)
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "PATCH")
+        XCTAssertEqual(
+            StateRouteURLProtocol.lastRequest?.url?.path,
+            "/api/v1/leases/lease-manual-move/gpus"
+        )
+        let body = try XCTUnwrap(StateRouteURLProtocol.lastRequest?.httpBody)
+        let payload = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+        XCTAssertEqual(payload["gpu_ids"] as? [String], ["fixture-1:GPU-new"])
+        XCTAssertTrue(store.notice?.contains("对应 Agent") == true)
     }
 
     func testCollectorIntervalReadsAndUpdatesServerSetting() async throws {
@@ -710,9 +759,9 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(BrokerStore.snapshotRevision(from: payload), 250)
 
         let errorPayload = try JSONSerialization.data(withJSONObject: [
-            "error": ["code": "endpoint_already_retired"]
+            "error": ["code": "endpoint_not_found"]
         ])
-        XCTAssertEqual(BrokerStore.apiErrorCode(from: errorPayload), "endpoint_already_retired")
+        XCTAssertEqual(BrokerStore.apiErrorCode(from: errorPayload), "endpoint_not_found")
     }
 
     func testKeepaliveSnapshotUsesPerGPUCoverageAndRedactsInternalLease() throws {
@@ -724,31 +773,32 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(endpoint.keepalive.label, "已开启")
         XCTAssertTrue(endpoint.keepalive.hasResidualLease)
         XCTAssertEqual(endpoint.keepalive.coverageSummary(totalGPUCount: 2, taskGPUCount: 1), "已开启 · 1/2 占卡，1 卡任务中")
+        XCTAssertEqual(endpoint.keepalive.coverageSummary(totalGPUCount: 0, taskGPUCount: 0), "无 GPU")
         XCTAssertEqual(fixture.gpus.map(\.state), ["KEEPALIVE", "RUNNING_MANAGED"])
+        XCTAssertTrue(try XCTUnwrap(fixture.gpus.first).isPubliclyAvailable)
         XCTAssertEqual(fixture.gpus.first?.keepalive.presentationLabel, "空闲占卡")
-        XCTAssertEqual(fixture.gpus.first?.keepalive.healthState, "HEALTHY")
-        XCTAssertEqual(fixture.gpus.first?.keepalive.vramPercent, 31)
-        XCTAssertEqual(fixture.gpus.first?.keepalive.rollingUtilizationPercent, 35)
         XCTAssertEqual(fixture.gpus.last?.keepalive.reason, "managed workload is running")
         XCTAssertTrue(fixture.leases.isEmpty)
 
-        let startingKeeper = try XCTUnwrap(GPURecord(raw: [
-            "id": "fixture-1:GPU-starting-keeper",
+        let missingKeeper = try XCTUnwrap(GPURecord(raw: [
+            "id": "fixture-1:GPU-missing-keeper",
             "endpoint_id": "fixture-1",
-            "gpu_uuid": "GPU-starting-keeper",
+            "gpu_uuid": "GPU-missing-keeper",
             "gpu_index": 2,
             "name": "Fixture GPU",
             "total_vram_mib": 81920,
-            "state": "HELD",
+            "state": "CONFLICT",
             "keepalive": [
                 "configured": true,
                 "policy": "idle_keepalive",
-                "state": "STARTING",
-                "lease_id": "keepalive-starting-lease"
+                "state": "ERROR",
+                "reason": "未检测到占卡程序",
+                "lease_id": "keepalive-missing-lease"
             ],
         ]))
-        XCTAssertFalse(startingKeeper.isTaskOccupancy)
-        XCTAssertEqual(startingKeeper.keepalive.leaseID, "keepalive-starting-lease")
+        XCTAssertFalse(missingKeeper.isTaskOccupancy)
+        XCTAssertTrue(missingKeeper.isPubliclyAvailable)
+        XCTAssertEqual(missingKeeper.keepalive.leaseID, "keepalive-missing-lease")
         XCTAssertTrue(try XCTUnwrap(fixture.gpus.last).isTaskOccupancy)
 
         let defensiveSnapshot = BrokerSnapshot(envelope: [
@@ -766,6 +816,27 @@ final class BrokerStoreTests: XCTestCase {
             ]
         ])
         XCTAssertTrue(defensiveSnapshot.leases.isEmpty)
+    }
+
+    func testKeepaliveProtocolRejectsUnknownPolicyAndState() {
+        XCTAssertNil(EndpointKeepaliveSummary(
+            raw: ["configured": true, "policy": "unknown", "state": "OFF"],
+            fallbackConfigured: true
+        ))
+        XCTAssertNil(EndpointKeepaliveSummary(
+            raw: ["configured": true, "policy": "disabled", "state": "UNKNOWN"],
+            fallbackConfigured: true
+        ))
+        XCTAssertNil(GPUKeepaliveStatus(
+            raw: ["policy": "unknown", "state": "OFF"],
+            fallbackConfigured: true,
+            fallbackState: "OFF"
+        ))
+        XCTAssertNil(GPUKeepaliveStatus(
+            raw: ["policy": "disabled", "state": "UNKNOWN"],
+            fallbackConfigured: true,
+            fallbackState: "OFF"
+        ))
     }
 
     func testStableSelectionFallsBackToFirstAvailableRecord() throws {

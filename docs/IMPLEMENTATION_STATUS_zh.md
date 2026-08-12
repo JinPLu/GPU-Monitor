@@ -1,90 +1,72 @@
 # ServerPilot 当前实现与验证状态
 
-更新时间：2026-08-12（Asia/Shanghai）
+更新时间：2026-08-13（Asia/Shanghai）
 
 本文只记录当前事实、直接证据和仍未验证的边界。历史过程见 `docs/archive/`。
 
-## 当前事实
+## 当前四项功能
 
-### 控制面
+1. **信息采集**：固定只读探针采集服务器 CPU、内存、GPU、进程和历史趋势；APP 刷新只读取这份状态。
+2. **人类监控与纠错**：APP 展示服务器、任务与 GPU。任务详情允许人保持卡数不变，直接选择新的 GPU；目标 GPU 正在占卡时先按卡停止并刷新确认，再更新分配，随后提示对应 Agent 按返回的 `CUDA_VISIBLE_DEVICES` 重启任务。
+3. **Agent 操作**：默认 MCP 只有 `gpu_status`、`gpu_apply`、`gpu_release`。申请返回 `lease_id` 与选中的服务器/GPU/`CUDA_VISIBLE_DEVICES`；租约持续到显式释放或 App 人工处理，容量不足直接返回 `no_capacity`，不排队。
+4. **空闲 GPU 占卡**：持久化的是 endpoint 的“空闲自动占卡策略”，不是一次启动动作。每轮既有采集之后逐卡协调：空闲且 helper 不在就启动，空闲且 helper 已在就保持，任务使用中不占卡，任务释放后在下一轮采集恢复。占卡只有 `OFF / ACTIVE / ERROR` 三种对外结果，不写 `STARTING` 或 keepalive `HELD`。启动和采集确认成功后才创建 `ACTIVE` 占卡记录；失败不留下半成品租约，并由既有 policy、GPU 状态和 helper 观测直接显示具体中文 `ERROR`，下一采集周期照常重试。
 
-- ServerPilot 是单用户、本机运行的资源协调器。用户级 LaunchAgent 长期持有状态；GUI、CLI 和 MCP 通过同一 loopback REST/domain 合同读取与写入。
-- 唯一数据目录是 `~/Library/Application Support/ServerPilot/`。MCP 不直连 SQLite 或 SSH，也不会创建备用数据库。
-- GPU、主机 CPU / 内存和外部 SchedulerTarget 使用同一资源合同与审计链。SchedulerTarget 不会伪装成普通服务器；`PENDING` 作业不表示已获得裸机 GPU。
-- 服务端 `available` 投影是准入真相。stale、unknown、unmanaged、conflict 和 maintenance 资源均不可分配；客户端不得自行用容量减用量重算。
+每个 endpoint 现在只有一个 canonical `workspace_path` 字段。新增服务器时 REST、MCP advanced 管理工具、Web 和原生 APP 都要求填写绝对远端路径；endpoint 快照、Agent 状态和 GPU 申请结果沿既有投影返回同一字段。用户已确认当前共用目录为 `/media/datasets/OminiEWM_Data/tmp/ljp`。历史记录迁移保留且未知路径保持空值，不猜测项目子目录。该字段只是元数据和操作指引，不创建/删除远端目录、不授权启动 workload；密封占卡 helper 固定布局为 `${workspace_path}/serverpilot-keepalive`，adapter 直接执行 `./serverpilot-keepalive --schema-version 2`，不依赖远端 `PATH`。
 
-### 申请与任务边界
+占卡 GPU 对 APP、REST 和 MCP 仍计为可用；helper 意外退出但新采集确认 GPU 空闲时也计为可用并显示具体中文异常。真正分配前，Agent 申请、浏览器快速申请、预设申请和 APP 人工改派都复用同一个“选中 GPU → 逐卡停止 helper → 定向采集 → 结束占卡记录 → 普通申请或改派”实现。
 
-- 裸机申请只会立即返回 `HELD` / `ACTIVE` lease，或返回 `no_capacity`。`no_capacity` 不创建等待队列，也不授权执行。
-- 成功 lease 返回 `resources[]`、endpoint、GPU 和 `cuda_visible_devices`。Agent 只能使用这些落点。
-- 日常 GPU Agent 直接调用 `gpu_apply`；只有需要查看可用性或诊断 placement 时才调用 `gpu_status`，旧的 `gpu_list` 只在 advanced profile 提供。`server_id` 可选，默认一张 GPU；ServerPilot 自动记录例行申请的归属并选择实际可分配的 GPU，Agent 只使用返回的资源并在完成后释放。
-- MCP 的默认状态读面只返回摘要、服务器容量和紧凑 GPU 列表；`gpu_list` 直接使用窄 REST 投影，不把 scheduler、通用资源和历史集合带回 Agent 上下文。紧凑状态会区分可见 workload lease 与内部 keepalive 归属：`available` 始终排除所有占用，`verified_keepalive` 仅表示可由 `gpu_apply` 在逐卡停止并取得新鲜空观测后尝试回收，`HELD` / `CONFLICT` 仍不可分配。完整控制面仍由 REST `control_plane_state` 保留给显式诊断。
-- 默认 stdio MCP 只暴露日常 GPU 工具；scheduler、通用资源、端点管理和低层 lease 兼容函数仍可通过 `SERVERPILOT_MCP_PROFILE=advanced` 显式启用。
-- ServerPilot 只协调归属。任务由项目已有且获授权的执行路径启动和停止；启动后 Agent 用该 lease 的 `gpu_bind_observed_workload` 确认可观测进程归属，完成或启动失败后释放 lease。
-- mutation 重试复用调用方生成的 `idempotency_key`。管理动作还需要当前任务明确授权和 `approval_ref`。
-- Codex MCP 从 `CODEX_THREAD_ID` 派生独立 actor 与 `codex://threads/<uuid>`。该 URI 只用于 Agent 间发现，不授予认证或调度权限，也不是 ServerPilot 会打开或解析的 URL；公开 GUI 不展示 Agent、owner 或协调 URI。客户端若维护 MCP allowlist，升级后必须同步新 routine 工具。
+loopback 控制面不使用登录 token：没有 token model、登录页面、签发接口或撤销接口。服务器永久删除也不在 REST、Web、MCP 或 APP 公共面中；暂停和恢复是非破坏操作。升级迁移只移除旧摘要字段，不删除已有 token 表、退役服务器、占卡请求、占卡租约或 lease resource。
 
-### 采集与 Adapter
+占卡链路没有校验摘要、attestation、自动重试、退避器、第二套定时器、自动抢占或整机占卡状态机。
 
-- Collector 只执行代码封闭的只读探针。`server-script-v1` 固定调用 `serverpilot-collect --schema-version 1`，并严格校验受限 JSON。
-- 数据采集间隔为持久化的 5 / 10 / 30 秒设置。数据库提交成功后才更新内存和 GUI；提交失败保留原值。
-- 服务器在应有观测缺失时显示连接或采集问题，对应资源停止分配。GUI 刷新只重新读取控制面状态，不伪造一次服务器观测。
-- 可选空闲占卡 adapter 在用户明确点击“开始占卡”时由 ServerPilot 自动挂载。服务器只有一个期望策略开关，但它为每张合格的空闲 GPU 管理独立 worker / lease / 健康状态；忙碌、未托管、冲突和 stale GPU 不会被占用。helper 只接受 ServerPilot 已知的物理 GPU UUID，不接受任意 shell、路径、PID、环境或调用方 selector。
-- 逐卡隔离已覆盖工作负载冲突：一张 GPU 的遗留归属不会阻断同一服务器其它空闲 GPU 的占卡启动；详情页提供“清理遗留归属”，先做新鲜采集并确认没有进程后才释放。
-- 受管即时 claim 先按原有分配；仅在无容量且服务能给出完整精确的逐卡 keepalive 回收计划时，才停止目标 GPU、做新鲜空观测并在同一 endpoint 锁内重试普通 claim。它不抢占直接 SSH 或未托管任务；后者必须先由管理员关闭该 endpoint 策略。旧整机 keepalive lease 被迁移标记为 legacy，保持 fail closed，不能猜测转换为新逐卡 lease。
-- helper 固定约 31% 显存、30% GPU duty cycle、单 PyTorch CPU 线程和 100ms 节流；稳态没有磁盘或网络轮询。五分钟宽限期后，读模型要求至少 30% 显存和 30% 滚动 GPU 利用率，否则标记为 `DEGRADED`；实际主机 CPU / RSS 与 GPU 效果仍需现场对照。
-- Slurm adapter 使用封闭的 transport / inspection profile。VPN 只检测，不自动操作；取消作业需要单独授权。
-
-### macOS App
-
-- 仓库最外层只保留一个最新 `ServerPilot.app`。目标 App 冻结 Python 后端与迁移，不要求目标 Mac 另外安装 Python 或 `uv`。
-- App 固定为浅色、不透明界面，一级页面只有`服务器 / 使用情况 / 设置`。
-- 服务器页使用 Beszel 式紧凑表格。表头为`服务器 / 项目与当前任务 / GPU 配置 / 空闲 / GPU / 显存 / CPU / 内存`；数字使用中性色，压力颜色只用于状态点与进度柱。
-- 所有表头可排序。只有当前排序列显示单个方向箭头；搜索、筛选、表头和服务器行可键盘到达。
-- 详情页显示 SSH、当前资源、GPU 型号与状态、项目 / 当前任务，以及 1h / 6h / 24h 历史。多 GPU 序列使用稳定的不同颜色；采样间断不补线。
-- 服务器行统一打开独立详情弹窗，列表不会因展开详情而压缩；详情页保留 GPU 状态、归属说明与 1h / 6h / 24h 历史。
-- 使用情况页只展示项目、当前任务与 GPU；不提供 Agent、聊天、消息或 Codex 链接。
-- 设置页只展示本机服务地址、数据采集间隔和版本。
+项目明确要求的资源正确性边界仍保留：过期采集不能被当成可用 GPU，Agent 只能使用实际返回的 lease 资源。这两项来自当前项目合同，不新增状态机。
 
 ## 已完成验证
 
-逐 GPU 空闲占卡候选已经通过独立 Strict Review。当前工作将日常 Agent GPU 申请收敛为服务端自动归属的 `gpu_apply`，并修正服务器详情与归属状态的呈现；在完成复核前，不声明新的发布结论。下表只记录已完成的直接验证。
+以下自动化结果来自当前工作树；测试使用临时数据库和 fake provider。
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `344` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过 |
-| Ruff | 通过 |
-| Swift desktop/core 全量类型检查 | 通过 |
-| Alembic | 单头 `20260812_0019` |
-| macOS App 构建 | `desktop/build-macos-app.sh` 通过 |
-| standalone 验证 | `desktop/verify-macos-app.sh` 通过 |
+| Python 全量测试 | `355` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过；覆盖 endpoint workspace 投影、迁移保留旧记录、workspace 内固定 helper 入口、三工具 MCP、Codex task URI、首次申请和改派后的真实进程自动归属，以及既有占卡/让位路径 |
+| Ruff | `.venv/bin/ruff check src tests` 通过 |
+| 数据迁移 | 当前源码迁移头 `20260813_0022`；新增 nullable endpoint 元数据列以保留历史记录，新增入口要求显式路径 |
+| MCP 上下文 | 默认发现结果严格为 3 个工具；instructions 为 `306` 字，每个工具一句说明；schema 和返回投影都有字段白名单测试 |
+| Codex task URL | 当前 Codex 配置声明转发既有 `CODEX_THREAD_ID`；client/header 与缺失变量停止申请/释放均有测试；新建子任务实际发现三个工具，但宿主没有向子任务 MCP 进程注入该变量，因此申请按合同在 daemon 前停止。顶层验收使用当前顶层 task 的既有 UUID 启动全新 stdio 进程完成实机申请与释放，没有生成随机身份 |
+| macOS App 构建 | `zsh desktop/build-macos-app.sh` 通过，包含 Swift 桌面端编译 |
+| standalone 验证 | `zsh desktop/verify-macos-app.sh` 通过 |
+| 冗余机制扫描 | 运行源码和桌面端没有摘要计算、登录 token、永久删除入口、占卡 `STARTING/HELD`、额外定时器或自动抢占 |
 | 文本与补丁完整性 | `git diff --check` 通过 |
 | App 落盘 | 根目录唯一 `ServerPilot.app` |
 
-既有 GUI 验收覆盖 1024、1280 和 1440 宽度，以及服务器表格、排序、搜索、键盘焦点、详情返回、使用情况、设置、错误、空状态和多 GPU 历史图。本次逐 GPU 空闲占卡还以 `keepalive` 假夹具实际生成了服务器列表的三个固定尺寸截图；显示为单一 endpoint 开关、逐卡占卡覆盖和普通运行任务并存。证据位于：
+四项核心功能的收敛决定记录在 `docs/teamwork/cases/c-f379fac55e2c1c893405737d74f7bdc3c2f3615e8a9fbb15e1aeff3b9c389dca/decision.md`。
 
-- `build/plan-closeout/native-ui-acceptance-final3/manifest.json`
-- `build/plan-closeout/evidence/`
-- `build/per-gpu-keepalive-final-ui-20260812/`
-- `docs/teamwork/cases/c-34f04361fc1a544e483dfee0bc8eb4343cd5b920bc1ffaa43cbb2b7ff2436e88/reviews/a48055759c63b956adfcd3f7502726a0dc1f79d540ef67d5b505c447f5de8d30.md`
+service 快照直接提供统一的 `publicly_available` 和简短中文 `public_status`；routine MCP 与 Web 只投影这份结果，不再各自判断占卡容量。API 与 Swift 模型遇到未知占卡 policy/state 会明确拒绝，不会伪装成 `disabled`、`OFF` 或 `ERROR`。
 
-这些证据证明当前本机构建和夹具路径符合验收合同，不代表任意时刻的现场 GPU 容量。
+## 已完成现场验收
+
+- 已备份实时数据库到 `serverpilot-before-0022-workspace-20260813.sqlite3`，随后把规范 state 从 `20260812_0021` 迁移到 `20260813_0022`。`PRAGMA integrity_check` 为 `ok`；迁移前已有的两条 `workload_bindings` 外键异常没有增加；endpoint、GPU、request、lease、lease resource 与 workload binding 的既有记录均保留。
+- 已安装当前本地 MCP/daemon 并重启。daemon 为 `live=true`、`ready=true`；全新 stdio 实际发现严格只有 `gpu_status`、`gpu_apply`、`gpu_release`。
+- 四个 endpoint 的 `workspace_path` 均为 `/media/datasets/OminiEWM_Data/tmp/ljp`。181 和 203 的 helper 固定入口及模块位于该工作区；实际 worker 的 cwd 与 Python 命令也位于该工作区。调试阶段的 `/root/.local/...` 与 `/usr/local/bin/serverpilot-keepalive` 副本已经移除。
+- 181 的两张 GPU 与 203 的四张 GPU 均完成真实逐卡占卡。状态为 `ACTIVE`、公开可用，中文显示“可用 · 空闲占卡”。
+- 181 实际申请只停止选中 GPU 的 helper，另一张继续占卡；释放后同一 GPU 在下一次成功采集中恢复，终态 2/2 `ACTIVE`。
+- 203 实际申请只停止选中 GPU 的 helper，另外三张继续占卡；释放后先准确显示“可用 · 占卡异常：未检测到占卡程序”，下一次成功采集恢复，终态 4/4 `ACTIVE`。
+- 全新 Codex task 的宿主实际工具清单严格只有 `gpu_status`、`gpu_apply`、`gpu_release`；`gpu_status(include_busy=false)` 实际返回 14 张 GPU、统一 `workspace_path` 和简短中文状态，没有 bind、renew 或 coordination 工具。
+- 通过根目录原生 APP 实际点击完成了申请表填写、选择 203、申请成功、查看任务、释放确认和释放。申请结果返回 `/media/datasets/OminiEWM_Data/tmp/ljp`、精确 GPU UUID 与 `cuda_visible_devices`；选中卡 helper 退出，另外三卡保持占卡。
+- 在申请到的 GPU 上从 Storyboard 正式入口执行了 Bernini R-1 真实项目：真实 checkpoint、300×3584 external feature 和 renderer 均完成，输出为 H.264 832×480、81 帧、16fps、5.0625 秒；运行现场达到 45,226 MiB、100% GPU 利用率和 334W。
+- 首次真实运行发现普通 lease 的进程没有自动归属；修复后，同一正式项目无需额外 bind 工具即可由既有采集直接变为 `ACTIVE / RUNNING_MANAGED / workloads 非空`。只有现有普通 lease 的每张目标 GPU 都观测到新鲜进程时才建立既有 binding；无 lease 的进程仍是未托管。
+- 原生 APP 的实际可见“使用情况”页已接通已有改派能力。现场把同一 lease 从 203 GPU 0 改派到正在占卡的 GPU 1：目标 helper 逐卡退出，旧 GPU 0 下一采集周期恢复占卡；随后按新 `cuda_visible_devices` 重启同一 Bernini 正式项目并完成。
+- 改派后的真实运行又发现 `ACTIVE` 且 binding 已清空的 lease 不会重新归属；最小修复后，同一真实 PID 在下一采集周期变为 `RUNNING_MANAGED`，未新增 MCP 工具、状态机、重试或摘要。
+- 使用本机浏览器实际点击 Web“申请 GPU”，填写项目、任务和 203 服务器并提交，随后在 Web 页面勾选确认并点击“归还资源”。真实 lease 创建、释放和下一采集周期恢复占卡均完成，不再以 REST 测试代替按钮验收。
+- 两段真实项目临时 request、receipt 和视频在核验后已精确清理；四个 launcher/workload PID 均不存在。最终为 14 available、0 busy、0 workload、6 verified keepalive、0 attention，203 为 4/4 `ACTIVE`。
+- 根目录 `ServerPilot.app` 已重新构建、standalone 验证通过并实际操作；仓库只有这一份 `ServerPilot*.app`。
 
 ## 尚未完成的验证
 
-当前机器只有 CommandLineTools，没有完整 Xcode / XCTest。因此以下项目没有宣称通过：
+当前机器没有下载 XCTest，因此没有运行 Swift 单元测试或 XCUITest；这不再阻塞核心功能验收。原生 APP 已通过实际构建、standalone 校验和真实按钮交互。尚未完成的桌面辅助体验检查只剩 VoiceOver、键盘完整焦点顺序、缩放重排、色彩对比度测量与 Reduce Motion；不能仅凭截图宣称这些辅助功能完全合规。
 
-1. 8 项 XCUITest 的真实执行。
-2. VoiceOver 自动化。
-3. 高对比度和 Reduce Motion 的行为级验证。
-4. error ScrollView、详情与确认框的完整 XCUITest 证据。
-5. 本次逐 GPU 占卡详情中的健康信息与启动中卡不计作任务的 XCUITest / 详情截图。
+以下运行环境能力仍未验证：
 
-这些是明确的环境补验，不应写成已有结果。提供完整 Xcode 后可直接补跑，不改变当前资源合同。
-
-以下运行环境能力也仍需单独授权和现场证据：
-
-- A800 占卡 helper 的实际显存、利用率、停止响应与主任务无干扰对照。
+- 222 保留禁用占卡策略；验收期间曾出现一次 SSH 采集超时，随后恢复在线。215 没有 GPU 且观测不完整。本轮没有为它们伪造成功状态。
 - 完整工作日 shadow、2 小时内存 soak 和 24 小时数据库增长观察。
 - 非 loopback 部署所需的 TLS 与访问控制。
 - 非 Codex 客户端和外部调度器的现场联调。

@@ -307,7 +307,7 @@ def test_resource_plan_evaluation_uses_marginal_threshold_and_actuals(service, a
     assert snapshot["resource_run_actuals"][0]["id"] == actual["actual"]["id"]
 
 
-def test_snapshot_bounds_resource_history_and_keeps_stable_usage_revision(service, admin) -> None:
+def test_snapshot_bounds_resource_history_and_uses_plain_revision(service, admin) -> None:
     now = datetime.now(UTC)
     with service.database.session() as session:
         for index in range(RESOURCE_HISTORY_ROWS := 55):
@@ -341,7 +341,7 @@ def test_snapshot_bounds_resource_history_and_keeps_stable_usage_revision(servic
 
     assert RESOURCE_HISTORY_ROWS > 50
     assert len(first["resource_run_actuals"]) == 50
-    assert first["resource_usage_revision"] == second["resource_usage_revision"]
+    assert first["resource_usage_revision"] != second["resource_usage_revision"]
     assert second["resource_usage_revision"] != third["resource_usage_revision"]
 
 
@@ -418,6 +418,7 @@ def test_snapshot_resource_projection_uses_bounded_query_count(service, admin) -
                 host=f"192.0.2.{index + 1}",
                 port=22,
                 ssh_user="gpu",
+                workspace_path=f"/srv/scale-{index}",
             ),
             idempotency_key=f"scale-endpoint-{index}",
         )

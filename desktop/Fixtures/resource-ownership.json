@@ -19,6 +19,7 @@
           "host": "10.20.0.11",
           "port": 22,
           "ssh_user": "compute",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "enabled": true,
           "lifecycle_state": "active",
           "labels": {
@@ -42,6 +43,7 @@
           "host": "10.20.0.21",
           "port": 2222,
           "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
           "enabled": true,
           "lifecycle_state": "active",
           "labels": {
@@ -407,8 +409,7 @@
           "actual_duration_seconds": 1920,
           "created_at": "2026-08-06T07:45:00Z"
         }
-      ],
-      "retired_endpoints": []
+      ]
     }
   }
 }

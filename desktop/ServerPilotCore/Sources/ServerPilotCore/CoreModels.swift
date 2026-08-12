@@ -23,12 +23,8 @@ public struct ServiceInfo: Equatable, Sendable {
     public static let fixture = ServiceInfo(
         schemaVersion: "v1",
         version: "fixture",
-        capabilities: ["instant_claims", "endpoint_update", "endpoint_retirement", "endpoint_keepalive", "endpoint_conflict_cleanup", "collector_settings"]
+        capabilities: ["instant_claims", "endpoint_update", "endpoint_keepalive", "endpoint_conflict_cleanup", "collector_settings"]
     )
-
-    public var supportsEndpointDeletion: Bool {
-        capabilities.contains("endpoint_deletion") || capabilities.contains("server_deletion")
-    }
 
     public var supportsEndpointUpdate: Bool {
         supports("endpoint_update")
@@ -36,10 +32,6 @@ public struct ServiceInfo: Equatable, Sendable {
 
     public var supportsEndpointPauseResume: Bool {
         supports("endpoint_pause_resume")
-    }
-
-    public var supportsEndpointRetirement: Bool {
-        supports("endpoint_retirement")
     }
 
     public var supportsEndpointTelemetryHistory: Bool {
@@ -280,7 +272,6 @@ public struct ResourceProviderRecord: Identifiable, Equatable, Sendable {
         case "CONFLICT": return "归属不一致"
         case "DISABLED": return "已停用"
         case "DRAINING": return "不可分配"
-        case "RETIRED": return "已退役"
         default: return state
         }
     }
@@ -290,7 +281,7 @@ public struct ResourceProviderRecord: Identifiable, Equatable, Sendable {
             return "外部系统尚未确认，因此暂不计入可用资源。"
         }
         if !enabled { return "此资源已停用，暂时不能申请。" }
-        if ["STALE", "ERROR", "CONFLICT", "DISABLED", "DRAINING", "RETIRED"].contains(state) {
+        if ["STALE", "ERROR", "CONFLICT", "DISABLED", "DRAINING"].contains(state) {
             return "资源暂不可用。"
         }
         return nil
@@ -418,68 +409,54 @@ public struct EndpointKeepaliveSummary: Equatable, Sendable {
     public let policy: String
     public let state: String
     public let activeGPUCount: Int
-    public let startingGPUCount: Int
     public let errorGPUCount: Int
-    public let legacyGPUCount: Int
     public let eligibleIdleGPUCount: Int
     public let reasons: [String]
     public let message: String?
 
-    public init(raw: [String: Any], fallbackConfigured: Bool) {
+    public init?(raw: [String: Any], fallbackConfigured: Bool) {
         configured = raw.bool("configured", default: fallbackConfigured)
         let suppliedState = (raw.string("state") ?? "OFF").uppercased()
-        state = ["OFF", "IDLE", "STARTING", "PARTIAL", "ACTIVE", "ERROR", "LEGACY_STOP_REQUIRED"].contains(suppliedState)
-            ? suppliedState
-            : "ERROR"
-        let suppliedPolicy = (raw.string("policy") ?? "").lowercased()
-        // Snapshots from the whole-endpoint implementation did not carry a
-        // policy. Preserve their visible active state while newer snapshots
-        // always use one of these two explicit values.
-        policy = ["disabled", "idle_keepalive"].contains(suppliedPolicy)
-            ? suppliedPolicy
-            : (["IDLE", "ACTIVE", "STARTING", "PARTIAL", "ERROR", "LEGACY_STOP_REQUIRED"].contains(state) ? "idle_keepalive" : "disabled")
+        guard ["OFF", "ACTIVE", "ERROR"].contains(suppliedState) else { return nil }
+        state = suppliedState
+        let suppliedPolicy = (
+            raw.string("policy") ?? (state == "OFF" ? "disabled" : "idle_keepalive")
+        ).lowercased()
+        guard ["disabled", "idle_keepalive"].contains(suppliedPolicy) else { return nil }
+        policy = suppliedPolicy
         activeGPUCount = max(0, raw.int("active_gpu_count"))
-        startingGPUCount = max(0, raw.int("starting_gpu_count"))
         errorGPUCount = max(0, raw.int("error_gpu_count"))
-        legacyGPUCount = max(0, raw.int("legacy_gpu_count"))
         eligibleIdleGPUCount = max(0, raw.int("eligible_idle_gpu_count"))
         reasons = (raw["reasons"] as? [String] ?? []).filter { !$0.isEmpty }
             + (raw["reasons"] as? [[String: Any]] ?? []).compactMap { $0.string("reason") }
-        if state == "ERROR", suppliedState != "ERROR" {
-            message = "服务返回了无法识别的保活状态。"
-        } else {
-            message = raw.string("message") ?? reasons.first
-        }
+        message = raw.string("message") ?? reasons.first
     }
 
     public var label: String {
         guard configured else { return "未配置" }
-        if legacyGPUCount > 0 || state == "LEGACY_STOP_REQUIRED" { return "需先停止旧版占卡" }
-        if policy == "disabled" { return state == "OFF" ? "已关闭" : "关闭中" }
+        if policy == "disabled" { return "已关闭" }
         if errorGPUCount > 0 || state == "ERROR" { return "异常" }
-        if startingGPUCount > 0 || ["STARTING", "PARTIAL"].contains(state) { return "启动中" }
         return "已开启"
     }
 
     public var isEnabled: Bool { policy == "idle_keepalive" }
     public var isActive: Bool { activeGPUCount > 0 || state == "ACTIVE" }
-    public var isTransitioning: Bool { startingGPUCount > 0 || ["STARTING", "PARTIAL"].contains(state) }
+    public var isTransitioning: Bool { false }
     public var hasResidualLease: Bool {
-        activeGPUCount > 0 || startingGPUCount > 0 || errorGPUCount > 0 || legacyGPUCount > 0
+        activeGPUCount > 0 || errorGPUCount > 0
     }
 
     public func coverageSummary(totalGPUCount: Int, taskGPUCount: Int) -> String {
+        guard totalGPUCount > 0 else { return "无 GPU" }
         guard configured else { return "未配置空闲占卡" }
-        if legacyGPUCount > 0 { return "需先停止旧版占卡" }
         guard isEnabled else {
-            return activeGPUCount > 0 ? "关闭中 · \(activeGPUCount) 卡仍占卡" : "已关闭"
+            return "已关闭"
         }
         var details: [String] = ["\(min(activeGPUCount, max(totalGPUCount, 0)))/\(totalGPUCount) 占卡"]
         if taskGPUCount > 0 { details.append("\(taskGPUCount) 卡任务中") }
-        if startingGPUCount > 0 { details.append("\(startingGPUCount) 卡启动中") }
         if errorGPUCount > 0 { details.append("\(errorGPUCount) 卡异常") }
-        if activeGPUCount == 0, taskGPUCount == 0, eligibleIdleGPUCount == 0, startingGPUCount == 0 {
-            details = ["等待符合条件的空闲 GPU"]
+        if activeGPUCount == 0, taskGPUCount == 0, eligibleIdleGPUCount == 0 {
+            details = ["等待空闲 GPU"]
         }
         return "已开启 · " + details.joined(separator: "，")
     }
@@ -491,33 +468,17 @@ public struct GPUKeepaliveStatus: Equatable, Sendable {
     public let state: String
     public let leaseID: String?
     public let reason: String?
-    public let healthState: String?
-    public let lastVerifiedAt: String?
-    public let vramPercent: Int?
-    public let rollingUtilizationPercent: Int?
 
-    public init(raw: [String: Any], fallbackConfigured: Bool, fallbackState: String) {
+    public init?(raw: [String: Any], fallbackConfigured: Bool, fallbackState: String) {
         configured = raw.bool("configured", default: fallbackConfigured)
         let suppliedPolicy = (raw.string("policy") ?? "disabled").lowercased()
-        policy = ["disabled", "idle_keepalive"].contains(suppliedPolicy) ? suppliedPolicy : "disabled"
+        guard ["disabled", "idle_keepalive"].contains(suppliedPolicy) else { return nil }
+        policy = suppliedPolicy
         let suppliedState = (raw.string("state") ?? fallbackState).uppercased()
-        state = ["OFF", "STARTING", "ACTIVE", "ERROR", "LEGACY_STOP_REQUIRED"].contains(suppliedState)
-            ? suppliedState
-            : "ERROR"
+        guard ["OFF", "ACTIVE", "ERROR"].contains(suppliedState) else { return nil }
+        state = suppliedState
         leaseID = raw.string("lease_id")
-        let health = raw["health"] as? [String: Any] ?? [:]
-        reason = raw.string("reason") ?? raw.string("message") ?? health.string("reason")
-        healthState = health.string("state")?.uppercased()
-        lastVerifiedAt = raw.string("last_verified_at") ?? health.string("last_verified_at")
-        vramPercent = raw.optionalInt("vram_percent")
-            ?? raw.optionalInt("vram_usage_pct")
-            ?? health.optionalInt("vram_percent")
-            ?? health.optionalInt("vram_usage_pct")
-            ?? health.optionalDouble("memory_fraction").map { Int(($0 * 100).rounded()) }
-        rollingUtilizationPercent = raw.optionalInt("rolling_utilization_pct")
-            ?? raw.optionalInt("rolling_5m_utilization_pct")
-            ?? health.optionalInt("rolling_utilization_pct")
-            ?? health.optionalInt("rolling_5m_utilization_pct")
+        reason = raw.string("reason") ?? raw.string("message")
     }
 
     public var isActive: Bool { state == "ACTIVE" }
@@ -525,32 +486,11 @@ public struct GPUKeepaliveStatus: Equatable, Sendable {
     public var presentationLabel: String {
         switch state {
         case "ACTIVE": return "空闲占卡"
-        case "STARTING": return "占卡启动中"
         case "ERROR": return "占卡异常"
-        case "LEGACY_STOP_REQUIRED": return "需先停止旧版占卡"
         default: return "未占卡"
         }
     }
 
-    public var healthDetail: String? {
-        var details: [String] = []
-        if healthState != nil { details.append(healthStateLabel) }
-        if let vramPercent { details.append("显存 \(vramPercent)%") }
-        if let rollingUtilizationPercent { details.append("5 分钟利用 \(rollingUtilizationPercent)%") }
-        if let lastVerifiedAt { details.append("已验证 \(lastVerifiedAt)") }
-        if let reason { details.append(reason) }
-        return details.isEmpty ? nil : details.joined(separator: " · ")
-    }
-
-    private var healthStateLabel: String {
-        switch healthState {
-        case "HEALTHY": return "占卡健康"
-        case "STARTING": return "启动宽限期"
-        case "DEGRADED": return "占卡未达标"
-        case "ERROR": return "占卡异常"
-        default: return healthState ?? ""
-        }
-    }
 }
 
 public struct EndpointRecord: Identifiable, Equatable, Sendable {
@@ -559,6 +499,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
     public let port: Int
     public let sshUser: String
     public let sshAlias: String?
+    public let workspacePath: String?
     public let observationProfile: String
     public let keepaliveAdapterID: String?
     public let keepalive: EndpointKeepaliveSummary
@@ -582,12 +523,14 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         self.port = raw.int("port", default: 22)
         self.sshUser = sshUser
         self.sshAlias = raw.string("ssh_alias")
+        self.workspacePath = raw.string("workspace_path")
         self.observationProfile = raw.string("observation_profile") ?? "linux-nvidia"
         self.keepaliveAdapterID = raw.string("keepalive_adapter_id")
-        self.keepalive = EndpointKeepaliveSummary(
+        guard let keepalive = EndpointKeepaliveSummary(
             raw: raw["keepalive"] as? [String: Any] ?? [:],
             fallbackConfigured: keepaliveAdapterID != nil
-        )
+        ) else { return nil }
+        self.keepalive = keepalive
         self.enabled = raw.bool("enabled", default: true)
         self.lifecycleState = raw.string("lifecycle_state")?.uppercased()
         let monitor = raw["monitor"] as? [String: Any] ?? [:]
@@ -611,10 +554,6 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         sshAlias ?? "\(sshUser)@\(host):\(port)"
     }
 
-    public var isRetired: Bool {
-        lifecycleState == "RETIRED" || monitorStatus == "RETIRED"
-    }
-
     public var monitorLabel: String {
         switch monitorStatus {
         case "ONLINE": return "在线"
@@ -623,7 +562,6 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         case "ERROR": return "连接失败"
         case "DISABLED": return "已停用"
         case "DRAINING": return "已暂停"
-        case "RETIRED": return "已退役"
         default: return monitorStatus
         }
     }
@@ -662,9 +600,6 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         }
         if lifecycleState == "DRAINING" || monitorStatus == "DRAINING" {
             return "这台服务器已暂停接收新任务，正在排空；不会停止远端任务。"
-        }
-        if lifecycleState == "RETIRED" || monitorStatus == "RETIRED" {
-            return "这台服务器已退役，仅保留历史状态。"
         }
         return nil
     }
@@ -737,11 +672,12 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
         self.leaseID = lease.string("id")
         self.owner = lease.string("actor_id")
         self.taskReference = lease.string("task_ref")
-        self.keepalive = GPUKeepaliveStatus(
+        guard let keepalive = GPUKeepaliveStatus(
             raw: raw["keepalive"] as? [String: Any] ?? [:],
             fallbackConfigured: false,
             fallbackState: self.state == "KEEPALIVE" ? "ACTIVE" : "OFF"
-        )
+        ) else { return nil }
+        self.keepalive = keepalive
     }
 
     public var memoryFraction: Double {
@@ -749,18 +685,22 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
         return min(max(Double(memoryUsedMiB) / Double(totalVRAMMiB), 0), 1)
     }
 
-    /// A held per-GPU keepalive lease is an internal startup transition, not a
-    /// user task. Keeping this derivation in Core prevents every SwiftUI view
-    /// from rediscovering that distinction from labels or row ordering.
     public var isTaskOccupancy: Bool {
+        if keepalive.leaseID != nil { return false }
         switch state {
         case "HELD":
-            return keepalive.state != "STARTING"
+            return true
         case "LEASED_IDLE", "RUNNING_MANAGED", "BUSY_UNMANAGED", "ORPHANED_BUSY":
             return true
         default:
             return false
         }
+    }
+
+    public var isPubliclyAvailable: Bool {
+        state == "AVAILABLE"
+            || state == "KEEPALIVE"
+            || (keepalive.state == "ERROR" && keepalive.reason == "未检测到占卡程序")
     }
 
     public var memoryLabel: String {
@@ -779,14 +719,12 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
 }
 
 public struct BrokerStateHistory: Equatable, Sendable {
-    public let retiredEndpoints: [EndpointRecord]
     public let resourcePlanEvaluations: [ResourcePlanEvaluationRecord]
     public let resourceRunActuals: [ResourceRunActualRecord]
 
     public static let empty = BrokerStateHistory(raw: [:])
 
     public init(raw: [String: Any]) {
-        retiredEndpoints = (raw["retired_endpoints"] as? [[String: Any]] ?? []).compactMap(EndpointRecord.init)
         resourcePlanEvaluations = (raw["resource_plan_evaluations"] as? [[String: Any]] ?? [])
             .compactMap(ResourcePlanEvaluationRecord.init)
         resourceRunActuals = (raw["resource_run_actuals"] as? [[String: Any]] ?? [])
@@ -987,7 +925,7 @@ public struct BrokerSnapshot: Equatable, Sendable {
     )
 
     public var operationalEndpoints: [EndpointRecord] {
-        endpoints.filter { !$0.isRetired }
+        endpoints
     }
 
     public var operationalGPUs: [GPURecord] {
@@ -1023,21 +961,16 @@ public struct BrokerSnapshot: Equatable, Sendable {
         summary = ResourceSummary(raw: payload["summary"] as? [String: Any] ?? [:])
         endpoints = (payload["endpoints"] as? [[String: Any]] ?? []).compactMap(EndpointRecord.init)
         gpus = (payload["gpus"] as? [[String: Any]] ?? []).compactMap(GPURecord.init)
-        let operationalEndpointIDs = Set(endpoints.filter { !$0.isRetired }.map(\.id))
+        let operationalEndpointIDs = Set(endpoints.map(\.id))
         let endpointAttention = endpoints.filter {
-            !$0.isRetired && ["ERROR", "STALE", "DRAINING"].contains($0.monitorStatus)
+            ["ERROR", "STALE", "DRAINING"].contains($0.monitorStatus)
         }.count
         let gpuAttentionStates = Set(["BUSY_UNMANAGED", "UNKNOWN_RECOVERING", "UNKNOWN_STALE", "UNHEALTHY", "CONFLICT", "ORPHANED_BUSY", "DRAINING"])
         let gpuAttention = gpus.filter {
             operationalEndpointIDs.contains($0.endpointID) && gpuAttentionStates.contains($0.state)
         }.count
         summary.attentionResources = max(summary.attentionResources, endpointAttention + gpuAttention)
-        // Keepalive is an internal endpoint control record, not a user workload.
-        // The service redacts it from snapshots; this is a compatibility guard for
-        // an older or partially upgraded local service.
-        leases = (payload["leases"] as? [[String: Any]] ?? [])
-            .compactMap(LeaseRecord.init)
-            .filter { !$0.isInternalKeepalive }
+        leases = (payload["leases"] as? [[String: Any]] ?? []).compactMap(LeaseRecord.init)
         requests = (payload["requests"] as? [[String: Any]] ?? []).compactMap(AllocationRequestRecord.init)
         reservations = (payload["reservations"] as? [[String: Any]] ?? []).compactMap(ReservationRecord.init)
         resourceProviders = (payload["resource_providers"] as? [[String: Any]] ?? []).compactMap(ResourceProviderRecord.init)
@@ -1148,7 +1081,7 @@ public struct BrokerSnapshot: Equatable, Sendable {
             let endpointGPUs = gpus(for: endpoint)
             guard !endpointGPUs.isEmpty else { return nil }
             let availableGPUs = endpoint.monitorStatus == "ONLINE"
-                ? endpointGPUs.filter { $0.state == "AVAILABLE" }.count
+                ? endpointGPUs.filter(\.isPubliclyAvailable).count
                 : 0
             return ResourceProviderRecord(
                 id: "direct-gpu:\(endpoint.id)",
@@ -1457,7 +1390,6 @@ public struct LeaseRecord: Identifiable, Equatable, Sendable {
         }
     }
 
-    public var isInternalKeepalive: Bool { kind == "keepalive" }
 }
 
 public struct AllocationRequestRecord: Identifiable, Equatable, Sendable {
@@ -1552,22 +1484,26 @@ public struct EndpointDraft: Equatable, Sendable {
     public let host: String
     public let port: Int
     public let sshUser: String
+    public let workspacePath: String
     public let observationProfile: EndpointObservationProfile
 
     public init(
         host: String,
         port: Int,
         sshUser: String,
+        workspacePath: String,
         observationProfile: EndpointObservationProfile,
         suppliedID: String
     ) throws {
         let cleanedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedUser = sshUser.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedWorkspacePath = workspacePath.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanedID = suppliedID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard
             !cleanedHost.isEmpty,
             (1...65535).contains(port),
             Self.isValidUser(cleanedUser),
+            Self.isValidWorkspacePath(cleanedWorkspacePath),
             Self.isValidID(cleanedID.isEmpty ? Self.defaultID(host: cleanedHost, port: port) : cleanedID)
         else {
             throw EndpointDraftError.invalidEndpointFields
@@ -1576,6 +1512,7 @@ public struct EndpointDraft: Equatable, Sendable {
         self.host = cleanedHost
         self.port = port
         self.sshUser = cleanedUser
+        self.workspacePath = cleanedWorkspacePath
         self.observationProfile = observationProfile
     }
 
@@ -1605,13 +1542,17 @@ public struct EndpointDraft: Equatable, Sendable {
             CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-" )).contains($0)
         }
     }
+
+    private static func isValidWorkspacePath(_ value: String) -> Bool {
+        value.hasPrefix("/") && !value.contains("\0") && !value.contains("\n") && !value.contains("\r")
+    }
 }
 
 public enum EndpointDraftError: LocalizedError, Equatable, Sendable {
     case invalidEndpointFields
 
     public var errorDescription: String? {
-        "请填写有效的服务器地址、端口、SSH 用户和服务器标识。"
+        "请填写有效的服务器地址、端口、SSH 用户、绝对远端工作区路径和服务器标识。"
     }
 }
 
@@ -1648,17 +1589,31 @@ public enum EndpointObservationProfile: String, CaseIterable, Equatable, Sendabl
 
 public struct EndpointUpdateDraft: Equatable, Sendable {
     public let sshUser: String
+    public let workspacePath: String
     public let observationProfile: EndpointObservationProfile
 
     public init(endpoint: EndpointRecord) {
         sshUser = endpoint.sshUser
+        workspacePath = endpoint.workspacePath ?? ""
         observationProfile = EndpointObservationProfile(rawValueOrDefault: endpoint.observationProfile)
     }
 
-    public init(sshUser: String, observationProfile: EndpointObservationProfile) throws {
+    public init(
+        sshUser: String,
+        workspacePath: String,
+        observationProfile: EndpointObservationProfile
+    ) throws {
         let cleanedUser = sshUser.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanedUser.isEmpty else { throw EndpointDraftError.invalidEndpointFields }
+        let cleanedWorkspacePath = workspacePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            !cleanedUser.isEmpty,
+            cleanedWorkspacePath.hasPrefix("/"),
+            !cleanedWorkspacePath.contains("\0"),
+            !cleanedWorkspacePath.contains("\n"),
+            !cleanedWorkspacePath.contains("\r")
+        else { throw EndpointDraftError.invalidEndpointFields }
         self.sshUser = cleanedUser
+        self.workspacePath = cleanedWorkspacePath
         self.observationProfile = observationProfile
     }
 }

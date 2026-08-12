@@ -30,10 +30,10 @@ ServerPilot 把散落在不同服务器上的 GPU 汇总为一个资源池：多
 
 | 核心价值 | ServerPilot 提供什么 |
 | --- | --- |
-| 🧩 **统一零散 GPU** | 汇总多台服务器和不同型号 GPU，以同一份状态形成可协作使用的资源池。 |
-| 🤖 **Agent 协作调度** | 多个 Agent 按项目与任务申请、使用和归还 GPU；成功立即获得明确的资源，容量不足返回 `no_capacity`。 |
-| 👁️ **人类实时监控** | 在紧凑表格中查看服务器、项目 / 任务、GPU 型号与资源压力；打开详情即可查看每张 GPU 和历史趋势。 |
-| 🔎 **状态与归属追溯** | 记录分配、任务绑定与释放，让人和 Agent 随时确认 GPU 正在为哪个项目、哪个任务工作。 |
+| 📡 **信息采集** | 从已登记服务器读取 CPU、内存、GPU、进程和历史趋势，形成一份当前状态。 |
+| 👁️ **人类实时监控** | 在原生 App 查看服务器与任务；可把任务改到人选定的 GPU，占卡中的目标会先自动让卡。 |
+| 🤖 **Agent 操作** | Agent 申请 GPU、进入返回的远端 `workspace_path`、使用 `CUDA_VISIBLE_DEVICES`，并在结束时归还。 |
+| 🟢 **空闲 GPU 占卡** | 每轮采集后逐卡自动恢复占卡；占卡 GPU 仍算可用，Agent 申请或人改派时只停止对应卡，刷新确认后交付。 |
 
 ## 🚀 快速开始
 
@@ -60,8 +60,8 @@ open "./ServerPilot.app"
 
 浅色原生 App 只保留三个一级页面：
 
-- **服务器**：紧凑资源表、筛选与排序；点击服务器查看 GPU 和 1h / 6h / 24h 历史。
-- **使用情况**：按项目查看当前任务与已分配 GPU。
+- **服务器**：添加时同时登记绝对远端工作区路径；资源表和详情清楚显示该路径、GPU 和 1h / 6h / 24h 历史。
+- **使用情况**：按项目查看当前任务与已分配 GPU，并可由人按原卡数改到指定 GPU。
 - **设置**：本机服务地址、数据采集间隔和版本。
 
 服务器按设置的 **5 / 10 / 30 秒**间隔采集；刷新读取控制面已经汇总的最新状态。
@@ -77,11 +77,21 @@ codex mcp add serverpilot \
 python3 scripts/install_agent_policy.py codex --install
 ```
 
-Agent 可直接调用 `gpu_apply` 即时申请：成功获得明确的 `lease.resources[]`，容量不足返回 `no_capacity`；需要诊断时再调用 `gpu_status`。Codex task URI 会自动登记，供 Agent 发现协作对象；它只是宿主侧交接引用，App 不实现聊天或消息功能。
+随后在 `~/.codex/config.toml` 的 `[mcp_servers.serverpilot]` 下加入：
+
+```toml
+env_vars = ["CODEX_THREAD_ID"]
+```
+
+Codex 本身已有当前 task ID；这行只把它转发给 MCP。ServerPilot 据此登记 `codex://threads/<task-id>`，缺失时不会猜测或使用共享身份。
+
+默认 MCP 只有三个工具：`gpu_status` 返回“哪台服务器的哪张 GPU 可用”、该服务器的 `workspace_path` 及简短中文状态，`gpu_apply` 返回 `lease_id` 和选中的 `gpus[]`（每项含 `workspace_path`），`gpu_release` 归还租约。Agent 应先进入返回路径，再按 `cuda_visible_devices` 启动自己的 workload。需要查看占用者或连接失败卡时用 `gpu_status(include_busy=true)`，忙卡额外返回 `task` 和 `agent_url`。例行申请不需要绑定、续租、协调工具或 `idempotency_key`；租约持续到显式释放或在 App 中人工处理。
+
+当前已确认服务器共用的远端工作目录是 `/media/datasets/OminiEWM_Data/tmp/ljp`。它是 endpoint 元数据和操作指引，不会让 ServerPilot 自动创建/删除目录，也不授权启动项目 workload。密封占卡 helper 的固定入口是 `${workspace_path}/serverpilot-keepalive`；ServerPilot 以该 workspace 为工作目录并直接执行 `./serverpilot-keepalive --schema-version 2`，不从远端 `PATH` 查找，也不允许 caller 覆盖 helper 路径或参数。
 
 默认 `serverpilot-mcp` 只发布日常 GPU 工具；scheduler、兼容性资源、端点管理和低层 lease 工具需显式设置 `SERVERPILOT_MCP_PROFILE=advanced`。
 
-安装、申请、绑定、释放与协调规则见 [Agent / MCP 指南](docs/AGENT_MCP_zh.md)。
+安装、申请、释放与联系规则见 [Agent / MCP 指南](docs/AGENT_MCP_zh.md)。
 
 ## 📚 文档
 

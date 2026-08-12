@@ -106,7 +106,7 @@ final class FixtureModeUITests: XCTestCase {
         XCTAssertTrue(serverRow.waitForExistence(timeout: 5), "Keepalive fixture server must appear in the resource table")
         let rowValue = String(describing: serverRow.value)
         XCTAssertTrue(rowValue.contains("占卡"), "Keepalive must use the user-facing occupancy term")
-        XCTAssertTrue(rowValue.contains("0/2 可用"), "Keepalive GPUs must not be presented as allocatable")
+        XCTAssertTrue(rowValue.contains("2/2 可用"), "Idle occupancy GPUs remain publicly available")
         XCTAssertFalse(rowValue.contains("__serverpilot_system__"), "Internal system identity must not appear in the resource table")
 
         serverRow.click()
@@ -117,10 +117,10 @@ final class FixtureModeUITests: XCTestCase {
         XCTAssertEqual(action.label, "结束占卡", "Active occupancy must offer the plainly named end action")
 
         let operations = app.buttons["服务器操作"]
-        XCTAssertTrue(operations.exists, "Server settings and deletion must remain reachable from the detail sheet")
+        XCTAssertTrue(operations.exists, "Server settings must remain reachable from the detail sheet")
         operations.click()
         XCTAssertTrue(app.menuItems["编辑服务器"].waitForExistence(timeout: 2))
-        XCTAssertTrue(app.menuItems["删除服务器"].exists)
+        XCTAssertFalse(app.menuItems["删除服务器"].exists)
 
         relaunch(fixture: "keepalive-off", section: "server-pool")
         let inactiveServer = app.descendants(matching: .any).matching(

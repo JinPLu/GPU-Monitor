@@ -29,7 +29,7 @@
   <button class="summary-item" type="button" data-resource-filter="all" aria-pressed="true"><i class="ph ph-hard-drives" aria-hidden="true"></i><span>服务器</span><strong id="kpi-servers">{{ payload.summary.online_servers }} / {{ payload.summary.total_servers }}</strong><small>在线 / 总数</small></button>
   <button class="summary-item summary-primary" type="button" data-resource-filter="available" aria-pressed="false"><i class="ph ph-check" aria-hidden="true"></i><span>可用 GPU</span><strong><span id="kpi-available">{{ payload.summary.available_gpus }}</span><i> / </i><span id="kpi-total">{{ payload.summary.total_gpus }}</span></strong><small>空闲 / 总数</small></button>
   <button class="summary-item" type="button" data-resource-filter="busy" aria-pressed="false"><i class="ph ph-waveform" aria-hidden="true"></i><span>占用</span><strong id="kpi-busy">{{ payload.summary.busy_gpus }}</strong><small>有计算进程</small></button>
-  <button class="summary-item" type="button" data-resource-filter="claimed" aria-pressed="false"><i class="ph ph-user" aria-hidden="true"></i><span>已分配</span><strong id="kpi-claimed">{{ payload.summary.claimed_gpus }}</strong><small>项目或 Agent</small></button>
+  <button class="summary-item" type="button" data-resource-filter="claimed" aria-pressed="false"><i class="ph ph-user" aria-hidden="true"></i><span>任务分配</span><strong id="kpi-claimed">{{ payload.summary.claimed_gpus }}</strong><small>已分配给任务</small></button>
   <button class="summary-item summary-warning" type="button" data-resource-filter="attention" aria-pressed="false"><i class="ph ph-warning" aria-hidden="true"></i><span>需注意</span><strong id="kpi-abnormal">{{ payload.summary.abnormal_gpus }}</strong><small>异常或待确认</small></button>
 </section>
 
@@ -51,7 +51,7 @@
     </div>
     <div class="resource-list-head" role="row" aria-label="资源列表表头">
       <span>SSH 连接<small>直接复制日常登录命令</small></span>
-      <span>GPU 状态<small class="resource-status-legend"><span>总数</span><span>可分配</span><span>占用</span><span>已分配</span><span>异常</span></small></span>
+      <span>GPU 状态<small class="resource-status-legend"><span>总数</span><span>可分配</span><span>占用</span><span>任务分配</span><span>异常</span></small></span>
       <span>资源使用<small class="resource-metric-legend"><span>CPU</span><span>内存</span><span>显存</span><span>GPU 利用率</span></small></span>
       <span>操作</span>
     </div>
@@ -86,6 +86,7 @@
     <div id="ssh-error" class="inline-message error-message" role="alert" hidden></div>
     <form id="ssh-preview-form" class="stack">
       <label>SSH 命令（每行一台服务器）<textarea id="ssh-command" name="command" rows="4" required spellcheck="false" autocomplete="off" placeholder="ssh -p 22 user@gpu-host"></textarea></label>
+      <label>远端工作区路径<input id="ssh-workspace-path" name="workspace_path" required value="/media/datasets/OminiEWM_Data/tmp/ljp"></label>
       <label>归属项目<input id="ssh-project-id" name="owner_project_id" required placeholder="例如：storyboard"></label>
       <button id="paste-ssh-command" class="quiet-action" type="button" hidden>从系统剪贴板粘贴</button>
       <p id="ssh-clipboard-status" class="muted" role="status" hidden></p>
@@ -107,6 +108,7 @@
       <label>主机或 SSH 地址<input name="host" required placeholder="10.0.0.1 或 gpu-host"></label>
       <label>SSH 端口<input name="port" type="number" min="1" max="65535" value="22" required></label>
       <label>SSH 用户<input name="ssh_user" value="root" required></label>
+      <label>远端工作区路径<input name="workspace_path" required value="/media/datasets/OminiEWM_Data/tmp/ljp"></label>
       <label>归属项目<input name="owner_project_id" required placeholder="例如：storyboard"></label>
       <label>期望 GPU 数（可留空）<input name="expected_gpu_count" type="number" min="1" placeholder="自动发现"></label>
       <input type="hidden" name="labels" value="gpu"><input type="hidden" name="enabled" value="true">
@@ -119,7 +121,7 @@
 
 <dialog id="claim-dialog" class="modal-dialog">
   <div class="dialog-heading"><div><p class="eyebrow">记录为：{{ actor.id }}</p><h2>申请 GPU</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
-  <p class="muted">为项目和任务申请 GPU。资源不足时进入队列，使用结束后归还。</p>
+  <p class="muted">为项目和任务申请 GPU。资源不足时返回 no_capacity，本次不进入队列；未获得租约前请勿启动任务，使用结束后归还。</p>
   {% if payload.claimable_workload_profiles %}
   <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
     <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ format_constraints(profile.constraints) }}</option>{% endfor %}</select></label>

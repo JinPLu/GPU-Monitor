@@ -26,7 +26,6 @@ class Base(DeclarativeBase):
 
 LeaseKind = Literal["workload", "keepalive"]
 KeepalivePolicy = Literal["disabled", "idle_keepalive"]
-KeepaliveScope = Literal["gpu", "legacy_endpoint"]
 
 
 class Revision(Base):
@@ -67,6 +66,9 @@ class Endpoint(Base):
     port: Mapped[int] = mapped_column(Integer, nullable=False)
     ssh_user: Mapped[str] = mapped_column(String(64), nullable=False)
     ssh_alias: Mapped[str | None] = mapped_column(String(120))
+    # Remote project/work directory for humans and Agents.  This is metadata
+    # only; it never authorizes ServerPilot to launch a workload there.
+    workspace_path: Mapped[str | None] = mapped_column(String(2000))
     observation_profile: Mapped[str] = mapped_column(
         String(40), nullable=False, default="linux-nvidia"
     )
@@ -331,7 +333,6 @@ class SchedulerJob(Base):
     purpose: Mapped[str] = mapped_column(String(1000), nullable=False)
     approval_ref: Mapped[str | None] = mapped_column(String(500))
     request_json: Mapped[str] = mapped_column(Text, nullable=False)
-    script_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     script_body: Mapped[str | None] = mapped_column(Text)
     retain_submission_body: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     scheduler_job_id: Mapped[str | None] = mapped_column(String(128), index=True)
@@ -672,22 +673,6 @@ class ActorProject(Base):
     )
 
 
-class ApiToken(Base):
-    __tablename__ = "api_tokens"
-    __table_args__ = (UniqueConstraint("token_hash", name="uq_api_token_hash"),)
-
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    actor_id: Mapped[str] = mapped_column(
-        ForeignKey("actors.id", ondelete="CASCADE"), nullable=False, index=True
-    )
-    label: Mapped[str] = mapped_column(String(120), nullable=False)
-    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-
 class AllocationRequest(Base):
     __tablename__ = "allocation_requests"
     __table_args__ = (Index("ix_request_queue", "state", "created_at"),)
@@ -722,10 +707,6 @@ class Lease(Base):
     __table_args__ = (
         Index("ix_lease_state_expiry", "state", "expires_at"),
         CheckConstraint("kind IN ('workload', 'keepalive')", name="ck_lease_kind"),
-        CheckConstraint(
-            "keepalive_scope IS NULL OR keepalive_scope IN ('gpu', 'legacy_endpoint')",
-            name="ck_lease_keepalive_scope",
-        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -735,13 +716,9 @@ class Lease(Base):
     actor_id: Mapped[str] = mapped_column(ForeignKey("actors.id"), nullable=False, index=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     kind: Mapped[LeaseKind] = mapped_column(String(16), nullable=False, default="workload")
-    # ``legacy_endpoint`` identifies pre-per-GPU keepalive leases. They remain
-    # fail-closed and can only be stopped; they must never be reinterpreted as
-    # independent GPU leases merely because a later schema is installed.
-    keepalive_scope: Mapped[KeepaliveScope | None] = mapped_column(String(24))
     state: Mapped[str] = mapped_column(String(40), nullable=False, default="HELD")
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -852,8 +829,8 @@ class AuditEvent(Base):
     resource_type: Mapped[str] = mapped_column(String(80), nullable=False)
     resource_id: Mapped[str] = mapped_column(String(260), nullable=False)
     result: Mapped[str] = mapped_column(String(32), nullable=False)
-    before_hash: Mapped[str | None] = mapped_column(String(64))
-    after_hash: Mapped[str | None] = mapped_column(String(64))
+    before_json: Mapped[str | None] = mapped_column(Text)
+    after_json: Mapped[str | None] = mapped_column(Text)
     summary_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

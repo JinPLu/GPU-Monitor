@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 import re
@@ -22,31 +21,11 @@ TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
 RESOURCE_MARGINAL_MIN_SAVED_RATIO = 0.10
 RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
 
-MCP_INSTRUCTIONS = """ServerPilot is the allocation and freshness authority. Do not bypass it through SSH, SQLite,
-inventory, remote probes, or nvidia-smi.
-
-ROUTE BY INTENT
-- Routine GPU work: use the route below; do not construct a resource contract first.
-- Routine GPU: call gpu_apply directly. It supports optionally selecting a server and requests one GPU by default.
-  ServerPilot records routine project/task attribution and chooses the actual allocatable GPUs.
-- Inspect or diagnose: use gpu_status only when needed; its default response is compact. The legacy gpu_list read is
-  available only in the advanced profile.
-- Start/stop: a successful apply returns a held or active lease; it fails with no_capacity and creates no queue. Use only
-  lease.resources[], including cuda_visible_devices. After start, call gpu_bind_observed_workload (lease_id;
-  run_id is optional). Call gpu_release when the workload stops or fails to start.
-- Coordinate: use gpu_coordination when you need other agents or leases. A codex://threads/<uuid>
-  coordination_uri is an opaque handoff reference, not a URL to open.
-- External scheduler: set `SERVERPILOT_MCP_PROFILE=advanced`, then use scheduler tools. External Slurm clusters are
-  SchedulerTargets, not SSH endpoints. A Slurm PENDING job is not a bare-metal lease; access_required means ask the
-  user to connect the approved VPN.
-
-BOUNDARIES
-- ServerPilot never launches or stops workloads. Reuse the same idempotency_key when retrying a mutation.
-- Generic-resource, low-level lease/workload, profile, endpoint, and scheduler-profile operations are advanced
-  compatibility surfaces, not routine inputs. Endpoint administration and scheduler-job cancellation require
-  current-task authorization, a non-empty approval_ref, and a stable idempotency_key. Keepalive policy is per idle GPU.
-- On macOS this adapter ensures the shared loopback daemon before REST calls. If it or the service is unavailable,
-  report that state; do not fall back to a bypass."""
+MCP_INSTRUCTIONS = """常规 GPU 任务只使用三个工具：gpu_status 查看可用 GPU；gpu_apply 由 ServerPilot
+自动选卡，成功后先进入返回的 workspace_path，再使用 cuda_visible_devices；任务结束或启动失败时 gpu_release。需要联系占用者时
+调用 gpu_status(include_busy=true) 读取 task 和 agent_url。Codex 必须向 MCP 传入 CODEX_THREAD_ID；缺失时
+申请和释放会失败。空闲占卡仍算可用，申请时自动让位。无容量直接失败，不排队。不要自行指定 GPU，
+也不要绕过 ServerPilot。"""
 
 
 mcp = FastMCP(
@@ -67,14 +46,23 @@ def _client(actor_name: str | None = None) -> BrokerClient:
     return BrokerClient.from_env(actor=actor_name)
 
 
-def _routine_gpu_claim_identifiers(client: BrokerClient, idempotency_key: str) -> tuple[str, str]:
-    """Derive bounded, Agent-scoped attribution for the no-setup routine claim."""
+def _routine_client(*, require_identity: bool) -> BrokerClient:
+    identity = codex_coordination_identity()
+    if require_identity and identity is None:
+        raise ValueError("当前 Codex task 没有 CODEX_THREAD_ID，不能申请或释放 GPU")
+    ensure_broker_ready_for_mcp()
+    return BrokerClient.from_env(actor=identity[0] if identity is not None else "observer")
 
-    actor = getattr(client, "actor", "agent")
-    actor_text = actor if isinstance(actor, str) and actor else "agent"
-    project_digest = hashlib.sha256(actor_text.encode("utf-8")).hexdigest()[:24]
-    task_digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:24]
-    return f"agent-{project_digest}", f"gpu-apply-{task_digest}"
+
+def _routine_task(task: str | None) -> str:
+    if task is None:
+        return "Codex task"
+    value = task.strip()
+    if not value:
+        raise ValueError("提供 task 时不能为空")
+    if len(value) > 120:
+        raise ValueError("task 最长 120 个字符")
+    return value
 
 
 def _require_request_fields(request: dict[str, Any]) -> None:
@@ -142,9 +130,9 @@ def _require_resource_plan_fields(evaluation: dict[str, Any]) -> None:
 
 def _require_endpoint_admin_contract(approval_ref: str, idempotency_key: str) -> None:
     if not isinstance(approval_ref, str) or not approval_ref.strip():
-        raise ValueError("endpoint administration requires a non-empty current-task approval_ref")
+        raise ValueError("服务器管理需要当前任务明确授权，并提供非空 approval_ref")
     if not isinstance(idempotency_key, str) or not idempotency_key.strip():
-        raise ValueError("endpoint administration requires a caller-stable non-empty idempotency_key")
+        raise ValueError("服务器管理需要提供稳定且非空的 idempotency_key")
 
 
 def _bounded_seconds(value: float, *, name: str, minimum: float, maximum: float) -> float:
@@ -209,7 +197,13 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
             },
         )
         counts["total"] += 1
-        if gpu.get("state") == "AVAILABLE":
+        keepalive = gpu.get("keepalive")
+        reclaimable_error = (
+            isinstance(keepalive, dict)
+            and keepalive.get("state") == "ERROR"
+            and keepalive.get("reason") == "未检测到占卡程序"
+        )
+        if gpu.get("state") in {"AVAILABLE", "KEEPALIVE"} or reclaimable_error:
             counts["available"] += 1
         lease = gpu.get("lease")
         if isinstance(lease, dict):
@@ -240,8 +234,6 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
         lease = lease if isinstance(lease, dict) else {}
         keepalive = gpu.get("keepalive")
         keepalive = keepalive if isinstance(keepalive, dict) else {}
-        keepalive_health = keepalive.get("health")
-        keepalive_health = keepalive_health if isinstance(keepalive_health, dict) else {}
         compact_gpus.append(
             {
                 "id": gpu.get("id"),
@@ -264,7 +256,6 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
                 "keepalive": {
                     "state": keepalive.get("state", "OFF"),
                     "reason": keepalive.get("reason"),
-                    "health_state": keepalive_health.get("state"),
                 },
             }
         )
@@ -291,6 +282,7 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
         servers.append(
             {
                 "server_id": endpoint_id,
+                "workspace_path": endpoint.get("workspace_path"),
                 "monitor_status": monitor.get("status"),
                 "gpu_count": counts["total"],
                 "available_gpu_count": counts["available"],
@@ -309,8 +301,8 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
         "data_age_seconds": data.get("data_age_seconds"),
         "freshness_seconds": data.get("freshness_seconds"),
         "availability_semantics": (
-            "available_gpu_count excludes every occupied GPU. gpu_apply may reclaim only a verified "
-            "KEEPALIVE GPU after stop and fresh empty observation; HELD and CONFLICT remain unavailable."
+            "可用 GPU 包含空闲卡和已确认的逐卡空闲占卡。真正分配前，ServerPilot 会先停止选中卡的占卡程序，"
+            "刷新确认后再走普通申请；任务占用和冲突 GPU 不可用。"
         ),
         "servers": servers,
         "gpus": compact_gpus,
@@ -321,6 +313,73 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
         "server_time": payload.get("server_time"),
         "data": compact_data,
     }
+
+
+def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[str, Any]:
+    data = payload.get("data")
+    values = data.get("gpus", []) if isinstance(data, dict) else []
+    endpoints = data.get("endpoints", []) if isinstance(data, dict) else []
+    workspace_by_endpoint = {
+        endpoint.get("id"): endpoint.get("workspace_path")
+        for endpoint in endpoints
+        if isinstance(endpoint, dict) and endpoint.get("id")
+    }
+    gpus: list[dict[str, Any]] = []
+    for gpu in values:
+        if not isinstance(gpu, dict):
+            continue
+        available = gpu.get("publicly_available")
+        status = gpu.get("public_status")
+        if not isinstance(available, bool) or not isinstance(status, str) or not status:
+            raise ValueError("ServerPilot 返回的 GPU 公开状态无效")
+        lease = gpu.get("lease")
+        if not available and not include_busy:
+            continue
+        row: dict[str, Any] = {
+            "server_id": gpu.get("endpoint_id"),
+            "workspace_path": workspace_by_endpoint.get(gpu.get("endpoint_id")),
+            "gpu_id": gpu.get("gpu_uuid"),
+            "index": gpu.get("gpu_index"),
+            "name": gpu.get("name"),
+            "vram_mib": gpu.get("total_vram_mib"),
+            "status": status,
+        }
+        if include_busy:
+            row["available"] = available
+            if isinstance(lease, dict):
+                row["task"] = lease.get("task_ref") or "Codex task"
+                row["agent_url"] = lease.get("coordination_uri") or ""
+        gpus.append(row)
+    result: dict[str, Any] = {"gpus": gpus}
+    summary = data.get("summary") if isinstance(data, dict) else None
+    if isinstance(summary, dict) and summary.get("total_gpus") == 0:
+        result["message"] = "无 GPU"
+    return result
+
+
+def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
+    lease = payload.get("lease")
+    if not isinstance(lease, dict):
+        raise ValueError("ServerPilot 没有返回 GPU 租约")
+    rows: list[dict[str, Any]] = []
+    for resource in lease.get("resources", []):
+        if not isinstance(resource, dict):
+            continue
+        endpoint = resource.get("endpoint")
+        server_id = endpoint.get("id") if isinstance(endpoint, dict) else None
+        workspace_path = endpoint.get("workspace_path") if isinstance(endpoint, dict) else None
+        cuda_visible_devices = resource.get("cuda_visible_devices")
+        for gpu in resource.get("gpus", []):
+            if isinstance(gpu, dict):
+                rows.append(
+                    {
+                        "server_id": server_id,
+                        "workspace_path": workspace_path,
+                        "gpu_id": gpu.get("gpu_uuid"),
+                        "cuda_visible_devices": cuda_visible_devices,
+                    }
+                )
+    return {"lease_id": lease.get("id"), "gpus": rows}
 
 
 def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
@@ -377,6 +436,7 @@ def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
         capacity = capacity if isinstance(capacity, dict) else {}
         return {
             "server_id": server.get("server_id"),
+            "workspace_path": server.get("workspace_path"),
             "monitor_status": server.get("monitor_status"),
             "capacity": {
                 key: capacity.get(key)
@@ -484,31 +544,19 @@ def control_plane_state(
 
 
 @mcp.tool()
-def gpu_status(
-    compact: bool = True,
-    server_id: str | None = None,
-    state: str | None = None,
-    only_available: bool = False,
-) -> dict[str, Any]:
-    """Return the compact placement view; use control_plane_state for explicit full diagnostics."""
+def gpu_status(include_busy: bool = False) -> dict[str, Any]:
+    """列出可用 GPU；需要联系占用者时同时列出 task 和 agent_url。"""
 
-    params: dict[str, Any] = {"compact": compact, "only_available": only_available}
-    if server_id:
-        params["endpoint_id"] = server_id
-    if state:
-        params["state"] = state
-    payload = _client().snapshot(**params)
-    return _compact_gpu_status(payload) if compact else payload
+    payload = _routine_client(require_identity=False).snapshot(
+        compact=False,
+        only_available=not include_busy,
+    )
+    return _routine_gpu_status(payload, include_busy=include_busy)
 
 
 @mcp.tool()
 def gpu_coordination(compact: bool = True) -> dict[str, Any]:
-    """Return the compact coordination board for visible agents, leases, and servers.
-
-    The board identifies each lease owner and task, real process attribution,
-    per-server capacity, observed GPU use, queued demand, and factual signals
-    such as an idle lease or unbound compute process. It is read-only.
-    """
+    """返回只读协作面板，显示可见 Agent、工作任务租约和服务器容量。"""
 
     payload = _client().coordination()
     return _compact_coordination(payload) if compact else payload
@@ -601,8 +649,7 @@ def gpu_scheduler_submit_once(
 
     The request must include target_id, project_id, task_ref, purpose,
     approval_ref, duration_seconds, constraints, scheduler, and script_body.
-    ServerPilot stores the script digest by default; retain_submission_body must be
-    explicitly true to retain the exact body.
+    ServerPilot omits the submitted body unless retain_submission_body is explicitly true.
     """
 
     required = {
@@ -847,7 +894,7 @@ def gpu_activate_lease(lease_id: str, idempotency_key: str | None = None) -> dic
 
 @mcp.tool()
 def gpu_renew_lease(lease_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
-    """Heartbeat/renew the caller's held or active lease."""
+    """续期调用者持有的工作任务租约。"""
 
     return _client().post(
         f"/api/v1/leases/{lease_id}/renew", {}, idempotency_key=idempotency_key or secrets.token_hex(16)
@@ -888,12 +935,7 @@ def gpu_bind_observed_workload(
     idempotency_key: str | None = None,
     agent_name: str | None = None,
 ) -> dict[str, Any]:
-    """Record fresh observed processes for an already-started workload on the caller's lease.
-
-    The broker reads only its latest collector observations on the lease's GPUs;
-    it neither launches nor changes the remote workload. `run_id` is optional:
-    without it, the broker uses a stable identifier derived from the lease.
-    """
+    """把已启动任务的最新采集进程绑定到调用者租约；不会启动或修改远端任务。"""
 
     return _client(agent_name).post(
         f"/api/v1/leases/{lease_id}/bind-observed-workload",
@@ -1102,53 +1144,41 @@ def gpu_claim_profile(
 def gpu_apply(
     server_id: str | None = None,
     gpu_count: int = 1,
-    idempotency_key: str | None = None,
+    task: str | None = None,
 ) -> dict[str, Any]:
-    """Apply for one or more GPUs now; ServerPilot chooses the allocatable GPUs.
-
-    `server_id` is an optional server preference, never a GPU selector. On
-    success, use only the returned lease resources; `no_capacity` creates no queue
-    and does not authorize workload execution.
-    """
+    """立即申请 GPU；ServerPilot 自动选卡，无容量返回 no_capacity 且不排队。"""
 
     if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
-        raise ValueError("gpu_count must be a positive integer")
+        raise ValueError("gpu_count 必须是正整数")
     if server_id is not None:
         server_id = server_id.strip()
         if not server_id:
-            raise ValueError("server_id must not be empty when provided")
-    mutation_key = idempotency_key or secrets.token_hex(16)
-    client = _client()
-    project_id, task_ref = _routine_gpu_claim_identifiers(client, mutation_key)
+            raise ValueError("提供 server_id 时不能为空")
     constraints: dict[str, Any] = {"gpu_count": gpu_count, "placement": "pack"}
     if server_id is not None:
         constraints["endpoint_ids"] = [server_id]
-    return client.post(
-        "/api/v1/claims",
+    payload = _routine_client(require_identity=True).post(
+        "/api/v1/routine/claims",
         {
-            "project_id": project_id,
-            "task_ref": task_ref,
-            "purpose": "routine Agent GPU allocation",
+            "project_id": "codex",
+            "task_ref": _routine_task(task),
+            "purpose": "Codex GPU task",
             "constraints": constraints,
         },
-        idempotency_key=mutation_key,
     )
+    return _routine_gpu_allocation(payload)
 
 
 @mcp.tool()
 def gpu_release(
     lease_id: str,
-    reason: str = "workload_completed",
-    idempotency_key: str | None = None,
-    agent_name: str | None = None,
 ) -> dict[str, Any]:
-    """Release a prior claim; this never stops a process on the remote server."""
+    """释放此前申请的 GPU。"""
 
-    return _client(agent_name).post(
-        f"/api/v1/leases/{lease_id}/release",
-        {"reason": reason},
-        idempotency_key=idempotency_key or secrets.token_hex(16),
+    _routine_client(require_identity=True).post(
+        f"/api/v1/routine/leases/{lease_id}/release"
     )
+    return {"released": True}
 
 
 def gpu_schedule(
@@ -1181,6 +1211,7 @@ def gpu_add_server(
     agent_name: str,
     project_id: str,
     host: str,
+    workspace_path: str,
     approval_ref: str,
     idempotency_key: str,
     port: int = 22,
@@ -1209,6 +1240,7 @@ def gpu_add_server(
             "port": port,
             "ssh_user": ssh_user,
             "ssh_alias": ssh_alias,
+            "workspace_path": workspace_path,
             "observation_profile": observation_profile,
             "labels": labels or [],
             "storage_group": storage_group,
@@ -1228,6 +1260,7 @@ def gpu_update_server(
     idempotency_key: str,
     ssh_user: str | None = None,
     ssh_alias: str | None = None,
+    workspace_path: str | None = None,
     observation_profile: str | None = None,
     labels: list[str] | None = None,
     storage_group: str | None = None,
@@ -1243,6 +1276,7 @@ def gpu_update_server(
         for key, value in {
             "ssh_user": ssh_user,
             "ssh_alias": ssh_alias,
+            "workspace_path": workspace_path,
             "observation_profile": observation_profile,
             "labels": labels,
             "storage_group": storage_group,
@@ -1297,17 +1331,15 @@ def gpu_set_keepalive(
     approval_ref: str,
     idempotency_key: str,
 ) -> dict[str, Any]:
-    """Set the endpoint's explicit idle-GPU keepalive policy after approval.
+    """经明确授权后开启或关闭服务器的逐卡空闲占卡策略。
 
-    This endpoint switch is not a whole-server worker: it reconciles eligible
-    GPUs independently and does not accept caller-supplied GPU targets, PIDs,
-    shell fragments, or helper settings. Disable it before direct SSH work;
-    ServerPilot-managed claim/recovery follows its verified per-GPU handoff.
+    每张空闲 GPU 独立协调；调用者不能传 GPU 目标、PID、shell 片段或 helper 参数。
+    Agent 申请和 APP 改派都会复用同一条逐卡让位路径。
     """
 
     _require_endpoint_admin_contract(approval_ref, idempotency_key)
     if type(enabled) is not bool:
-        raise ValueError("enabled must be a boolean")
+        raise ValueError("enabled 必须是布尔值")
     return _client(agent_name).post(
         f"/api/v1/endpoints/{server_id}/keepalive",
         {"enabled": enabled},
@@ -1315,42 +1347,9 @@ def gpu_set_keepalive(
     )
 
 
-@mcp.tool()
-def gpu_retire_server(
-    agent_name: str,
-    server_id: str,
-    approval_ref: str,
-    idempotency_key: str,
-) -> dict[str, Any]:
-    """Retire a drained endpoint only after active leases and pinned queue work are clear."""
-
-    _require_endpoint_admin_contract(approval_ref, idempotency_key)
-    return _client(agent_name).post(
-        f"/api/v1/endpoints/{server_id}/retire", {}, idempotency_key=idempotency_key
-    )
-
-
-@mcp.tool()
-def gpu_delete_server(
-    agent_name: str,
-    server_id: str,
-    approval_ref: str,
-    idempotency_key: str,
-) -> dict[str, Any]:
-    """Remove a server after all of its GPU leases have been released."""
-
-    _require_endpoint_admin_contract(approval_ref, idempotency_key)
-    return _client(agent_name).post(
-        f"/api/v1/endpoints/{server_id}/retire", {}, idempotency_key=idempotency_key
-    )
-
-
 ROUTINE_MCP_TOOL_NAMES = (
     "gpu_status",
-    "gpu_coordination",
     "gpu_apply",
-    "gpu_bind_observed_workload",
-    "gpu_renew_lease",
     "gpu_release",
 )
 

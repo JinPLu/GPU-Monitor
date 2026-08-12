@@ -64,6 +64,7 @@
     <label>主机或 SSH 地址<input name="host" required placeholder="10.0.0.1 或 gpu-host"></label>
     <label>SSH 端口<input name="port" type="number" min="1" max="65535" value="22" required></label>
     <label>SSH 用户<input name="ssh_user" value="root" required></label>
+    <label>远端工作区路径<input name="workspace_path" required value="/media/datasets/OminiEWM_Data/tmp/ljp"></label>
     <label>归属项目<input name="owner_project_id" required placeholder="例如：storyboard"></label>
     <label>期望 GPU 数（可留空）<input name="expected_gpu_count" type="number" min="1" placeholder="自动发现"></label>
     <input type="hidden" name="labels" value="gpu">
@@ -127,7 +128,7 @@
 <section id="new-request" class="actions" aria-labelledby="request-title">
   <h2 id="request-title">申请 GPU</h2>
   <p>记录为：<strong>{{ actor.id }}</strong></p>
-  <p class="muted">为项目和任务申请 GPU。资源不足时进入队列，使用结束后归还。</p>
+  <p class="muted">为项目和任务申请 GPU。资源不足时返回 no_capacity，本次不进入队列；未获得租约前请勿启动任务，使用结束后归还。</p>
   {% if payload.claimable_workload_profiles %}
   <form method="post" action="/ui/action/profile-claim" class="stack form-grid quick-claim-form">
     <label>预设任务<select name="profile_id" required>{% for profile in payload.claimable_workload_profiles %}<option value="{{ profile.id }}">{{ profile.display_name }} · {{ profile.project_id }} · {{ format_constraints(profile.constraints) }}</option>{% endfor %}</select></label>
@@ -284,7 +285,7 @@
 {% if actor.is_admin %}
 <section class="actions" aria-labelledby="identity-admin-title">
   <h2 id="identity-admin-title">Agent 与预设</h2>
-  <p class="muted">这些凭证用于本机操作记录和 Agent 接入，不是多用户账号。</p>
+  <p class="muted">本机 Agent 以名称登记操作归属；loopback 控制面不使用登录 token。</p>
   <details>
     <summary>创建或更新预设任务</summary>
     <form method="post" action="/ui/action/workload-profile" class="stack form-grid">
@@ -300,19 +301,18 @@
     </form>
   </details>
   <details>
-    <summary>创建本机操作或 Agent 凭证</summary>
+    <summary>登记本机 Agent 标识</summary>
     <form method="post" action="/ui/action/actor" class="stack form-grid">
-      <label>凭证 ID<input name="id" required placeholder="agent-name"></label><label>显示名称<input name="display_name" required placeholder="Agent Name"></label>
-      <label>角色<select name="role"><option value="viewer">只读 viewer</option><option value="allocator" selected>申请 allocator</option><option value="operator">运维 operator</option><option value="admin">管理员 admin</option><option value="collector">采集 collector</option></select></label><label>Token 标签<input name="token_label" value="generated" required></label>
-      <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认 token 只会显示一次，并会安全保存。</label><button type="submit">创建凭证并显示 token</button>
+      <label>Agent ID<input name="id" required placeholder="agent-name"></label><label>显示名称<input name="display_name" required placeholder="Agent Name"></label>
+      <label>角色<select name="role"><option value="viewer">只读 viewer</option><option value="allocator" selected>申请 allocator</option><option value="operator">运维 operator</option><option value="admin">管理员 admin</option><option value="collector">采集 collector</option></select></label>
+      <input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认登记这个本机操作标识。</label><button type="submit">登记标识</button>
     </form>
   </details>
 </section>
 
-<section class="list-section"><h2>已登记凭证</h2><div class="stacked-cards">
+<section class="list-section"><h2>已登记标识</h2><div class="stacked-cards">
 {% for item in payload.actors %}<article class="card"><div class="card-title"><strong>{{ item.display_name }}</strong><span class="badge">{{ item.role }}</span></div><p><code>{{ item.id }}</code></p>
-  {% for token in item.tokens %}<div class="token-row">{{ token.label }} · {{ '已撤销' if token.revoked_at else '有效' }}{% if not token.revoked_at %}<form method="post" action="/ui/action/revoke-token" class="inline-form"><input type="hidden" name="token_id" value="{{ token.id }}"><input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm"><input type="checkbox" name="confirmed" value="yes" required> 确认撤销</label><button type="submit" class="danger">撤销</button></form>{% endif %}</div>{% endfor %}
-</article>{% else %}<p class="empty">尚无凭证。</p>{% endfor %}
+</article>{% else %}<p class="empty">尚无标识。</p>{% endfor %}
 </div></section>
 {% endif %}
 
