@@ -98,6 +98,26 @@ def _idempotency_key(value: str | None) -> str:
 def _public_error_message(exc: BrokerError) -> str:
     messages = {
         "no_capacity": "当前没有满足本次申请的可用 GPU；本次申请未排队。",
+        "keepalive_cuda_target_unavailable": (
+            "远端占卡程序已启动，但 PyTorch/CUDA 没有识别出唯一目标 GPU；"
+            "请检查这台服务器的 CUDA 运行环境。"
+        ),
+        "keepalive_cuda_runtime_unavailable": (
+            "远端 PyTorch 已安装 CUDA 支持，但无法初始化目标 GPU；"
+            "请检查这台服务器的驱动与 CUDA 运行环境。"
+        ),
+        "keepalive_cuda_architecture_unsupported": (
+            "远端 PyTorch 的 CUDA 内核不支持这台服务器的 GPU 架构。"
+        ),
+        "keepalive_pytorch_cuda_required": (
+            "远端占卡程序使用的 Python 缺少支持 CUDA 的 PyTorch。"
+        ),
+        "keepalive_cuda_index_mapping_failed": (
+            "远端占卡程序无法把目标 GPU UUID 映射到当前 CUDA 设备编号。"
+        ),
+        "keepalive_cuda_uuid_not_found": (
+            "远端当前 PCI GPU 清单中找不到目标 GPU UUID。"
+        ),
         "keepalive_outcome_uncertain": "占卡程序返回结果不确定，本次没有分配任务。",
         "keepalive_adapter_failed": "占卡程序启动或停止失败；下一采集周期会继续尝试。",
         "keepalive_cleanup_failed": "占卡异常且未能完成清理；请在 APP 中确认该 GPU 的实际状态。",
@@ -118,6 +138,28 @@ def _public_error_message(exc: BrokerError) -> str:
     if re.search(r"[\u4e00-\u9fff]", exc.message):
         return exc.message
     return f"操作未完成（{exc.code}）。"
+
+
+def _keepalive_adapter_failure_code(exc: AdapterCommandError) -> str:
+    """Preserve a known actionable helper failure without exposing remote stderr."""
+
+    message = str(exc)
+    if "PyTorch with CUDA support is required" in message:
+        return "keepalive_pytorch_cuda_required"
+    if "PyTorch CUDA runtime could not initialize the selected GPU" in message:
+        return "keepalive_cuda_runtime_unavailable"
+    if "no kernel image is available for execution on the device" in message:
+        return "keepalive_cuda_architecture_unsupported"
+    if "does not contain requested GPU UUID" in message:
+        return "keepalive_cuda_uuid_not_found"
+    if "keepalive CUDA PCI ordinal mapping" in message:
+        return "keepalive_cuda_index_mapping_failed"
+    if (
+        "exactly one CUDA GPU must be visible" in message
+        or "CUDA visible device count is" in message
+    ):
+        return "keepalive_cuda_target_unavailable"
+    return "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed"
 
 
 def _public_keepalive_result(
@@ -360,9 +402,7 @@ def create_app(
                     adapter_result = await adapter.set_enabled(endpoint, True, gpu_uuids)
                     result_by_gpu_uuid(adapter_result, gpu_uuids, enabled=True)
                 except AdapterCommandError as exc:
-                    await cleanup_failed_start(
-                        "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed"
-                    )
+                    await cleanup_failed_start(_keepalive_adapter_failure_code(exc))
                 except BrokerError as exc:
                     await cleanup_failed_start(exc.code)
                 except Exception:
@@ -785,10 +825,7 @@ def create_app(
         )
 
     def api_actor(request: Request) -> ActorContext:
-        actor = service.local_actor(
-            request.headers.get("x-serverpilot-actor", "agent"),
-            coordination_uri=request.headers.get("x-serverpilot-coordination-uri"),
-        )
+        actor = service.local_actor(request.headers.get("x-serverpilot-actor", "agent"))
         limiter.check(actor.id)
         return actor
 

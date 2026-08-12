@@ -9,11 +9,13 @@ receives a separate CUDA process, so stopping GPU A does not stop GPU B.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import contextlib
 import fcntl
 import json
 import math
 import os
+import re
 import select
 import signal
 import subprocess
@@ -71,8 +73,24 @@ class TorchSubprocessProvider:
 
     _worker_marker = "serverpilot.server_keepalive"
 
+    def __init__(self) -> None:
+        self._gpu_ordinals: dict[str, str] | None = None
+
+    def _cuda_visible_device(self, gpu_uuid: str) -> str:
+        """Resolve one UUID to its PCI_BUS_ID-ordered CUDA ordinal."""
+
+        if self._gpu_ordinals is None:
+            self._gpu_ordinals = _resolve_gpu_ordinals()
+        try:
+            return self._gpu_ordinals[gpu_uuid]
+        except KeyError as exc:
+            raise RuntimeError(
+                "keepalive CUDA PCI ordinal mapping does not contain requested GPU UUID"
+            ) from exc
+
     def start(self, gpu_uuid: str) -> int:
         gpu_uuid = validate_gpu_uuid(gpu_uuid)
+        cuda_visible_device = self._cuda_visible_device(gpu_uuid)
         read_fd, write_fd = os.pipe()
         try:
             process = subprocess.Popen(
@@ -90,7 +108,11 @@ class TorchSubprocessProvider:
                 # The worker's CUDA selector is assigned only here, from the
                 # helper's validated typed target.  It is not an API/CLI
                 # parameter and no caller can add an environment variable.
-                env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_uuid},
+                env={
+                    **os.environ,
+                    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                    "CUDA_VISIBLE_DEVICES": cuda_visible_device,
+                },
                 close_fds=True,
                 pass_fds=(write_fd,),
                 start_new_session=True,
@@ -181,32 +203,48 @@ class LocalKeepaliveController:
         requested: tuple[str, ...],
         identities: dict[str, int],
     ) -> KeepaliveResponse:
-        results: list[KeepaliveGPUResult] = []
+        results_by_uuid: dict[str, KeepaliveGPUResult] = {}
+        pending: list[str] = []
         for gpu_uuid in requested:
             pid = identities.get(gpu_uuid)
             if pid is not None and self.provider.is_running(pid):
-                results.append(
-                    KeepaliveGPUResult(
-                        gpu_uuid=gpu_uuid,
-                        status="running",
-                        outcome="unchanged",
-                    )
+                results_by_uuid[gpu_uuid] = KeepaliveGPUResult(
+                    gpu_uuid=gpu_uuid,
+                    status="running",
+                    outcome="unchanged",
                 )
                 continue
             if pid is not None:
                 identities.pop(gpu_uuid)
                 self._write_identities(identities)
-            pid = self.provider.start(gpu_uuid)
-            identities[gpu_uuid] = pid
+            pending.append(gpu_uuid)
+
+        failures: list[Exception] = []
+        if pending:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as executor:
+                started = {
+                    gpu_uuid: executor.submit(self.provider.start, gpu_uuid)
+                    for gpu_uuid in pending
+                }
+                for gpu_uuid in pending:
+                    try:
+                        pid = started[gpu_uuid].result()
+                    except Exception as exc:
+                        failures.append(exc)
+                        continue
+                    identities[gpu_uuid] = pid
+                    results_by_uuid[gpu_uuid] = KeepaliveGPUResult(
+                        gpu_uuid=gpu_uuid,
+                        status="running",
+                        outcome="started",
+                    )
             self._write_identities(identities)
-            results.append(
-                KeepaliveGPUResult(
-                    gpu_uuid=gpu_uuid,
-                    status="running",
-                    outcome="started",
-                )
-            )
-        return KeepaliveResponse(enabled=True, results=tuple(results))
+        if failures:
+            raise RuntimeError(f"CUDA keepalive worker could not start: {failures[0]}")
+        return KeepaliveResponse(
+            enabled=True,
+            results=tuple(results_by_uuid[gpu_uuid] for gpu_uuid in requested),
+        )
 
     def _disable(
         self,
@@ -333,6 +371,46 @@ def _resolve_known_gpu_uuids() -> set[str]:
     return gpu_uuids
 
 
+_PCI_BUS_ID_PATTERN = re.compile(
+    r"^(?P<domain>[0-9A-Fa-f]{4,8}):(?P<bus>[0-9A-Fa-f]{2}):"
+    r"(?P<device>[0-9A-Fa-f]{2})\.(?P<function>[0-7])$"
+)
+
+
+def _resolve_gpu_ordinals() -> dict[str, str]:
+    """Map UUID identity to CUDA ordinals under ``PCI_BUS_ID`` ordering."""
+
+    observed: list[tuple[tuple[int, int, int, int], str]] = []
+    seen_indices: set[int] = set()
+    seen_uuids: set[str] = set()
+    seen_bus_ids: set[tuple[int, int, int, int]] = set()
+    output = _run_nvidia_smi_query("--query-gpu=index,uuid,pci.bus_id")
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split(",", maxsplit=2)]
+        if len(parts) != 3 or not parts[0].isdigit():
+            raise RuntimeError("keepalive CUDA PCI ordinal mapping is invalid")
+        observed_index = int(parts[0])
+        gpu_uuid = validate_gpu_uuid(parts[1])
+        match = _PCI_BUS_ID_PATTERN.fullmatch(parts[2])
+        if match is None:
+            raise RuntimeError("keepalive CUDA PCI ordinal mapping is invalid")
+        bus_id = tuple(int(match.group(name), 16) for name in ("domain", "bus", "device", "function"))
+        if observed_index in seen_indices or gpu_uuid in seen_uuids or bus_id in seen_bus_ids:
+            raise RuntimeError("keepalive CUDA PCI ordinal mapping is invalid")
+        seen_indices.add(observed_index)
+        seen_uuids.add(gpu_uuid)
+        seen_bus_ids.add(bus_id)
+        observed.append((bus_id, gpu_uuid))
+    if not observed:
+        raise RuntimeError("keepalive CUDA PCI ordinal mapping is empty")
+    return {
+        gpu_uuid: str(ordinal)
+        for ordinal, (_bus_id, gpu_uuid) in enumerate(sorted(observed))
+    }
+
+
 def _run_cuda_worker(ready_fd: int) -> None:
     """Run one fixed worker against the single GPU made visible by its provider."""
 
@@ -341,7 +419,8 @@ def _run_cuda_worker(ready_fd: int) -> None:
         cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
         if cuda_visible_devices is None:
             raise RuntimeError("CUDA_VISIBLE_DEVICES must be set only by the keepalive provider")
-        validate_gpu_uuid(cuda_visible_devices)
+        if not cuda_visible_devices.isdigit():
+            raise RuntimeError("keepalive provider supplied an invalid CUDA device index")
         try:
             import torch
         except ImportError as exc:
@@ -349,8 +428,13 @@ def _run_cuda_worker(ready_fd: int) -> None:
         torch.set_num_threads(1)
         with contextlib.suppress(RuntimeError):
             torch.set_num_interop_threads(1)
-        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-            raise RuntimeError("exactly one CUDA GPU must be visible")
+        visible_device_count = torch.cuda.device_count()
+        if visible_device_count != 1:
+            raise RuntimeError(
+                f"CUDA visible device count is {visible_device_count}; expected exactly one"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("PyTorch CUDA runtime could not initialize the selected GPU")
 
         device = torch.device("cuda:0")
         properties = torch.cuda.get_device_properties(device)

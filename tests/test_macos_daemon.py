@@ -510,7 +510,6 @@ def test_uninstall_preserves_plist_when_launchctl_cannot_unload(
 def test_mcp_ensures_daemon_before_constructing_rest_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     calls: list[str] = []
 
     class FakeClient:

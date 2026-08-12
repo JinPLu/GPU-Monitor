@@ -5,34 +5,12 @@ from __future__ import annotations
 import os
 import time
 from typing import Any
-from uuid import UUID
 
 import httpx
 
 
 class BrokerClientError(RuntimeError):
     pass
-
-
-def codex_coordination_identity() -> tuple[str, str] | None:
-    """Return the task-scoped Actor and URI inherited by a Codex MCP child.
-
-    A thread UUID is a process identity boundary, not user input.  Reject a
-    malformed ambient value instead of silently falling back to the shared
-    ``agent`` Actor, which would merge unrelated Codex tasks.
-    """
-
-    raw_thread_id = os.environ.get("CODEX_THREAD_ID")
-    if raw_thread_id is None:
-        return None
-    try:
-        parsed = UUID(raw_thread_id)
-    except (ValueError, AttributeError) as exc:
-        raise BrokerClientError("CODEX_THREAD_ID must be a canonical UUID") from exc
-    canonical = str(parsed)
-    if raw_thread_id != canonical:
-        raise BrokerClientError("CODEX_THREAD_ID must be a canonical UUID")
-    return f"codex-{canonical}", f"codex://threads/{canonical}"
 
 
 class BrokerClient:
@@ -42,26 +20,20 @@ class BrokerClient:
         actor: str = "agent",
         *,
         timeout_seconds: float = 20,
-        coordination_uri: str | None = None,
     ) -> None:
         if not url.startswith(("http://", "https://")):
             raise BrokerClientError("SERVERPILOT_URL must start with http:// or https://")
         self.url = url.rstrip("/")
         self.actor = actor or "agent"
-        self.coordination_uri = coordination_uri
         self.timeout_seconds = timeout_seconds
         self._last_state_revision: int | None = None
 
     @classmethod
     def from_env(cls, *, url: str | None = None, actor: str | None = None) -> "BrokerClient":
-        coordination_identity = codex_coordination_identity()
         configured_actor = actor or os.environ.get("SERVERPILOT_ACTOR")
-        if configured_actor is None and coordination_identity is not None:
-            configured_actor = coordination_identity[0]
         return cls(
             url or os.environ.get("SERVERPILOT_URL", "http://127.0.0.1:8787"),
             configured_actor or "agent",
-            coordination_uri=(coordination_identity[1] if coordination_identity else None),
         )
 
     def request(
@@ -74,8 +46,6 @@ class BrokerClient:
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         headers = {"X-ServerPilot-Actor": self.actor}
-        if self.coordination_uri:
-            headers["X-ServerPilot-Coordination-URI"] = self.coordination_uri
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         try:

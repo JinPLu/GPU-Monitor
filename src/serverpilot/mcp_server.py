@@ -11,7 +11,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from serverpilot.client import BrokerClient, codex_coordination_identity
+from serverpilot.client import BrokerClient
 from serverpilot.daemon import ensure_broker_ready_for_mcp
 
 
@@ -22,10 +22,10 @@ RESOURCE_MARGINAL_MIN_SAVED_RATIO = 0.10
 RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
 
 MCP_INSTRUCTIONS = """常规 GPU 任务只使用三个工具：gpu_status 查看可用 GPU；gpu_apply 由 ServerPilot
-自动选卡，成功后先进入返回的 workspace_path，再使用 cuda_visible_devices；任务结束或启动失败时 gpu_release。需要联系占用者时
-调用 gpu_status(include_busy=true) 读取 task 和 agent_url。Codex 必须向 MCP 传入 CODEX_THREAD_ID；缺失时
-申请和释放会失败。空闲占卡仍算可用，申请时自动让位。无容量直接失败，不排队。不要自行指定 GPU，
-也不要绕过 ServerPilot。"""
+自动选卡；task 应写用户给定的任务名或当前目标的简短人类可读概括，不读取客户端 UI 标题。成功后先进入返回的
+workspace_path，再使用 cuda_visible_devices；任务结束或启动失败时 gpu_release。需要检查占用情况时调用
+gpu_status(include_busy=true) 读取 task。空闲占卡仍算可用，申请时
+自动让位。无容量直接失败，不排队。不要自行指定 GPU，也不要绕过 ServerPilot。"""
 
 
 mcp = FastMCP(
@@ -37,26 +37,17 @@ mcp = FastMCP(
 
 def _client(actor_name: str | None = None) -> BrokerClient:
     ensure_broker_ready_for_mcp()
-    coordination_identity = codex_coordination_identity()
-    if coordination_identity is not None:
-        # Codex tasks are the actual coordination principals.  Tool arguments
-        # such as agent_name predate task URIs and must not collapse distinct
-        # tasks onto a shared label such as ``agent`` or ``codex-root``.
-        actor_name = coordination_identity[0]
     return BrokerClient.from_env(actor=actor_name)
 
 
-def _routine_client(*, require_identity: bool) -> BrokerClient:
-    identity = codex_coordination_identity()
-    if require_identity and identity is None:
-        raise ValueError("当前 Codex task 没有 CODEX_THREAD_ID，不能申请或释放 GPU")
+def _routine_client() -> BrokerClient:
     ensure_broker_ready_for_mcp()
-    return BrokerClient.from_env(actor=identity[0] if identity is not None else "observer")
+    return BrokerClient.from_env(actor="agent")
 
 
 def _routine_task(task: str | None) -> str:
     if task is None:
-        return "Codex task"
+        return "未命名任务"
     value = task.strip()
     if not value:
         raise ValueError("提供 task 时不能为空")
@@ -347,8 +338,7 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
         if include_busy:
             row["available"] = available
             if isinstance(lease, dict):
-                row["task"] = lease.get("task_ref") or "Codex task"
-                row["agent_url"] = lease.get("coordination_uri") or ""
+                row["task"] = lease.get("task_ref") or "未命名任务"
         gpus.append(row)
     result: dict[str, Any] = {"gpus": gpus}
     summary = data.get("summary") if isinstance(data, dict) else None
@@ -383,7 +373,7 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
-    """Project the shared board without dropping actor contact references."""
+    """Project the shared board to its operational fields."""
 
     data = payload.get("data")
     if not isinstance(data, dict):
@@ -398,7 +388,6 @@ def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
             key: agent.get(key)
             for key in (
                 "agent_name",
-                "coordination_uri",
                 "active_leases",
                 "active_workload_leases",
                 "leased_gpus",
@@ -417,7 +406,6 @@ def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
             for key in (
                 "lease_id",
                 "agent_name",
-                "coordination_uri",
                 "project_id",
                 "task",
                 "state",
@@ -545,9 +533,9 @@ def control_plane_state(
 
 @mcp.tool()
 def gpu_status(include_busy: bool = False) -> dict[str, Any]:
-    """列出可用 GPU；需要联系占用者时同时列出 task 和 agent_url。"""
+    """列出可用 GPU；include_busy=true 时同时列出占用 GPU 及人类可读 task。"""
 
-    payload = _routine_client(require_identity=False).snapshot(
+    payload = _routine_client().snapshot(
         compact=False,
         only_available=not include_busy,
     )
@@ -1146,7 +1134,7 @@ def gpu_apply(
     gpu_count: int = 1,
     task: str | None = None,
 ) -> dict[str, Any]:
-    """立即申请 GPU；ServerPilot 自动选卡，无容量返回 no_capacity 且不排队。"""
+    """立即申请 GPU；task 填用户任务名或当前目标概括；自动选卡，无容量返回 no_capacity 且不排队。"""
 
     if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
         raise ValueError("gpu_count 必须是正整数")
@@ -1157,12 +1145,13 @@ def gpu_apply(
     constraints: dict[str, Any] = {"gpu_count": gpu_count, "placement": "pack"}
     if server_id is not None:
         constraints["endpoint_ids"] = [server_id]
-    payload = _routine_client(require_identity=True).post(
+    task_ref = _routine_task(task)
+    payload = _routine_client().post(
         "/api/v1/routine/claims",
         {
-            "project_id": "codex",
-            "task_ref": _routine_task(task),
-            "purpose": "Codex GPU task",
+            "project_id": "agent",
+            "task_ref": task_ref,
+            "purpose": task_ref,
             "constraints": constraints,
         },
     )
@@ -1175,7 +1164,7 @@ def gpu_release(
 ) -> dict[str, Any]:
     """释放此前申请的 GPU。"""
 
-    _routine_client(require_identity=True).post(
+    _routine_client().post(
         f"/api/v1/routine/leases/{lease_id}/release"
     )
     return {"released": True}

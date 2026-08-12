@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,7 @@ from serverpilot.server_keepalive import (
     DUTY_PERIOD_SECONDS,
     TARGET_MEMORY_FRACTION,
     LocalKeepaliveController,
+    TorchSubprocessProvider,
     default_state_directory,
     handle_request,
 )
@@ -34,6 +37,61 @@ GPU_A = "GPU-00000000-0000-0000-0000-000000000001"
 GPU_B = "GPU-00000000-0000-0000-0000-000000000002"
 GPU_C = "GPU-00000000-0000-0000-0000-000000000003"
 KNOWN_GPUS = {GPU_A, GPU_B, GPU_C}
+
+
+def test_torch_provider_resolves_uuid_to_pci_ordered_cuda_ordinal_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_query(argument: str) -> str:
+        calls.append(argument)
+        return (
+            f"7, {GPU_A}, 00000000:AF:00.0\n"
+            f"3, {GPU_B}, 00000000:01:00.0\n"
+        )
+
+    monkeypatch.setattr("serverpilot.server_keepalive._run_nvidia_smi_query", fake_query)
+    provider = TorchSubprocessProvider()
+
+    assert provider._cuda_visible_device(GPU_A) == "1"
+    assert provider._cuda_visible_device(GPU_B) == "0"
+    assert calls == ["--query-gpu=index,uuid,pci.bus_id"]
+
+
+def test_torch_provider_sets_pci_order_and_derived_ordinal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        pid = 9876
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    def fake_popen(command: list[str], **options: Any) -> FakeProcess:
+        captured["command"] = command
+        captured["env"] = options["env"]
+        os.write(options["pass_fds"][0], b"READY\n")
+        return FakeProcess()
+
+    monkeypatch.setattr("serverpilot.server_keepalive.subprocess.Popen", fake_popen)
+    provider = TorchSubprocessProvider()
+    provider._gpu_ordinals = {GPU_A: "4"}
+
+    assert provider.start(GPU_A) == 9876
+    assert captured["env"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "4"
+
+
+def test_torch_provider_reports_unknown_uuid_in_pci_mapping() -> None:
+    provider = TorchSubprocessProvider()
+    provider._gpu_ordinals = {GPU_A: "0"}
+
+    with pytest.raises(RuntimeError, match="does not contain requested GPU UUID"):
+        provider._cuda_visible_device(GPU_B)
 
 
 def _result(
@@ -250,6 +308,27 @@ def test_local_controller_starts_each_gpu_directly_without_batch_rollback(tmp_pa
     assert provider.running == {pid_a}
     stored = json.loads((state_directory / "workers.v2.json").read_text(encoding="utf-8"))
     assert stored["workers"] == [{"gpu_uuid": GPU_A, "pid": pid_a}]
+
+
+def test_local_controller_starts_batch_workers_concurrently(tmp_path: Path) -> None:
+    barrier = threading.Barrier(2)
+
+    class ConcurrentProvider(FakeProvider):
+        def start(self, gpu_uuid: str) -> int:
+            barrier.wait(timeout=1)
+            return super().start(gpu_uuid)
+
+    provider = ConcurrentProvider()
+    controller = LocalKeepaliveController(
+        provider=provider,
+        state_directory=tmp_path / "keepalive",
+        known_gpu_uuids_resolver=lambda: KNOWN_GPUS,
+    )
+
+    started = controller.set_enabled(True, [GPU_A, GPU_B])
+
+    assert [result.gpu_uuid for result in started.results] == [GPU_A, GPU_B]
+    assert {gpu_uuid for gpu_uuid, _pid in provider.started} == {GPU_A, GPU_B}
 
 
 def test_local_controller_rejects_a_valid_but_unknown_gpu_before_mutation(tmp_path: Path) -> None:

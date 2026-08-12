@@ -10,6 +10,15 @@ from scripts.install_agent_policy import MARKERS, install, main, merge, render
 from scripts.install_agent_policy import POLICY
 
 
+ROOT = Path(__file__).resolve().parents[1]
+CLIENT_RULES = (
+    POLICY,
+    ROOT / "AGENTS.md",
+    ROOT / ".cursor" / "rules" / "serverpilot.mdc",
+)
+CLAUDE_RULE = ROOT / "CLAUDE.md"
+
+
 def _plain_policy_text(text: str) -> str:
     return " ".join(text.replace("`", "").split())
 
@@ -123,8 +132,8 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "cuda_visible_devices",
         "workspace_path",
         "gpu_release",
-        "codex_thread_id",
-        "codex://threads/<uuid>",
+        "human-readable",
+        "ui title",
         "ssh",
         "sqlite",
         "inventory",
@@ -137,6 +146,9 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "gpu_bind_observed_workload",
         "gpu_renew_lease",
         "gpu_coordination",
+        "agent_url",
+        "coordination_uri",
+        "codex_thread_id",
         "idempotency_key",
         "heartbeat",
     ):
@@ -151,8 +163,8 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "workspace_path",
         "gpu_release",
         "include_busy=true",
-        "agent_url",
-        "codex_thread_id",
+        "task",
+        "不读取客户端 ui 标题",
         "无容量直接失败，不排队",
     ):
         assert runtime_contract in mcp_instructions
@@ -161,10 +173,51 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "gpu_bind_observed_workload",
         "gpu_renew_lease",
         "gpu_coordination",
+        "agent_url",
+        "coordination_uri",
+        "codex_thread_id",
         "idempotency_key",
         "approval_ref",
     ):
         assert removed_routine_step not in mcp_instructions
+
+
+def test_tracked_client_rules_use_only_the_exact_harness_neutral_routine_contract() -> None:
+    required = (
+        "gpu_status(include_busy=false)",
+        "gpu_apply(server_id?, gpu_count=1, task?)",
+        "gpu_release(lease_id)",
+    )
+    forbidden = (
+        "gpu_claim(",
+        "gpu_claim_profile",
+        "agent_url",
+        "coordination_uri",
+        "codex://",
+        "codex_thread_id",
+        "codex",
+        "claude",
+        "cursor",
+    )
+    for path in CLIENT_RULES:
+        text = _plain_policy_text(path.read_text(encoding="utf-8")).lower()
+        for contract in required:
+            assert contract in text, path
+        for retired in forbidden:
+            assert retired not in text, path
+
+    cursor_text = (ROOT / ".cursor" / "rules" / "serverpilot.mdc").read_text(
+        encoding="utf-8"
+    )
+    cursor_start, cursor_end = MARKERS["cursor"]
+    cursor_body = cursor_text.split(cursor_start, 1)[1].split(cursor_end, 1)[0]
+    assert _plain_policy_text(cursor_body) == _plain_policy_text(
+        POLICY.read_text(encoding="utf-8")
+    )
+
+    # Claude inherits the repository rule instead of maintaining a second,
+    # drift-prone ServerPilot contract.
+    assert CLAUDE_RULE.read_text(encoding="utf-8").strip() == "@AGENTS.md"
 
 
 def test_global_policy_keeps_scheduler_detail_out_of_routine_mcp_help() -> None:

@@ -14,7 +14,12 @@ from sqlalchemy import select
 from serverpilot import API_CAPABILITIES
 from serverpilot import mcp_server
 from serverpilot.adapters import AdapterCommandError
-from serverpilot.api import _public_keepalive_result, create_app
+from serverpilot.api import (
+    _keepalive_adapter_failure_code,
+    _public_error_message,
+    _public_keepalive_result,
+    create_app,
+)
 from serverpilot.config import InventoryConfig, Settings
 from serverpilot.keepalive_protocol import (
     KeepaliveGPUResult,
@@ -779,6 +784,92 @@ def test_keepalive_api_failures_are_reported_as_errors(
     snapshot = app.state.service.snapshot(app.state.service.local_actor("agent-a"))["data"]
     assert snapshot["summary"]["available_gpus"] == len(GPU_UUIDS)
     assert app.state.service.list_leases(app.state.service.local_actor("agent-a"))["data"] == []
+
+
+def test_keepalive_api_reports_known_cuda_worker_failure_in_chinese_without_remote_stderr(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    class CudaStartFailingAdapter(FakeKeepaliveAdapter):
+        async def set_enabled(  # type: ignore[no-untyped-def]
+            self, endpoint, enabled: bool, gpu_uuids: list[str]
+        ) -> KeepaliveResponse:
+            if enabled:
+                self.calls.append((endpoint.id, enabled, tuple(gpu_uuids)))
+                raise AdapterCommandError(
+                    "serverpilot-keepalive failed: RuntimeError: "
+                    "CUDA keepalive worker could not start: RuntimeError: "
+                    "exactly one CUDA GPU must be visible",
+                    uncertain=True,
+                )
+            return await super().set_enabled(endpoint, enabled, gpu_uuids)
+
+    adapter = CudaStartFailingAdapter()
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+
+    response = TestClient(app).post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("known-cuda-worker-failure"),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "keepalive_cuda_target_unavailable",
+        "message": (
+            "远端占卡程序已启动，但 PyTorch/CUDA 没有识别出唯一目标 GPU；"
+            "请检查这台服务器的 CUDA 运行环境。"
+        ),
+        "details": {
+            "failed_gpu_ids": [
+                f"endpoint-a:{GPU_UUIDS[0]}",
+                f"endpoint-a:{GPU_UUIDS[1]}",
+            ]
+        },
+    }
+    assert "serverpilot-keepalive failed" not in response.text
+    assert adapter.calls == [
+        ("endpoint-a", True, GPU_UUIDS),
+        ("endpoint-a", False, GPU_UUIDS),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("remote_failure", "expected_code"),
+    [
+        ("PyTorch with CUDA support is required", "keepalive_pytorch_cuda_required"),
+        (
+            "PyTorch CUDA runtime could not initialize the selected GPU",
+            "keepalive_cuda_runtime_unavailable",
+        ),
+        (
+            "CUDA error: no kernel image is available for execution on the device",
+            "keepalive_cuda_architecture_unsupported",
+        ),
+        ("keepalive CUDA PCI ordinal mapping is invalid", "keepalive_cuda_index_mapping_failed"),
+        (
+            "keepalive CUDA PCI ordinal mapping does not contain requested GPU UUID",
+            "keepalive_cuda_uuid_not_found",
+        ),
+        ("CUDA visible device count is 8; expected exactly one", "keepalive_cuda_target_unavailable"),
+    ],
+)
+def test_keepalive_adapter_failure_preserves_known_cuda_category(
+    remote_failure: str, expected_code: str
+) -> None:
+    assert _keepalive_adapter_failure_code(
+        AdapterCommandError(remote_failure, uncertain=True)
+    ) == expected_code
+
+
+def test_keepalive_unknown_uuid_has_specific_public_chinese_message() -> None:
+    failure = BrokerError(
+        "keepalive_cuda_uuid_not_found",
+        "remote detail is not public",
+        status_code=503,
+    )
+
+    assert _public_error_message(failure) == "远端当前 PCI GPU 清单中找不到目标 GPU UUID。"
 
 
 @pytest.mark.parametrize(

@@ -910,6 +910,9 @@ def test_mcp_exposes_required_tools() -> None:
     status_schema = by_name["gpu_status"].inputSchema
     assert set(status_schema["properties"]) == {"include_busy"}
     assert status_schema["properties"]["include_busy"]["default"] is False
+    assert by_name["gpu_status"].description == (
+        "列出可用 GPU；include_busy=true 时同时列出占用 GPU 及人类可读 task。"
+    )
     for name in (
         "gpu_add_server",
         "gpu_update_server",
@@ -919,7 +922,8 @@ def test_mcp_exposes_required_tools() -> None:
 
 def test_default_stdio_mcp_uses_intent_first_routine_surface() -> None:
     tools = asyncio.run(routine_mcp.list_tools())
-    names = {tool.name for tool in tools}
+    by_name = {tool.name: tool for tool in tools}
+    names = set(by_name)
 
     assert names == set(ROUTINE_MCP_TOOL_NAMES)
     assert "control_plane_state" not in names
@@ -929,6 +933,9 @@ def test_default_stdio_mcp_uses_intent_first_routine_surface() -> None:
     assert "gpu_list" not in names
     assert not any(name.startswith("gpu_scheduler_") for name in names)
     assert names == {"gpu_status", "gpu_apply", "gpu_release"}
+    assert by_name["gpu_status"].description == (
+        "列出可用 GPU；include_busy=true 时同时列出占用 GPU 及人类可读 task。"
+    )
 
 
 def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1042,7 +1049,7 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
     monkeypatch.setattr(
         mcp_server,
         "_routine_client",
-        lambda *, require_identity: FakeClient(),
+        lambda: FakeClient(),
     )
     result = mcp_server.gpu_apply(server_id="server-a", gpu_count=2, task="训练")
     assert result == {
@@ -1069,15 +1076,18 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
         "placement": "pack",
         "endpoint_ids": ["server-a"],
     }
-    assert body["project_id"] == "codex"
+    assert body["project_id"] == "agent"
+    assert body["purpose"] == "训练"
     assert body["task_ref"] == "训练"
 
 
-def test_mcp_status_defaults_to_available_and_adds_busy_contact_only_on_request(
+def test_mcp_default_task_is_harness_neutral() -> None:
+    assert mcp_server._routine_task(None) == "未命名任务"
+
+
+def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
-    coordination_uri = "codex://threads/019febd4-c455-7693-bb58-91ca9af7718e"
-
     class FakeClient:
         def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
             assert kwargs in (
@@ -1151,10 +1161,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_contact_only_on_request(
                             "total_vram_mib": 80000,
                             "state": "HELD",
                             "state_reason": "workload lease is held",
-                            "lease": {
-                                "task_ref": "训练",
-                                "coordination_uri": coordination_uri,
-                            },
+                            "lease": {"task_ref": "训练"},
                             "publicly_available": False,
                             "public_status": "任务使用中",
                             "keepalive": {"state": "OFF", "reason": None, "lease_id": None},
@@ -1170,7 +1177,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_contact_only_on_request(
     monkeypatch.setattr(
         mcp_server,
         "_routine_client",
-        lambda *, require_identity: FakeClient(),
+        lambda: FakeClient(),
     )
 
     status = mcp_server.gpu_status()
@@ -1207,7 +1214,6 @@ def test_mcp_status_defaults_to_available_and_adds_busy_contact_only_on_request(
             "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
             "available": False,
             "task": "训练",
-            "agent_url": coordination_uri,
         },
     ]}
 
@@ -1267,7 +1273,7 @@ def test_mcp_reads_distinguish_internal_keepalive_from_available_capacity(
     monkeypatch.setattr(
         mcp_server,
         "_routine_client",
-        lambda *, require_identity: RestBackedClient(),
+        lambda: RestBackedClient(),
     )
 
     status = mcp_server.gpu_status()

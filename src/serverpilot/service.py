@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, TypeVar
-from uuid import UUID
 
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.orm import Session
@@ -120,10 +119,6 @@ COLLECTOR_INTERVAL_SETTING_KEY = "collector_interval_seconds"
 OPERATOR_ROLES = MUTATING_ROLES
 ADMIN_ROLES = {"admin"}
 CUDA_SELECTOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,159}$")
-CODEX_COORDINATION_URI_RE = re.compile(
-    r"^codex://threads/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
-)
-
 T = TypeVar("T")
 
 
@@ -639,9 +634,7 @@ class BrokerService:
 
         return self._read(operation)
 
-    def local_actor(
-        self, actor_id: str, *, coordination_uri: str | None = None
-    ) -> ActorContext:
+    def local_actor(self, actor_id: str) -> ActorContext:
         """Resolve a cooperative loopback label, never an administrator.
 
         The label is intentionally not a credential.  It records ownership so
@@ -663,54 +656,16 @@ class BrokerService:
                 "actor name must start with a letter and contain 2-128 letters, numbers, '.', '_' or '-'",
                 status_code=422,
             )
-        normalized_coordination_uri: str | None = None
-        if coordination_uri is not None:
-            match = CODEX_COORDINATION_URI_RE.fullmatch(coordination_uri)
-            if match is None:
-                raise BrokerError(
-                    "invalid_coordination_uri",
-                    "coordination URI must be codex://threads/<canonical UUID>",
-                    status_code=422,
-                )
-            try:
-                canonical_thread_id = str(UUID(match.group(1)))
-            except ValueError as exc:
-                raise BrokerError(
-                    "invalid_coordination_uri",
-                    "coordination URI must be codex://threads/<canonical UUID>",
-                    status_code=422,
-                ) from exc
-            normalized_coordination_uri = f"codex://threads/{canonical_thread_id}"
-            if coordination_uri != normalized_coordination_uri:
-                raise BrokerError(
-                    "invalid_coordination_uri",
-                    "coordination URI must be codex://threads/<canonical UUID>",
-                    status_code=422,
-                )
-
-        def resolve(session: Session) -> tuple[ActorContext, str | None] | None:
+        def resolve(session: Session) -> ActorContext | None:
             stored_actor = session.get(Actor, normalized)
             if stored_actor is None:
                 return None
             project_ids = frozenset(session.scalars(select(Project.id)).all())
-            return (
-                ActorContext(id=normalized, role="allocator", project_ids=project_ids),
-                stored_actor.coordination_uri,
-            )
+            return ActorContext(id=normalized, role="allocator", project_ids=project_ids)
 
         existing = self._read(resolve)
         if existing is not None:
-            actor_context, stored_coordination_uri = existing
-            if normalized_coordination_uri is None or (
-                stored_coordination_uri == normalized_coordination_uri
-            ):
-                return actor_context
-            if stored_coordination_uri is not None:
-                raise BrokerError(
-                    "actor_coordination_conflict",
-                    "actor is already registered to another Codex task",
-                    status_code=409,
-                )
+            return existing
 
         def create(session: Session) -> ActorContext:
             stored_actor = session.get(Actor, normalized)
@@ -721,24 +676,11 @@ class BrokerService:
                     display_name=normalized,
                     role="allocator",
                     enabled=True,
-                    coordination_uri=normalized_coordination_uri,
                     created_at=now,
                     updated_at=now,
                 )
                 session.add(stored_actor)
                 session.flush()
-            elif normalized_coordination_uri is not None:
-                if stored_actor.coordination_uri is None:
-                    now = utcnow()
-                    stored_actor.coordination_uri = normalized_coordination_uri
-                    stored_actor.updated_at = now
-                    self._bump_revision(session, now)
-                elif stored_actor.coordination_uri != normalized_coordination_uri:
-                    raise BrokerError(
-                        "actor_coordination_conflict",
-                        "actor is already registered to another Codex task",
-                        status_code=409,
-                    )
             project_ids = frozenset(session.scalars(select(Project.id)).all())
             return ActorContext(id=normalized, role="allocator", project_ids=project_ids)
 
@@ -1049,7 +991,6 @@ class BrokerService:
             "display_name": actor.display_name,
             "role": actor.role,
             "enabled": actor.enabled,
-            "coordination_uri": actor.coordination_uri,
             "project_ids": sorted(project_ids),
             "created_at": _iso(actor.created_at),
             "updated_at": _iso(actor.updated_at),
@@ -1097,7 +1038,6 @@ class BrokerService:
             ).all()
         if request is None:
             request = session.get(AllocationRequest, lease.request_id)
-        lease_actor = session.get(Actor, lease.actor_id)
         active_resources = [resource for resource in resources if resource.active]
         gpu_by_id = (
             {
@@ -1179,7 +1119,6 @@ class BrokerService:
             "id": lease.id,
             "request_id": lease.request_id,
             "actor_id": lease.actor_id,
-            "coordination_uri": lease_actor.coordination_uri if lease_actor else None,
             "project_id": lease.project_id,
             "kind": lease.kind,
             "state": lease.state,
@@ -3864,7 +3803,6 @@ class BrokerService:
             card = {
                 "lease_id": lease["id"],
                 "agent_name": lease["actor_id"],
-                "coordination_uri": lease.get("coordination_uri"),
                 "project_id": lease["project_id"],
                 "task": lease["task_ref"],
                 "state": lease["state"],
@@ -3894,7 +3832,6 @@ class BrokerService:
                     {
                         "lease_id": card["lease_id"],
                         "agent_name": card["agent_name"],
-                        "coordination_uri": card["coordination_uri"],
                         "project_id": card["project_id"],
                         "task": card["task"],
                         "gpu_count": endpoint_gpu_count,
@@ -3905,7 +3842,6 @@ class BrokerService:
                 lease["actor_id"],
                 {
                     "agent_name": lease["actor_id"],
-                    "coordination_uri": lease.get("coordination_uri"),
                     "active_leases": 0,
                     "active_workload_leases": 0,
                     "leased_gpus": 0,
