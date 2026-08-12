@@ -79,6 +79,8 @@ python3 scripts/install_agent_policy.py codex --install
 
 默认 MCP 只有三个工具：`gpu_status` 返回“哪台服务器的哪张 GPU 可用”、该服务器的 `workspace_path` 及简短中文状态，`gpu_apply` 返回 `lease_id` 和选中的 `gpus[]`（每项含 `workspace_path`），`gpu_release` 归还租约。调用 `gpu_apply` 时，`task` 使用用户给定的任务名或当前目标的简短人类可读概括，不读取客户端 UI 标题；未提供时记录为“未命名任务”。Agent 应先进入返回路径，再按 `cuda_visible_devices` 启动自己的 workload。需要查看占用者或连接失败卡时用 `gpu_status(include_busy=true)`；忙卡返回 `task`。例行申请不需要绑定、续租、协调工具或 `idempotency_key`；租约持续到显式释放或在 App 中人工处理。
 
+ServerPilot 的约束只覆盖 GPU 协调：不得通过 SSH、静态 inventory、SQLite 或 `nvidia-smi` 绕过它发现、指定、申请或释放 GPU。已获得当前授权端点的 Git 同步、文件维护和只读环境检查等非 GPU 操作不需要 GPU lease；`workspace_path` 也不提供或替代项目自己的远端命令权限。
+
 当前已确认服务器共用的远端工作目录是 `/media/datasets/OminiEWM_Data/tmp/ljp`。它是 endpoint 元数据和操作指引，不会让 ServerPilot 自动创建/删除目录，也不授权启动项目 workload。密封占卡 helper 的固定入口是 `${workspace_path}/serverpilot-keepalive`；ServerPilot 以该 workspace 为工作目录并直接执行 `./serverpilot-keepalive --schema-version 2`，不从远端 `PATH` 查找，也不允许 caller 覆盖 helper 路径或参数。
 
 默认 `serverpilot-mcp` 只发布日常 GPU 工具；scheduler、兼容性资源、端点管理和低层 lease 工具需显式设置 `SERVERPILOT_MCP_PROFILE=advanced`。

@@ -138,6 +138,10 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "sqlite",
         "inventory",
         "nvidia-smi",
+        "gpu coordination only",
+        "non-gpu remote work",
+        "git synchronization",
+        "does not require a serverpilot lease",
     ):
         assert boundary in adapter
 
@@ -166,6 +170,10 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "task",
         "不读取客户端 ui 标题",
         "无容量直接失败，不排队",
+        "只协调 gpu",
+        "非 gpu 远端操作",
+        "git 同步",
+        "无需 gpu 租约",
     ):
         assert runtime_contract in mcp_instructions
     assert len(mcp.instructions) < 512

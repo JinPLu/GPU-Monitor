@@ -25,7 +25,9 @@ MCP_INSTRUCTIONS = """常规 GPU 任务只使用三个工具：gpu_status 查看
 自动选卡；task 应写用户给定的任务名或当前目标的简短人类可读概括，不读取客户端 UI 标题。成功后先进入返回的
 workspace_path，再使用 cuda_visible_devices；任务结束或启动失败时 gpu_release。需要检查占用情况时调用
 gpu_status(include_busy=true) 读取 task。空闲占卡仍算可用，申请时
-自动让位。无容量直接失败，不排队。不要自行指定 GPU，也不要绕过 ServerPilot。"""
+自动让位。无容量直接失败，不排队。ServerPilot 只协调 GPU；不得通过 SSH、SQLite、inventory 或 nvidia-smi
+绕过 GPU 发现、选卡、申请或释放。已获授权的非 GPU 远端操作（Git 同步、文件维护、只读环境检查）无需 GPU
+租约，但仍须使用当前获授权端点。"""
 
 
 mcp = FastMCP(

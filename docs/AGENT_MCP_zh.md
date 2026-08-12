@@ -40,10 +40,13 @@ serverpilot daemon status
 
 `no_capacity` 不创建队列。例行租约持续到显式 `gpu_release` 或 App 人工处理，不需要 bind、renew、heartbeat、coordination 或 `idempotency_key`。
 
+ServerPilot 只协调 GPU。不得通过 SSH、SQLite、静态 inventory 或 `nvidia-smi` 绕过 ServerPilot 发现、指定、申请或释放 GPU。已经取得当前授权端点的非 GPU 远端操作，例如 Git 同步、文件维护和只读环境检查，不需要申请 GPU lease；普通 SSH 操作本身不等于绕过 ServerPilot。
+
 ## 边界
 
 - 通用资源、管理与 scheduler 操作是 advanced 兼容接口，不进入默认 Agent 上下文。
 - App 负责人工查看和纠错；默认 Agent 路径不需要额外生命周期步骤。
+- `workspace_path` 和 GPU lease 不提供 SSH shell，也不代替项目自己的远端执行授权。
 
 ## 自检
 

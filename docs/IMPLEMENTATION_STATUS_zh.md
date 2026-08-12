@@ -21,6 +21,8 @@ loopback 控制面不使用登录 token：没有 token model、登录页面、�
 
 项目明确要求的资源正确性边界仍保留：过期采集不能被当成可用 GPU，Agent 只能使用实际返回的 lease 资源。这两项来自当前项目合同，不新增状态机。
 
+Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕过的对象是 GPU 发现、选卡、申请和释放；已获得当前授权端点的 Git 同步、文件维护与只读环境检查不需要 GPU lease。`workspace_path` 仍只是元数据，不提供远端 shell 或额外授权。
+
 ## 已完成验证
 
 以下自动化结果来自当前工作树；测试使用临时数据库和 fake provider。

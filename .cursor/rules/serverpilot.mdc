@@ -19,7 +19,11 @@ GPU path:
 3. `gpu_release(lease_id)` releases the allocation when the workload stops or
    fails to start.
 
-Routine leases last until explicit release or human correction in the App. Do
-not bypass ServerPilot through SSH, SQLite, inventory, or `nvidia-smi`.
-Advanced compatibility tools are outside the routine path.
+Routine leases last until explicit release or human correction in the App.
+ServerPilot governs GPU coordination only: do not use SSH, SQLite, inventory,
+or `nvidia-smi` to discover, select, claim, or release GPUs outside the broker.
+Authorized non-GPU remote work—including Git synchronization, file maintenance,
+and read-only environment checks—does not require a ServerPilot lease, but it
+still requires a current authorized endpoint. Advanced compatibility tools are
+outside the routine path.
 <!-- SERVERPILOT_GLOBAL_END -->
