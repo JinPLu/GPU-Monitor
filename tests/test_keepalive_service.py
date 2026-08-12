@@ -349,6 +349,38 @@ def test_stop_is_per_gpu_and_requires_fresh_empty_target_observation(service, ad
     assert gpus["endpoint-a:GPU-endpoint-a-1"]["state"] == "AVAILABLE"
 
 
+def test_endpoint_operator_can_clear_stale_per_gpu_keepalive_lease(service, admin) -> None:
+    """A failed stop leaves a recoverable internal lease, not a permanent wedge."""
+
+    _configure_idle_policy(service, admin)
+    begun = _begin(service, admin)
+    keepalive = begun["keepalive"]
+    assert isinstance(keepalive, dict)
+    lease_id = str(keepalive["lease_id"])
+
+    service.configure_keepalive_policy(
+        admin,
+        "endpoint-a",
+        "disabled",
+        idempotency_key="stale-keepalive-policy-disabled",
+    )
+    barrier = utcnow()
+    service.ingest_observation(observation(count=2, processes=[]))
+
+    released = service.release_empty_conflicted_lease(
+        admin,
+        "endpoint-a",
+        lease_id,
+        observation_not_before=barrier,
+        idempotency_key="stale-keepalive-release-empty",
+    )
+
+    assert released["released"] is True
+    assert released["lease"]["state"] == "RELEASED"
+    gpus = _gpus(service.snapshot(admin))
+    assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "AVAILABLE"
+
+
 def test_legacy_whole_endpoint_keepalive_is_fail_closed_until_explicit_stop(service, admin) -> None:
     _configure_idle_policy(service, admin)
     now = utcnow()

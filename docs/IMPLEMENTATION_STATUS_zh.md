@@ -18,7 +18,7 @@
 - 裸机申请只会立即返回 `HELD` / `ACTIVE` lease，或返回 `no_capacity`。`no_capacity` 不创建等待队列，也不授权执行。
 - 成功 lease 返回 `resources[]`、endpoint、GPU 和 `cuda_visible_devices`。Agent 只能使用这些落点。
 - 日常 GPU Agent 直接调用 `gpu_apply`；只有需要查看可用性或诊断 placement 时才调用 `gpu_status`，旧的 `gpu_list` 只在 advanced profile 提供。`server_id` 可选，默认一张 GPU；ServerPilot 自动记录例行申请的归属并选择实际可分配的 GPU，Agent 只使用返回的资源并在完成后释放。
-- MCP 的默认状态读面只返回摘要、服务器容量和紧凑 GPU 列表；`gpu_list` 直接使用窄 REST 投影，不把 scheduler、通用资源和历史集合带回 Agent 上下文。完整控制面仍由 REST `control_plane_state` 保留给显式诊断。
+- MCP 的默认状态读面只返回摘要、服务器容量和紧凑 GPU 列表；`gpu_list` 直接使用窄 REST 投影，不把 scheduler、通用资源和历史集合带回 Agent 上下文。紧凑状态会区分可见 workload lease 与内部 keepalive 归属：`available` 始终排除所有占用，`verified_keepalive` 仅表示可由 `gpu_apply` 在逐卡停止并取得新鲜空观测后尝试回收，`HELD` / `CONFLICT` 仍不可分配。完整控制面仍由 REST `control_plane_state` 保留给显式诊断。
 - 默认 stdio MCP 只暴露日常 GPU 工具；scheduler、通用资源、端点管理和低层 lease 兼容函数仍可通过 `SERVERPILOT_MCP_PROFILE=advanced` 显式启用。
 - ServerPilot 只协调归属。任务由项目已有且获授权的执行路径启动和停止；启动后 Agent 用该 lease 的 `gpu_bind_observed_workload` 确认可观测进程归属，完成或启动失败后释放 lease。
 - mutation 重试复用调用方生成的 `idempotency_key`。管理动作还需要当前任务明确授权和 `approval_ref`。
@@ -52,7 +52,7 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `339` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过 |
+| Python 全量测试 | `344` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过 |
 | Ruff | 通过 |
 | Swift desktop/core 全量类型检查 | 通过 |
 | Alembic | 单头 `20260812_0019` |

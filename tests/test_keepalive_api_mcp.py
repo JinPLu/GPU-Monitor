@@ -66,6 +66,18 @@ class FakeKeepaliveAdapter:
         return KeepaliveResponse(enabled=enabled, results=tuple(results))
 
 
+class PartiallyFailingStopAdapter(FakeKeepaliveAdapter):
+    def __init__(self, fail_gpu_uuid: str) -> None:
+        super().__init__()
+        self.fail_gpu_uuid = fail_gpu_uuid
+
+    async def set_enabled(self, endpoint, enabled: bool, gpu_uuids: list[str]) -> KeepaliveResponse:  # type: ignore[no-untyped-def]
+        if not enabled and gpu_uuids == [self.fail_gpu_uuid]:
+            self.calls.append((endpoint.id, enabled, tuple(gpu_uuids)))
+            raise AdapterCommandError("one GPU stop failed", uncertain=True)
+        return await super().set_enabled(endpoint, enabled, gpu_uuids)
+
+
 class FakeTargetedCollector:
     def __init__(
         self,
@@ -309,6 +321,73 @@ def test_keepalive_api_disable_without_managed_coverage_never_targets_foreign_gp
     assert collector.calls == []
 
 
+def test_endpoint_operator_can_clear_empty_internal_keepalive_lease(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    adapter = FakeKeepaliveAdapter()
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+    service = app.state.service
+    actor = service.local_actor("agent-a")
+    service.configure_keepalive_policy(
+        actor, "endpoint-a", "idle_keepalive", idempotency_key="cleanup-policy-on"
+    )
+    begun = service.begin_keepalive(
+        actor,
+        "endpoint-a",
+        "endpoint-a:GPU-00000000-0000-0000-0000-000000000001",
+        idempotency_key="cleanup-begin",
+    )
+    lease_id = str(begun["keepalive"]["lease_id"])
+    service.configure_keepalive_policy(
+        actor, "endpoint-a", "disabled", idempotency_key="cleanup-policy-off"
+    )
+
+    response = TestClient(app).post(
+        f"/api/v1/endpoints/endpoint-a/leases/{lease_id}/release-empty",
+        headers=_headers("cleanup-empty-keepalive"),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["released"] is True
+    assert response.json()["lease"]["kind"] == "keepalive"
+    assert collector.calls[-1] == (["endpoint-a"], 1)
+
+
+def test_keepalive_stop_releases_empty_sibling_when_another_gpu_stop_is_uncertain(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    adapter = PartiallyFailingStopAdapter(GPU_UUIDS[1])
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+    client = TestClient(app)
+
+    enabled = client.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("partial-stop-on"),
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    disabled = client.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": False},
+        headers=_headers("partial-stop-off"),
+    )
+    assert disabled.status_code == 409, disabled.text
+    assert disabled.json()["error"]["code"] == "keepalive_partial_stop"
+    assert adapter.calls[-2:] == [
+        ("endpoint-a", False, (GPU_UUIDS[0],)),
+        ("endpoint-a", False, (GPU_UUIDS[1],)),
+    ]
+    snapshot = client.get(
+        "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
+    ).json()["data"]
+    states_by_uuid = {gpu["gpu_uuid"]: gpu["state"] for gpu in snapshot["gpus"]}
+    assert states_by_uuid[GPU_UUIDS[0]] == "AVAILABLE"
+    assert states_by_uuid[GPU_UUIDS[1]] in {"KEEPALIVE", "CONFLICT"}
+
+
 def test_keepalive_api_missing_endpoint_does_not_resolve_adapter_or_collect(
     tmp_path: Path, inventory: InventoryConfig
 ) -> None:
@@ -393,7 +472,10 @@ def test_keepalive_api_exposes_public_reconcile_hook(
     )
 
     assert result["keepalive"]["active_gpu_count"] == len(GPU_UUIDS)
-    assert adapter.calls == [("endpoint-a", True, GPU_UUIDS)]
+    assert adapter.calls == [
+        ("endpoint-a", True, (GPU_UUIDS[0],)),
+        ("endpoint-a", True, (GPU_UUIDS[1],)),
+    ]
 
 
 def test_immediate_claim_reclaims_only_the_selected_verified_keeper_gpu(

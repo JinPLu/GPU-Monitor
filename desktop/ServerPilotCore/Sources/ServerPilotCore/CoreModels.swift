@@ -464,6 +464,9 @@ public struct EndpointKeepaliveSummary: Equatable, Sendable {
     public var isEnabled: Bool { policy == "idle_keepalive" }
     public var isActive: Bool { activeGPUCount > 0 || state == "ACTIVE" }
     public var isTransitioning: Bool { startingGPUCount > 0 || ["STARTING", "PARTIAL"].contains(state) }
+    public var hasResidualLease: Bool {
+        activeGPUCount > 0 || startingGPUCount > 0 || errorGPUCount > 0 || legacyGPUCount > 0
+    }
 
     public func coverageSummary(totalGPUCount: Int, taskGPUCount: Int) -> String {
         guard configured else { return "未配置空闲占卡" }
@@ -486,6 +489,7 @@ public struct GPUKeepaliveStatus: Equatable, Sendable {
     public let configured: Bool
     public let policy: String
     public let state: String
+    public let leaseID: String?
     public let reason: String?
     public let healthState: String?
     public let lastVerifiedAt: String?
@@ -500,6 +504,7 @@ public struct GPUKeepaliveStatus: Equatable, Sendable {
         state = ["OFF", "STARTING", "ACTIVE", "ERROR", "LEGACY_STOP_REQUIRED"].contains(suppliedState)
             ? suppliedState
             : "ERROR"
+        leaseID = raw.string("lease_id")
         let health = raw["health"] as? [String: Any] ?? [:]
         reason = raw.string("reason") ?? raw.string("message") ?? health.string("reason")
         healthState = health.string("state")?.uppercased()

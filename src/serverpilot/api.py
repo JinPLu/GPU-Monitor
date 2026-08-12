@@ -321,7 +321,8 @@ def create_app(
                 ) from None
 
             if starts:
-                prepared: list[tuple[dict[str, Any], str]] = []
+                start_failures: list[dict[str, str]] = []
+                started_count = 0
                 for transition in starts:
                     gpu_id = transition.get("gpu_id")
                     gpu_uuid = transition.get("gpu_uuid")
@@ -331,57 +332,74 @@ def create_app(
                             "endpoint keepalive start target is invalid",
                             status_code=503,
                         )
-                    pending = service.begin_keepalive(
-                        actor,
-                        endpoint_id,
-                        gpu_id,
-                        idempotency_key=f"{idempotency_key}:start:{gpu_id}",
-                    )
-                    lease_id = pending.get("keepalive", {}).get("lease_id")
-                    if not isinstance(lease_id, str):
-                        raise BrokerError(
-                            "keepalive_transition_plan_invalid",
-                            "endpoint keepalive reservation could not be verified",
-                            status_code=503,
+                    try:
+                        pending = service.begin_keepalive(
+                            actor,
+                            endpoint_id,
+                            gpu_id,
+                            idempotency_key=f"{idempotency_key}:start:{gpu_id}",
                         )
-                    prepared.append((transition, lease_id))
-                target_uuids = [transition["gpu_uuid"] for transition, _ in prepared]
-                try:
-                    adapter_result = await adapter.set_enabled(endpoint, True, target_uuids)
-                except AdapterCommandError as exc:
+                        lease_id = pending.get("keepalive", {}).get("lease_id")
+                        if not isinstance(lease_id, str):
+                            raise BrokerError(
+                                "keepalive_transition_plan_invalid",
+                                "endpoint keepalive reservation could not be verified",
+                                status_code=503,
+                            )
+                    except BrokerError as exc:
+                        start_failures.append({"gpu_id": gpu_id, "code": exc.code})
+                        continue
+                    try:
+                        # The helper is explicitly per-GPU.  A failure on one
+                        # target must not turn a healthy sibling into a
+                        # failed start, nor reserve a batch that cannot be
+                        # individually attested.
+                        adapter_result = await adapter.set_enabled(endpoint, True, [gpu_uuid])
+                        workers = result_workers_by_gpu_uuid(
+                            adapter_result, [gpu_uuid], enabled=True
+                        )
+                        observation_not_before = utcnow()
+                        await collect_keepalive_endpoint(endpoint)
+                        worker = getattr(workers[gpu_uuid], "worker", None)
+                        pid = getattr(worker, "pid", None)
+                        if not isinstance(pid, int) or pid <= 0:
+                            raise BrokerError(
+                                "keepalive_attestation_missing",
+                                "endpoint keepalive state could not be verified",
+                                status_code=503,
+                            )
+                        service.confirm_keepalive(
+                            actor,
+                            endpoint_id,
+                            lease_id,
+                            attested_pid=pid,
+                            observation_not_before=observation_not_before,
+                            idempotency_key=f"{idempotency_key}:confirm:{gpu_id}",
+                        )
+                        started_count += 1
+                    except AdapterCommandError as exc:
+                        start_failures.append(
+                            {
+                                "gpu_id": gpu_id,
+                                "code": "keepalive_outcome_uncertain"
+                                if exc.uncertain
+                                else "keepalive_adapter_failed",
+                            }
+                        )
+                    except BrokerError as exc:
+                        start_failures.append({"gpu_id": gpu_id, "code": exc.code})
+                    except Exception:
+                        start_failures.append({"gpu_id": gpu_id, "code": "keepalive_adapter_failed"})
+                if start_failures and started_count == 0:
                     raise BrokerError(
-                        "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed",
+                        start_failures[0]["code"],
                         "endpoint keepalive operation could not be verified",
                         status_code=503,
-                    ) from None
-                except Exception:
-                    raise BrokerError(
-                        "keepalive_adapter_failed",
-                        "endpoint keepalive operation could not be verified",
-                        status_code=503,
-                    ) from None
-                workers = result_workers_by_gpu_uuid(adapter_result, target_uuids, enabled=True)
-                observation_not_before = utcnow()
-                await collect_keepalive_endpoint(endpoint)
-                for transition, lease_id in prepared:
-                    worker = getattr(workers[transition["gpu_uuid"]], "worker", None)
-                    pid = getattr(worker, "pid", None)
-                    if not isinstance(pid, int) or pid <= 0:
-                        raise BrokerError(
-                            "keepalive_attestation_missing",
-                            "endpoint keepalive state could not be verified",
-                            status_code=503,
-                        )
-                    service.confirm_keepalive(
-                        actor,
-                        endpoint_id,
-                        lease_id,
-                        attested_pid=pid,
-                        observation_not_before=observation_not_before,
-                        idempotency_key=f"{idempotency_key}:confirm:{transition['gpu_id']}",
+                        details={"failed_gpu_ids": [item["gpu_id"] for item in start_failures]},
                     )
             else:
                 prepared_stops: list[tuple[dict[str, Any], str]] = []
+                stop_failures: list[dict[str, str]] = []
                 for transition in stops:
                     lease_id = transition.get("lease_id")
                     gpu_uuid = transition.get("gpu_uuid")
@@ -393,44 +411,74 @@ def create_app(
                         )
                     # Resolve the lease through the service before remote I/O;
                     # a stale plan must never ask the helper to stop a GPU.
-                    pending = service.prepare_keepalive_stop(
-                        actor,
-                        endpoint_id,
-                        transition.get("gpu_id"),
-                    )
-                    resolved_lease_id = pending.get("keepalive", {}).get("lease_id")
-                    if resolved_lease_id != lease_id:
-                        raise BrokerError(
-                            "keepalive_transition_plan_invalid",
-                            "endpoint keepalive stop reservation changed before execution",
-                            status_code=409,
+                    try:
+                        pending = service.prepare_keepalive_stop(
+                            actor,
+                            endpoint_id,
+                            transition.get("gpu_id"),
                         )
+                        resolved_lease_id = pending.get("keepalive", {}).get("lease_id")
+                        if resolved_lease_id != lease_id:
+                            raise BrokerError(
+                                "keepalive_transition_plan_invalid",
+                                "endpoint keepalive stop reservation changed before execution",
+                                status_code=409,
+                            )
+                    except BrokerError as exc:
+                        stop_failures.append(
+                            {"gpu_id": str(transition.get("gpu_id")), "code": exc.code}
+                        )
+                        continue
                     prepared_stops.append((transition, lease_id))
-                target_uuids = [transition["gpu_uuid"] for transition, _ in prepared_stops]
-                try:
-                    adapter_result = await adapter.set_enabled(endpoint, False, target_uuids)
-                except AdapterCommandError as exc:
-                    raise BrokerError(
-                        "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed",
-                        "endpoint keepalive operation could not be verified",
-                        status_code=503,
-                    ) from None
-                except Exception:
-                    raise BrokerError(
-                        "keepalive_adapter_failed",
-                        "endpoint keepalive operation could not be verified",
-                        status_code=503,
-                    ) from None
-                result_workers_by_gpu_uuid(adapter_result, target_uuids, enabled=False)
-                observation_not_before = utcnow()
-                await collect_keepalive_endpoint(endpoint)
                 for transition, lease_id in prepared_stops:
-                    service.finalize_keepalive_stop(
-                        actor,
-                        endpoint_id,
-                        lease_id,
-                        observation_not_before=observation_not_before,
-                        idempotency_key=f"{idempotency_key}:stop:{transition['gpu_id']}",
+                    gpu_id = transition["gpu_id"]
+                    gpu_uuid = transition["gpu_uuid"]
+                    try:
+                        # Stop is deliberately one GPU at a time.  The remote
+                        # helper mutates each GPU before it reports a later
+                        # failure, so a batch response cannot safely describe
+                        # which local leases were actually released.
+                        adapter_result = await adapter.set_enabled(endpoint, False, [gpu_uuid])
+                        result_workers_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=False)
+                    except AdapterCommandError as exc:
+                        adapter_code = (
+                            "keepalive_outcome_uncertain"
+                            if exc.uncertain
+                            else "keepalive_adapter_failed"
+                        )
+                    except BrokerError as exc:
+                        adapter_code = exc.code
+                    except Exception:
+                        adapter_code = "keepalive_adapter_failed"
+                    else:
+                        adapter_code = ""
+
+                    # Even an adapter exception can mean that the helper
+                    # stopped this GPU before failing on a later target.  A
+                    # fresh observation is therefore mandatory on both the
+                    # success and error paths; finalize only if it proves the
+                    # target empty.
+                    try:
+                        observation_not_before = utcnow()
+                        await collect_keepalive_endpoint(endpoint)
+                        service.finalize_keepalive_stop(
+                            actor,
+                            endpoint_id,
+                            lease_id,
+                            observation_not_before=observation_not_before,
+                            idempotency_key=f"{idempotency_key}:stop:{gpu_id}",
+                        )
+                    except BrokerError as exc:
+                        stop_failures.append(
+                            {"gpu_id": gpu_id, "code": exc.code if adapter_code == "" else adapter_code}
+                        )
+
+                if stop_failures:
+                    raise BrokerError(
+                        "keepalive_partial_stop",
+                        "已逐卡结束占卡；仍有 GPU 未能确认释放，请确认这些 GPU 上没有运行中的进程后再清理。",
+                        status_code=409,
+                        details={"failed_gpu_ids": [item["gpu_id"] for item in stop_failures]},
                     )
             return service.get_endpoint_keepalive_summary(endpoint_id)
 
@@ -536,32 +584,43 @@ def create_app(
                         if observed_lease_id != target["lease_id"]:
                             return None
                         prepared.append(target)
-                    target_uuids = [target["gpu_uuid"] for target in prepared]
-                    try:
-                        adapter_result = await adapter.set_enabled(endpoint, False, target_uuids)
-                    except AdapterCommandError as exc:
-                        raise BrokerError(
-                            "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed",
-                            "keepalive release for an immediate claim could not be verified",
-                            status_code=503,
-                        ) from None
-                    except Exception:
-                        raise BrokerError(
-                            "keepalive_adapter_failed",
-                            "keepalive release for an immediate claim could not be verified",
-                            status_code=503,
-                        ) from None
-                    result_workers_by_gpu_uuid(adapter_result, target_uuids, enabled=False)
-                    observation_not_before = utcnow()
-                    await collect_keepalive_endpoint(endpoint)
                     for target in prepared:
-                        service.finalize_keepalive_stop(
-                            actor,
-                            endpoint_id,
-                            target["lease_id"],
-                            observation_not_before=observation_not_before,
-                            idempotency_key=f"{idempotency_key}:reclaim:{target['gpu_id']}",
-                        )
+                        gpu_uuid = target["gpu_uuid"]
+                        adapter_code: str | None = None
+                        try:
+                            # Reclaim follows the same per-GPU rule as the
+                            # endpoint stop action. Never retry the claim
+                            # until every selected keeper has independently
+                            # passed fresh, process-free finalization.
+                            adapter_result = await adapter.set_enabled(endpoint, False, [gpu_uuid])
+                            result_workers_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=False)
+                        except AdapterCommandError as exc:
+                            adapter_code = (
+                                "keepalive_outcome_uncertain"
+                                if exc.uncertain
+                                else "keepalive_adapter_failed"
+                            )
+                        except BrokerError as exc:
+                            adapter_code = exc.code
+                        except Exception:
+                            adapter_code = "keepalive_adapter_failed"
+                        observation_not_before = utcnow()
+                        try:
+                            await collect_keepalive_endpoint(endpoint)
+                            service.finalize_keepalive_stop(
+                                actor,
+                                endpoint_id,
+                                target["lease_id"],
+                                observation_not_before=observation_not_before,
+                                idempotency_key=f"{idempotency_key}:reclaim:{target['gpu_id']}",
+                            )
+                        except BrokerError as exc:
+                            raise BrokerError(
+                                adapter_code or exc.code,
+                                "keepalive release for an immediate claim could not be verified",
+                                status_code=503,
+                                details={"gpu_id": target["gpu_id"]},
+                            ) from None
                 # Keep the endpoint locks through the ordinary claim retry.
                 # Otherwise collector reconciliation could observe the fresh
                 # empty GPU and restart its keeper in the gap.
@@ -1199,7 +1258,7 @@ def create_app(
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        """Clear an empty workload lease only after a fresh collection."""
+        """Clear an empty workload/keepalive lease only after fresh collection."""
 
         mutation_key = _idempotency_key(idempotency_key)
         observation_not_before = utcnow()

@@ -3809,6 +3809,12 @@ class BrokerService:
             counts = defaultdict(int)
             for gpu in all_gpu_payloads:
                 counts[gpu["state"]] += 1
+            workload_claimed_gpu_count = sum(
+                item["lease"] is not None for item in all_gpu_payloads
+            )
+            keepalive_owned_gpu_count = sum(
+                item["keepalive"]["lease_id"] is not None for item in all_gpu_payloads
+            )
             claimed_states = {
                 "HELD",
                 "LEASED_IDLE",
@@ -3845,6 +3851,9 @@ class BrokerService:
                 "available_gpus": counts["AVAILABLE"],
                 "busy_gpus": counts["BUSY_UNMANAGED"] + counts["RUNNING_MANAGED"],
                 "claimed_gpus": sum(counts[item] for item in claimed_states),
+                "workload_claimed_gpus": workload_claimed_gpu_count,
+                "keepalive_owned_gpus": keepalive_owned_gpu_count,
+                "verified_keepalive_gpus": counts["KEEPALIVE"],
                 "abnormal_gpus": sum(counts[item] for item in abnormal_states),
                 "attention": {
                     "endpoint_count": attention_endpoint_count,
@@ -4650,6 +4659,7 @@ class BrokerService:
                     "agent_name": lease["actor_id"],
                     "coordination_uri": lease.get("coordination_uri"),
                     "active_leases": 0,
+                    "active_workload_leases": 0,
                     "leased_gpus": 0,
                     "managed_running_gpus": 0,
                     "idle_leased_gpus": 0,
@@ -4658,6 +4668,7 @@ class BrokerService:
                 },
             )
             agent["active_leases"] += 1
+            agent["active_workload_leases"] += 1
             agent["leased_gpus"] += len(lease_gpus)
             agent["managed_running_gpus"] += state_counts.get("RUNNING_MANAGED", 0)
             agent["idle_leased_gpus"] += state_counts.get("LEASED_IDLE", 0)
@@ -4701,6 +4712,12 @@ class BrokerService:
                 gpu["telemetry"] for gpu in endpoint_gpus if gpu["telemetry"] is not None
             ]
             state_counts = gpu_state_counts(endpoint_gpus)
+            workload_leased_gpu_count = sum(
+                gpu["lease"] is not None for gpu in endpoint_gpus
+            )
+            keepalive_owned_gpu_count = sum(
+                gpu["keepalive"]["lease_id"] is not None for gpu in endpoint_gpus
+            )
             host = endpoint["host_telemetry"]
             server_cards.append(
                 {
@@ -4710,7 +4727,13 @@ class BrokerService:
                     "capacity": {
                         "total_gpus": len(endpoint_gpus),
                         "available_gpus": state_counts.get("AVAILABLE", 0),
-                        "leased_gpus": sum(1 for gpu in endpoint_gpus if gpu["lease"] is not None),
+                        # Compatibility: leased_gpus has always meant visible
+                        # workload leases. Internal keepalive ownership is
+                        # intentionally counted separately below.
+                        "leased_gpus": workload_leased_gpu_count,
+                        "workload_leased_gpus": workload_leased_gpu_count,
+                        "keepalive_owned_gpus": keepalive_owned_gpu_count,
+                        "verified_keepalive_gpus": state_counts.get("KEEPALIVE", 0),
                         "managed_running_gpus": state_counts.get("RUNNING_MANAGED", 0),
                         "idle_leased_gpus": state_counts.get("LEASED_IDLE", 0),
                         "unattributed_compute_gpus": state_counts.get("BUSY_UNMANAGED", 0),
@@ -4785,7 +4808,10 @@ class BrokerService:
         total_telemetry = [gpu["telemetry"] for gpu in gpus if gpu["telemetry"] is not None]
         coordination_summary = {
             **data["summary"],
+            # Compatibility: active_leases remains the visible workload lease
+            # count. Keepalive ownership is reported by keepalive_owned_gpus.
             "active_leases": len(lease_cards),
+            "active_workload_leases": len(lease_cards),
             "active_agents": len(agent_cards),
             "queued_requests": len(data["requests"]),
             "queued_gpus": sum(item["constraints"]["gpu_count"] for item in data["requests"]),
@@ -4821,7 +4847,11 @@ class BrokerService:
                 "guidance": (
                     "This board is read-only. Claims without a requested server are placed by the broker's "
                     "shared scheduler; external Slurm jobs remain separate from raw GPU leases and are "
-                    "allocated only when Slurm reports RUNNING with AllocTRES."
+                    "allocated only when Slurm reports RUNNING with AllocTRES. active_leases counts only "
+                    "visible workload leases; keepalive_owned_gpus reports internal occupancy. "
+                    "available_gpus excludes every occupied GPU. gpu_apply may reclaim only a verified "
+                    "KEEPALIVE GPU after stopping it and obtaining a fresh empty observation; HELD and "
+                    "CONFLICT GPUs remain unavailable."
                 ),
             },
         }
@@ -7543,7 +7573,7 @@ class BrokerService:
         observation_not_before: datetime,
         idempotency_key: str,
     ) -> dict[str, Any]:
-        """Release one empty workload lease after a fresh empty observation.
+        """Release one empty workload or keepalive lease after fresh evidence.
 
         A conflict is deliberately not auto-cleared by collection: it means a
         prior lease/process binding diverged, and the original actor may have
@@ -7551,7 +7581,9 @@ class BrokerService:
         recovery path only after the REST layer has collected the endpoint and
         this method verifies a complete, fresh, process-free observation for
         every GPU still owned by the lease. GPU utilization alone is never
-        treated as proof of emptiness.
+        treated as proof of emptiness. The same proof applies to internal
+        per-GPU keepalive leases so a failed stop cannot permanently wedge a
+        GPU that a human needs to recover.
         """
 
         self._require_role(actor, MUTATING_ROLES)
@@ -7573,10 +7605,15 @@ class BrokerService:
             lease = session.get(Lease, lease_id)
             if lease is None:
                 raise BrokerError("lease_not_found", "lease does not exist", status_code=404)
-            if lease.kind != "workload" or lease.state not in {"HELD", "ACTIVE", "CONFLICT"}:
+            if lease.kind not in {"workload", "keepalive"} or lease.state not in {
+                "HELD",
+                "ACTIVE",
+                "ORPHANED_BUSY",
+                "CONFLICT",
+            }:
                 raise BrokerError(
                     "empty_workload_lease_required",
-                    "only a held, active, or conflicted workload lease can be cleared here",
+                    "only a held, active, orphaned, or conflicted workload/keepalive lease can be cleared here",
                     status_code=409,
                 )
             resources = session.scalars(
@@ -7587,16 +7624,16 @@ class BrokerService:
             ).all()
             if not resources:
                 raise BrokerError(
-                    "workload_lease_has_no_resources",
-                    "the workload lease has no active GPU resources",
+                    "lease_has_no_resources",
+                    "the lease has no active GPU resources",
                     status_code=409,
                 )
             gpu_ids = {resource.gpu_id for resource in resources}
             gpus = [session.get(GPUDevice, gpu_id) for gpu_id in gpu_ids]
             if any(gpu is None or gpu.endpoint_id != endpoint_id for gpu in gpus):
                 raise BrokerError(
-                    "workload_lease_endpoint_mismatch",
-                    "the workload lease does not belong entirely to this server",
+                    "lease_endpoint_mismatch",
+                    "the lease does not belong entirely to this server",
                     status_code=409,
                 )
 
@@ -7661,7 +7698,7 @@ class BrokerService:
             before = self._lease_dict(session, lease)
             lease.state = "RELEASED"
             lease.released_at = now
-            lease.release_reason = "empty fresh observation cleared workload ownership"
+            lease.release_reason = "empty fresh observation cleared endpoint ownership"
             for resource in resources:
                 resource.active = False
                 resource.released_at = now
@@ -7688,7 +7725,11 @@ class BrokerService:
                 result="success",
                 before=before,
                 after=self._lease_dict(session, lease),
-                summary={"source": "endpoint_operator", "endpoint_id": endpoint_id},
+                summary={
+                    "source": "endpoint_operator",
+                    "endpoint_id": endpoint_id,
+                    "lease_kind": lease.kind,
+                },
                 now=now,
             )
             self._allocate_queued(session, now, revision)

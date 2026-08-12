@@ -198,10 +198,27 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
         endpoint_id = gpu.get("endpoint_id")
         if not endpoint_id:
             continue
-        counts = gpu_counts.setdefault(endpoint_id, {"total": 0, "available": 0})
+        counts = gpu_counts.setdefault(
+            endpoint_id,
+            {
+                "total": 0,
+                "available": 0,
+                "workload_leased": 0,
+                "keepalive_owned": 0,
+                "verified_keepalive": 0,
+            },
+        )
         counts["total"] += 1
         if gpu.get("state") == "AVAILABLE":
             counts["available"] += 1
+        lease = gpu.get("lease")
+        if isinstance(lease, dict):
+            counts["workload_leased"] += 1
+        keepalive = gpu.get("keepalive")
+        if isinstance(keepalive, dict) and keepalive.get("lease_id"):
+            counts["keepalive_owned"] += 1
+        if gpu.get("state") == "KEEPALIVE":
+            counts["verified_keepalive"] += 1
 
     compact_gpus = []
     for gpu in gpus:
@@ -219,24 +236,37 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
                     "temperature_c",
                 )
             }
+        lease = gpu.get("lease")
+        lease = lease if isinstance(lease, dict) else {}
+        keepalive = gpu.get("keepalive")
+        keepalive = keepalive if isinstance(keepalive, dict) else {}
+        keepalive_health = keepalive.get("health")
+        keepalive_health = keepalive_health if isinstance(keepalive_health, dict) else {}
         compact_gpus.append(
             {
-                key: gpu.get(key)
-                for key in (
-                    "id",
-                    "endpoint_id",
-                    "gpu_index",
-                    "name",
-                    "total_vram_mib",
-                    "state",
-                    "state_reason",
+                "id": gpu.get("id"),
+                "endpoint_id": gpu.get("endpoint_id"),
+                "gpu_index": gpu.get("gpu_index"),
+                "name": gpu.get("name"),
+                "total_vram_mib": gpu.get("total_vram_mib"),
+                "state": gpu.get("state"),
+                "state_reason": gpu.get("state_reason"),
+                "process_count": gpu.get(
                     "process_count",
-                    "owner",
-                    "task_ref",
-                    "expires_at",
-                )
+                    len(gpu.get("processes", [])) if isinstance(gpu.get("processes"), list) else 0,
+                ),
+                "owner": gpu.get("owner", lease.get("actor_id")),
+                "task_ref": gpu.get("task_ref", lease.get("task_ref")),
+                "expires_at": gpu.get("expires_at", lease.get("expires_at")),
             }
-            | {"telemetry": telemetry}
+            | {
+                "telemetry": telemetry,
+                "keepalive": {
+                    "state": keepalive.get("state", "OFF"),
+                    "reason": keepalive.get("reason"),
+                    "health_state": keepalive_health.get("state"),
+                },
+            }
         )
 
     servers = []
@@ -248,13 +278,25 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
         host = capacity_by_endpoint.get(endpoint_id, {})
         capacity = host.get("capacity") if isinstance(host, dict) else {}
         capacity = capacity if isinstance(capacity, dict) else {}
-        counts = gpu_counts.get(endpoint_id, {"total": 0, "available": 0})
+        counts = gpu_counts.get(
+            endpoint_id,
+            {
+                "total": 0,
+                "available": 0,
+                "workload_leased": 0,
+                "keepalive_owned": 0,
+                "verified_keepalive": 0,
+            },
+        )
         servers.append(
             {
                 "server_id": endpoint_id,
                 "monitor_status": monitor.get("status"),
                 "gpu_count": counts["total"],
                 "available_gpu_count": counts["available"],
+                "workload_leased_gpu_count": counts["workload_leased"],
+                "keepalive_owned_gpu_count": counts["keepalive_owned"],
+                "verified_keepalive_gpu_count": counts["verified_keepalive"],
                 "available_cpu_cores": capacity.get("available_cpu_cores"),
                 "available_memory_mib": capacity.get("available_memory_mib"),
                 "total_memory_mib": capacity.get("total_memory_mib"),
@@ -266,6 +308,10 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
         "summary": summary,
         "data_age_seconds": data.get("data_age_seconds"),
         "freshness_seconds": data.get("freshness_seconds"),
+        "availability_semantics": (
+            "available_gpu_count excludes every occupied GPU. gpu_apply may reclaim only a verified "
+            "KEEPALIVE GPU after stop and fresh empty observation; HELD and CONFLICT remain unavailable."
+        ),
         "servers": servers,
         "gpus": compact_gpus,
     }
@@ -295,6 +341,7 @@ def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
                 "agent_name",
                 "coordination_uri",
                 "active_leases",
+                "active_workload_leases",
                 "leased_gpus",
                 "managed_running_gpus",
                 "idle_leased_gpus",
@@ -337,6 +384,9 @@ def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
                     "total_gpus",
                     "available_gpus",
                     "leased_gpus",
+                    "workload_leased_gpus",
+                    "keepalive_owned_gpus",
+                    "verified_keepalive_gpus",
                     "managed_running_gpus",
                     "idle_leased_gpus",
                     "unattributed_compute_gpus",

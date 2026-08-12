@@ -1033,7 +1033,14 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
                 "snapshot_revision": 9,
                 "server_time": "2026-08-12T00:00:00Z",
                 "data": {
-                    "summary": {"total_gpus": 2, "available_gpus": 1},
+                    "summary": {
+                        "total_gpus": 2,
+                        "available_gpus": 1,
+                        "claimed_gpus": 1,
+                        "workload_claimed_gpus": 0,
+                        "keepalive_owned_gpus": 1,
+                        "verified_keepalive_gpus": 1,
+                    },
                     "data_age_seconds": 1.2,
                     "freshness_seconds": 30,
                     "endpoints": [
@@ -1066,7 +1073,32 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
                             "owner": None,
                             "task_ref": None,
                             "expires_at": None,
+                            "lease": None,
+                            "keepalive": {
+                                "state": "OFF",
+                                "reason": None,
+                                "lease_id": None,
+                                "health": {"state": "OFF"},
+                            },
                             "telemetry": {"memory_used_mib": 0, "private": "drop"},
+                            "processes": ["drop"],
+                        },
+                        {
+                            "id": "gpu-b",
+                            "endpoint_id": "server-a",
+                            "gpu_index": 1,
+                            "name": "A",
+                            "total_vram_mib": 80000,
+                            "state": "KEEPALIVE",
+                            "state_reason": "per-GPU keepalive is active",
+                            "lease": None,
+                            "keepalive": {
+                                "state": "ACTIVE",
+                                "reason": None,
+                                "lease_id": "internal-keepalive-id",
+                                "health": {"state": "HEALTHY"},
+                            },
+                            "telemetry": {"memory_used_mib": 25000},
                             "processes": ["drop"],
                         }
                     ],
@@ -1087,6 +1119,7 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
                             "agent_name": "codex-agent",
                             "coordination_uri": coordination_uri,
                             "active_leases": 1,
+                            "active_workload_leases": 1,
                             "leased_gpus": 1,
                             "managed_running_gpus": 1,
                             "idle_leased_gpus": 0,
@@ -1126,6 +1159,7 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
         "summary",
         "data_age_seconds",
         "freshness_seconds",
+        "availability_semantics",
         "servers",
         "gpus",
     }
@@ -1133,8 +1167,11 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
         {
             "server_id": "server-a",
             "monitor_status": "ONLINE",
-            "gpu_count": 1,
+            "gpu_count": 2,
             "available_gpu_count": 1,
+            "workload_leased_gpu_count": 0,
+            "keepalive_owned_gpu_count": 1,
+            "verified_keepalive_gpu_count": 1,
             "available_cpu_cores": 12.0,
             "available_memory_mib": 32768,
             "total_memory_mib": 65536,
@@ -1144,10 +1181,107 @@ def test_mcp_status_and_coordination_default_to_context_safe_projections(
     assert "resource_claims" not in status["data"]
     assert "private" not in status["data"]["gpus"][0]["telemetry"]
     assert "processes" not in status["data"]["gpus"][0]
+    assert status["data"]["gpus"][1]["keepalive"] == {
+        "state": "ACTIVE",
+        "reason": None,
+        "health_state": "HEALTHY",
+    }
+    assert "HELD and CONFLICT remain unavailable" in status["data"]["availability_semantics"]
 
     board = mcp_server.gpu_coordination()
     assert board["data"]["agents"][0]["coordination_uri"] == coordination_uri
+    assert board["data"]["agents"][0]["active_workload_leases"] == 1
     assert "workloads" not in board["data"]["leases"][0]
+
+
+def test_mcp_reads_distinguish_internal_keepalive_from_available_capacity(
+    tmp_path: Path, inventory, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    configured = inventory.model_copy(deep=True)
+    configured.collector.enabled = False
+    configured.endpoints[0].keepalive_adapter_id = "server-script-v1"
+    configured.endpoints[0].expected_gpu_count = 2
+    inventory_path = tmp_path / "mcp-keepalive-inventory.yaml"
+    inventory_path.write_text(
+        yaml.safe_dump(configured.model_dump(mode="json")), encoding="utf-8"
+    )
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'mcp-keepalive.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    service.ingest_observation(observation(count=2))
+    actor = service.local_actor("agent-a")
+    service.configure_keepalive_policy(
+        actor,
+        "endpoint-a",
+        "idle_keepalive",
+        idempotency_key="mcp-keepalive-policy",
+    )
+    service.begin_keepalive(
+        actor,
+        "endpoint-a",
+        "endpoint-a:GPU-endpoint-a-0",
+        idempotency_key="mcp-keepalive-begin",
+    )
+    rest = TestClient(app)
+    headers = {"X-ServerPilot-Actor": "agent-a"}
+
+    class RestBackedClient:
+        def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
+            assert kwargs == {"compact": True, "only_available": False}
+            response = rest.get("/api/v1/state", headers=headers)
+            assert response.status_code == 200
+            payload = response.json()
+            return {
+                "schema_version": payload["schema_version"],
+                "snapshot_revision": payload["snapshot_revision"],
+                "server_time": payload["server_time"],
+                "data": payload["data"]["current"],
+            }
+
+        def coordination(self):  # type: ignore[no-untyped-def]
+            response = rest.get("/api/v1/coordination", headers=headers)
+            assert response.status_code == 200
+            return response.json()
+
+    monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: RestBackedClient())
+
+    status = mcp_server.gpu_status()
+    summary = status["data"]["summary"]
+    server = next(
+        item for item in status["data"]["servers"] if item["server_id"] == "endpoint-a"
+    )
+    held = next(item for item in status["data"]["gpus"] if item["state"] == "HELD")
+    assert summary["total_gpus"] == 2
+    assert summary["available_gpus"] == 1
+    assert summary["claimed_gpus"] == 1
+    assert summary["workload_claimed_gpus"] == 0
+    assert summary["keepalive_owned_gpus"] == 1
+    assert summary["verified_keepalive_gpus"] == 0
+    assert server["available_gpu_count"] == 1
+    assert server["workload_leased_gpu_count"] == 0
+    assert server["keepalive_owned_gpu_count"] == 1
+    assert server["verified_keepalive_gpu_count"] == 0
+    assert held["keepalive"]["state"] == "STARTING"
+    assert held["owner"] is None
+
+    board = mcp_server.gpu_coordination()
+    board_summary = board["data"]["summary"]
+    board_server = next(
+        item for item in board["data"]["servers"] if item["server_id"] == "endpoint-a"
+    )
+    assert board_summary["active_leases"] == 0
+    assert board_summary["active_workload_leases"] == 0
+    assert board_summary["keepalive_owned_gpus"] == 1
+    assert board_server["capacity"]["available_gpus"] == 1
+    assert board_server["capacity"]["workload_leased_gpus"] == 0
+    assert board_server["capacity"]["keepalive_owned_gpus"] == 1
+    assert board_server["capacity"]["verified_keepalive_gpus"] == 0
+    assert "active_leases counts only visible workload leases" in board["data"]["guidance"]
 
 
 def test_mcp_general_resource_tools_delegate_and_enforce_marginal_policy(monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -472,6 +472,17 @@ private func confirmEmptyLeaseCleanup(_ lease: LeaseRecord, conflict: Bool) -> B
     return alert.runModal() == .alertFirstButtonReturn
 }
 
+@discardableResult
+private func confirmEmptyKeepaliveCleanup(gpuCount: Int) -> Bool {
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = "释放遗留占卡？"
+    alert.informativeText = "ServerPilot 会先重新采集这台服务器；只有确认 \(gpuCount) 张占卡 GPU 都没有运行中的进程时才会释放。"
+    alert.addButton(withTitle: "释放遗留占卡")
+    alert.addButton(withTitle: "取消")
+    return alert.runModal() == .alertFirstButtonReturn
+}
+
 // MARK: - Apple Home inspired native interface
 
 private struct StableRecordSelection: Identifiable, Equatable {
@@ -4609,6 +4620,20 @@ private struct ServerDetailSheet: View {
         }
     }
 
+    private var reclaimableKeepaliveLeaseIDs: [String] {
+        guard let endpoint else { return [] }
+        let policyDisabled = endpoint.keepalive.policy == "disabled"
+        let ids = gpus.compactMap { gpu -> String? in
+            guard let leaseID = gpu.keepalive.leaseID else { return nil }
+            // A normal start owns a held per-GPU lease while the helper is
+            // being attested. It is not a stale record. Recovery appears only
+            // after the user has asked to stop occupancy but that lease still
+            // survives the fresh state projection.
+            return policyDisabled ? leaseID : nil
+        }
+        return Array(Set(ids)).sorted()
+    }
+
     private var isMutating: Bool {
         guard let endpoint else { return false }
         return store.mutatingEndpointIDs.contains(endpoint.id)
@@ -4629,7 +4654,11 @@ private struct ServerDetailSheet: View {
     }
 
     private var occupancyActionStarts: Bool {
-        !(endpoint?.keepalive.isEnabled ?? false)
+        guard let endpoint else { return true }
+        // A disabled policy can still have leases left by a partial/uncertain
+        // stop. Keep the action as “结束占卡” so a human can retry the
+        // authoritative stop instead of being forced through a new start.
+        return !endpoint.keepalive.isEnabled && !endpoint.keepalive.hasResidualLease
     }
 
     private var occupancyActionTitle: String {
@@ -4676,6 +4705,25 @@ private struct ServerDetailSheet: View {
 
                         if !gpus.isEmpty {
                             ServerLeaseSummary(gpus: gpus)
+                        }
+
+                        if !reclaimableKeepaliveLeaseIDs.isEmpty {
+                            ForEach(reclaimableKeepaliveLeaseIDs, id: \.self) { leaseID in
+                                let gpuCount = gpus.filter { $0.keepalive.leaseID == leaseID }.count
+                                DetailCallout(
+                                    icon: "shield.lefthalf.filled.badge.checkmark",
+                                    color: DesignTokens.warning,
+                                    message: "占卡已停止，但 \(gpuCount) 张 GPU 仍有遗留占卡租约；确认没有进程后可释放。",
+                                    actionTitle: isMutating ? "处理中" : "释放遗留占卡",
+                                    action: {
+                                        guard !isMutating, confirmEmptyKeepaliveCleanup(gpuCount: gpuCount) else { return }
+                                        store.clearEmptyConflictedLease(
+                                            endpointID: endpoint.id,
+                                            leaseID: leaseID
+                                        ) { _, _ in }
+                                    }
+                                )
+                            }
                         }
 
                         let conflictedGPUCount = gpus.filter { $0.state == "CONFLICT" }.count
