@@ -118,7 +118,7 @@ def test_raw_ssh_adapter_runs_fixed_ssh_invocation(
     ]
 
 
-def test_raw_ssh_adapter_rejects_arbitrary_or_invalid_probes() -> None:
+def test_raw_ssh_adapter_rejects_arbitrary_probe() -> None:
     adapter = RawSSHObservationAdapter()
     endpoint = EndpointConfig(
         id="endpoint-a", host="gpu.example.test", port=2202, ssh_user="gpu",
@@ -127,15 +127,6 @@ def test_raw_ssh_adapter_rejects_arbitrary_or_invalid_probes() -> None:
 
     with pytest.raises(ValueError, match="unknown raw SSH probe"):
         asyncio.run(adapter.run_probe(endpoint, probe="arbitrary", connect_timeout_seconds=7))  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="positive integer"):
-        asyncio.run(
-            adapter.run_probe(
-                endpoint,
-                probe="process-details",
-                connect_timeout_seconds=7,
-                process_ids=(0,),
-            )
-        )
 
 
 def test_raw_ssh_adapter_uses_the_configured_sealed_observation_profile(

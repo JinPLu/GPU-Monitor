@@ -188,6 +188,7 @@ def create_app(
     shared_collector = collector or SSHCollector(inventory)
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "web" / "templates"))
     keepalive_reconcile_locks: dict[str, asyncio.Lock] = {}
+    keepalive_reconcile_tasks: set[asyncio.Task[None]] = set()
 
     def keepalive_reconcile_lock(endpoint_id: str) -> asyncio.Lock:
         lock = keepalive_reconcile_locks.get(endpoint_id)
@@ -324,8 +325,7 @@ def create_app(
                 ) from None
 
             if starts:
-                start_failures: list[dict[str, str]] = []
-                started_count = 0
+                start_targets: list[tuple[str, str]] = []
                 for transition in starts:
                     gpu_id = transition.get("gpu_id")
                     gpu_uuid = transition.get("gpu_uuid")
@@ -335,50 +335,56 @@ def create_app(
                             "endpoint keepalive start target is invalid",
                             status_code=503,
                         )
-                    start_attempted = False
+                    start_targets.append((gpu_id, gpu_uuid))
+                gpu_uuids = [gpu_uuid for _gpu_id, gpu_uuid in start_targets]
+
+                async def cleanup_failed_start(code: str) -> None:
                     try:
-                        # The helper runs one GPU at a time, so one failed card
-                        # does not change a healthy sibling.
-                        start_attempted = True
-                        adapter_result = await adapter.set_enabled(endpoint, True, [gpu_uuid])
-                        result_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=True)
-                        observation_not_before = utcnow()
-                        await collect_keepalive_endpoint(endpoint)
-                        service.activate_keepalive(
-                            actor,
-                            endpoint_id,
-                            gpu_id,
-                            observation_not_before=observation_not_before,
-                            idempotency_key=f"{idempotency_key}:activate:{gpu_id}",
-                        )
-                        started_count += 1
-                    except AdapterCommandError as exc:
-                        start_failures.append(
-                            {
-                                "gpu_id": gpu_id,
-                                "code": "keepalive_outcome_uncertain"
-                                if exc.uncertain
-                                else "keepalive_adapter_failed",
-                            }
-                        )
-                    except BrokerError as exc:
-                        start_failures.append({"gpu_id": gpu_id, "code": exc.code})
+                        cleanup = await adapter.set_enabled(endpoint, False, gpu_uuids)
+                        result_by_gpu_uuid(cleanup, gpu_uuids, enabled=False)
                     except Exception:
-                        start_failures.append({"gpu_id": gpu_id, "code": "keepalive_adapter_failed"})
-                    if start_attempted and start_failures and start_failures[-1]["gpu_id"] == gpu_id:
-                        # A failed start/collection must not leave an unrecorded
-                        # helper behind. The next normal collection retries it.
-                        try:
-                            await adapter.set_enabled(endpoint, False, [gpu_uuid])
-                        except Exception:
-                            start_failures[-1]["code"] = "keepalive_cleanup_failed"
-                if start_failures and started_count == 0:
+                        code = "keepalive_cleanup_failed"
+                    try:
+                        await collect_keepalive_endpoint(endpoint)
+                    except BrokerError:
+                        if code != "keepalive_cleanup_failed":
+                            code = "keepalive_observation_failed"
                     raise BrokerError(
-                        start_failures[0]["code"],
+                        code,
                         "空闲占卡未能启动，将在下一次采集后重试。",
                         status_code=503,
-                        details={"failed_gpu_ids": [item["gpu_id"] for item in start_failures]},
+                        details={"failed_gpu_ids": [gpu_id for gpu_id, _gpu_uuid in start_targets]},
                     )
+
+                try:
+                    adapter_result = await adapter.set_enabled(endpoint, True, gpu_uuids)
+                    result_by_gpu_uuid(adapter_result, gpu_uuids, enabled=True)
+                except AdapterCommandError as exc:
+                    await cleanup_failed_start(
+                        "keepalive_outcome_uncertain" if exc.uncertain else "keepalive_adapter_failed"
+                    )
+                except BrokerError as exc:
+                    await cleanup_failed_start(exc.code)
+                except Exception:
+                    await cleanup_failed_start("keepalive_adapter_failed")
+
+                observation_not_before = utcnow()
+                try:
+                    await collect_keepalive_endpoint(endpoint)
+                except BrokerError as exc:
+                    await cleanup_failed_start(exc.code)
+                try:
+                    service.activate_keepalives(
+                        actor,
+                        endpoint_id,
+                        [gpu_id for gpu_id, _gpu_uuid in start_targets],
+                        observation_not_before=observation_not_before,
+                        idempotency_key=f"{idempotency_key}:activate-batch",
+                    )
+                except BrokerError as exc:
+                    await cleanup_failed_start(exc.code)
+                except Exception:
+                    await cleanup_failed_start("keepalive_activation_failed")
             else:
                 prepared_stops: list[tuple[dict[str, Any], str]] = []
                 stop_failures: list[dict[str, str]] = []
@@ -657,20 +663,23 @@ def create_app(
             cycle_started = time.monotonic()
             try:
                 endpoints = service.collector_endpoints()
-                stagger = interval / len(endpoints) if len(endpoints) > 1 else 0.0
                 collected = await shared_collector.collect_once(
                     service,
+                    concurrency=5,
                     endpoints=endpoints,
-                    stagger_seconds=stagger,
+                    stagger_seconds=0.0,
                 )
                 system_actor = ActorContext(
                     id=SYSTEM_ACTOR_ID,
                     role="admin",
                     project_ids=frozenset(),
                 )
-                async def reconcile_collected(endpoint: Any) -> None:
-                    result = collected.get(endpoint.id)
-                    if not isinstance(result, dict) or "error" in result:
+
+                async def reconcile_collected(endpoint: Any, result: dict[str, Any]) -> None:
+                    # An explicit action or the previous collection cycle may
+                    # still be coordinating this endpoint. Do not queue a
+                    # duplicate; the next ordinary collection will see it.
+                    if keepalive_reconcile_lock(endpoint.id).locked():
                         return
                     revision = result.get("snapshot_revision")
                     key_suffix = revision if isinstance(revision, int) else int(time.time())
@@ -681,7 +690,16 @@ def create_app(
                             idempotency_key=f"keepalive-reconcile:{endpoint.id}:{key_suffix}",
                         )
 
-                await asyncio.gather(*(reconcile_collected(endpoint) for endpoint in endpoints))
+                for endpoint in endpoints:
+                    result = collected.get(endpoint.id)
+                    if not isinstance(result, dict) or "error" in result:
+                        continue
+                    task = asyncio.create_task(
+                        reconcile_collected(endpoint, result),
+                        name=f"serverpilot-keepalive-{endpoint.id}",
+                    )
+                    keepalive_reconcile_tasks.add(task)
+                    task.add_done_callback(keepalive_reconcile_tasks.discard)
             except Exception:
                 # Per-endpoint failures are already recorded by SSHCollector. This
                 # protects the service loop from an unexpected local failure.
@@ -706,6 +724,9 @@ def create_app(
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            reconcile_tasks = tuple(keepalive_reconcile_tasks)
+            if reconcile_tasks:
+                await asyncio.gather(*reconcile_tasks, return_exceptions=True)
 
     app = FastAPI(title="ServerPilot", version=__version__, lifespan=lifespan)
     app.state.service = service

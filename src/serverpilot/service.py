@@ -2168,6 +2168,187 @@ class BrokerService:
 
         return self._write(operation)
 
+    def activate_keepalives(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        gpu_ids: list[str],
+        *,
+        observation_not_before: datetime,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Atomically record one freshly observed keepalive for every target GPU."""
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="keepalive.activate_gpus", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            if endpoint.keepalive_policy != "idle_keepalive":
+                raise BrokerError(
+                    "keepalive_policy_disabled",
+                    "per-GPU keepalive may start only under idle_keepalive policy",
+                    status_code=409,
+                )
+            if endpoint.keepalive_adapter_id is None:
+                raise BrokerError(
+                    "keepalive_not_configured",
+                    "endpoint has no sealed keepalive adapter configured",
+                    status_code=409,
+                )
+            if endpoint.lifecycle_state != "active" or not endpoint.enabled:
+                raise BrokerError(
+                    "endpoint_not_active",
+                    "keepalive requires an active, enabled endpoint",
+                    status_code=409,
+                )
+            if not gpu_ids or len(gpu_ids) != len(set(gpu_ids)):
+                raise BrokerError(
+                    "keepalive_gpu_invalid",
+                    "keepalive targets must be a non-empty set of GPUs",
+                    status_code=409,
+                )
+
+            targets: list[tuple[GPUDevice, Lease | None]] = []
+            for gpu_id in gpu_ids:
+                gpu = session.get(GPUDevice, gpu_id)
+                if gpu is None or gpu.endpoint_id != endpoint.id:
+                    raise BrokerError(
+                        "keepalive_gpu_mismatch",
+                        "GPU does not belong to the endpoint",
+                        status_code=409,
+                    )
+                existing_lease = self._active_lease_for_gpu(session, gpu.id)
+                if existing_lease is not None and existing_lease.kind != "keepalive":
+                    raise BrokerError(
+                        "keepalive_gpu_ineligible",
+                        "a workload already owns the target GPU",
+                        status_code=409,
+                        details={"gpu_id": gpu.id},
+                    )
+                if existing_lease is not None:
+                    resources = self._keepalive_resources(session, existing_lease.id)
+                    if len(resources) != 1 or resources[0].gpu_id != gpu.id:
+                        raise BrokerError(
+                            "keepalive_gpu_invalid",
+                            "per-GPU keepalive record does not match the target GPU",
+                            status_code=409,
+                        )
+                targets.append((gpu, existing_lease))
+
+            processes = self._validate_keepalive_observation(
+                session,
+                endpoint_id=endpoint_id,
+                gpu_ids=gpu_ids,
+                observation_not_before=observation_not_before,
+            )
+            observed_gpu_ids = {process.gpu_id for process in processes}
+            missing_gpu_ids = [gpu_id for gpu_id in gpu_ids if gpu_id not in observed_gpu_ids]
+            if missing_gpu_ids:
+                raise BrokerError(
+                    "keepalive_process_missing",
+                    "fresh collection did not find every occupancy process",
+                    status_code=409,
+                    details={"gpu_ids": missing_gpu_ids},
+                )
+
+            now = utcnow()
+            revision = self._bump_revision(session, now)
+            keepalives: list[dict[str, Any]] = []
+            event_ids: list[int] = []
+            for gpu, existing_lease in targets:
+                if existing_lease is None:
+                    request = AllocationRequest(
+                        id=secrets.token_hex(16),
+                        actor_id=SYSTEM_ACTOR_ID,
+                        project_id=SYSTEM_PROJECT_ID,
+                        profile_id=None,
+                        auto_activate=False,
+                        task_ref=f"keepalive:{endpoint.id}:{gpu.id}",
+                        purpose="ServerPilot idle GPU keepalive",
+                        constraints_json=json_dump(
+                            {"gpu_count": 1, "endpoint_ids": [endpoint.id], "gpu_ids": [gpu.id]}
+                        ),
+                        duration_seconds=self._keepalive_ttl_seconds(),
+                        expected_duration_seconds=None,
+                        start_after=None,
+                        deadline=None,
+                        approval_ref=None,
+                        state="ACTIVE",
+                        priority_class="keepalive",
+                        blocked_reason=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(request)
+                    lease = Lease(
+                        id=secrets.token_hex(16),
+                        request_id=request.id,
+                        actor_id=SYSTEM_ACTOR_ID,
+                        project_id=SYSTEM_PROJECT_ID,
+                        kind="keepalive",
+                        state="ACTIVE",
+                        issued_at=now,
+                        expires_at=now + timedelta(seconds=self._keepalive_ttl_seconds()),
+                        last_heartbeat_at=now,
+                        activated_at=now,
+                        released_at=None,
+                        release_reason=None,
+                        issued_revision=revision,
+                    )
+                    session.add(lease)
+                    session.flush()
+                    session.add(
+                        LeaseResource(
+                            lease_id=lease.id, gpu_id=gpu.id, active=True, released_at=None
+                        )
+                    )
+                else:
+                    lease = existing_lease
+                    lease.state = "ACTIVE"
+                    lease.activated_at = lease.activated_at or now
+                    lease.last_heartbeat_at = now
+                    lease.expires_at = now + timedelta(seconds=self._keepalive_ttl_seconds())
+                    request = session.get(AllocationRequest, lease.request_id)
+                    if request is not None:
+                        request.state = "ACTIVE"
+                        request.updated_at = now
+                event = self._audit(
+                    session,
+                    actor_id=actor.id,
+                    action="keepalive.gpu_activated",
+                    resource_type="gpu",
+                    resource_id=gpu.id,
+                    result="success",
+                    summary={"lease_id": lease.id, "endpoint_id": endpoint.id},
+                    now=now,
+                )
+                event_ids.append(event.id)
+                keepalives.append(self._keepalive_lease_summary(lease, endpoint.id, gpu.id))
+            result = {
+                "event_ids": event_ids,
+                "snapshot_revision": revision,
+                "keepalives": keepalives,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="keepalive.activate_gpus",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
     @staticmethod
     def _keepalive_lease_summary(lease: Lease, endpoint_id: str, gpu_id: str) -> dict[str, Any]:
         return {

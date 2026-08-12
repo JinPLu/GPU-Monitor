@@ -19,6 +19,7 @@ from serverpilot.adapters import (
     GPU_UNAVAILABLE,
     HOST_RESOURCES_SECTION,
     IDENTITY_SECTION,
+    PROCESS_DETAILS_SECTION,
     PROCESS_SECTION,
     RAW_SSH_COMBINED_QUERY,
     RAW_SSH_OBSERVATION_ADAPTER,
@@ -528,19 +529,26 @@ def parse_host_resources(raw: str) -> tuple[int, float, int, int]:
     return cpu_count, load_1m, memory_total, memory_available
 
 
-def parse_combined_probe(raw: str) -> tuple[str, str, str, str]:
-    """Split the single fixed SSH probe into GPU, process, identity and host resource output."""
+def parse_combined_probe(raw: str) -> tuple[str, str, str, str, str]:
+    """Split one fixed SSH probe into GPU, process, details, identity, and host output."""
 
     try:
         gpu_marker, rest = raw.split(GPU_SECTION, maxsplit=1)
         gpu_raw, rest = rest.split(PROCESS_SECTION, maxsplit=1)
-        process_raw, rest = rest.split(IDENTITY_SECTION, maxsplit=1)
+        process_raw, rest = rest.split(PROCESS_DETAILS_SECTION, maxsplit=1)
+        process_details_raw, rest = rest.split(IDENTITY_SECTION, maxsplit=1)
         identity_raw, host_raw = rest.split(HOST_RESOURCES_SECTION, maxsplit=1)
     except ValueError as exc:
         raise CollectionError("combined SSH probe returned incomplete section markers") from exc
     if gpu_marker.strip():
         raise CollectionError("combined SSH probe returned data before its first section marker")
-    return gpu_raw.strip(), process_raw.strip(), identity_raw.strip(), host_raw.strip()
+    return (
+        gpu_raw.strip(),
+        process_raw.strip(),
+        process_details_raw.strip(),
+        identity_raw.strip(),
+        host_raw.strip(),
+    )
 
 
 def parse_ps_output(raw: str, observed_at) -> dict[int, tuple[str | None, object, str]]:  # noqa: ANN001
@@ -567,8 +575,6 @@ async def default_runner(
     endpoint: EndpointConfig,
     probe: RawSSHProbe,
     connect_timeout_seconds: int = 8,
-    *,
-    process_ids: tuple[int, ...] = (),
 ) -> str:
     """Execute a sealed, read-only SSH probe without a local shell."""
 
@@ -576,23 +582,10 @@ async def default_runner(
         endpoint,
         probe=probe,
         connect_timeout_seconds=connect_timeout_seconds,
-        process_ids=process_ids,
     )
     if result.stdout_truncated or result.stderr_truncated:
         raise CollectionError(f"SSH probe output exceeded bounded limits for {endpoint.id}")
     if result.returncode != 0:
-        # GNU/procps `ps -p` exits 1 when none of the requested PIDs are
-        # visible.  This is expected when nvidia-smi reports host PIDs from a
-        # different PID namespace, and the caller already has a conservative
-        # fallback for missing process metadata.  Keep every other non-zero
-        # result fail-closed, including any diagnostic output.
-        if (
-            probe == "process-details"
-            and result.returncode == 1
-            and not result.stdout.strip()
-            and not result.stderr.strip()
-        ):
-            return ""
         detail = result.stderr.strip().replace("\n", " ")[:500]
         raise CollectionError(f"SSH probe failed for {endpoint.id}: {detail or result.returncode}")
     return result.stdout
@@ -609,14 +602,12 @@ class SSHCollector:
         command: str,
         *,
         probe: RawSSHProbe,
-        process_ids: tuple[int, ...] = (),
     ) -> str:
         if self.runner is default_runner:
             output = await default_runner(
                 endpoint,
                 probe,
                 self.inventory.collector.ssh_connect_timeout_seconds,
-                process_ids=process_ids,
             )
         else:
             output = await self.runner(endpoint, command)
@@ -640,7 +631,7 @@ class SSHCollector:
                 endpoint_id=endpoint.id,
                 observed_at=observed_at,
             )
-        gpu_raw, process_raw, identity_raw, host_raw = parse_combined_probe(
+        gpu_raw, process_raw, process_details_raw, identity_raw, host_raw = parse_combined_probe(
             await self._run(endpoint, COMBINED_QUERY, probe="endpoint-telemetry")
         )
         # Some CPU-only hosts expose an `nvidia-smi` wrapper that succeeds but
@@ -659,20 +650,7 @@ class SSHCollector:
             memory_total_mib,
             memory_available_mib,
         ) = parse_host_resource_snapshot(host_raw)
-        pids = sorted({app.pid for app in apps})
-        details: dict[int, tuple[str | None, object, str]] = {}
-        if pids:
-            # Values are parsed positive integers only; no client input is interpolated.
-            ps_command = "ps -o pid=,user=,etimes=,comm= -p " + ",".join(str(pid) for pid in pids)
-            details = parse_ps_output(
-                await self._run(
-                    endpoint,
-                    ps_command,
-                    probe="process-details",
-                    process_ids=tuple(pids),
-                ),
-                observed_at,
-            )
+        details = parse_ps_output(process_details_raw, observed_at)
         processes = []
         for app in apps:
             username, started_at, executable = details.get(

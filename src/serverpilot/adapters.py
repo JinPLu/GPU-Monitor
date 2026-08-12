@@ -38,7 +38,7 @@ Capability = Literal[
 ]
 OperationId = Literal["scheduler.submit", "scheduler.cancel", "scheduler.upload"]
 ParameterType = Literal["string", "path"]
-RawSSHProbe = Literal["endpoint-telemetry", "process-details"]
+RawSSHProbe = Literal["endpoint-telemetry"]
 ObservationProfile = Literal["linux-nvidia", "linux-host", "server-script-v1"]
 
 
@@ -62,23 +62,39 @@ HOST_RESOURCES_QUERY = (
 )
 GPU_SECTION = "__SERVERPILOT_GPU__"
 PROCESS_SECTION = "__SERVERPILOT_PROCESSES__"
+PROCESS_DETAILS_SECTION = "__SERVERPILOT_PROCESS_DETAILS__"
 IDENTITY_SECTION = "__SERVERPILOT_IDENTITY__"
 HOST_RESOURCES_SECTION = "__SERVERPILOT_HOST_RESOURCES__"
 GPU_UNAVAILABLE = "__SERVERPILOT_GPU_UNAVAILABLE__"
 RAW_SSH_COMBINED_QUERY = (
     f"set -e; printf '{GPU_SECTION}\\n'; "
     f"if command -v nvidia-smi >/dev/null 2>&1; then "
+    "serverpilot_nvidia=1; "
     f"{GPU_QUERY} 2>/dev/null || printf '{GPU_UNAVAILABLE}\\n'; "
-    f"else printf '{GPU_UNAVAILABLE}\\n'; fi; "
+    f"else serverpilot_nvidia=0; printf '{GPU_UNAVAILABLE}\\n'; fi; "
     f"printf '{PROCESS_SECTION}\\n'; "
-    f"if command -v nvidia-smi >/dev/null 2>&1; then "
-    f"{PROCESS_QUERY} 2>/dev/null || true; fi; "
+    "if [ \"$serverpilot_nvidia\" = 1 ]; then "
+    f"serverpilot_processes=$({PROCESS_QUERY} 2>/dev/null || true); "
+    "printf '%s\\n' \"$serverpilot_processes\"; "
+    "else serverpilot_processes=''; fi; "
+    f"printf '{PROCESS_DETAILS_SECTION}\\n'; "
+    "serverpilot_pids=$(printf '%s\\n' \"$serverpilot_processes\" | "
+    "awk -F',' '{pid=$2; gsub(/^[ \\t]+|[ \\t]+$/, \"\", pid); "
+    "if (pid ~ /^[0-9]+$/ && pid > 0 && !seen[pid]++) "
+    "{printf \"%s%s\", separator, pid; separator=\",\"}}'); "
+    "if [ -n \"$serverpilot_pids\" ]; then "
+    "serverpilot_ps_output=$(ps -o pid=,user=,etimes=,comm= "
+    "-p \"$serverpilot_pids\" 2>&1) && serverpilot_ps_rc=0 || serverpilot_ps_rc=$?; "
+    "if [ \"$serverpilot_ps_rc\" = 0 ]; then printf '%s\\n' \"$serverpilot_ps_output\"; "
+    "elif [ \"$serverpilot_ps_rc\" != 1 ] || [ -n \"$serverpilot_ps_output\" ]; then "
+    "printf '%s\\n' \"$serverpilot_ps_output\" >&2; exit \"$serverpilot_ps_rc\"; fi; fi; "
     f"printf '{IDENTITY_SECTION}\\n'; {IDENTITY_QUERY}; "
     f"printf '{HOST_RESOURCES_SECTION}\\n'; {HOST_RESOURCES_QUERY}"
 )
 RAW_SSH_HOST_ONLY_QUERY = (
     f"set -e; printf '{GPU_SECTION}\\n{GPU_UNAVAILABLE}\\n'; "
     f"printf '{PROCESS_SECTION}\\n'; "
+    f"printf '{PROCESS_DETAILS_SECTION}\\n'; "
     f"printf '{IDENTITY_SECTION}\\n'; {IDENTITY_QUERY}; "
     f"printf '{HOST_RESOURCES_SECTION}\\n'; {HOST_RESOURCES_QUERY}"
 )
@@ -238,7 +254,6 @@ class RawSSHObservationAdapter:
         *,
         probe: RawSSHProbe,
         connect_timeout_seconds: int,
-        process_ids: tuple[int, ...] = (),
     ) -> RawSSHResult:
         if probe == "endpoint-telemetry":
             try:
@@ -247,12 +262,6 @@ class RawSSHObservationAdapter:
                 raise ValueError(
                     f"unknown endpoint observation profile: {endpoint.observation_profile}"
                 ) from exc
-        elif probe == "process-details":
-            if not process_ids or any(type(pid) is not int or pid <= 0 for pid in process_ids):
-                raise ValueError("process-details probe requires positive integer process ids")
-            remote_command = "ps -o pid=,user=,etimes=,comm= -p " + ",".join(
-                str(pid) for pid in sorted(set(process_ids))
-            )
         else:
             raise ValueError(f"unknown raw SSH probe: {probe}")
         process = await asyncio.create_subprocess_exec(

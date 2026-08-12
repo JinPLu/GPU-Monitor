@@ -558,7 +558,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         switch monitorStatus {
         case "ONLINE": return "在线"
         case "PENDING": return "正在连接"
-        case "STALE": return "更新中断"
+        case "STALE": return "采集延迟"
         case "ERROR": return "连接失败"
         case "DISABLED": return "已停用"
         case "DRAINING": return "已暂停"
@@ -584,7 +584,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
             return "无法连接服务器 · 检查 SSH"
         }
         if monitorStatus == "STALE" {
-            return "服务器状态未按计划更新"
+            return "最近一次服务器数据已过期"
         }
         if monitorStatus == "PENDING" {
             return "正在进行首次连接"

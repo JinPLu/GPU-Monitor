@@ -3278,7 +3278,7 @@ private func gpuStateLabel(_ state: String) -> String {
     case "BUSY_UNMANAGED", "ORPHANED_BUSY": return "任务占用"
     case "RESERVED": return "不可分配"
     case "UNKNOWN_RECOVERING": return "正在连接"
-    case "UNKNOWN_STALE": return "更新中断"
+    case "UNKNOWN_STALE": return "采集延迟"
     case "UNHEALTHY": return "GPU 故障"
     case "CONFLICT": return "归属待确认"
     case "DISABLED": return "已停用"
@@ -3343,7 +3343,7 @@ private func localizedStateReason(_ reason: String) -> String {
         return "资源已分配给其他项目或任务"
     }
     if reason.hasPrefix("telemetry age "), reason.contains("exceeds stale threshold") {
-        return "服务器状态未按计划更新"
+        return "最近一次服务器数据已过期"
     }
     if reason.hasPrefix("reservation "), reason.contains(" is active") {
         return "预约正在生效"
@@ -4567,7 +4567,7 @@ private struct ServerDetailSheet: View {
 
                         HStack {
                             Label(
-                                endpoint.monitorStatus == "ONLINE" ? "状态按设定周期自动更新" : "为安全起见，当前不可分配",
+                                endpoint.monitorStatus == "ONLINE" ? "状态按设定周期自动更新" : "当前数据已过期，暂不可申请 GPU",
                                 systemImage: endpoint.monitorStatus == "ONLINE" ? "arrow.clockwise" : "hand.raised.fill"
                             )
                                 .font(.system(size: 11, weight: .medium))
