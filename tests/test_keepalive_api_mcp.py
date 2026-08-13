@@ -37,9 +37,7 @@ GPU_UUIDS = (
     "GPU-00000000-0000-0000-0000-000000000001",
     "GPU-00000000-0000-0000-0000-000000000002",
 )
-EIGHT_GPU_UUIDS = tuple(
-    f"GPU-00000000-0000-0000-0000-{index:012d}" for index in range(1, 9)
-)
+EIGHT_GPU_UUIDS = tuple(f"GPU-00000000-0000-0000-0000-{index:012d}" for index in range(1, 9))
 
 
 class FakeKeepaliveAdapter:
@@ -200,9 +198,11 @@ class BlockingKeepaliveAdapter(FakeKeepaliveAdapter):
         assert self._loop is not None
         assert self._release is not None
         self._loop.call_soon_threadsafe(
-            lambda: self._release is not None
-            and not self._release.done()
-            and self._release.set_result(None)
+            lambda: (
+                self._release is not None
+                and not self._release.done()
+                and self._release.set_result(None)
+            )
         )
 
 
@@ -313,9 +313,7 @@ def _keepalive_app(
     configured.endpoints[0].keepalive_adapter_id = "server-script-v1"
     configured.endpoints[0].expected_gpu_count = len(collector.gpu_uuids)
     inventory_path = tmp_path / "inventory.yaml"
-    inventory_path.write_text(
-        yaml.safe_dump(configured.model_dump(mode="json")), encoding="utf-8"
-    )
+    inventory_path.write_text(yaml.safe_dump(configured.model_dump(mode="json")), encoding="utf-8")
     resolved: list[str] = []
 
     def resolve(adapter_id: str):  # type: ignore[no-untyped-def]
@@ -351,9 +349,7 @@ def test_keepalive_api_sets_desired_policy_and_reconciles_each_eligible_gpu(
 ) -> None:
     adapter = FakeKeepaliveAdapter()
     collector = FakeTargetedCollector(adapter, unmanaged_gpu_uuids=(GPU_UUIDS[1],))
-    app, resolved = _keepalive_app(
-        tmp_path, inventory, adapter=adapter, collector=collector
-    )
+    app, resolved = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
     client = TestClient(app)
 
     enabled = client.post(
@@ -451,6 +447,7 @@ def test_routine_claim_waits_for_inflight_keeper_start_on_same_endpoint(
     adapter = BlockingKeepaliveAdapter()
     collector = FakeTargetedCollector(adapter)
     app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+
     async def scenario() -> tuple[httpx.Response, httpx.Response]:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -629,7 +626,9 @@ def test_keepalive_api_starts_sibling_when_one_gpu_has_workload_conflict(
         LeaseObservedBind(run_id="conflict-before-keepalive-run"),
         idempotency_key="conflict-before-keepalive-bind",
     )
-    replacement = initial.model_copy(update={"process_started_at": started_at + timedelta(seconds=10)})
+    replacement = initial.model_copy(
+        update={"process_started_at": started_at + timedelta(seconds=10)}
+    )
     # A materially changed process identity on the same GPU is observed twice,
     # which is the service's conflict threshold.
     service.ingest_observation(
@@ -750,9 +749,9 @@ def test_keepalive_stop_releases_empty_sibling_when_another_gpu_stop_is_uncertai
         ("endpoint-a", False, (GPU_UUIDS[0],)),
         ("endpoint-a", False, (GPU_UUIDS[1],)),
     ]
-    snapshot = client.get(
-        "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
-    ).json()["data"]
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
     states_by_uuid = {gpu["gpu_uuid"]: gpu["state"] for gpu in snapshot["gpus"]}
     assert states_by_uuid[GPU_UUIDS[0]] == "AVAILABLE"
     assert states_by_uuid[GPU_UUIDS[1]] in {"KEEPALIVE", "CONFLICT"}
@@ -785,7 +784,9 @@ def test_keepalive_api_strict_body_and_mutation_headers(
     client = TestClient(app)
     path = "/api/v1/endpoints/endpoint-a/keepalive"
     assert client.post(path, json={"enabled": True}).status_code == 422
-    invalid = client.post(path, json={"enabled": True, "gpu_uuids": [GPU_UUIDS[0]]}, headers=_headers("strict"))
+    invalid = client.post(
+        path, json={"enabled": True, "gpu_uuids": [GPU_UUIDS[0]]}, headers=_headers("strict")
+    )
     assert invalid.status_code == 422
     assert invalid.json()["error"]["code"] == "validation_error"
     policy = client.post(path, json={"policy": "idle_keepalive"}, headers=_headers("strict-policy"))
@@ -897,15 +898,19 @@ def test_keepalive_api_reports_known_cuda_worker_failure_in_chinese_without_remo
             "keepalive CUDA PCI ordinal mapping does not contain requested GPU UUID",
             "keepalive_cuda_uuid_not_found",
         ),
-        ("CUDA visible device count is 8; expected exactly one", "keepalive_cuda_target_unavailable"),
+        (
+            "CUDA visible device count is 8; expected exactly one",
+            "keepalive_cuda_target_unavailable",
+        ),
     ],
 )
 def test_keepalive_adapter_failure_preserves_known_cuda_category(
     remote_failure: str, expected_code: str
 ) -> None:
-    assert _keepalive_adapter_failure_code(
-        AdapterCommandError(remote_failure, uncertain=True)
-    ) == expected_code
+    assert (
+        _keepalive_adapter_failure_code(AdapterCommandError(remote_failure, uncertain=True))
+        == expected_code
+    )
 
 
 def test_keepalive_unknown_uuid_has_specific_public_chinese_message() -> None:
@@ -997,9 +1002,7 @@ def test_keepalive_reconcile_starts_eight_gpus_with_one_helper_call_and_collecti
     assert adapter.calls == [("endpoint-a", True, EIGHT_GPU_UUIDS)]
     assert collector.calls == [(["endpoint-a"], 1)]
     with service.database.session() as session:
-        assert len(
-            session.scalars(select(Lease).where(Lease.kind == "keepalive")).all()
-        ) == 8
+        assert len(session.scalars(select(Lease).where(Lease.kind == "keepalive")).all()) == 8
 
 
 def test_batch_activation_conflict_on_second_gpu_cleans_all_helpers_and_adds_no_keepalive(
@@ -1185,9 +1188,9 @@ def test_immediate_claim_reclaims_only_the_selected_verified_keeper_gpu(
             ("endpoint-a", False, (GPU_UUIDS[0],)),
         ],
     ]
-    snapshot = client.get(
-        "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
-    ).json()["data"]
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
     states_by_uuid = {gpu["gpu_uuid"]: gpu["state"] for gpu in snapshot["gpus"]}
     assert states_by_uuid[GPU_UUIDS[0]] == "HELD"
     assert states_by_uuid[GPU_UUIDS[1]] == "BUSY_UNMANAGED"
@@ -1233,9 +1236,9 @@ def test_immediate_claim_stop_failure_does_not_create_workload_lease(
 
     assert failed.status_code == 503, failed.text
     assert failed.json()["error"]["code"] == "keepalive_outcome_uncertain"
-    snapshot = client.get(
-        "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
-    ).json()["data"]
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
     assert snapshot["leases"] == []
     assert adapter.calls == [
         ("endpoint-a", True, (GPU_UUIDS[0],)),
@@ -1266,12 +1269,10 @@ def test_missing_keeper_is_still_publicly_available_and_claimable(
         )
     )
 
-    snapshot = client.get(
-        "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
-    ).json()["data"]
-    missing = next(
-        gpu for gpu in snapshot["gpus"] if gpu["gpu_uuid"] == GPU_UUIDS[0]
-    )
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
+    missing = next(gpu for gpu in snapshot["gpus"] if gpu["gpu_uuid"] == GPU_UUIDS[0])
     assert missing["keepalive"] == {
         "configured": True,
         "policy": "idle_keepalive",
@@ -1342,13 +1343,9 @@ def test_quick_claim_uses_the_same_selected_keeper_handoff(
         ("endpoint-a", True, (GPU_UUIDS[0],)),
         ("endpoint-a", False, (GPU_UUIDS[0],)),
     ]
-    workloads = app.state.service.list_leases(
-        app.state.service.local_actor("human")
-    )["data"]
+    workloads = app.state.service.list_leases(app.state.service.local_actor("human"))["data"]
     assert len(workloads) == 1
-    assert workloads[0]["gpu_ids"] == [
-        "endpoint-a:GPU-00000000-0000-0000-0000-000000000001"
-    ]
+    assert workloads[0]["gpu_ids"] == ["endpoint-a:GPU-00000000-0000-0000-0000-000000000001"]
 
 
 def test_release_restores_the_selected_keeper_on_the_next_collection(
@@ -1405,9 +1402,9 @@ def test_release_restores_the_selected_keeper_on_the_next_collection(
     asyncio.run(next_collection())
 
     assert set(adapter.active_pids) == set(GPU_UUIDS)
-    snapshot = client.get(
-        "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
-    ).json()["data"]
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
     assert {gpu["state"] for gpu in snapshot["gpus"]} == {"KEEPALIVE"}
 
 
@@ -1442,9 +1439,7 @@ def test_routine_agent_path_handles_keepalive_on_and_off(
     status_on = mcp_server.gpu_status()
     assert len(status_on["gpus"]) == len(GPU_UUIDS)
     assert {gpu["status"] for gpu in status_on["gpus"]} == {"可用 · 空闲占卡"}
-    assert {tuple(gpu["keepalive"].values()) for gpu in status_on["gpus"]} == {
-        ("ON", "ON")
-    }
+    assert {tuple(gpu["keepalive"].values()) for gpu in status_on["gpus"]} == {("ON", "ON")}
 
     allocation_on = mcp_server.gpu_apply(
         server_id="endpoint-a", gpu_count=1, task="Agent 占卡开启申请验收"
@@ -1477,9 +1472,7 @@ def test_routine_agent_path_handles_keepalive_on_and_off(
     status_off = mcp_server.gpu_status()
     assert len(status_off["gpus"]) == len(GPU_UUIDS)
     assert {gpu["status"] for gpu in status_off["gpus"]} == {"可用 · 未开启占卡"}
-    assert {tuple(gpu["keepalive"].values()) for gpu in status_off["gpus"]} == {
-        ("OFF", "OFF")
-    }
+    assert {tuple(gpu["keepalive"].values()) for gpu in status_off["gpus"]} == {("OFF", "OFF")}
 
     allocation_off = mcp_server.gpu_apply(
         server_id="endpoint-a", gpu_count=1, task="Agent 占卡关闭申请验收"
@@ -1494,9 +1487,7 @@ def test_restart_preserves_keepalive_ownership_without_remote_churn(
 ) -> None:
     adapter = FakeKeepaliveAdapter()
     collector = FakeTargetedCollector(adapter)
-    first_app, _ = _keepalive_app(
-        tmp_path, inventory, adapter=adapter, collector=collector
-    )
+    first_app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
     first_client = TestClient(first_app)
 
     enabled = first_client.post(
@@ -1514,9 +1505,7 @@ def test_restart_preserves_keepalive_ownership_without_remote_churn(
             ).all()
         )
 
-    restarted_app, _ = _keepalive_app(
-        tmp_path, inventory, adapter=adapter, collector=collector
-    )
+    restarted_app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
 
     reconciled = asyncio.run(
         restarted_app.state.reconcile_endpoint_keepalive(
@@ -1566,9 +1555,9 @@ def test_app_reassignment_stops_the_selected_keeper_before_moving_the_task(
     assert claimed.status_code == 200, claimed.text
     lease = claimed.json()["lease"]
     original_gpu_id = lease["gpu_ids"][0]
-    snapshot = client.get(
-        "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
-    ).json()["data"]
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
     keeper = next(gpu for gpu in snapshot["gpus"] if gpu["state"] == "KEEPALIVE")
 
     moved = client.patch(
@@ -1581,9 +1570,9 @@ def test_app_reassignment_stops_the_selected_keeper_before_moving_the_task(
     assert moved.json()["restart_required"] is True
     assert moved.json()["lease"]["gpu_ids"] == [keeper["id"]]
     assert adapter.calls[-1] == ("endpoint-a", False, (keeper["gpu_uuid"],))
-    after = client.get(
-        "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
-    ).json()["data"]
+    after = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
     states_by_id = {gpu["id"]: gpu["state"] for gpu in after["gpus"]}
     assert states_by_id[original_gpu_id] == "AVAILABLE"
     assert states_by_id[keeper["id"]] == "HELD"
@@ -1703,3 +1692,6 @@ def test_keepalive_capability_and_mcp_schema_and_delegation(monkeypatch) -> None
     instructions = mcp_server.MCP_INSTRUCTIONS.lower()
     assert "常规 gpu 任务" in instructions
     assert "空闲占卡" in instructions
+    assert "code_location=not_provided" in instructions
+    assert "不得把 workspace_path 当代码仓库路径" in instructions
+    assert "以它为工作目录" in instructions

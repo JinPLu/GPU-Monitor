@@ -4,6 +4,15 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## 1.5.3 - 2026-08-14
+
+**ServerPilot 1.5.3 lets Agents connect directly without conflating a working directory with a code path.**
+
+- Routine `gpu_status` and `gpu_apply` return structured `ssh {host, port, user}` data. After allocation, Agents use direct SSH for the workload instead of treating a missing Codex saved host as a missing server.
+- Clarified that `workspace_path` is the remote working directory for post-SSH operations, not a source repository path. Agents enter it first, then run commands and synchronize code or artifacts beneath it.
+- Added machine-readable `workspace {path, kind=working_directory, use_as_cwd=true, code_location=not_provided}` data, separating connection details, the working directory, code location, and CUDA selectors while retaining legacy `workspace_path`.
+- Agent guidance now distinguishes normal SSH execution from bypassing ServerPilot for GPU discovery, selection, allocation, or release.
+
 ## 1.5.2 - 2026-08-13
 
 **ServerPilot 1.5.2 removes false ownership-conflict errors and restores human correction in the App.**

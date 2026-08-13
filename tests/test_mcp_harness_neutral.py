@@ -88,9 +88,12 @@ def test_historical_contact_column_is_inert_and_not_projected(service, admin) ->
 
     assert service.local_actor("legacy-contact-agent") == actor
     with service.database.engine.connect() as connection:
-        assert connection.execute(
-            text("SELECT coordination_uri FROM actors WHERE id = 'legacy-contact-agent'")
-        ).scalar_one() == "legacy-contact"
+        assert (
+            connection.execute(
+                text("SELECT coordination_uri FROM actors WHERE id = 'legacy-contact-agent'")
+            ).scalar_one()
+            == "legacy-contact"
+        )
 
     service.ingest_observation(observation(count=1))
     allocated = service.create_request(
@@ -109,9 +112,7 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
     inventory,
 ) -> None:  # type: ignore[no-untyped-def]
     inventory_path = tmp_path / "inventory.yaml"
-    inventory_path.write_text(
-        yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8"
-    )
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
         Settings(
             database_url=f"sqlite:///{tmp_path / 'routine.sqlite3'}",
@@ -148,14 +149,17 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
             actor_id="serverpilot-system",
         )
         session.commit()
-        assert session.execute(
-            text("SELECT state FROM leases WHERE id = :lease_id"),
-            {"lease_id": lease["id"]},
-        ).scalar_one() == "HELD"
+        assert (
+            session.execute(
+                text("SELECT state FROM leases WHERE id = :lease_id"),
+                {"lease_id": lease["id"]},
+            ).scalar_one()
+            == "HELD"
+        )
     with app.state.service.database.engine.connect() as connection:
-        assert connection.execute(
-            text("SELECT COUNT(*) FROM idempotency_records")
-        ).scalar_one() == 0
+        assert (
+            connection.execute(text("SELECT COUNT(*) FROM idempotency_records")).scalar_one() == 0
+        )
 
     released = client.post(
         f"/api/v1/routine/leases/{lease['id']}/release",
@@ -165,9 +169,9 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
     assert released.status_code == 200
     assert released.json()["lease"]["state"] == "RELEASED"
     with app.state.service.database.engine.connect() as connection:
-        assert connection.execute(
-            text("SELECT COUNT(*) FROM idempotency_records")
-        ).scalar_one() == 0
+        assert (
+            connection.execute(text("SELECT COUNT(*) FROM idempotency_records")).scalar_one() == 0
+        )
 
 
 def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
@@ -176,9 +180,7 @@ def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # type: ignore[no-untyped-def]
     inventory_path = tmp_path / "inventory.yaml"
-    inventory_path.write_text(
-        yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8"
-    )
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
         Settings(
             database_url=f"sqlite:///{tmp_path / 'routine-retry.sqlite3'}",
@@ -195,8 +197,7 @@ def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
             if response.is_error:
                 error = response.json()["error"]
                 raise BrokerClientError(
-                    f"broker HTTP {response.status_code}: "
-                    f"{error['code']}: {error['message']}"
+                    f"broker HTTP {response.status_code}: {error['code']}: {error['message']}"
                 )
             return response.json()
 
@@ -204,37 +205,35 @@ def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
 
     with pytest.raises(BrokerClientError, match=r"no_capacity"):
         mcp_server.gpu_apply(server_id="endpoint-a", gpu_count=2, task="双卡训练")
-    assert app.state.service.list_requests(
-        app.state.service.local_actor("agent")
-    )["data"] == []
+    assert app.state.service.list_requests(app.state.service.local_actor("agent"))["data"] == []
 
     app.state.service.ingest_observation(observation(count=2))
-    claimed = mcp_server.gpu_apply(
-        server_id="endpoint-a", gpu_count=2, task="双卡训练"
-    )
+    claimed = mcp_server.gpu_apply(server_id="endpoint-a", gpu_count=2, task="双卡训练")
 
     assert claimed["lease_id"]
     assert len(claimed["gpus"]) == 2
     assert claimed["server_id"] == "endpoint-a"
     assert claimed["workspace_path"] == inventory.endpoints[0].workspace_path
+    assert claimed["ssh"] == {
+        "host": inventory.endpoints[0].host,
+        "port": inventory.endpoints[0].port,
+        "user": inventory.endpoints[0].ssh_user,
+    }
     assert {gpu["server_id"] for gpu in claimed["gpus"]} == {"endpoint-a"}
     assert {gpu["workspace_path"] for gpu in claimed["gpus"]} == {
         inventory.endpoints[0].workspace_path
     }
+    assert {tuple(gpu["ssh"].items()) for gpu in claimed["gpus"]} == {tuple(claimed["ssh"].items())}
     assert len({gpu["gpu_id"] for gpu in claimed["gpus"]}) == 2
     expected_visible_devices = ",".join(gpu["gpu_id"] for gpu in claimed["gpus"])
     assert claimed["cuda_visible_devices"] == expected_visible_devices
-    assert {gpu["cuda_visible_devices"] for gpu in claimed["gpus"]} == {
-        expected_visible_devices
-    }
+    assert {gpu["cuda_visible_devices"] for gpu in claimed["gpus"]} == {expected_visible_devices}
     assert {gpu["gpu_cuda_visible_devices"] for gpu in claimed["gpus"]} == {
         gpu["gpu_id"] for gpu in claimed["gpus"]
     }
 
     assert mcp_server.gpu_release(claimed["lease_id"]) == {"released": True}
-    leases = app.state.service.list_leases(
-        app.state.service.local_actor("agent")
-    )["data"]
+    leases = app.state.service.list_leases(app.state.service.local_actor("agent"))["data"]
     assert len(leases) == 1
     assert leases[0]["state"] == "RELEASED"
 
@@ -301,6 +300,12 @@ def test_busy_status_returns_task_without_a_contact_field() -> None:
     )
 
     assert status["gpus"][0]["task"] == "训练任务"
+    assert status["gpus"][0]["workspace"] == {
+        "path": "/srv/server-a",
+        "kind": "working_directory",
+        "use_as_cwd": True,
+        "code_location": "not_provided",
+    }
     assert set(status["gpus"][0]) == {
         "server_id",
         "gpu_id",
@@ -309,6 +314,7 @@ def test_busy_status_returns_task_without_a_contact_field() -> None:
         "vram_mib",
         "status",
         "workspace_path",
+        "workspace",
         "available",
         "task",
         "keepalive",
@@ -335,8 +341,7 @@ def test_routine_status_explains_when_all_gpus_are_unavailable() -> None:
         "no_capacity": {
             "reason": "all_gpus_busy_or_unavailable",
             "message": (
-                "当前没有可申请 GPU；可调用 gpu_status(include_busy=true) "
-                "查看占用任务或异常状态。"
+                "当前没有可申请 GPU；可调用 gpu_status(include_busy=true) 查看占用任务或异常状态。"
             ),
             "total_gpus": 4,
         },
@@ -365,6 +370,9 @@ def test_historical_actor_contact_migration_is_additive(tmp_path: Path) -> None:
         column["name"] for column in inspect(database.engine).get_columns("actors")
     }
     with database.engine.connect() as connection:
-        assert connection.execute(
-            text("SELECT coordination_uri FROM actors WHERE id = 'legacy-agent'")
-        ).scalar_one() is None
+        assert (
+            connection.execute(
+                text("SELECT coordination_uri FROM actors WHERE id = 'legacy-agent'")
+            ).scalar_one()
+            is None
+        )

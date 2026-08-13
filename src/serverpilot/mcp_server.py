@@ -21,14 +21,13 @@ TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
 RESOURCE_MARGINAL_MIN_SAVED_RATIO = 0.10
 RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
 
-MCP_INSTRUCTIONS = """常规 GPU 任务只使用三个工具：gpu_status 查看可用 GPU；gpu_apply 由 ServerPilot 自动选卡，task
-写任务名或目标，不读取客户端 UI 标题。workspace_path 是远端路径，经 endpoint 进入。
-单 endpoint 的 cuda_visible_devices 是完整集合；gpus[] 新增单 UUID 的 gpu_cuda_visible_devices，分别用于多卡
-与逐卡进程。启动前做 CUDA gate；失败立即 gpu_release，避开同一 server；结束 release，多 lease 确认。
-gpu_status(include_busy=true) 读取 task。空闲占卡可用。无容量直接失败，不排队；同 turn 最多刷新一次；
-Transport closed 重试一次。ServerPilot 只协调 GPU；不得用 SSH、SQLite、inventory 或
-nvidia-smi 绕过 GPU 发现、选卡、申请、释放。非 GPU 远端操作（Git 同步、维护）无需 GPU 租约，
-需授权 endpoint。"""
+MCP_INSTRUCTIONS = """常规 GPU 任务只用三个工具：gpu_status；gpu_apply 自动选卡，task=任务名，不读取客户端 UI 标题；gpu_release。
+ssh=连接；workspace.path/workspace_path=远端 cwd；kind=working_directory、use_as_cwd=true；
+code_location=not_provided，不得把 workspace_path 当代码仓库路径；cuda_visible_devices=租约，
+gpus[].gpu_cuda_visible_devices=单卡。按 ssh 直连，无需主机设置；cd workspace.path，以它为工作目录。
+CUDA gate/启动失败或结束均释放。gpu_status(include_busy=true) 查看 task；空闲占卡可用。无容量直接失败，不排队；
+同 turn 刷新一次；Transport closed 重试一次。只协调 GPU；不得用 SSH、SQLite、inventory 或
+nvidia-smi 绕过协调。非 GPU 远端操作（Git 同步）无需 GPU 租约。"""
 
 
 mcp = FastMCP(
@@ -59,6 +58,38 @@ def _routine_task(task: str | None) -> str:
     return value
 
 
+def _routine_ssh(endpoint: Any) -> dict[str, Any] | None:
+    """Project one registered endpoint into shell-neutral SSH connection data."""
+
+    if not isinstance(endpoint, dict):
+        return None
+    host = endpoint.get("host")
+    port = endpoint.get("port")
+    user = endpoint.get("ssh_user")
+    if (
+        not isinstance(host, str)
+        or not host
+        or isinstance(port, bool)
+        or not isinstance(port, int)
+        or not 1 <= port <= 65_535
+        or not isinstance(user, str)
+        or not user
+    ):
+        return None
+    return {"host": host, "port": port, "user": user}
+
+
+def _routine_workspace(path: Any) -> dict[str, Any]:
+    """Describe the endpoint cwd without implying that it is a code checkout."""
+
+    return {
+        "path": path if isinstance(path, str) and path else None,
+        "kind": "working_directory",
+        "use_as_cwd": True,
+        "code_location": "not_provided",
+    }
+
+
 def _require_request_fields(request: dict[str, Any]) -> None:
     missing = [field for field in ("project_id", "task_ref", "purpose") if not request.get(field)]
     if missing:
@@ -73,17 +104,27 @@ def _has_resource_quantity(quantities: dict[str, Any]) -> bool:
 
 
 def _require_resource_claim_fields(claim: dict[str, Any]) -> None:
-    missing = [field for field in ("project_id", "task_ref", "purpose", "quantities", "forecast") if not claim.get(field)]
+    missing = [
+        field
+        for field in ("project_id", "task_ref", "purpose", "quantities", "forecast")
+        if not claim.get(field)
+    ]
     if missing:
         raise ValueError("resource_claim requires " + ", ".join(missing))
     quantities = claim["quantities"]
     if not isinstance(quantities, dict) or not _has_resource_quantity(quantities):
-        raise ValueError("resource_claim quantities must request CPU, memory, GPU, nodes, or scheduler units")
+        raise ValueError(
+            "resource_claim quantities must request CPU, memory, GPU, nodes, or scheduler units"
+        )
     forecast = claim["forecast"]
     if not isinstance(forecast, dict):
         raise ValueError("resource_claim forecast must be a mapping")
-    if not isinstance(forecast.get("quantities"), dict) or not forecast.get("predicted_runtime_seconds"):
-        raise ValueError("resource_claim forecast requires quantities and predicted_runtime_seconds")
+    if not isinstance(forecast.get("quantities"), dict) or not forecast.get(
+        "predicted_runtime_seconds"
+    ):
+        raise ValueError(
+            "resource_claim forecast requires quantities and predicted_runtime_seconds"
+        )
 
 
 def _require_resource_plan_fields(evaluation: dict[str, Any]) -> None:
@@ -94,9 +135,15 @@ def _require_resource_plan_fields(evaluation: dict[str, Any]) -> None:
     ]
     if missing:
         raise ValueError("resource_evaluate_plan requires " + ", ".join(missing))
-    if evaluation.get("marginal_min_saved_ratio", RESOURCE_MARGINAL_MIN_SAVED_RATIO) != RESOURCE_MARGINAL_MIN_SAVED_RATIO:
+    if (
+        evaluation.get("marginal_min_saved_ratio", RESOURCE_MARGINAL_MIN_SAVED_RATIO)
+        != RESOURCE_MARGINAL_MIN_SAVED_RATIO
+    ):
         raise ValueError("resource_evaluate_plan marginal_min_saved_ratio must be 0.10")
-    if evaluation.get("marginal_min_saved_seconds", RESOURCE_MARGINAL_MIN_SAVED_SECONDS) != RESOURCE_MARGINAL_MIN_SAVED_SECONDS:
+    if (
+        evaluation.get("marginal_min_saved_seconds", RESOURCE_MARGINAL_MIN_SAVED_SECONDS)
+        != RESOURCE_MARGINAL_MIN_SAVED_SECONDS
+    ):
         raise ValueError("resource_evaluate_plan marginal_min_saved_seconds must be 120")
     candidates = evaluation["candidates"]
     if not isinstance(candidates, list) or not candidates:
@@ -115,11 +162,14 @@ def _require_resource_plan_fields(evaluation: dict[str, Any]) -> None:
         missing_candidate = [field for field in required if field not in candidate]
         if missing_candidate:
             raise ValueError(
-                f"resource_evaluate_plan candidate {index} requires "
-                + ", ".join(missing_candidate)
+                f"resource_evaluate_plan candidate {index} requires " + ", ".join(missing_candidate)
             )
-        if not isinstance(candidate["quantities"], dict) or not _has_resource_quantity(candidate["quantities"]):
-            raise ValueError(f"resource_evaluate_plan candidate {index} quantities must include a resource")
+        if not isinstance(candidate["quantities"], dict) or not _has_resource_quantity(
+            candidate["quantities"]
+        ):
+            raise ValueError(
+                f"resource_evaluate_plan candidate {index} quantities must include a resource"
+            )
 
 
 def _require_endpoint_admin_contract(approval_ref: str, idempotency_key: str) -> None:
@@ -143,7 +193,9 @@ def _matching_request(payload: dict[str, Any], request_id: str) -> dict[str, Any
 
 
 def _matching_lease(payload: dict[str, Any], request_id: str) -> dict[str, Any] | None:
-    return next((item for item in payload.get("data", []) if item.get("request_id") == request_id), None)
+    return next(
+        (item for item in payload.get("data", []) if item.get("request_id") == request_id), None
+    )
 
 
 def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
@@ -310,8 +362,8 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
     data = payload.get("data")
     values = data.get("gpus", []) if isinstance(data, dict) else []
     endpoints = data.get("endpoints", []) if isinstance(data, dict) else []
-    workspace_by_endpoint = {
-        endpoint.get("id"): endpoint.get("workspace_path")
+    endpoint_by_id = {
+        endpoint.get("id"): endpoint
         for endpoint in endpoints
         if isinstance(endpoint, dict) and endpoint.get("id")
     }
@@ -326,15 +378,22 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
         lease = gpu.get("lease")
         if not available and not include_busy:
             continue
+        endpoint = endpoint_by_id.get(gpu.get("endpoint_id"))
         row: dict[str, Any] = {
             "server_id": gpu.get("endpoint_id"),
-            "workspace_path": workspace_by_endpoint.get(gpu.get("endpoint_id")),
+            "workspace_path": (
+                endpoint.get("workspace_path") if isinstance(endpoint, dict) else None
+            ),
             "gpu_id": gpu.get("gpu_uuid"),
             "index": gpu.get("gpu_index"),
             "name": gpu.get("name"),
             "vram_mib": gpu.get("total_vram_mib"),
             "status": status,
         }
+        row["workspace"] = _routine_workspace(row["workspace_path"])
+        ssh = _routine_ssh(endpoint)
+        if ssh is not None:
+            row["ssh"] = ssh
         keepalive = gpu.get("keepalive")
         if isinstance(keepalive, dict):
             row["keepalive"] = {
@@ -380,25 +439,30 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
         endpoint = resource.get("endpoint")
         server_id = endpoint.get("id") if isinstance(endpoint, dict) else None
         workspace_path = endpoint.get("workspace_path") if isinstance(endpoint, dict) else None
+        ssh = _routine_ssh(endpoint)
         cuda_visible_devices = resource.get("cuda_visible_devices")
-        resources.append(
-            {
-                "server_id": server_id,
-                "workspace_path": workspace_path,
-                "cuda_visible_devices": cuda_visible_devices,
-            }
-        )
+        resource_projection = {
+            "server_id": server_id,
+            "workspace_path": workspace_path,
+            "workspace": _routine_workspace(workspace_path),
+            "cuda_visible_devices": cuda_visible_devices,
+        }
+        if ssh is not None:
+            resource_projection["ssh"] = ssh
+        resources.append(resource_projection)
         for gpu in resource.get("gpus", []):
             if isinstance(gpu, dict):
-                rows.append(
-                    {
-                        "server_id": server_id,
-                        "workspace_path": workspace_path,
-                        "gpu_id": gpu.get("gpu_uuid"),
-                        "cuda_visible_devices": cuda_visible_devices,
-                        "gpu_cuda_visible_devices": gpu.get("gpu_uuid"),
-                    }
-                )
+                row = {
+                    "server_id": server_id,
+                    "workspace_path": workspace_path,
+                    "workspace": _routine_workspace(workspace_path),
+                    "gpu_id": gpu.get("gpu_uuid"),
+                    "cuda_visible_devices": cuda_visible_devices,
+                    "gpu_cuda_visible_devices": gpu.get("gpu_uuid"),
+                }
+                if ssh is not None:
+                    row["ssh"] = ssh
+                rows.append(row)
     result: dict[str, Any] = {"lease_id": lease.get("id"), "gpus": rows}
     if len(resources) == 1:
         result.update(resources[0])
@@ -566,7 +630,7 @@ def control_plane_state(
 
 @mcp.tool()
 def gpu_status(include_busy: bool = False) -> dict[str, Any]:
-    """列出可用 GPU；include_busy=true 时同时列出占用 GPU 及人类可读 task。"""
+    """列出可用 GPU、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"""
 
     payload = _routine_client().snapshot(
         compact=False,
@@ -634,9 +698,7 @@ def gpu_scheduler_profiles(project_id: str) -> dict[str, Any]:
 
     result = _client().workload_profiles(project_id=project_id)
     result["data"] = [
-        profile
-        for profile in result.get("data", [])
-        if profile.get("runtime_kind") == "slurm"
+        profile for profile in result.get("data", []) if profile.get("runtime_kind") == "slurm"
     ]
     return result
 
@@ -686,9 +748,7 @@ def gpu_scheduler_submit_once(
     }
     missing = sorted(field for field in required if not request.get(field))
     if missing:
-        raise ValueError(
-            "gpu_scheduler_submit_once requires " + ", ".join(missing)
-        )
+        raise ValueError("gpu_scheduler_submit_once requires " + ", ".join(missing))
     return _client(agent_name).post(
         "/api/v1/scheduler-jobs",
         request,
@@ -900,7 +960,9 @@ def gpu_cancel_request(request_id: str, idempotency_key: str | None = None) -> d
     """Cancel the caller's queued request. This does not stop a workload."""
 
     return _client().post(
-        f"/api/v1/requests/{request_id}/cancel", {}, idempotency_key=idempotency_key or secrets.token_hex(16)
+        f"/api/v1/requests/{request_id}/cancel",
+        {},
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
@@ -909,7 +971,9 @@ def gpu_activate_lease(lease_id: str, idempotency_key: str | None = None) -> dic
     """Record that a held lease is active; it does not launch any command."""
 
     return _client().post(
-        f"/api/v1/leases/{lease_id}/activate", {}, idempotency_key=idempotency_key or secrets.token_hex(16)
+        f"/api/v1/leases/{lease_id}/activate",
+        {},
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
@@ -918,12 +982,16 @@ def gpu_renew_lease(lease_id: str, idempotency_key: str | None = None) -> dict[s
     """续期调用者持有的工作任务租约。"""
 
     return _client().post(
-        f"/api/v1/leases/{lease_id}/renew", {}, idempotency_key=idempotency_key or secrets.token_hex(16)
+        f"/api/v1/leases/{lease_id}/renew",
+        {},
+        idempotency_key=idempotency_key or secrets.token_hex(16),
     )
 
 
 @mcp.tool()
-def gpu_release_lease(lease_id: str, reason: str, idempotency_key: str | None = None) -> dict[str, Any]:
+def gpu_release_lease(
+    lease_id: str, reason: str, idempotency_key: str | None = None
+) -> dict[str, Any]:
     """Release a lease cooperatively. Real observed compute processes remain fail-closed."""
 
     return _client().post(
@@ -1078,9 +1146,18 @@ def resource_record_actual(
 ) -> dict[str, Any]:
     """Record observed runtime and outcome for later scheduling calibration and human monitoring."""
 
-    if not actual.get("project_id") or not actual.get("task_ref") or not actual.get("quantities") or not actual.get("outcome"):
-        raise ValueError("resource_record_actual requires project_id, task_ref, quantities, and outcome")
-    if not isinstance(actual["quantities"], dict) or not _has_resource_quantity(actual["quantities"]):
+    if (
+        not actual.get("project_id")
+        or not actual.get("task_ref")
+        or not actual.get("quantities")
+        or not actual.get("outcome")
+    ):
+        raise ValueError(
+            "resource_record_actual requires project_id, task_ref, quantities, and outcome"
+        )
+    if not isinstance(actual["quantities"], dict) or not _has_resource_quantity(
+        actual["quantities"]
+    ):
         raise ValueError("resource_record_actual quantities must include a resource")
     return _client(agent_name).record_resource_run_actual(
         actual,
@@ -1167,7 +1244,7 @@ def gpu_apply(
     gpu_count: int = 1,
     task: str | None = None,
 ) -> dict[str, Any]:
-    """立即申请 GPU；不排队，无容量返回 no_capacity；顶层 CUDA 值完整，gpus[] 另给逐卡 CUDA 值。"""
+    """立即申请 GPU；返回 SSH、结构化远端工作目录和 CUDA selector；no_capacity 不排队。"""
 
     if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
         raise ValueError("gpu_count 必须是正整数")
@@ -1200,9 +1277,7 @@ def gpu_release(
     if not isinstance(lease_id, str) or not lease_id.strip():
         raise ValueError("lease_id 不能为空")
     lease_id = lease_id.strip()
-    _routine_client().post(
-        f"/api/v1/routine/leases/{lease_id}/release"
-    )
+    _routine_client().post(f"/api/v1/routine/leases/{lease_id}/release")
     return {"released": True}
 
 

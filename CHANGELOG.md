@@ -4,6 +4,15 @@
 
 这里只记录用户能感受到的变化；实现细节见 Git 提交。
 
+## 1.5.3 - 2026-08-14
+
+**ServerPilot 1.5.3 让 Agent 可以直接连接服务器，同时不再混淆工作目录和代码路径。**
+
+- routine `gpu_status` 与 `gpu_apply` 返回结构化 `ssh {host, port, user}`；Agent 在申请成功后直接 SSH 执行 workload，不再把“未加入 Codex saved hosts”误报成服务器不可达。
+- 明确 `workspace_path` 是 SSH 后操作所在的远端工作目录，不是代码仓库路径；Agent 先进入该目录，再在其下进行命令、代码同步与产物操作。
+- 新增机器可读的 `workspace {path, kind=working_directory, use_as_cwd=true, code_location=not_provided}`，将连接参数、工作目录、代码位置和 CUDA selector 分成四个独立概念；保留 `workspace_path` 兼容字段。
+- Agent 规则明确区分正常 SSH 执行与绕过 ServerPilot 查卡、选卡、申请或释放 GPU。
+
 ## 1.5.2 - 2026-08-13
 
 **ServerPilot 1.5.2 清理了“归属待确认”的误报，并恢复 App 的人工纠错能力。**

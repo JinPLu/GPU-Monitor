@@ -1037,7 +1037,7 @@ def test_mcp_exposes_required_tools() -> None:
     assert set(status_schema["properties"]) == {"include_busy"}
     assert status_schema["properties"]["include_busy"]["default"] is False
     assert by_name["gpu_status"].description == (
-        "列出可用 GPU；include_busy=true 时同时列出占用 GPU 及人类可读 task。"
+        "列出可用 GPU、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"
     )
     for name in (
         "gpu_add_server",
@@ -1060,7 +1060,7 @@ def test_default_stdio_mcp_uses_intent_first_routine_surface() -> None:
     assert not any(name.startswith("gpu_scheduler_") for name in names)
     assert names == {"gpu_status", "gpu_apply", "gpu_release"}
     assert by_name["gpu_status"].description == (
-        "列出可用 GPU；include_busy=true 时同时列出占用 GPU 及人类可读 task。"
+        "列出可用 GPU、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"
     )
 
 
@@ -1178,15 +1178,23 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
         lambda: FakeClient(),
     )
     result = mcp_server.gpu_apply(server_id="server-a", gpu_count=2, task="训练")
+    workspace = {
+        "path": "/srv/server-a",
+        "kind": "working_directory",
+        "use_as_cwd": True,
+        "code_location": "not_provided",
+    }
     assert result == {
         "lease_id": "lease-a",
         "server_id": "server-a",
         "workspace_path": "/srv/server-a",
+        "workspace": workspace,
         "cuda_visible_devices": "GPU-a,GPU-b",
         "gpus": [
             {
                 "server_id": "server-a",
                 "workspace_path": "/srv/server-a",
+                "workspace": workspace,
                 "gpu_id": "GPU-a",
                 "cuda_visible_devices": "GPU-a,GPU-b",
                 "gpu_cuda_visible_devices": "GPU-a",
@@ -1194,6 +1202,7 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
             {
                 "server_id": "server-a",
                 "workspace_path": "/srv/server-a",
+                "workspace": workspace,
                 "gpu_id": "GPU-b",
                 "cuda_visible_devices": "GPU-a,GPU-b",
                 "gpu_cuda_visible_devices": "GPU-b",
@@ -1213,6 +1222,12 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
 
 
 def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> None:
+    workspace_a = {
+        "path": "/srv/server-a",
+        "kind": "working_directory",
+        "use_as_cwd": True,
+        "code_location": "not_provided",
+    }
     single = mcp_server._routine_gpu_allocation(
         {
             "lease": {
@@ -1234,11 +1249,13 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
         "lease_id": "lease-single",
         "server_id": "server-a",
         "workspace_path": "/srv/server-a",
+        "workspace": workspace_a,
         "cuda_visible_devices": "GPU-a",
         "gpus": [
             {
                 "server_id": "server-a",
                 "workspace_path": "/srv/server-a",
+                "workspace": workspace_a,
                 "gpu_id": "GPU-a",
                 "cuda_visible_devices": "GPU-a",
                 "gpu_cuda_visible_devices": "GPU-a",
@@ -1277,6 +1294,7 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
             {
                 "server_id": "server-a",
                 "workspace_path": "/srv/server-a",
+                "workspace": workspace_a,
                 "gpu_id": "GPU-a",
                 "cuda_visible_devices": "GPU-a",
                 "gpu_cuda_visible_devices": "GPU-a",
@@ -1284,12 +1302,78 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
             {
                 "server_id": "server-b",
                 "workspace_path": "/srv/server-b",
+                "workspace": {
+                    "path": "/srv/server-b",
+                    "kind": "working_directory",
+                    "use_as_cwd": True,
+                    "code_location": "not_provided",
+                },
                 "gpu_id": "GPU-b",
                 "cuda_visible_devices": "GPU-b",
                 "gpu_cuda_visible_devices": "GPU-b",
             },
         ],
     }
+
+
+def test_routine_projects_registered_ssh_connection_without_a_shell_command() -> None:
+    endpoint = {
+        "id": "server-a",
+        "host": "gpu.example.test",
+        "port": 2201,
+        "ssh_user": "gpu",
+        "workspace_path": "/srv/server-a",
+    }
+    status = mcp_server._routine_gpu_status(
+        {
+            "data": {
+                "endpoints": [endpoint],
+                "gpus": [
+                    {
+                        "endpoint_id": "server-a",
+                        "gpu_uuid": "GPU-a",
+                        "gpu_index": 0,
+                        "name": "A800",
+                        "total_vram_mib": 80_000,
+                        "publicly_available": True,
+                        "public_status": "可用 · 未开启占卡",
+                    }
+                ],
+            }
+        },
+        include_busy=False,
+    )
+    assert status["gpus"][0]["ssh"] == {
+        "host": "gpu.example.test",
+        "port": 2201,
+        "user": "gpu",
+    }
+    assert status["gpus"][0]["workspace"] == {
+        "path": "/srv/server-a",
+        "kind": "working_directory",
+        "use_as_cwd": True,
+        "code_location": "not_provided",
+    }
+    assert "ssh_command" not in status["gpus"][0]
+
+    allocation = mcp_server._routine_gpu_allocation(
+        {
+            "lease": {
+                "id": "lease-a",
+                "resources": [
+                    {
+                        "endpoint": endpoint,
+                        "gpus": [{"gpu_uuid": "GPU-a"}],
+                        "cuda_visible_devices": "GPU-a",
+                    }
+                ],
+            }
+        }
+    )
+    expected_ssh = {"host": "gpu.example.test", "port": 2201, "user": "gpu"}
+    assert allocation["ssh"] == expected_ssh
+    assert allocation["gpus"][0]["ssh"] == expected_ssh
+    assert "ssh_command" not in allocation
 
 
 def test_mcp_default_task_is_harness_neutral() -> None:
@@ -1390,6 +1474,12 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
         "_routine_client",
         lambda: FakeClient(),
     )
+    workspace = {
+        "path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+        "kind": "working_directory",
+        "use_as_cwd": True,
+        "code_location": "not_provided",
+    }
 
     status = mcp_server.gpu_status()
     assert status == {
@@ -1402,6 +1492,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "vram_mib": 80000,
                 "status": "可用 · 未开启占卡",
                 "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
             }
         ]
@@ -1417,6 +1508,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "vram_mib": 80000,
                 "status": "可用 · 未开启占卡",
                 "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
                 "available": True,
             },
@@ -1428,6 +1520,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "vram_mib": 80000,
                 "status": "任务使用中",
                 "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
                 "available": False,
                 "task": "训练",
