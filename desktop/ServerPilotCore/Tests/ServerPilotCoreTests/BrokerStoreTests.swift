@@ -769,7 +769,7 @@ final class BrokerStoreTests: XCTestCase {
         let endpoint = try XCTUnwrap(fixture.endpoints.first)
         XCTAssertTrue(endpoint.keepalive.configured)
         XCTAssertEqual(endpoint.keepalive.policy, "idle_keepalive")
-        XCTAssertEqual(endpoint.keepalive.state, "ACTIVE")
+        XCTAssertEqual(endpoint.keepalive.state, "ON")
         XCTAssertEqual(endpoint.keepalive.label, "已开启")
         XCTAssertTrue(endpoint.keepalive.hasResidualLease)
         XCTAssertEqual(endpoint.keepalive.coverageSummary(totalGPUCount: 2, taskGPUCount: 1), "已开启 · 1/2 占卡，1 卡任务中")
@@ -787,12 +787,13 @@ final class BrokerStoreTests: XCTestCase {
             "gpu_index": 2,
             "name": "Fixture GPU",
             "total_vram_mib": 81920,
-            "state": "CONFLICT",
+            "state": "AVAILABLE",
             "keepalive": [
                 "configured": true,
                 "policy": "idle_keepalive",
-                "state": "ERROR",
-                "reason": "未检测到占卡程序",
+                "desired": "ON",
+                "actual": "OFF",
+                "state": "OFF",
                 "lease_id": "keepalive-missing-lease"
             ],
         ]))

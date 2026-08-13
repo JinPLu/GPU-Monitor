@@ -178,8 +178,9 @@ def _public_keepalive_result(
             "服务返回了无法识别的空闲占卡策略。",
             status_code=500,
         )
-    state = keepalive.get("state")
-    if not isinstance(state, str) or state not in {"OFF", "ACTIVE", "ERROR"}:
+    desired = keepalive.get("desired")
+    actual = keepalive.get("actual")
+    if desired not in {"ON", "OFF"} or actual not in {"ON", "OFF", "ERROR"}:
         raise BrokerError(
             "invalid_keepalive_protocol",
             "服务返回了无法识别的空闲占卡状态。",
@@ -189,7 +190,11 @@ def _public_keepalive_result(
         "endpoint_id": endpoint_id,
         "enabled": policy == "idle_keepalive",
         "policy": policy,
-        "state": state,
+        "desired": desired,
+        "actual": actual,
+        # Compatibility alias for clients that have not yet switched to the
+        # explicit desired/actual pair.
+        "state": actual,
         "configured": bool(keepalive.get("configured", False)),
         "active_gpu_count": max(0, int(keepalive.get("active_gpu_count") or 0)),
         "error_gpu_count": max(0, int(keepalive.get("error_gpu_count") or 0)),
@@ -342,12 +347,6 @@ def create_app(
             ]
             starts = [transition for transition in transitions if transition.get("action") == "start"]
             stops = [transition for transition in transitions if transition.get("action") == "stop"]
-            if starts and stops:
-                raise BrokerError(
-                    "keepalive_transition_plan_invalid",
-                    "endpoint keepalive plan mixes start and stop transitions",
-                    status_code=503,
-                )
             if not starts and not stops:
                 return service.get_endpoint_keepalive_summary(endpoint_id)
             adapter_id = endpoint.keepalive_adapter_id
@@ -391,6 +390,13 @@ def create_app(
                     except BrokerError:
                         if code != "keepalive_cleanup_failed":
                             code = "keepalive_observation_failed"
+                    service.set_keepalive_error(
+                        endpoint_id,
+                        [gpu_id for gpu_id, _gpu_uuid in start_targets],
+                        _public_error_message(
+                            BrokerError(code, "keepalive start failed", status_code=503)
+                        ),
+                    )
                     raise BrokerError(
                         code,
                         "空闲占卡未能启动，将在下一次采集后重试。",
@@ -425,7 +431,7 @@ def create_app(
                     await cleanup_failed_start(exc.code)
                 except Exception:
                     await cleanup_failed_start("keepalive_activation_failed")
-            else:
+            if stops:
                 prepared_stops: list[tuple[dict[str, Any], str]] = []
                 stop_failures: list[dict[str, str]] = []
                 for transition in stops:
@@ -516,6 +522,7 @@ def create_app(
         claim: Callable[[], dict[str, Any]],
         *,
         idempotency_key: str | None,
+        locked_endpoint_ids: set[str] | None = None,
     ) -> dict[str, Any] | None:
         """Make only a fully matching, verified keeper placement claimable.
 
@@ -527,33 +534,39 @@ def create_app(
         the claim blocked rather than broadening the set.
         """
 
-        request_data = request_data_provider()
-        plan = service.plan_keepalive_reclaim(request_data)
-        transitions = plan.get("transitions")
-        if plan.get("complete") is not True or not isinstance(transitions, list) or not transitions:
-            return None
-        targets: list[dict[str, str]] = []
-        for transition in transitions:
-            if not isinstance(transition, dict) or transition.get("action") != "reclaim":
+        async def execute_locked() -> dict[str, Any] | None:
+            request_data = request_data_provider()
+            plan = service.plan_keepalive_reclaim(request_data)
+            transitions = plan.get("transitions")
+            if (
+                plan.get("complete") is not True
+                or not isinstance(transitions, list)
+                or not transitions
+            ):
                 return None
-            endpoint_id = transition.get("endpoint_id")
-            gpu_id = transition.get("gpu_id")
-            gpu_uuid = transition.get("gpu_uuid")
-            lease_id = transition.get("lease_id")
-            if not all(isinstance(value, str) and value for value in (endpoint_id, gpu_id, gpu_uuid, lease_id)):
+            targets: list[dict[str, str]] = []
+            for transition in transitions:
+                if not isinstance(transition, dict) or transition.get("action") != "reclaim":
+                    return None
+                endpoint_id = transition.get("endpoint_id")
+                gpu_id = transition.get("gpu_id")
+                gpu_uuid = transition.get("gpu_uuid")
+                lease_id = transition.get("lease_id")
+                if not all(
+                    isinstance(value, str) and value
+                    for value in (endpoint_id, gpu_id, gpu_uuid, lease_id)
+                ):
+                    return None
+                targets.append(
+                    {
+                        "endpoint_id": endpoint_id,
+                        "gpu_id": gpu_id,
+                        "gpu_uuid": gpu_uuid,
+                        "lease_id": lease_id,
+                    }
+                )
+            if len({target["gpu_id"] for target in targets}) != len(targets):
                 return None
-            targets.append(
-                {
-                    "endpoint_id": endpoint_id,
-                    "gpu_id": gpu_id,
-                    "gpu_uuid": gpu_uuid,
-                    "lease_id": lease_id,
-                }
-            )
-        if len({target["gpu_id"] for target in targets}) != len(targets):
-            return None
-        endpoint_ids = {target["endpoint_id"] for target in targets}
-        async with keepalive_endpoint_locks(endpoint_ids):
             by_endpoint: dict[str, list[dict[str, str]]] = defaultdict(list)
             for target in targets:
                 by_endpoint[target["endpoint_id"]].append(target)
@@ -626,6 +639,12 @@ def create_app(
             # empty GPU and restart its keeper in the gap.
             return claim()
 
+        if locked_endpoint_ids is not None:
+            return await execute_locked()
+        endpoint_ids = {endpoint.id for endpoint in service.collector_endpoints()}
+        async with keepalive_endpoint_locks(endpoint_ids):
+            return await execute_locked()
+
     async def claim_request_now(
         actor: ActorContext,
         request_data: RequestCreate,
@@ -635,32 +654,38 @@ def create_app(
     ) -> dict[str, Any]:
         """Claim through the one shared per-GPU occupancy handoff."""
 
-        try:
-            return service.create_request(
-                actor,
-                request_data,
-                idempotency_key=idempotency_key,
-                activate_if_allocated=True,
-                persistent_lease=persistent_lease,
-            )
-        except BrokerError as exc:
-            if exc.code != "no_capacity":
-                raise
-            claimed = await reclaim_keepalive_for_claim(
-                actor,
-                lambda: request_data,
-                lambda: service.create_request(
+        endpoint_ids = {endpoint.id for endpoint in service.collector_endpoints()}
+        # A keeper start and an ordinary claim must not race between remote
+        # start and ownership persistence. Keep this lock through a possible
+        # exact keeper handoff and the ordinary claim.
+        async with keepalive_endpoint_locks(endpoint_ids):
+            try:
+                return service.create_request(
                     actor,
                     request_data,
                     idempotency_key=idempotency_key,
                     activate_if_allocated=True,
                     persistent_lease=persistent_lease,
-                ),
-                idempotency_key=idempotency_key,
-            )
-            if claimed is None:
-                raise exc
-            return claimed
+                )
+            except BrokerError as exc:
+                if exc.code != "no_capacity":
+                    raise
+                claimed = await reclaim_keepalive_for_claim(
+                    actor,
+                    lambda: request_data,
+                    lambda: service.create_request(
+                        actor,
+                        request_data,
+                        idempotency_key=idempotency_key,
+                        activate_if_allocated=True,
+                        persistent_lease=persistent_lease,
+                    ),
+                    idempotency_key=idempotency_key,
+                    locked_endpoint_ids=endpoint_ids,
+                )
+                if claimed is None:
+                    raise exc
+                return claimed
 
     async def claim_workload_profile_now(
         actor: ActorContext,
@@ -671,30 +696,33 @@ def create_app(
     ) -> dict[str, Any]:
         """Claim one profile through the same exact keepalive handoff as /claims."""
 
-        try:
-            return service.claim_workload_profile(
-                actor,
-                profile_id,
-                claim,
-                idempotency_key=idempotency_key,
-            )
-        except BrokerError as exc:
-            if exc.code != "no_capacity":
-                raise
-            claimed = await reclaim_keepalive_for_claim(
-                actor,
-                lambda: service.workload_profile_claim_request(actor, profile_id, claim),
-                lambda: service.claim_workload_profile(
+        endpoint_ids = {endpoint.id for endpoint in service.collector_endpoints()}
+        async with keepalive_endpoint_locks(endpoint_ids):
+            try:
+                return service.claim_workload_profile(
                     actor,
                     profile_id,
                     claim,
                     idempotency_key=idempotency_key,
-                ),
-                idempotency_key=idempotency_key,
-            )
-            if claimed is None:
-                raise exc
-            return claimed
+                )
+            except BrokerError as exc:
+                if exc.code != "no_capacity":
+                    raise
+                claimed = await reclaim_keepalive_for_claim(
+                    actor,
+                    lambda: service.workload_profile_claim_request(actor, profile_id, claim),
+                    lambda: service.claim_workload_profile(
+                        actor,
+                        profile_id,
+                        claim,
+                        idempotency_key=idempotency_key,
+                    ),
+                    idempotency_key=idempotency_key,
+                    locked_endpoint_ids=endpoint_ids,
+                )
+                if claimed is None:
+                    raise exc
+                return claimed
 
     async def collector_loop() -> None:
         next_prune_at = 0.0
@@ -1329,35 +1357,38 @@ def create_app(
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
         mutation_key = _idempotency_key(idempotency_key)
-        try:
-            return service.reassign_lease_gpus(
-                actor,
-                lease_id,
-                assignment.gpu_ids,
-                idempotency_key=mutation_key,
-            )
-        except BrokerError as exc:
-            if exc.code != "gpu_already_assigned":
-                raise
-            reclaim_request = service.keepalive_reclaim_request_for_reassignment(
-                actor, lease_id, assignment.gpu_ids
-            )
-            if reclaim_request is None:
-                raise exc
-            reassigned = await reclaim_keepalive_for_claim(
-                actor,
-                lambda: reclaim_request,
-                lambda: service.reassign_lease_gpus(
+        endpoint_ids = {endpoint.id for endpoint in service.collector_endpoints()}
+        async with keepalive_endpoint_locks(endpoint_ids):
+            try:
+                return service.reassign_lease_gpus(
                     actor,
                     lease_id,
                     assignment.gpu_ids,
                     idempotency_key=mutation_key,
-                ),
-                idempotency_key=mutation_key,
-            )
-            if reassigned is None:
-                raise exc
-            return reassigned
+                )
+            except BrokerError as exc:
+                if exc.code != "gpu_already_assigned":
+                    raise
+                reclaim_request = service.keepalive_reclaim_request_for_reassignment(
+                    actor, lease_id, assignment.gpu_ids
+                )
+                if reclaim_request is None:
+                    raise exc
+                reassigned = await reclaim_keepalive_for_claim(
+                    actor,
+                    lambda: reclaim_request,
+                    lambda: service.reassign_lease_gpus(
+                        actor,
+                        lease_id,
+                        assignment.gpu_ids,
+                        idempotency_key=mutation_key,
+                    ),
+                    idempotency_key=mutation_key,
+                    locked_endpoint_ids=endpoint_ids,
+                )
+                if reassigned is None:
+                    raise exc
+                return reassigned
 
     @app.post("/api/v1/endpoints/{endpoint_id}/leases/{lease_id}/release-empty")
     @app.post("/api/v1/endpoints/{endpoint_id}/conflicted-leases/{lease_id}/release-empty")

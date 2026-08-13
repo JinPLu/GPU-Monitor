@@ -25,6 +25,8 @@
           "keepalive": {
             "configured": true,
             "policy": "disabled",
+            "desired": "OFF",
+            "actual": "OFF",
             "state": "OFF",
             "active_gpu_count": 0,
             "error_gpu_count": 0,
@@ -57,6 +59,8 @@
           "keepalive": {
             "configured": true,
             "policy": "disabled",
+            "desired": "OFF",
+            "actual": "OFF",
             "state": "OFF"
           },
           "telemetry": {

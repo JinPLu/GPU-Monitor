@@ -25,7 +25,9 @@
           "keepalive": {
             "configured": true,
             "policy": "idle_keepalive",
-            "state": "ACTIVE",
+            "desired": "ON",
+            "actual": "ON",
+            "state": "ON",
             "active_gpu_count": 1,
             "error_gpu_count": 0,
             "eligible_idle_gpu_count": 0
@@ -57,7 +59,9 @@
           "keepalive": {
             "configured": true,
             "policy": "idle_keepalive",
-            "state": "ACTIVE"
+            "desired": "ON",
+            "actual": "ON",
+            "state": "ON"
           },
           "telemetry": {
             "memory_used_mib": 25395,
@@ -78,6 +82,8 @@
           "keepalive": {
             "configured": true,
             "policy": "idle_keepalive",
+            "desired": "ON",
+            "actual": "OFF",
             "state": "OFF",
             "reason": "managed workload is running"
           },

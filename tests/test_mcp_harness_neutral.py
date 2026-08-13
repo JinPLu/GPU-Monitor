@@ -13,7 +13,7 @@ from sqlalchemy import inspect, text
 
 from serverpilot import mcp_server
 from serverpilot.api import create_app
-from serverpilot.client import BrokerClient
+from serverpilot.client import BrokerClient, BrokerClientError
 from serverpilot.config import Settings
 from serverpilot.database import Database
 from serverpilot.schemas import RequestCreate
@@ -170,6 +170,109 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
         ).scalar_one() == 0
 
 
+def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
+    tmp_path: Path,
+    inventory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(
+        yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8"
+    )
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'routine-retry.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    rest = TestClient(app)
+    headers = {"X-ServerPilot-Actor": "agent"}
+
+    class RoutineClient:
+        def post(self, path, body=None):  # type: ignore[no-untyped-def]
+            response = rest.post(path, json=body, headers=headers)
+            if response.is_error:
+                error = response.json()["error"]
+                raise BrokerClientError(
+                    f"broker HTTP {response.status_code}: "
+                    f"{error['code']}: {error['message']}"
+                )
+            return response.json()
+
+    monkeypatch.setattr(mcp_server, "_routine_client", RoutineClient)
+
+    with pytest.raises(BrokerClientError, match=r"no_capacity"):
+        mcp_server.gpu_apply(server_id="endpoint-a", gpu_count=2, task="双卡训练")
+    assert app.state.service.list_requests(
+        app.state.service.local_actor("agent")
+    )["data"] == []
+
+    app.state.service.ingest_observation(observation(count=2))
+    claimed = mcp_server.gpu_apply(
+        server_id="endpoint-a", gpu_count=2, task="双卡训练"
+    )
+
+    assert claimed["lease_id"]
+    assert len(claimed["gpus"]) == 2
+    assert claimed["server_id"] == "endpoint-a"
+    assert claimed["workspace_path"] == inventory.endpoints[0].workspace_path
+    assert {gpu["server_id"] for gpu in claimed["gpus"]} == {"endpoint-a"}
+    assert {gpu["workspace_path"] for gpu in claimed["gpus"]} == {
+        inventory.endpoints[0].workspace_path
+    }
+    assert len({gpu["gpu_id"] for gpu in claimed["gpus"]}) == 2
+    expected_visible_devices = ",".join(gpu["gpu_id"] for gpu in claimed["gpus"])
+    assert claimed["cuda_visible_devices"] == expected_visible_devices
+    assert {gpu["cuda_visible_devices"] for gpu in claimed["gpus"]} == {
+        expected_visible_devices
+    }
+
+    assert mcp_server.gpu_release(claimed["lease_id"]) == {"released": True}
+    leases = app.state.service.list_leases(
+        app.state.service.local_actor("agent")
+    )["data"]
+    assert len(leases) == 1
+    assert leases[0]["state"] == "RELEASED"
+
+
+@pytest.mark.parametrize(
+    ("server_id", "gpu_count", "message"),
+    [
+        (None, True, "gpu_count 必须是正整数"),
+        (None, 0, "gpu_count 必须是正整数"),
+        (None, -1, "gpu_count 必须是正整数"),
+        ("   ", 1, "提供 server_id 时不能为空"),
+    ],
+)
+def test_routine_apply_rejects_invalid_daily_inputs_before_contacting_broker(
+    server_id: str | None,
+    gpu_count: int,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_client() -> object:
+        raise AssertionError("invalid routine input must not contact the broker")
+
+    monkeypatch.setattr(mcp_server, "_routine_client", unexpected_client)
+
+    with pytest.raises(ValueError, match=message):
+        mcp_server.gpu_apply(server_id=server_id, gpu_count=gpu_count, task="训练")
+
+
+@pytest.mark.parametrize("lease_id", ["", "   "])
+def test_routine_release_rejects_blank_lease_before_contacting_broker(
+    lease_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_client() -> object:
+        raise AssertionError("blank lease id must not contact the broker")
+
+    monkeypatch.setattr(mcp_server, "_routine_client", unexpected_client)
+
+    with pytest.raises(ValueError, match="lease_id 不能为空"):
+        mcp_server.gpu_release(lease_id)
+
+
 def test_busy_status_returns_task_without_a_contact_field() -> None:
     status = mcp_server._routine_gpu_status(
         {
@@ -205,6 +308,7 @@ def test_busy_status_returns_task_without_a_contact_field() -> None:
         "workspace_path",
         "available",
         "task",
+        "keepalive",
     }
 
 
@@ -215,6 +319,25 @@ def test_routine_status_reports_no_gpu_from_the_canonical_summary() -> None:
     )
 
     assert status == {"gpus": [], "message": "无 GPU"}
+
+
+def test_routine_status_explains_when_all_gpus_are_unavailable() -> None:
+    status = mcp_server._routine_gpu_status(
+        {"data": {"summary": {"total_gpus": 4, "available_gpus": 0}, "gpus": []}},
+        include_busy=False,
+    )
+
+    assert status == {
+        "gpus": [],
+        "no_capacity": {
+            "reason": "all_gpus_busy_or_unavailable",
+            "message": (
+                "当前没有可申请 GPU；可调用 gpu_status(include_busy=true) "
+                "查看占用任务或异常状态。"
+            ),
+            "total_gpus": 4,
+        },
+    }
 
 
 def test_historical_actor_contact_migration_is_additive(tmp_path: Path) -> None:

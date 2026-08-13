@@ -30,7 +30,7 @@ serverpilot daemon status
 申请 → 使用返回的分配 → 释放
 ```
 
-1. `gpu_status()` 只返回当前可用 GPU：`server_id`、`workspace_path`、`gpu_id`、`index`、`name`、`vram_mib` 和简短中文 `status`。占卡相关状态直接显示“可用 · 空闲占卡”或“可用 · 占卡异常：原因”；没有 GPU 时返回“无 GPU”。需要查看占用者或连接失败卡时调用 `gpu_status(include_busy=true)`；忙卡带人类可读的 `task`。
+1. `gpu_status()` 只返回当前可用 GPU：`server_id`、`workspace_path`、`gpu_id`、`index`、`name`、`vram_mib`、简短中文 `status`，以及占卡的 `keepalive.desired` 与 `keepalive.actual`。`desired` 只随持久开关改变，`actual` 只使用 `ON / OFF / ERROR` 表示当前进程状态；没有 GPU 时返回“无 GPU”。需要查看占用者或连接失败卡时调用 `gpu_status(include_busy=true)`；忙卡带人类可读的 `task`。
 2. `gpu_apply(server_id?, gpu_count=1, task?)` 直接申请。`task` 应使用用户给定的任务名，或把当前工作目标概括成简短、可读的任务说明；不要尝试读取客户端 UI 标题。未提供时记录为“未命名任务”。ServerPilot 自动选择具体 GPU；Agent 不提供 GPU ID。成功只返回 `lease_id` 与 `gpus[{server_id, workspace_path, gpu_id, cuda_visible_devices}]`。Agent 先进入返回的 `workspace_path`，再使用该项的 `cuda_visible_devices` 启动项目 workload。
 3. workload 停止或启动失败时调用 `gpu_release(lease_id)`。
 

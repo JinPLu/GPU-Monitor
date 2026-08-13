@@ -92,9 +92,9 @@ def test_policy_is_persisted_and_candidates_are_independent_per_gpu(service, adm
     ]
     summary = service.get_endpoint_keepalive_summary("endpoint-a")["keepalive"]
     assert summary["policy"] == "idle_keepalive"
-    assert summary["state"] == "ERROR"
-    assert summary["error_gpu_count"] == 1
-    assert {item["reason"] for item in summary["reasons"]} == {"未检测到占卡程序"}
+    assert summary["desired"] == "ON"
+    assert summary["actual"] == "ON"
+    assert summary["error_gpu_count"] == 0
     assert summary["eligible_idle_gpu_count"] == 1
 
 
@@ -108,25 +108,24 @@ def test_one_gpu_keepalive_does_not_block_sibling_gpu_or_hide_public_state(servi
     first = gpus["endpoint-a:GPU-endpoint-a-0"]
     second = gpus["endpoint-a:GPU-endpoint-a-1"]
     assert first["state"] == "KEEPALIVE"
-    assert first["keepalive"]["state"] == "ACTIVE"
+    assert first["keepalive"]["desired"] == "ON"
+    assert first["keepalive"]["actual"] == "ON"
     assert second["state"] == "AVAILABLE"
-    assert second["keepalive"]["state"] == "ERROR"
-    assert second["keepalive"]["reason"] == "未检测到占卡程序"
+    assert second["keepalive"]["desired"] == "ON"
+    assert second["keepalive"]["actual"] == "OFF"
+    assert second["keepalive"]["reason"] is None
     assert second["publicly_available"] is True
-    assert second["public_status"] == "可用 · 占卡异常：未检测到占卡程序"
+    assert second["public_status"] == "可用 · 占卡未运行"
     assert endpoint["keepalive"] == {
         "configured": True,
         "policy": "idle_keepalive",
-        "state": "ERROR",
+        "desired": "ON",
+        "actual": "ON",
+        "state": "ON",
         "active_gpu_count": 1,
-        "error_gpu_count": 1,
+        "error_gpu_count": 0,
         "eligible_idle_gpu_count": 1,
-        "reasons": [
-            {
-                "gpu_id": "endpoint-a:GPU-endpoint-a-1",
-                "reason": "未检测到占卡程序",
-            }
-        ],
+        "reasons": [],
     }
     assert all(item["kind"] != "keepalive" for item in snapshot["data"]["leases"])
     assert [item["gpu_id"] for item in service.desired_keepalive_candidates("endpoint-a")["candidates"]] == [
@@ -191,7 +190,7 @@ def test_workload_conflict_on_one_gpu_does_not_block_sibling_keepalive_candidate
     ]
 
 
-def test_confirm_uses_the_current_gpu_process_without_extra_binding_state(service, admin) -> None:
+def test_confirm_rejects_additional_process_on_keepalive_gpu(service, admin) -> None:
     _configure_idle_policy(service, admin)
     barrier = utcnow()
     service.ingest_observation(
@@ -203,14 +202,34 @@ def test_confirm_uses_the_current_gpu_process_without_extra_binding_state(servic
             ],
         )
     )
-    confirmed = service.activate_keepalive(
-        admin,
-        "endpoint-a",
-        "endpoint-a:GPU-endpoint-a-0",
-        observation_not_before=barrier,
-        idempotency_key="activate-current-process",
+    with pytest.raises(BrokerError) as conflicted:
+        service.activate_keepalive(
+            admin,
+            "endpoint-a",
+            "endpoint-a:GPU-endpoint-a-0",
+            observation_not_before=barrier,
+            idempotency_key="activate-current-process",
+        )
+    assert conflicted.value.code == "keepalive_process_conflict"
+
+
+def test_foreign_replacement_never_becomes_public_keepalive_capacity(service, admin) -> None:
+    _configure_idle_policy(service, admin)
+    _begin(service, admin, 0)
+    service.ingest_observation(
+        observation(
+            count=2,
+            processes=[process_for_gpu("GPU-endpoint-a-0", pid=8801)],
+        )
     )
-    assert confirmed["keepalive"]["state"] == "ACTIVE"
+
+    gpu = _gpus(service.snapshot(admin))["endpoint-a:GPU-endpoint-a-0"]
+    assert gpu["state"] == "CONFLICT"
+    assert gpu["keepalive"]["desired"] == "ON"
+    assert gpu["keepalive"]["actual"] == "ERROR"
+    assert gpu["keepalive"]["reason"] == "检测到不属于占卡程序的进程"
+    assert gpu["publicly_available"] is False
+    assert gpu["public_status"] == "任务使用中"
 
 
 def test_reclaim_plan_selects_only_complete_verified_per_gpu_keepalive_set(service, admin) -> None:

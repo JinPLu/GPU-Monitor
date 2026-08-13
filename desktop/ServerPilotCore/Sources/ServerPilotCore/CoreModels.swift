@@ -416,8 +416,8 @@ public struct EndpointKeepaliveSummary: Equatable, Sendable {
 
     public init?(raw: [String: Any], fallbackConfigured: Bool) {
         configured = raw.bool("configured", default: fallbackConfigured)
-        let suppliedState = (raw.string("state") ?? "OFF").uppercased()
-        guard ["OFF", "ACTIVE", "ERROR"].contains(suppliedState) else { return nil }
+        let suppliedState = (raw.string("actual") ?? raw.string("state") ?? "OFF").uppercased()
+        guard ["OFF", "ON", "ERROR"].contains(suppliedState) else { return nil }
         state = suppliedState
         let suppliedPolicy = (
             raw.string("policy") ?? (state == "OFF" ? "disabled" : "idle_keepalive")
@@ -440,7 +440,7 @@ public struct EndpointKeepaliveSummary: Equatable, Sendable {
     }
 
     public var isEnabled: Bool { policy == "idle_keepalive" }
-    public var isActive: Bool { activeGPUCount > 0 || state == "ACTIVE" }
+    public var isActive: Bool { activeGPUCount > 0 || state == "ON" }
     public var isTransitioning: Bool { false }
     public var hasResidualLease: Bool {
         activeGPUCount > 0 || errorGPUCount > 0
@@ -474,18 +474,18 @@ public struct GPUKeepaliveStatus: Equatable, Sendable {
         let suppliedPolicy = (raw.string("policy") ?? "disabled").lowercased()
         guard ["disabled", "idle_keepalive"].contains(suppliedPolicy) else { return nil }
         policy = suppliedPolicy
-        let suppliedState = (raw.string("state") ?? fallbackState).uppercased()
-        guard ["OFF", "ACTIVE", "ERROR"].contains(suppliedState) else { return nil }
+        let suppliedState = (raw.string("actual") ?? raw.string("state") ?? fallbackState).uppercased()
+        guard ["OFF", "ON", "ERROR"].contains(suppliedState) else { return nil }
         state = suppliedState
         leaseID = raw.string("lease_id")
         reason = raw.string("reason") ?? raw.string("message")
     }
 
-    public var isActive: Bool { state == "ACTIVE" }
+    public var isActive: Bool { state == "ON" }
 
     public var presentationLabel: String {
         switch state {
-        case "ACTIVE": return "空闲占卡"
+        case "ON": return "空闲占卡"
         case "ERROR": return "占卡异常"
         default: return "未占卡"
         }
@@ -675,7 +675,7 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
         guard let keepalive = GPUKeepaliveStatus(
             raw: raw["keepalive"] as? [String: Any] ?? [:],
             fallbackConfigured: false,
-            fallbackState: self.state == "KEEPALIVE" ? "ACTIVE" : "OFF"
+            fallbackState: self.state == "KEEPALIVE" ? "ON" : "OFF"
         ) else { return nil }
         self.keepalive = keepalive
     }
@@ -700,7 +700,6 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
     public var isPubliclyAvailable: Bool {
         state == "AVAILABLE"
             || state == "KEEPALIVE"
-            || (keepalive.state == "ERROR" && keepalive.reason == "未检测到占卡程序")
     }
 
     public var memoryLabel: String {

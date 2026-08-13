@@ -191,12 +191,7 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
         )
         counts["total"] += 1
         keepalive = gpu.get("keepalive")
-        reclaimable_error = (
-            isinstance(keepalive, dict)
-            and keepalive.get("state") == "ERROR"
-            and keepalive.get("reason") == "未检测到占卡程序"
-        )
-        if gpu.get("state") in {"AVAILABLE", "KEEPALIVE"} or reclaimable_error:
+        if gpu.get("state") in {"AVAILABLE", "KEEPALIVE"}:
             counts["available"] += 1
         lease = gpu.get("lease")
         if isinstance(lease, dict):
@@ -247,6 +242,8 @@ def _compact_gpu_status(payload: dict[str, Any]) -> dict[str, Any]:
             | {
                 "telemetry": telemetry,
                 "keepalive": {
+                    "desired": keepalive.get("desired", "OFF"),
+                    "actual": keepalive.get("actual", keepalive.get("state", "OFF")),
                     "state": keepalive.get("state", "OFF"),
                     "reason": keepalive.get("reason"),
                 },
@@ -337,6 +334,12 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
             "vram_mib": gpu.get("total_vram_mib"),
             "status": status,
         }
+        keepalive = gpu.get("keepalive")
+        if isinstance(keepalive, dict):
+            row["keepalive"] = {
+                "desired": keepalive.get("desired", "OFF"),
+                "actual": keepalive.get("actual", keepalive.get("state", "OFF")),
+            }
         if include_busy:
             row["available"] = available
             if isinstance(lease, dict):
@@ -346,6 +349,13 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
     summary = data.get("summary") if isinstance(data, dict) else None
     if isinstance(summary, dict) and summary.get("total_gpus") == 0:
         result["message"] = "无 GPU"
+    elif not include_busy and not gpus:
+        total_gpus = summary.get("total_gpus") if isinstance(summary, dict) else None
+        result["no_capacity"] = {
+            "reason": "all_gpus_busy_or_unavailable",
+            "message": "当前没有可申请 GPU；可调用 gpu_status(include_busy=true) 查看占用任务或异常状态。",
+            "total_gpus": total_gpus if isinstance(total_gpus, int) else None,
+        }
     return result
 
 
@@ -354,6 +364,7 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(lease, dict):
         raise ValueError("ServerPilot 没有返回 GPU 租约")
     rows: list[dict[str, Any]] = []
+    resources: list[dict[str, Any]] = []
     for resource in lease.get("resources", []):
         if not isinstance(resource, dict):
             continue
@@ -361,6 +372,13 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
         server_id = endpoint.get("id") if isinstance(endpoint, dict) else None
         workspace_path = endpoint.get("workspace_path") if isinstance(endpoint, dict) else None
         cuda_visible_devices = resource.get("cuda_visible_devices")
+        resources.append(
+            {
+                "server_id": server_id,
+                "workspace_path": workspace_path,
+                "cuda_visible_devices": cuda_visible_devices,
+            }
+        )
         for gpu in resource.get("gpus", []):
             if isinstance(gpu, dict):
                 rows.append(
@@ -371,7 +389,10 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
                         "cuda_visible_devices": cuda_visible_devices,
                     }
                 )
-    return {"lease_id": lease.get("id"), "gpus": rows}
+    result: dict[str, Any] = {"lease_id": lease.get("id"), "gpus": rows}
+    if len(resources) == 1:
+        result.update(resources[0])
+    return result
 
 
 def _compact_coordination(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1166,6 +1187,9 @@ def gpu_release(
 ) -> dict[str, Any]:
     """释放此前申请的 GPU。"""
 
+    if not isinstance(lease_id, str) or not lease_id.strip():
+        raise ValueError("lease_id 不能为空")
+    lease_id = lease_id.strip()
     _routine_client().post(
         f"/api/v1/routine/leases/{lease_id}/release"
     )

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -366,7 +367,9 @@ def test_keepalive_api_sets_desired_policy_and_reconciles_each_eligible_gpu(
         "endpoint_id": "endpoint-a",
         "enabled": True,
         "policy": "idle_keepalive",
-        "state": "ACTIVE",
+        "desired": "ON",
+        "actual": "ON",
+        "state": "ON",
         "configured": True,
         "active_gpu_count": 1,
         "error_gpu_count": 0,
@@ -390,6 +393,8 @@ def test_keepalive_api_sets_desired_policy_and_reconciles_each_eligible_gpu(
         "endpoint_id": "endpoint-a",
         "enabled": False,
         "policy": "disabled",
+        "desired": "OFF",
+        "actual": "OFF",
         "state": "OFF",
         "configured": True,
         "active_gpu_count": 0,
@@ -437,6 +442,48 @@ def test_periodic_collection_does_not_wait_or_queue_duplicate_keepalive_reconcil
     assert adapter.calls == [
         ("endpoint-a", True, (GPU_UUIDS[0],)),
         ("endpoint-a", False, (GPU_UUIDS[0],)),
+    ]
+
+
+def test_routine_claim_waits_for_inflight_keeper_start_on_same_endpoint(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    adapter = BlockingKeepaliveAdapter()
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+    async def scenario() -> tuple[httpx.Response, httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            toggle_task = asyncio.create_task(
+                client.post(
+                    "/api/v1/endpoints/endpoint-a/keepalive",
+                    json={"enabled": True},
+                    headers=_headers("blocked-start-race"),
+                )
+            )
+            assert await asyncio.to_thread(adapter.started.wait, 2)
+            claim_task = asyncio.create_task(
+                client.post(
+                    "/api/v1/routine/claims",
+                    json={
+                        "project_id": "project-a",
+                        "task_ref": "claim-during-keeper-start",
+                        "purpose": "verify keeper start and Agent claim are serialized",
+                        "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
+                    },
+                    headers={"X-ServerPilot-Actor": "agent-a"},
+                )
+            )
+            await asyncio.sleep(0.2)
+            assert not claim_task.done()
+            adapter.release()
+            return await toggle_task, await claim_task
+
+    toggle, claim = asyncio.run(scenario())
+    assert toggle.status_code == 503
+    assert claim.status_code == 200
+    assert claim.json()["lease"]["gpu_ids"] == [
+        "endpoint-a:GPU-00000000-0000-0000-0000-000000000001"
     ]
 
 
@@ -775,12 +822,11 @@ def test_keepalive_api_failures_are_reported_as_errors(
     assert "remote secret" not in response.text
     summary = app.state.service.get_endpoint_keepalive_summary("endpoint-a")["keepalive"]
     assert summary["policy"] == "idle_keepalive"
-    assert summary["state"] == "ERROR"
+    assert summary["desired"] == "ON"
+    assert summary["actual"] == "ERROR"
     assert summary["active_gpu_count"] == 0
     assert summary["error_gpu_count"] == len(GPU_UUIDS)
-    assert {
-        reason["reason"] for reason in summary["reasons"]
-    } == {"未检测到占卡程序"}
+    assert len({reason["reason"] for reason in summary["reasons"]}) == 1
     snapshot = app.state.service.snapshot(app.state.service.local_actor("agent-a"))["data"]
     assert snapshot["summary"]["available_gpus"] == len(GPU_UUIDS)
     assert app.state.service.list_leases(app.state.service.local_actor("agent-a"))["data"] == []
@@ -1229,8 +1275,10 @@ def test_missing_keeper_is_still_publicly_available_and_claimable(
     assert missing["keepalive"] == {
         "configured": True,
         "policy": "idle_keepalive",
-        "state": "ERROR",
-        "reason": "未检测到占卡程序",
+        "desired": "ON",
+        "actual": "OFF",
+        "state": "OFF",
+        "reason": None,
         "lease_id": missing["keepalive"]["lease_id"],
     }
     assert snapshot["summary"]["available_gpus"] == 1
@@ -1361,6 +1409,134 @@ def test_release_restores_the_selected_keeper_on_the_next_collection(
         "/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}
     ).json()["data"]
     assert {gpu["state"] for gpu in snapshot["gpus"]} == {"KEEPALIVE"}
+
+
+def test_routine_agent_path_handles_keepalive_on_and_off(
+    tmp_path: Path, inventory: InventoryConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = FakeKeepaliveAdapter()
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+    rest = TestClient(app)
+    headers = {"X-ServerPilot-Actor": "agent"}
+
+    class RoutineClient:
+        def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
+            response = rest.get("/api/v1/snapshot", params=kwargs, headers=headers)
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        def post(self, path, body=None):  # type: ignore[no-untyped-def]
+            response = rest.post(path, json=body, headers=headers)
+            assert response.status_code == 200, response.text
+            return response.json()
+
+    monkeypatch.setattr(mcp_server, "_routine_client", RoutineClient)
+
+    enabled = rest.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("agent-path-on"),
+    )
+    assert enabled.status_code == 200, enabled.text
+    status_on = mcp_server.gpu_status()
+    assert len(status_on["gpus"]) == len(GPU_UUIDS)
+    assert {gpu["status"] for gpu in status_on["gpus"]} == {"可用 · 空闲占卡"}
+    assert {tuple(gpu["keepalive"].values()) for gpu in status_on["gpus"]} == {
+        ("ON", "ON")
+    }
+
+    allocation_on = mcp_server.gpu_apply(
+        server_id="endpoint-a", gpu_count=1, task="Agent 占卡开启申请验收"
+    )
+    assert len(allocation_on["gpus"]) == 1
+    assert allocation_on["workspace_path"]
+    assert allocation_on["cuda_visible_devices"]
+    selected_uuid = allocation_on["gpus"][0]["gpu_id"]
+    assert selected_uuid not in adapter.active_pids
+    assert len(adapter.active_pids) == len(GPU_UUIDS) - 1
+    mcp_server.gpu_release(allocation_on["lease_id"])
+
+    async def restore_then_disable() -> None:
+        endpoint = app.state.service.collector_endpoint("endpoint-a")
+        await collector.collect_once(app.state.service, endpoints=[endpoint])
+        await app.state.reconcile_endpoint_keepalive(
+            app.state.service.local_actor("agent-a"),
+            "endpoint-a",
+            idempotency_key="agent-path-restore",
+        )
+
+    asyncio.run(restore_then_disable())
+    assert set(adapter.active_pids) == set(GPU_UUIDS)
+    disabled = rest.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": False},
+        headers=_headers("agent-path-off"),
+    )
+    assert disabled.status_code == 200, disabled.text
+    status_off = mcp_server.gpu_status()
+    assert len(status_off["gpus"]) == len(GPU_UUIDS)
+    assert {gpu["status"] for gpu in status_off["gpus"]} == {"可用 · 未开启占卡"}
+    assert {tuple(gpu["keepalive"].values()) for gpu in status_off["gpus"]} == {
+        ("OFF", "OFF")
+    }
+
+    allocation_off = mcp_server.gpu_apply(
+        server_id="endpoint-a", gpu_count=1, task="Agent 占卡关闭申请验收"
+    )
+    assert len(allocation_off["gpus"]) == 1
+    assert adapter.active_pids == {}
+    mcp_server.gpu_release(allocation_off["lease_id"])
+
+
+def test_restart_preserves_keepalive_ownership_without_remote_churn(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    adapter = FakeKeepaliveAdapter()
+    collector = FakeTargetedCollector(adapter)
+    first_app, _ = _keepalive_app(
+        tmp_path, inventory, adapter=adapter, collector=collector
+    )
+    first_client = TestClient(first_app)
+
+    enabled = first_client.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("restart-recovery-on"),
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert set(adapter.active_pids) == set(GPU_UUIDS)
+    calls_before_restart = list(adapter.calls)
+    with first_app.state.service.database.session() as session:
+        lease_ids_before_restart = set(
+            session.scalars(
+                select(Lease.id).where(Lease.kind == "keepalive", Lease.state == "ACTIVE")
+            ).all()
+        )
+
+    restarted_app, _ = _keepalive_app(
+        tmp_path, inventory, adapter=adapter, collector=collector
+    )
+
+    reconciled = asyncio.run(
+        restarted_app.state.reconcile_endpoint_keepalive(
+            restarted_app.state.service.local_actor("agent-a"),
+            "endpoint-a",
+            idempotency_key="restart-preserve",
+        )
+    )
+
+    assert adapter.calls == calls_before_restart
+    assert set(adapter.active_pids) == set(GPU_UUIDS)
+    assert reconciled["keepalive"]["desired"] == "ON"
+    assert reconciled["keepalive"]["actual"] == "ON"
+    with restarted_app.state.service.database.session() as session:
+        active_keepers = session.scalars(
+            select(Lease).where(Lease.kind == "keepalive", Lease.state == "ACTIVE")
+        ).all()
+        assert len(active_keepers) == len(GPU_UUIDS)
+        assert {lease.id for lease in active_keepers} == lease_ids_before_restart
+        assert {lease.expires_at for lease in active_keepers} == {None}
 
 
 def test_app_reassignment_stops_the_selected_keeper_before_moving_the_task(

@@ -170,6 +170,27 @@ class GPUDevice(Base):
     absent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class KeepaliveCurrent(Base):
+    """Current worker state, separate from endpoint desired policy."""
+
+    __tablename__ = "keepalive_current"
+    __table_args__ = (
+        CheckConstraint("actual IN ('ON', 'OFF', 'ERROR')", name="ck_keepalive_actual"),
+    )
+
+    gpu_id: Mapped[str] = mapped_column(
+        ForeignKey("gpu_devices.id", ondelete="CASCADE"), primary_key=True
+    )
+    actual: Mapped[str] = mapped_column(String(16), nullable=False, default="OFF")
+    error_reason: Mapped[str | None] = mapped_column(String(1000))
+    expected_pid: Mapped[int | None] = mapped_column(Integer)
+    expected_boot_id: Mapped[str | None] = mapped_column(String(120))
+    expected_process_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class TelemetrySnapshot(Base):
     __tablename__ = "telemetry_snapshots"
     __table_args__ = (Index("ix_telemetry_gpu_observed", "gpu_id", "observed_at"),)

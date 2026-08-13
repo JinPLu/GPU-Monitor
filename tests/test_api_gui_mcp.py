@@ -1054,6 +1054,9 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
     result = mcp_server.gpu_apply(server_id="server-a", gpu_count=2, task="训练")
     assert result == {
         "lease_id": "lease-a",
+        "server_id": "server-a",
+        "workspace_path": "/srv/server-a",
+        "cuda_visible_devices": "GPU-a,GPU-b",
         "gpus": [
             {
                 "server_id": "server-a",
@@ -1190,6 +1193,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
             "vram_mib": 80000,
             "status": "可用 · 未开启占卡",
             "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+            "keepalive": {"desired": "OFF", "actual": "OFF"},
         }
     ]}
 
@@ -1202,6 +1206,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
             "vram_mib": 80000,
             "status": "可用 · 未开启占卡",
             "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+            "keepalive": {"desired": "OFF", "actual": "OFF"},
             "available": True,
         },
         {
@@ -1212,6 +1217,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
             "vram_mib": 80000,
             "status": "任务使用中",
             "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+            "keepalive": {"desired": "OFF", "actual": "OFF"},
             "available": False,
             "task": "训练",
         },
@@ -1285,7 +1291,11 @@ def test_mcp_reads_distinguish_internal_keepalive_from_available_capacity(
     assert all("available" not in item for item in status["gpus"])
     assert {item["status"] for item in status["gpus"]} == {
         "可用 · 空闲占卡",
-        "可用 · 占卡异常：未检测到占卡程序",
+        "可用 · 占卡未运行",
+    }
+    assert {tuple(item["keepalive"].values()) for item in status["gpus"]} == {
+        ("ON", "ON"),
+        ("ON", "OFF"),
     }
 
 

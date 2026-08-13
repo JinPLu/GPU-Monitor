@@ -148,6 +148,119 @@ def test_workspace_migration_preserves_legacy_endpoints_without_inventing_paths(
     assert count == 1
 
 
+def test_keepalive_persistence_migration_changes_only_active_ownership(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    database = Database(f"sqlite:///{tmp_path / 'keepalive-upgrade.sqlite3'}", root)
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "src" / "serverpilot" / "migrations"))
+    config.set_main_option("sqlalchemy.url", database.url)
+    command.upgrade(config, "20260813_0022")
+
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO projects ("
+                "id, display_name, weight, concurrency_limit, enabled, created_at, updated_at"
+                ") VALUES "
+                "('project-a', 'Project A', 1, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), "
+                "('__serverpilot_keepalive__', 'Keepalive', 1, 1, 1, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO actors (id, display_name, role, enabled, created_at, updated_at) "
+                "VALUES ('__serverpilot_keepalive__', 'Keepalive', 'admin', 1, "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO endpoints ("
+                "id, host, port, ssh_user, observation_profile, keepalive_policy, "
+                "labels_json, lifecycle_state, enabled, created_at, updated_at"
+                ") VALUES ('endpoint-a', '127.0.0.1', 22, 'gpu', 'linux-nvidia', "
+                "'idle_keepalive', '[]', 'active', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO gpu_devices ("
+                "id, endpoint_id, gpu_uuid, gpu_index, name, total_vram_mib, labels_json, "
+                "health, enabled, present, first_seen_at, last_seen_at"
+                ") VALUES ('gpu-a', 'endpoint-a', 'GPU-a', 0, 'GPU', 80000, '[]', "
+                "'OK', 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        for request_id, actor_id, project_id, priority, state in (
+            ("active-request", "__serverpilot_keepalive__", "__serverpilot_keepalive__", "keepalive", "ACTIVE"),
+            ("released-request", "__serverpilot_keepalive__", "__serverpilot_keepalive__", "keepalive", "RELEASED"),
+            ("workload-request", "__serverpilot_keepalive__", "project-a", "normal", "ACTIVE"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO allocation_requests ("
+                    "id, actor_id, project_id, auto_activate, task_ref, purpose, "
+                    "constraints_json, duration_seconds, state, priority_class, created_at, updated_at"
+                    ") VALUES (:id, :actor, :project, 0, :id, :id, '{}', 600, :state, "
+                    ":priority, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {
+                    "id": request_id,
+                    "actor": actor_id,
+                    "project": project_id,
+                    "state": state,
+                    "priority": priority,
+                },
+            )
+        for lease_id, request_id, kind, state, expiry in (
+            ("active-keeper", "active-request", "keepalive", "ACTIVE", "2026-08-13 12:00:00"),
+            ("released-keeper", "released-request", "keepalive", "RELEASED", "2026-08-13 13:00:00"),
+            ("active-workload", "workload-request", "workload", "ACTIVE", "2026-08-13 14:00:00"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO leases ("
+                    "id, request_id, actor_id, project_id, kind, state, issued_at, expires_at, "
+                    "last_heartbeat_at, issued_revision"
+                    ") VALUES (:id, :request, '__serverpilot_keepalive__', "
+                    ":project, :kind, :state, CURRENT_TIMESTAMP, :expiry, CURRENT_TIMESTAMP, 1)"
+                ),
+                {
+                    "id": lease_id,
+                    "request": request_id,
+                    "project": "project-a" if kind == "workload" else "__serverpilot_keepalive__",
+                    "kind": kind,
+                    "state": state,
+                    "expiry": expiry,
+                },
+            )
+        connection.execute(
+            text(
+                "INSERT INTO lease_resources (lease_id, gpu_id, active) "
+                "VALUES ('active-keeper', 'gpu-a', 1)"
+            )
+        )
+
+    command.upgrade(config, "head")
+    with database.engine.connect() as connection:
+        expiries = dict(
+            connection.execute(text("SELECT id, expires_at FROM leases")).all()
+        )
+        current_columns = {
+            column["name"] for column in inspect(database.engine).get_columns("keepalive_current")
+        }
+
+    assert expiries["active-keeper"] is None
+    assert expiries["released-keeper"] is not None
+    assert expiries["active-workload"] is not None
+    assert {"expected_pid", "expected_boot_id", "expected_process_started_at"}.issubset(
+        current_columns
+    )
+
+
 def test_scheduler_transport_migration_scrubs_legacy_argv_and_disables_target(
     tmp_path: Path,
 ) -> None:
