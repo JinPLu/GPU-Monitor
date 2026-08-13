@@ -8,10 +8,10 @@
 
 1. **信息采集**：固定只读探针采集服务器 CPU、内存、GPU、进程和历史趋势；APP 刷新只读取这份状态。
 2. **人类监控与纠错**：APP 展示服务器、任务与 GPU。任务详情允许人保持卡数不变，直接选择新的 GPU；目标 GPU 正在占卡时先按卡停止并刷新确认，再更新分配，随后提示对应 Agent 按返回的 `CUDA_VISIBLE_DEVICES` 重启任务。
-3. **Agent 操作**：默认 MCP 只有 `gpu_status`、`gpu_apply`、`gpu_release`。连接、工作目录、代码位置和设备选择分开投影：`ssh` 只负责连接；`workspace {path, kind=working_directory, use_as_cwd=true, code_location=not_provided}` 明确远端 cwd 且不暗示代码路径；`workspace_path` 继续兼容；CUDA 字段只选择租约设备。单 endpoint 顶层 `cuda_visible_devices` 是完整资源集合，逐卡 `gpu_cuda_visible_devices` 只含该卡 UUID。启动前做最小 CUDA gate，失败立即释放并在当前任务内避开同一环境。租约持续到显式释放或 App 人工处理，容量不足直接返回 `no_capacity`，不排队且同一 turn 不反复轮询；多个 lease 由申请者逐个确认释放。
-4. **空闲 GPU 占卡**：明确分开持久意图与当前进程状态。endpoint 的 `desired` 只有 `ON / OFF`，只随用户开关改变；逐卡 `actual` 只有 `ON / OFF / ERROR`，由 helper 操作与新鲜采集更新。内部逐卡归属不再使用 TTL，并持久保存唯一的 PID、boot ID 和进程启动时间；只有新鲜采集与该身份完全匹配才是 `actual=ON`。无进程为 `OFF`，额外或替代业务进程为 `ERROR/CONFLICT` 并 fail closed。正常启动直接读取持久 ownership，采集后原地更新 `actual`，不会为了重建归属而停止或重启远端 helper。
+3. **Agent 操作**：默认 MCP 只有 `gpu_status`、`gpu_apply`、`gpu_release`。连接、工作目录、代码位置和设备选择分开投影：`ssh` 只负责连接；`workspace {path, kind=working_directory, use_as_cwd=true, code_location=not_provided}` 明确远端 cwd 且不暗示代码路径；`workspace_path` 继续保留。GPU UUID 只作物理身份，`gpu_index` 保留采集时的 `nvidia-smi index`；collector schema v2 另按 PCI bus 顺序生成 `cuda_ordinal`，lease 返回 `cuda_device_order=PCI_BUS_ID`、顶层完整 `cuda_visible_devices` ordinal 集合和逐卡 `gpu_cuda_visible_devices` ordinal。数据库中没有当前 `cuda_ordinal` 的 GPU 不参与分配。启动前做最小 CUDA gate，失败立即释放并在当前任务内避开同一环境。租约持续到显式释放或 App 人工处理，容量不足直接返回 `no_capacity`，不排队且同一 turn 不反复轮询。一次 MCP 调用具有内部重放键并在本地传输失败时只重试一次；新的同参数调用仍能取得第二个 lease，多个 lease 由申请者逐个确认释放。
+4. **空闲 GPU 占卡**：明确分开持久意图与当前进程状态。endpoint 的 `desired` 只有 `ON / OFF`，只随用户开关改变；逐卡 `actual` 只有 `ON / OFF / ERROR`，由 helper 操作与新鲜采集更新。内部逐卡归属不再使用 TTL，并持久保存唯一的 PID、boot ID 和进程启动时间；远端 helper 本地状态也必须包含 PID、Linux boot ID、`/proc` 启动时钟和当前固定 worker marker，停止前使用 pidfd 重新校验并发信号，PID 重用或 marker 不匹配时绝不 kill。PID-only 或旧 marker 状态直接 fail closed，不提供旧版收养路径。无进程为 `OFF`，额外或替代业务进程为 `ERROR/CONFLICT` 并 fail closed。helper 状态文件和数据库备份都通过同目录临时文件、fsync 与原子替换发布。
 
-每个 endpoint 仍只持久保存一个 canonical `workspace_path`。新增服务器时 REST、MCP advanced 管理工具、Web 和原生 APP 都要求填写绝对远端路径；routine MCP 在不改变持久化模型的前提下将它投影为结构化 `workspace`，明确这是远端 cwd、不是代码路径。用户已确认当前共用目录为 `/media/datasets/OminiEWM_Data/tmp/ljp`。历史记录迁移保留且未知路径保持空值，不猜测项目子目录。该字段只是元数据和操作指引，不创建/删除远端目录、不授权启动 workload；密封占卡 helper 固定布局为 `${workspace_path}/serverpilot-keepalive`，adapter 直接执行 `./serverpilot-keepalive --schema-version 2`，不依赖远端 `PATH`。
+每个 endpoint 仍只持久保存一个 canonical `workspace_path`。新增服务器时 REST、MCP advanced 管理工具、Web 和原生 APP 都要求填写绝对远端路径；routine MCP 在不改变持久化模型的前提下将它投影为结构化 `workspace`，明确这是远端 cwd、不是代码路径。用户已确认当前共用目录为 `/media/datasets/OminiEWM_Data/tmp/ljp`。历史记录迁移保留且未知路径保持空值，不猜测项目子目录。该字段只是元数据和操作指引，不创建/删除远端目录、不授权启动 workload；密封占卡 helper 固定布局为 `${workspace_path}/serverpilot-keepalive`，adapter 先只读执行 `./serverpilot-keepalive --protocol-info`，确认 v3 能力后再执行 `./serverpilot-keepalive --schema-version 3`，不依赖远端 `PATH`；预检失败不发送 mutation，旧 v2 wire/state 直接 fail closed。
 
 占卡 GPU 对 APP、REST 和 MCP 仍计为可用；`desired=ON, actual=OFF` 时 GPU 空闲则仍可申请，同时下一轮按策略重新启动 helper。真正分配前，Agent 申请、浏览器快速申请、预设申请和 APP 人工改派都复用同一个“选中 GPU → 逐卡停止 helper → 定向采集 → 结束占卡记录 → 普通申请或改派”实现。
 
@@ -29,10 +29,10 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `393` 项 collected，`PYTHONPATH=src uv run --reinstall-package serverpilot pytest -q` 通过；覆盖 endpoint workspace 投影、迁移保留旧记录、workspace 内固定 helper 入口、三工具 MCP、占卡 ON/OFF 下的 routine 工具调用、daemon 重启不扰动 helper、业务进程替代 keeper 时 fail closed、routine 完整进程换代自动恢复、终态 lease 告警自愈、APP operator 释放、keeper 启动与 Agent 申请串行，以及无容量重试、同机双卡、顶层/逐行兼容集合投影、逐卡单 UUID 新字段、跨 endpoint 去歧义、申请、释放和让位路径 |
-| Ruff | `.venv/bin/ruff check src tests` 通过 |
-| 数据迁移 | 当前源码迁移头 `20260813_0024`；`keepalive_current` 保存 `actual/error_reason` 与逐卡唯一进程身份，只把仍有 active resource 的活动 keepalive lease 转为无 TTL，保留 terminal keeper 与 workload 历史 expiry |
-| MCP 上下文 | 默认发现结果严格为 3 个工具；instructions 在短上下文上限内区分 `ssh`、结构化 `workspace`、未知代码位置与 CUDA selector，并说明 CUDA gate、失败释放和有限重试；schema 和返回投影都有字段白名单测试 |
+| Python 全量测试 | `426` 项 collected，`uv run pytest -q` 通过；新增覆盖实际 ASGI body 限流与断连转发、并发限流、CSV 字段投影、Web actor CSRF、SQLite 原子备份、owner/operator 改派授权、direct 与 generic CPU/RAM 双向 admission、CUDA ordinal 采集与 fail-closed admission、MCP request-id 命名空间/传输重试/同参数多 lease，以及 keepalive v3 protocol-info 预检、旧 wire/state 拒绝、PID 重用、marker、目标 GPU 映射、Python wrapper 缺失时的 Linux pidfd syscall 与原子状态写入 |
+| Ruff | `uv run ruff check .` 通过 |
+| 数据迁移 | 当前源码迁移头 `20260814_0025`；`gpu_devices.cuda_ordinal` 初始为 NULL，只有当前 collector 观测才写入并恢复分配；`keepalive_current` 保存 `actual/error_reason` 与逐卡唯一进程身份，只把仍有 active resource 的活动 keepalive lease 转为无 TTL，保留 terminal keeper 与 workload 历史 expiry |
+| MCP 上下文 | 默认发现结果严格为 3 个工具；`gpu_apply` schema 仍只有 `server_id / gpu_count / task`。adapter 使用进程随机命名空间与 MCP request ID 生成不公开的重放键；同一次本地 HTTP 传输失败只重试一次，不同调用不按任务名折叠 |
 | Agent 任务说明 | 默认 MCP 不依赖客户端身份、UI 标题或专用环境变量。`gpu_apply(task?)` 接收用户任务名或当前目标的简短人类可读概括；未提供时使用“未命名任务”。`gpu_status(include_busy=true)` 为忙卡返回人类可读 `task` |
 | macOS App 构建 | `zsh desktop/build-macos-app.sh` 通过，包含 Swift 桌面端编译 |
 | standalone 验证 | `zsh desktop/verify-macos-app.sh` 通过 |
@@ -46,11 +46,17 @@ service 快照直接提供统一的 `publicly_available` 和简短中文 `public
 
 原生 APP 同样直接读取 `desired / actual / publicly_available / public_status`；`CONFLICT` 或其他不可申请状态不会再显示“可用”，`desired=ON, actual=OFF` 显示“占卡未运行”。普通 routine Agent 在同一 lease 内完整换代进程时会自动更新 collector binding；只有旧进程已经全部退出、完整 endpoint 采集确认每张租用 GPU 都出现新进程、且 binding 是 collector 自动建立时才恢复。新进程必须自身连续观测两次才触发冲突；完整采集确认重试窗口暂时为空时保留 lease 并清掉瞬态冲突。旧新进程稳定并存、不完整采集、非 routine 项目和显式高级 binding 仍保持 fail closed。租约终止或不再拥有活动资源时，lease-scoped 冲突/孤儿告警会立即关闭；初始化与 reconcile 会自愈历史陈旧告警。APP 通过独立 operator 路由释放用户已确认结束的 Agent 租约，routine Agent 仍只能释放自己的 lease。
 
+APP 人工 GPU 改派现在也走独立的 loopback desktop operator 路由；普通 lease API 只能由 lease owner 调用，不能借 keeper reclaim 的规划阶段跨过授权。Host CPU/RAM admission 同时计算 direct GPU lease commitments 与 active generic host claims，不再因创建顺序不同而过量分配。
+
 ## 已完成现场验收
 
-- 本轮升级前已把实时数据库备份到 `~/Library/Application Support/ServerPilot/state/backups/pre-0023-20260813.sqlite3`，并在最终迁移前另存 `.artifacts/live-backups/pre-0024-20260813.sqlite3`；最终源码迁移头为 `20260813_0024`。
-- 已安装 `1.5.3` 本地 MCP/daemon 并重启。daemon 为 `live=true`、`ready=true`；根目录唯一 App 为 `1.5.3 / build 8`，build 与 standalone verify 均通过。
+- 本轮升级前已把实时数据库备份到 `~/Library/Application Support/ServerPilot/state/backups/pre-0023-20260813.sqlite3` 与 `.artifacts/live-backups/pre-0024-20260813.sqlite3`；CUDA ordinal 迁移前又原子备份为 `state/backups/pre-cuda-ordinal-rollout.sqlite3`。最终源码迁移头为 `20260814_0025`。
+- 已安装 `1.5.5` 本地 MCP/daemon 并重启。daemon 为 `live=true`、`ready=true`、`cuda_ordinal_selectors` 与 `keepalive_protocol_v3` capability 已生效，重启没有新增 stderr；根目录唯一 App 为 `1.5.5 / build 10`，build 与 standalone verify 均通过。
+- 四个已配置 keepalive endpoint（181、203、215、222）均已只读执行 `./serverpilot-keepalive --protocol-info`，返回 v3、实现版本 1.5.5 与 `per_gpu_keepalive / pidfd_identity / pci_bus_id`；181、203 的正式 workload 未被本轮升级触碰。
 - 全新已安装 `serverpilot-mcp` stdio 子进程实际发现严格只有 `gpu_status`、`gpu_apply`、`gpu_release`；真实 `gpu_status` 返回 12 张可用 GPU，样例同时包含直接 SSH 参数、兼容 `workspace_path` 与 `workspace={path, kind: working_directory, use_as_cwd: true, code_location: not_provided}`。
+- 2026-08-14 在 222 完成 CUDA ordinal 修复实机验收。当前 collector 把 `gpu_index` 与 `cuda_ordinal` 分开保存；全新安装版 MCP stdio 子进程只发现三个工具，`gpu_apply` 返回 `cuda_ordinal=0`、`cuda_visible_devices=0`、逐卡 `gpu_cuda_visible_devices=0` 与 `cuda_device_order=PCI_BUS_ID`。按这些字段运行最小 CUDA gate，实际得到 `cuda_available=true`、`device_count=1` 并完成 GPU 张量计算；lease 随后通过同一 fresh MCP 释放，222 的 8 张 GPU 全部恢复 `desired=ON / actual=ON`。
+- 同轮无兼容升级先由旧 helper 正常停止 222 的 8 个 PID-only worker，再部署当前 helper；新状态逐卡包含 PID、Linux boot ID、start ticks 与固定 marker。222 的 Python 3.11 没有 pidfd 包装，首次停止因此 fail closed 且没有发出租约；修复后直接使用 Linux pidfd syscall，真实申请、精确停止、释放与 keeper 恢复均通过，始终没有退回普通 PID signal。
+- 1.5.5 最终重启后，另一个正式任务 `Storyboard MSPC-C-260813-003 materialize selected 4096 in 8 shards then C/D training` 随后取得 222 的 8 张卡；当前 `actual=OFF` 是正式 workload lease 的预期状态，不是 keeper 恢复失败。本轮没有停止、释放或改派该任务。
 - 本轮直接通过 Agent routine MCP 在 181 完成两组现场验收。占卡开启时，`gpu_status(include_busy=false)` 返回两张“可用 · 空闲占卡”，`keepalive={desired: ON, actual: ON}`；`gpu_apply` 自动停止所选 GPU 的 helper、返回真实 `workspace_path` 与 `cuda_visible_devices`，`gpu_status(include_busy=true)` 显示验收任务，随后 `gpu_release` 成功并恢复占卡。占卡关闭后，状态变为“可用 · 未开启占卡”，同一套 `gpu_apply → gpu_status → gpu_release` 仍成功且不启动 helper。验收后 181 已恢复 `desired=ON / actual=ON`，两张卡均为“可用 · 空闲占卡”。
 - daemon 重启自动化验收会模拟远端 helper 仍在运行：重启后的对账不调用 adapter、不改变远端 PID、不更换逐卡 lease ID，继续沿用 `expires_at=NULL` 的持久 ownership，并由采集保持 `desired=ON / actual=ON`。
 - 最终安装版在 222 实际重启 daemon 前后比较 7 个当时空闲 keeper：7 个 PID 逐一不变，没有为“重建 ownership”停止或重启远端 helper。
@@ -83,3 +89,4 @@ service 快照直接提供统一的 `publicly_available` 和简短中文 `public
 - 完整工作日 shadow、2 小时内存 soak 和 24 小时数据库增长观察。
 - 非 loopback 部署所需的 TLS 与访问控制。
 - 其他 MCP 客户端和外部调度器的现场联调。
+- MCP 进程已经退出后，由调用方重新发起的新工具调用没有跨进程稳定 token，不能与旧调用判定为同一次传输重放；当前公开三工具合同不增加该 token。

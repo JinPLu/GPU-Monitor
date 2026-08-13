@@ -797,15 +797,22 @@ public final class BrokerStore: ObservableObject {
         gpuIDs: [String],
         completion: @escaping @MainActor @Sendable (Bool, String?) -> Void
     ) {
+        guard serviceInfo?.supportsOperatorLeaseReassignment == true else {
+            let message = "当前本机服务不支持人工改派其他 Agent 的租约，请先升级并重启 ServerPilot。"
+            errorMessage = message
+            completion(false, message)
+            return
+        }
         guard !reassigningLeaseIDs.contains(lease.id) else {
             completion(false, "这项任务的 GPU 分配正在更新。")
             return
         }
         reassigningLeaseIDs.insert(lease.id)
         performMutationWithPayload(
-            path: "api/v1/leases/\(lease.id)/gpus",
+            path: "api/v1/operator/leases/\(lease.id)/gpus",
             method: "PATCH",
-            payload: ["gpu_ids": gpuIDs]
+            payload: ["gpu_ids": gpuIDs],
+            desktopClient: true
         ) { [weak self] _, error in
             guard let self else { return }
             self.reassigningLeaseIDs.remove(lease.id)
@@ -1144,6 +1151,7 @@ public final class BrokerStore: ObservableObject {
         path: String,
         method: String = "POST",
         payload: [String: Any],
+        desktopClient: Bool = false,
         completion: @escaping @MainActor @Sendable ([String: Any]?, String?) -> Void
     ) {
         guard allowsMutations else {
@@ -1171,6 +1179,9 @@ public final class BrokerStore: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(actorID, forHTTPHeaderField: "X-ServerPilot-Actor")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "Idempotency-Key")
+        if desktopClient {
+            request.setValue("desktop-app", forHTTPHeaderField: "X-ServerPilot-Client")
+        }
 
         mutationSession.dataTask(with: request) { [weak self] data, response, error in
             Task { @MainActor in

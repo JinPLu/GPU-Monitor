@@ -52,8 +52,16 @@ def _lease(state: str = "HELD") -> dict[str, Any]:
         "resources": [
             {
                 "endpoint": {"id": "server-a", "host": "127.0.0.1", "port": 22, "ssh_user": "u"},
-                "gpus": [{"id": "gpu-a", "gpu_uuid": "GPU-a", "gpu_index": 0}],
-                "cuda_visible_devices": "GPU-a",
+                "gpus": [
+                    {
+                        "id": "gpu-a",
+                        "gpu_uuid": "GPU-a",
+                        "gpu_index": 0,
+                        "cuda_ordinal": 0,
+                    }
+                ],
+                "cuda_visible_devices": "0",
+                "cuda_device_order": "PCI_BUS_ID",
                 "commitment": {"cpu_cores": 8.0, "memory_mib": 32768},
             }
         ],

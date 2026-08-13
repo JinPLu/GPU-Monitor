@@ -39,6 +39,7 @@ def observation(
             TelemetryInput(
                 gpu_uuid=gpu_uuid,
                 gpu_index=index,
+                cuda_ordinal=index,
                 name="Test GPU",
                 total_vram_mib=100_000,
                 memory_used_mib=0,

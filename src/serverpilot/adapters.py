@@ -20,7 +20,10 @@ from typing import Any, Callable, Literal, Mapping
 from serverpilot.config import EndpointConfig
 from serverpilot.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
 from serverpilot.keepalive_protocol import (
+    KEEPALIVE_PROTOCOL_INFO_CAPABILITIES,
+    KEEPALIVE_PROTOCOL_INFO_COMMAND,
     KEEPALIVE_REMOTE_COMMAND,
+    KEEPALIVE_SCHEMA_VERSION,
     KeepaliveGPUResult,
     KeepaliveRequest,
     KeepaliveResponse,
@@ -44,7 +47,7 @@ ObservationProfile = Literal["linux-nvidia", "linux-host", "server-script-v1"]
 
 GPU_QUERY = (
     "nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,memory.free,"
-    "utilization.gpu,utilization.memory,temperature.gpu,power.draw,pstate "
+    "utilization.gpu,utilization.memory,temperature.gpu,power.draw,pstate,pci.bus_id "
     "--format=csv,noheader,nounits"
 )
 PROCESS_QUERY = (
@@ -344,13 +347,87 @@ class ServerScriptKeepaliveAdapter:
     connect_timeout_seconds = 8
     timeout_seconds = 45
 
+    @staticmethod
+    def _incompatible_helper(message: str) -> AdapterCommandError:
+        return AdapterCommandError(
+            f"keepalive_helper_incompatible: {message}",
+            uncertain=False,
+        )
+
+    async def _probe_helper(self, endpoint: EndpointConfig) -> None:
+        """Verify the remote helper's v3 protocol before sending a mutation."""
+
+        remote_command = (
+            f"cd -- {shlex.quote(endpoint.workspace_path or '')} && "
+            f"{KEEPALIVE_PROTOCOL_INFO_COMMAND}"
+        )
+        process: Any | None = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                f"ConnectTimeout={self.connect_timeout_seconds}",
+                "-p",
+                str(endpoint.port),
+                f"{endpoint.ssh_user}@{endpoint.host}",
+                remote_command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self.connect_timeout_seconds
+            )
+        except TimeoutError as exc:
+            if process is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                with contextlib.suppress(Exception):
+                    await process.wait()
+            raise self._incompatible_helper("protocol-info probe timed out") from exc
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise self._incompatible_helper(
+                f"protocol-info probe could not start: {type(exc).__name__}"
+            ) from exc
+        if process.returncode != 0:
+            detail = _clean_output(_decode_remote_output(stderr[:16_384], stream_name="stderr"))
+            raise self._incompatible_helper(
+                detail[-500:] if detail else f"protocol-info exited with code {process.returncode}"
+            )
+        try:
+            decoded = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise self._incompatible_helper("protocol-info is not valid JSON") from exc
+        if not isinstance(decoded, dict):
+            raise self._incompatible_helper("protocol-info must be a JSON object")
+        if decoded.get("kind") != "serverpilot-keepalive":
+            raise self._incompatible_helper("protocol-info kind is incompatible")
+        if decoded.get("schema_version") != KEEPALIVE_SCHEMA_VERSION:
+            raise self._incompatible_helper(
+                "protocol-info schema version mismatch: "
+                f"expected {KEEPALIVE_SCHEMA_VERSION}, got {decoded.get('schema_version')!r}"
+            )
+        capabilities = decoded.get("capabilities")
+        if (
+            not isinstance(capabilities, list)
+            or not all(isinstance(capability, str) for capability in capabilities)
+            or not set(KEEPALIVE_PROTOCOL_INFO_CAPABILITIES) <= set(capabilities)
+        ):
+            raise self._incompatible_helper(
+                "protocol-info capabilities are missing required v3 features"
+            )
+
     async def set_enabled(
         self,
         endpoint: EndpointConfig,
         enabled: bool,
         gpu_uuids: list[str],
     ) -> KeepaliveResponse:
-        """Set only ``gpu_uuids`` using the fixed v2 helper command.
+        """Set only ``gpu_uuids`` using the fixed v3 helper command.
 
         The UUID set is derived by BrokerService from its current endpoint
         lease, never supplied by REST/MCP callers.  The adapter validates the
@@ -373,6 +450,7 @@ class ServerScriptKeepaliveAdapter:
             raise ValueError("gpu_uuids contains duplicates")
         if endpoint.workspace_path is None:
             raise AdapterCommandError("endpoint workspace_path is required for keepalive")
+        await self._probe_helper(endpoint)
         payload = KeepaliveRequest(enabled=enabled, gpu_uuids=requested).encode()
         remote_command = (
             f"cd -- {shlex.quote(endpoint.workspace_path)} && {KEEPALIVE_REMOTE_COMMAND}"
@@ -412,7 +490,7 @@ class ServerScriptKeepaliveAdapter:
             response = KeepaliveResponse.decode(stdout)
         except ValueError as exc:
             raise AdapterCommandError(
-                "endpoint keepalive returned an invalid response", uncertain=True
+                f"endpoint keepalive returned an invalid response: {exc}", uncertain=True
             ) from exc
         if response.enabled is not enabled:
             raise AdapterCommandError(

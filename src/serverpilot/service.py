@@ -704,6 +704,31 @@ class BrokerService:
     def _can_manage_lease(actor: ActorContext, lease: Lease) -> bool:
         return lease.actor_id == actor.id
 
+    @classmethod
+    def _require_lease_reassignment_authorization(
+        cls,
+        actor: ActorContext,
+        lease: Lease,
+        *,
+        operator_override: bool,
+    ) -> None:
+        """Authorize an owner move or an explicit human operator correction."""
+
+        if operator_override:
+            if actor.role not in {"operator", "admin"}:
+                raise BrokerError(
+                    "operator_role_required",
+                    "human lease correction requires an operator role",
+                    status_code=403,
+                )
+            return
+        if not cls._can_manage_lease(actor, lease):
+            raise BrokerError(
+                "lease_forbidden",
+                "cannot reassign another actor's GPU lease",
+                status_code=403,
+            )
+
     @staticmethod
     def _reject_generic_keepalive_mutation(lease: Lease) -> None:
         if lease.kind == "keepalive":
@@ -1143,8 +1168,15 @@ class BrokerService:
                 endpoint = endpoints.get(endpoint_id)
                 if endpoint is None:
                     continue
-                gpus.sort(key=lambda item: item.gpu_index)
-                selectors = [gpu.gpu_uuid for gpu in gpus]
+                gpus.sort(
+                    key=lambda item: (
+                        item.cuda_ordinal if item.cuda_ordinal is not None else 1025,
+                        item.gpu_index,
+                    )
+                )
+                if any(gpu.cuda_ordinal is None for gpu in gpus):
+                    continue
+                selectors = [str(gpu.cuda_ordinal) for gpu in gpus]
                 # Admission rejects unsafe selectors, but never emit an unvalidated
                 # value should historical telemetry predate that invariant.
                 if not all(CUDA_SELECTOR_RE.fullmatch(selector) for selector in selectors):
@@ -1164,10 +1196,12 @@ class BrokerService:
                                 "id": gpu.id,
                                 "gpu_uuid": gpu.gpu_uuid,
                                 "gpu_index": gpu.gpu_index,
+                                "cuda_ordinal": gpu.cuda_ordinal,
                             }
                             for gpu in gpus
                         ],
                         "cuda_visible_devices": ",".join(selectors),
+                        "cuda_device_order": "PCI_BUS_ID",
                         "commitment": {
                             "cpu_cores": commitment.cpu_cores if commitment else 0.0,
                             "memory_mib": commitment.memory_mib if commitment else 0,
@@ -1623,6 +1657,93 @@ class BrokerService:
                 )
             else:
                 self._set_keepalive_current(session, resource.gpu_id, "OFF", now=now)
+
+    def _clear_keepalive_errors_for_bound_workloads(
+        self,
+        session: Session,
+        *,
+        endpoint_id: str,
+        observation_complete: bool,
+        now: datetime,
+    ) -> None:
+        """Forget only stale keepalive errors superseded by a bound workload.
+
+        A failed keepalive transition can leave a ``KeepaliveCurrent`` ERROR
+        row after its internal lease is gone.  Once a complete, current
+        endpoint observation proves that every active GPU in this endpoint's
+        portion of a workload lease has only its *known* process cohort, that
+        historical display state no longer describes those GPUs.  Clear the
+        current rows only; workload ownership and observed processes are
+        deliberately untouched.
+        """
+
+        if not observation_complete:
+            return
+        session.flush()
+        leases = session.scalars(
+            select(Lease)
+            .join(LeaseResource, LeaseResource.lease_id == Lease.id)
+            .join(GPUDevice, GPUDevice.id == LeaseResource.gpu_id)
+            .where(
+                Lease.kind == "workload",
+                Lease.state == "ACTIVE",
+                LeaseResource.active.is_(True),
+                GPUDevice.endpoint_id == endpoint_id,
+            )
+        ).unique().all()
+        for lease in leases:
+            resources = session.scalars(
+                select(LeaseResource).where(
+                    LeaseResource.lease_id == lease.id,
+                    LeaseResource.active.is_(True),
+                )
+            ).all()
+            gpu_by_id = {
+                gpu.id: gpu
+                for gpu in session.scalars(
+                    select(GPUDevice).where(
+                        GPUDevice.id.in_([resource.gpu_id for resource in resources])
+                    )
+                ).all()
+            }
+            endpoint_resources = [
+                resource
+                for resource in resources
+                if gpu_by_id.get(resource.gpu_id) is not None
+                and gpu_by_id[resource.gpu_id].endpoint_id == endpoint_id
+            ]
+            active_leases_by_gpu = {
+                resource.gpu_id: self._active_lease_for_gpu(session, resource.gpu_id)
+                for resource in endpoint_resources
+            }
+            if (
+                not endpoint_resources
+                or any(
+                    gpu_by_id.get(resource.gpu_id) is None
+                    or gpu_by_id[resource.gpu_id].endpoint_id != endpoint_id
+                    or active_leases_by_gpu[resource.gpu_id] is None
+                    or active_leases_by_gpu[resource.gpu_id].id != lease.id
+                    for resource in endpoint_resources
+                )
+            ):
+                continue
+            if not self._resources_have_fresh_telemetry(session, endpoint_resources, now):
+                continue
+            processes_by_gpu = {
+                resource.gpu_id: self._current_processes(session, resource.gpu_id, now)
+                for resource in endpoint_resources
+            }
+            if any(not processes for processes in processes_by_gpu.values()):
+                continue
+            if any(
+                not self._processes_match_binding(session, lease.id, processes)
+                for processes in processes_by_gpu.values()
+            ):
+                continue
+            for resource in endpoint_resources:
+                current = session.get(KeepaliveCurrent, resource.gpu_id)
+                if current is not None and current.actual == "ERROR":
+                    self._set_keepalive_current(session, resource.gpu_id, "OFF", now=now)
 
     # ---- per-GPU keepalive policy and ownership --------------------------------
 
@@ -2772,6 +2893,7 @@ class BrokerService:
             "endpoint_id": gpu.endpoint_id,
             "gpu_uuid": gpu.gpu_uuid,
             "gpu_index": gpu.gpu_index,
+            "cuda_ordinal": gpu.cuda_ordinal,
             "name": gpu.name,
             "total_vram_mib": gpu.total_vram_mib,
             "labels": json_load(gpu.labels_json),
@@ -3128,6 +3250,7 @@ class BrokerService:
                     "endpoint_id": gpu.endpoint_id,
                     "gpu_uuid": gpu.gpu_uuid,
                     "gpu_index": gpu.gpu_index,
+                    "cuda_ordinal": gpu.cuda_ordinal,
                     "name": gpu.name,
                     "total_vram_mib": gpu.total_vram_mib,
                     "labels": json_load(gpu.labels_json),
@@ -5373,6 +5496,7 @@ class BrokerService:
                         endpoint_id=endpoint.id,
                         gpu_uuid=sample.gpu_uuid,
                         gpu_index=sample.gpu_index,
+                        cuda_ordinal=sample.cuda_ordinal,
                         name=sample.name,
                         total_vram_mib=sample.total_vram_mib,
                         labels_json="[]",
@@ -5386,6 +5510,7 @@ class BrokerService:
                     session.add(gpu)
                 else:
                     gpu.gpu_index = sample.gpu_index
+                    gpu.cuda_ordinal = sample.cuda_ordinal
                     gpu.name = sample.name
                     gpu.total_vram_mib = sample.total_vram_mib
                     gpu.health = sample.health
@@ -5612,6 +5737,12 @@ class BrokerService:
                 now=now,
             )
             self._bind_new_workload_processes(
+                session,
+                endpoint_id=endpoint.id,
+                observation_complete=observation.observation_complete,
+                now=now,
+            )
+            self._clear_keepalive_errors_for_bound_workloads(
                 session,
                 endpoint_id=endpoint.id,
                 observation_complete=observation.observation_complete,
@@ -6301,13 +6432,17 @@ class BrokerService:
         lease_end = now + timedelta(seconds=request.duration_seconds)
         excluded: dict[str, int] = defaultdict(int)
         values: list[GPUDevice] = []
-        commitment_usage = self._endpoint_commitment_usage(session)
+        direct_commitment_usage = self._endpoint_commitment_usage(session)
+        generic_host_usage = self._active_generic_host_usage(session)
         all_gpus = session.scalars(
             select(GPUDevice).order_by(GPUDevice.endpoint_id, GPUDevice.gpu_index)
         ).all()
         for gpu in all_gpus:
             if not gpu.present:
                 excluded["absent"] += 1
+                continue
+            if gpu.cuda_ordinal is None:
+                excluded["cuda_selector"] += 1
                 continue
             endpoint = session.get(Endpoint, gpu.endpoint_id)
             if endpoint is None:
@@ -6329,7 +6464,10 @@ class BrokerService:
                 excluded["host_telemetry"] += 1
                 continue
             if host_telemetry is not None:
-                committed_cpu, committed_memory = commitment_usage.get(endpoint.id, (0.0, 0))
+                direct_cpu, direct_memory = direct_commitment_usage.get(endpoint.id, (0.0, 0))
+                generic_cpu, generic_memory = generic_host_usage.get(endpoint.id, (0.0, 0))
+                committed_cpu = direct_cpu + generic_cpu
+                committed_memory = direct_memory + generic_memory
                 if (
                     constraints.cpu_cores is not None
                     and committed_cpu + constraints.cpu_cores > host_telemetry.cpu_count
@@ -6359,9 +6497,6 @@ class BrokerService:
                     continue
             if constraints.gpu_ids and gpu.id not in constraints.gpu_ids:
                 excluded["gpu_allowlist"] += 1
-                continue
-            if not CUDA_SELECTOR_RE.fullmatch(gpu.gpu_uuid):
-                excluded["invalid_cuda_selector"] += 1
                 continue
             if gpu.id in constraints.deny_gpu_ids:
                 excluded["gpu_denylist"] += 1
@@ -7168,12 +7303,20 @@ class BrokerService:
     def _workload_reassignment_targets(
         self,
         session: Session,
+        actor: ActorContext,
         lease_id: str,
         gpu_ids: list[str],
+        *,
+        operator_override: bool,
     ) -> tuple[Lease, list[LeaseResource], list[GPUDevice]]:
         lease = session.get(Lease, lease_id)
         if lease is None:
             raise BrokerError("lease_not_found", "lease does not exist", status_code=404)
+        self._require_lease_reassignment_authorization(
+            actor,
+            lease,
+            operator_override=operator_override,
+        )
         if lease.kind != "workload" or lease.state not in ACTIVE_LEASE_STATES:
             raise BrokerError(
                 "workload_lease_required",
@@ -7207,6 +7350,8 @@ class BrokerService:
         actor: ActorContext,
         lease_id: str,
         gpu_ids: list[str],
+        *,
+        operator_override: bool = False,
     ) -> RequestCreate | None:
         """Describe only the selected occupancy GPUs that block an APP move."""
 
@@ -7214,7 +7359,11 @@ class BrokerService:
 
         def operation(session: Session) -> RequestCreate | None:
             lease, _current_resources, _target_gpus = self._workload_reassignment_targets(
-                session, lease_id, gpu_ids
+                session,
+                actor,
+                lease_id,
+                gpu_ids,
+                operator_override=operator_override,
             )
             occupied = session.scalars(
                 select(LeaseResource).where(
@@ -7258,6 +7407,7 @@ class BrokerService:
         gpu_ids: list[str],
         *,
         idempotency_key: str,
+        operator_override: bool = False,
     ) -> dict[str, Any]:
         """Move a workload assignment to the exact GPUs chosen in the APP.
 
@@ -7268,14 +7418,18 @@ class BrokerService:
         self._require_role(actor, MUTATING_ROLES)
 
         def operation(session: Session) -> dict[str, Any]:
+            lease, current_resources, target_gpus = self._workload_reassignment_targets(
+                session,
+                actor,
+                lease_id,
+                gpu_ids,
+                operator_override=operator_override,
+            )
             existing = self._idempotent(
                 session, actor=actor, action="lease.gpus.reassign", key=idempotency_key
             )
             if existing is not None:
                 return existing
-            lease, current_resources, target_gpus = self._workload_reassignment_targets(
-                session, lease_id, gpu_ids
-            )
             occupied = session.scalars(
                 select(LeaseResource).where(
                     LeaseResource.gpu_id.in_(gpu_ids),

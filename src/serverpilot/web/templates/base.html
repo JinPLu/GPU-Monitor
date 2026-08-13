@@ -44,6 +44,7 @@
         <button class="sidebar-toggle icon-button" type="button" data-toggle-sidebar aria-expanded="true" aria-controls="app-sidebar" aria-label="显示或隐藏导航"><i class="ph ph-list" aria-hidden="true"></i></button>
         <div class="topbar-title"><span>项目与 Agent 资源</span><small><i class="ph ph-shield-check" aria-hidden="true"></i> 一个本机用户 · 同一份状态</small></div>
         <form class="actor-switcher" method="post" action="/ui/actor">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
           <label><span>记录为</span><input name="actor_id" value="{{ actor.id }}" pattern="[A-Za-z][A-Za-z0-9_.-]{1,127}" required aria-label="本机操作或 Agent 标识"></label>
           <button class="quiet" type="submit">保存</button>
         </form>

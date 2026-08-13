@@ -10,6 +10,7 @@ import asyncio
 import csv
 import json
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
@@ -50,6 +51,21 @@ MAX_SERVER_SCRIPT_PROCESS_COUNT = 16_384
 
 class CollectionError(RuntimeError):
     pass
+
+
+_PCI_BUS_ID_PATTERN = re.compile(
+    r"^(?P<domain>[0-9A-Fa-f]{4,8}):(?P<bus>[0-9A-Fa-f]{2}):"
+    r"(?P<device>[0-9A-Fa-f]{2})\.(?P<function>[0-7])$"
+)
+
+
+def _pci_bus_key(value: str | None) -> tuple[int, int, int, int]:
+    match = _PCI_BUS_ID_PATTERN.fullmatch(value or "")
+    if match is None:
+        raise CollectionError("nvidia-smi GPU output has an invalid PCI bus ID")
+    return tuple(
+        int(match.group(name), 16) for name in ("domain", "bus", "device", "function")
+    )
 
 
 Runner = Callable[[EndpointConfig, str], Awaitable[str]]
@@ -228,6 +244,7 @@ def parse_server_script_snapshot(
     gpus: list[TelemetryInput] = []
     gpu_uuids: set[str] = set()
     gpu_indexes: set[int] = set()
+    cuda_ordinals: set[int] = set()
     gpu_totals: dict[str, int] = {}
     for position, value in enumerate(
         _list(snapshot["gpus"], label="gpus", maximum=MAX_SERVER_SCRIPT_GPU_COUNT)
@@ -237,6 +254,7 @@ def parse_server_script_snapshot(
             label=f"gpus[{position}]",
             keys={
                 "gpu_index",
+                "cuda_ordinal",
                 "gpu_uuid",
                 "name",
                 "total_vram_mib",
@@ -251,6 +269,12 @@ def parse_server_script_snapshot(
             },
         )
         gpu_index = _integer(gpu["gpu_index"], label=f"gpus[{position}].gpu_index", minimum=0, maximum=1024)
+        cuda_ordinal = _integer(
+            gpu["cuda_ordinal"],
+            label=f"gpus[{position}].cuda_ordinal",
+            minimum=0,
+            maximum=1024,
+        )
         gpu_uuid = _text(gpu["gpu_uuid"], label=f"gpus[{position}].gpu_uuid", maximum=160)
         name = _text(gpu["name"], label=f"gpus[{position}].name", maximum=255)
         total = _integer(gpu["total_vram_mib"], label=f"gpus[{position}].total_vram_mib", minimum=1)
@@ -284,6 +308,7 @@ def parse_server_script_snapshot(
         health = _text(gpu["health"], label=f"gpus[{position}].health", maximum=32)
         assert (
             gpu_index is not None
+            and cuda_ordinal is not None
             and gpu_uuid is not None
             and name is not None
             and total is not None
@@ -291,16 +316,22 @@ def parse_server_script_snapshot(
             and free is not None
             and health is not None
         )
-        if gpu_uuid in gpu_uuids or gpu_index in gpu_indexes:
+        if (
+            gpu_uuid in gpu_uuids
+            or gpu_index in gpu_indexes
+            or cuda_ordinal in cuda_ordinals
+        ):
             raise CollectionError("server collector snapshot contains duplicate GPU identities")
         if used > total or free > total:
             raise CollectionError("server collector GPU memory telemetry is internally inconsistent")
         gpu_uuids.add(gpu_uuid)
         gpu_indexes.add(gpu_index)
+        cuda_ordinals.add(cuda_ordinal)
         gpu_totals[gpu_uuid] = total
         gpus.append(
             TelemetryInput(
                 gpu_index=gpu_index,
+                cuda_ordinal=cuda_ordinal,
                 gpu_uuid=gpu_uuid,
                 name=name,
                 total_vram_mib=total,
@@ -415,39 +446,61 @@ def _float(value: str | None) -> float | None:
 def parse_gpu_csv(raw: str) -> list[TelemetryInput]:
     """Parse the fixed `nvidia-smi --query-gpu` CSV, rejecting unsafe partial rows."""
 
-    samples: list[TelemetryInput] = []
+    observed: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+    nvidia_indexes: set[int] = set()
+    gpu_uuids: set[str] = set()
+    bus_ids: set[tuple[int, int, int, int]] = set()
     for row in csv.reader(raw.splitlines()):
         if not row or not any(column.strip() for column in row):
             continue
-        index = _int(_value(row, 0))
+        if len(row) != 12:
+            raise CollectionError("nvidia-smi GPU output has an unexpected column count")
+        nvidia_index = _int(_value(row, 0))
         uuid = _value(row, 1)
         name = _value(row, 2)
         total = _int(_value(row, 3))
         used = _int(_value(row, 4))
         free = _int(_value(row, 5))
-        if index is None or uuid is None or name is None or total is None or used is None or free is None:
+        bus_id = _pci_bus_key(_value(row, 11))
+        if (
+            nvidia_index is None
+            or uuid is None
+            or name is None
+            or total is None
+            or used is None
+            or free is None
+        ):
             raise CollectionError("nvidia-smi GPU output is missing an identity or memory field")
-        samples.append(
-            TelemetryInput(
-                gpu_index=index,
-                gpu_uuid=uuid,
-                name=name,
-                total_vram_mib=total,
-                memory_used_mib=used,
-                memory_free_mib=free,
-                gpu_utilization_pct=_int(_value(row, 6)),
-                memory_utilization_pct=_int(_value(row, 7)),
-                temperature_c=_int(_value(row, 8)),
-                power_watts=_float(_value(row, 9)),
-                pstate=_value(row, 10),
-                health="OK",
+        if nvidia_index in nvidia_indexes or uuid in gpu_uuids or bus_id in bus_ids:
+            raise CollectionError("nvidia-smi GPU output contains duplicate identities")
+        nvidia_indexes.add(nvidia_index)
+        gpu_uuids.add(uuid)
+        bus_ids.add(bus_id)
+        observed.append(
+            (
+                bus_id,
+                {
+                    "gpu_uuid": uuid,
+                    "gpu_index": nvidia_index,
+                    "name": name,
+                    "total_vram_mib": total,
+                    "memory_used_mib": used,
+                    "memory_free_mib": free,
+                    "gpu_utilization_pct": _int(_value(row, 6)),
+                    "memory_utilization_pct": _int(_value(row, 7)),
+                    "temperature_c": _int(_value(row, 8)),
+                    "power_watts": _float(_value(row, 9)),
+                    "pstate": _value(row, 10),
+                    "health": "OK",
+                },
             )
         )
-    if not samples:
+    if not observed:
         raise CollectionError("nvidia-smi GPU output is empty")
-    if len({sample.gpu_uuid for sample in samples}) != len(samples):
-        raise CollectionError("nvidia-smi GPU output contains duplicate UUIDs")
-    return samples
+    return [
+        TelemetryInput(cuda_ordinal=ordinal, **sample)
+        for ordinal, (_bus_id, sample) in enumerate(sorted(observed))
+    ]
 
 
 @dataclass(frozen=True, slots=True)

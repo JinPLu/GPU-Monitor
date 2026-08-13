@@ -70,10 +70,68 @@ def test_routine_mutations_use_a_harness_neutral_actor(
     mcp_server.gpu_apply(task="训练任务")
     mcp_server.gpu_release("lease-a")
 
-    assert [call["headers"] for call in calls] == [
-        {"X-ServerPilot-Actor": "agent"},
-        {"X-ServerPilot-Actor": "agent"},
-    ]
+    apply_headers = calls[0]["headers"]
+    assert isinstance(apply_headers, dict)
+    assert apply_headers["X-ServerPilot-Actor"] == "agent"
+    assert str(apply_headers["Idempotency-Key"]).startswith("mcp-call:")
+    assert calls[1]["headers"] == {"X-ServerPilot-Actor": "agent"}
+
+
+def test_gpu_apply_maps_the_mcp_request_id_to_an_internal_replay_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_server, "ensure_broker_ready_for_mcp", lambda: None)
+    calls: list[dict[str, object]] = []
+
+    def request(_method: str, _url: str, **kwargs: object) -> httpx.Response:
+        calls.append(kwargs)
+        return httpx.Response(200, json={"lease": {"id": "lease-a", "resources": []}})
+
+    class FakeContext:
+        request_id = "json-rpc-call-17"
+
+    monkeypatch.setattr("serverpilot.client.httpx.request", request)
+    mcp_server.gpu_apply(task="训练任务", context=FakeContext())  # type: ignore[arg-type]
+
+    headers = calls[0]["headers"]
+    assert isinstance(headers, dict)
+    assert headers == {
+        "X-ServerPilot-Actor": "agent",
+        "Idempotency-Key": mcp_server._routine_request_key(FakeContext()),  # type: ignore[arg-type]
+    }
+
+
+def test_mcp_process_namespace_prevents_request_id_reuse_across_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeContext:
+        request_id = "1"
+
+    monkeypatch.setattr(mcp_server, "_ROUTINE_MCP_INSTANCE_ID", "session-one")
+    first = mcp_server._routine_request_key(FakeContext())  # type: ignore[arg-type]
+    monkeypatch.setattr(mcp_server, "_ROUTINE_MCP_INSTANCE_ID", "session-two")
+    second = mcp_server._routine_request_key(FakeContext())  # type: ignore[arg-type]
+
+    assert first != second
+
+
+def test_gpu_apply_retries_one_http_transport_failure_with_the_same_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_server, "ensure_broker_ready_for_mcp", lambda: None)
+    calls: list[dict[str, object]] = []
+
+    def request(_method: str, _url: str, **kwargs: object) -> httpx.Response:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise httpx.ReadError("response interrupted")
+        return httpx.Response(200, json={"lease": {"id": "lease-a", "resources": []}})
+
+    monkeypatch.setattr("serverpilot.client.httpx.request", request)
+
+    assert mcp_server.gpu_apply(task="训练任务")["lease_id"] == "lease-a"
+    assert len(calls) == 2
+    assert calls[0]["headers"] == calls[1]["headers"]
 
 
 def test_historical_contact_column_is_inert_and_not_projected(service, admin) -> None:
@@ -120,9 +178,10 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
             session_secret="s" * 32,
         )
     )
-    app.state.service.ingest_observation(observation(count=1))
+    app.state.service.ingest_observation(observation(count=2))
     client = TestClient(app)
     headers = {"X-ServerPilot-Actor": "agent"}
+    replay_headers = {**headers, "Idempotency-Key": "routine-call-one"}
 
     claimed = client.post(
         "/api/v1/routine/claims",
@@ -132,7 +191,7 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
             "purpose": "训练任务",
             "constraints": {"gpu_count": 1, "placement": "pack"},
         },
-        headers=headers,
+        headers=replay_headers,
     )
 
     assert claimed.status_code == 200
@@ -142,6 +201,30 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
     assert lease["expires_at"] is None
     assert lease["state"] == "HELD"
     assert claimed.json()["request"]["task_ref"] == "训练任务"
+    retried = client.post(
+        "/api/v1/routine/claims",
+        json={
+            "project_id": "agent",
+            "task_ref": "训练任务",
+            "purpose": "训练任务",
+            "constraints": {"gpu_count": 1, "placement": "pack"},
+        },
+        headers=replay_headers,
+    )
+    assert retried.status_code == 200
+    assert retried.json()["lease"]["id"] == lease["id"]
+    second_claim = client.post(
+        "/api/v1/routine/claims",
+        json={
+            "project_id": "agent",
+            "task_ref": "训练任务",
+            "purpose": "训练任务",
+            "constraints": {"gpu_count": 1, "placement": "pack"},
+        },
+        headers={**headers, "Idempotency-Key": "routine-call-two"},
+    )
+    assert second_claim.status_code == 200
+    assert second_claim.json()["lease"]["id"] != lease["id"]
     with app.state.service.database.session() as session:
         app.state.service._reconcile_leases(
             session,
@@ -158,7 +241,7 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
         )
     with app.state.service.database.engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT COUNT(*) FROM idempotency_records")).scalar_one() == 0
+            connection.execute(text("SELECT COUNT(*) FROM idempotency_records")).scalar_one() == 2
         )
 
     released = client.post(
@@ -168,9 +251,21 @@ def test_routine_routes_keep_the_task_lease_until_explicit_release(
 
     assert released.status_code == 200
     assert released.json()["lease"]["state"] == "RELEASED"
+    claimed_again = client.post(
+        "/api/v1/routine/claims",
+        json={
+            "project_id": "agent",
+            "task_ref": "训练任务",
+            "purpose": "训练任务",
+            "constraints": {"gpu_count": 1, "placement": "pack"},
+        },
+        headers=headers,
+    )
+    assert claimed_again.status_code == 200
+    assert claimed_again.json()["lease"]["id"] != lease["id"]
     with app.state.service.database.engine.connect() as connection:
         assert (
-            connection.execute(text("SELECT COUNT(*) FROM idempotency_records")).scalar_one() == 0
+            connection.execute(text("SELECT COUNT(*) FROM idempotency_records")).scalar_one() == 2
         )
 
 
@@ -192,8 +287,11 @@ def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
     headers = {"X-ServerPilot-Actor": "agent"}
 
     class RoutineClient:
-        def post(self, path, body=None):  # type: ignore[no-untyped-def]
-            response = rest.post(path, json=body, headers=headers)
+        def post(self, path, body=None, *, idempotency_key=None):  # type: ignore[no-untyped-def]
+            request_headers = dict(headers)
+            if idempotency_key is not None:
+                request_headers["Idempotency-Key"] = idempotency_key
+            response = rest.post(path, json=body, headers=request_headers)
             if response.is_error:
                 error = response.json()["error"]
                 raise BrokerClientError(
@@ -225,12 +323,16 @@ def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
     }
     assert {tuple(gpu["ssh"].items()) for gpu in claimed["gpus"]} == {tuple(claimed["ssh"].items())}
     assert len({gpu["gpu_id"] for gpu in claimed["gpus"]}) == 2
-    expected_visible_devices = ",".join(gpu["gpu_id"] for gpu in claimed["gpus"])
+    expected_visible_devices = ",".join(
+        str(gpu["cuda_ordinal"]) for gpu in claimed["gpus"]
+    )
     assert claimed["cuda_visible_devices"] == expected_visible_devices
+    assert claimed["cuda_device_order"] == "PCI_BUS_ID"
     assert {gpu["cuda_visible_devices"] for gpu in claimed["gpus"]} == {expected_visible_devices}
     assert {gpu["gpu_cuda_visible_devices"] for gpu in claimed["gpus"]} == {
-        gpu["gpu_id"] for gpu in claimed["gpus"]
+        str(gpu["cuda_ordinal"]) for gpu in claimed["gpus"]
     }
+    assert {gpu["cuda_device_order"] for gpu in claimed["gpus"]} == {"PCI_BUS_ID"}
 
     assert mcp_server.gpu_release(claimed["lease_id"]) == {"released": True}
     leases = app.state.service.list_leases(app.state.service.local_actor("agent"))["data"]

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 
 from alembic import command
@@ -62,16 +64,42 @@ class Database:
             return False
 
     def backup(self, destination: Path) -> Path:
-        """Create a recoverable SQLite copy after checkpointing the WAL."""
+        """Create and atomically publish a consistent online SQLite backup."""
 
         parsed = make_url(self.url)
         if not parsed.database or parsed.database == ":memory:":
             raise ValueError("cannot back up an in-memory database")
         source = Path(parsed.database).expanduser().resolve()
+        destination = destination.expanduser().resolve()
+        if destination == source:
+            raise ValueError("backup destination must differ from the live database")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with self.engine.connect() as connection:
-            connection.execute(text("PRAGMA wal_checkpoint(FULL)"))
-        shutil.copy2(source, destination)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as source_db:
+                with sqlite3.connect(temporary) as destination_db:
+                    source_db.backup(destination_db)
+                    destination_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            with sqlite3.connect(f"file:{temporary}?mode=ro", uri=True) as copied_db:
+                integrity = copied_db.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or integrity[0] != "ok":
+                raise ValueError("backup integrity check failed")
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            directory_descriptor = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
         return destination
 
     @staticmethod

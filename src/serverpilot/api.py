@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Callable
@@ -76,19 +77,84 @@ class RateLimiter:
     def __init__(self, per_minute: int) -> None:
         self.per_minute = per_minute
         self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
 
     def check(self, actor_id: str) -> None:
         now = time.monotonic()
-        hits = self._hits[actor_id]
-        while hits and hits[0] <= now - 60:
-            hits.popleft()
-        if len(hits) >= self.per_minute:
-            raise BrokerError(
-                "rate_limited",
-                "rate limit exceeded; retry after one minute",
-                status_code=429,
-            )
-        hits.append(now)
+        with self._lock:
+            hits = self._hits[actor_id]
+            while hits and hits[0] <= now - 60:
+                hits.popleft()
+            if len(hits) >= self.per_minute:
+                raise BrokerError(
+                    "rate_limited",
+                    "rate limit exceeded; retry after one minute",
+                    status_code=429,
+                )
+            hits.append(now)
+
+
+class RequestBodyLimitMiddleware:
+    """Enforce the configured limit against bytes actually received."""
+
+    def __init__(self, app: Any, *, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            key.lower(): value
+            for key, value in scope.get("headers", [])
+        }
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                declared_length = None
+            if declared_length is not None and declared_length > self.max_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+        received = 0
+        messages: list[dict[str, Any]] = []
+        while True:
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    await self._reject(scope, receive, send)
+                    return
+            messages.append(message)
+            if message.get("type") != "http.request" or not message.get("more_body", False):
+                break
+
+        message_iterator = iter(messages)
+        sentinel = object()
+
+        async def replay_receive() -> dict[str, Any]:
+            message = next(message_iterator, sentinel)
+            if message is sentinel:
+                # Keep forwarding lifecycle events such as http.disconnect
+                # after the buffered request body has been replayed.
+                return await receive()
+            return message
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    async def _reject(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        response = JSONResponse(
+            status_code=413,
+            content={
+                "schema_version": SCHEMA_VERSION,
+                "error": {"code": "body_too_large", "message": "请求内容过大。"},
+            },
+        )
+        await response(scope, receive, send)
 
 
 def _idempotency_key(value: str | None) -> str:
@@ -120,6 +186,9 @@ def _public_error_message(exc: BrokerError) -> str:
             "远端占卡程序无法把目标 GPU UUID 映射到当前 CUDA 设备编号。"
         ),
         "keepalive_cuda_uuid_not_found": ("远端当前 PCI GPU 清单中找不到目标 GPU UUID。"),
+        "keepalive_helper_incompatible": (
+            "远端占卡 helper 版本或能力不匹配；请先完成该服务器的 helper 升级。"
+        ),
         "keepalive_outcome_uncertain": "占卡程序返回结果不确定，本次没有分配任务。",
         "keepalive_adapter_failed": "占卡程序启动或停止失败；下一采集周期会继续尝试。",
         "keepalive_cleanup_failed": "占卡异常且未能完成清理；请在 APP 中确认该 GPU 的实际状态。",
@@ -146,6 +215,8 @@ def _keepalive_adapter_failure_code(exc: AdapterCommandError) -> str:
     """Preserve a known actionable helper failure without exposing remote stderr."""
 
     message = str(exc)
+    if "keepalive_helper_incompatible" in message:
+        return "keepalive_helper_incompatible"
     if "PyTorch with CUDA support is required" in message:
         return "keepalive_pytorch_cuda_required"
     if "PyTorch CUDA runtime could not initialize the selected GPU" in message:
@@ -383,12 +454,13 @@ def create_app(
                     start_targets.append((gpu_id, gpu_uuid))
                 gpu_uuids = [gpu_uuid for _gpu_id, gpu_uuid in start_targets]
 
-                async def cleanup_failed_start(code: str) -> None:
-                    try:
-                        cleanup = await adapter.set_enabled(endpoint, False, gpu_uuids)
-                        result_by_gpu_uuid(cleanup, gpu_uuids, enabled=False)
-                    except Exception:
-                        code = "keepalive_cleanup_failed"
+                async def cleanup_failed_start(code: str, *, cleanup_remote: bool = True) -> None:
+                    if cleanup_remote:
+                        try:
+                            cleanup = await adapter.set_enabled(endpoint, False, gpu_uuids)
+                            result_by_gpu_uuid(cleanup, gpu_uuids, enabled=False)
+                        except Exception:
+                            code = "keepalive_cleanup_failed"
                     try:
                         await collect_keepalive_endpoint(endpoint)
                     except BrokerError:
@@ -412,7 +484,9 @@ def create_app(
                     adapter_result = await adapter.set_enabled(endpoint, True, gpu_uuids)
                     result_by_gpu_uuid(adapter_result, gpu_uuids, enabled=True)
                 except AdapterCommandError as exc:
-                    await cleanup_failed_start(_keepalive_adapter_failure_code(exc))
+                    await cleanup_failed_start(
+                        _keepalive_adapter_failure_code(exc), cleanup_remote=exc.uncertain
+                    )
                 except BrokerError as exc:
                     await cleanup_failed_start(exc.code)
                 except Exception:
@@ -479,11 +553,7 @@ def create_app(
                         adapter_result = await adapter.set_enabled(endpoint, False, [gpu_uuid])
                         result_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=False)
                     except AdapterCommandError as exc:
-                        adapter_code = (
-                            "keepalive_outcome_uncertain"
-                            if exc.uncertain
-                            else "keepalive_adapter_failed"
-                        )
+                        adapter_code = _keepalive_adapter_failure_code(exc)
                     except BrokerError as exc:
                         adapter_code = exc.code
                     except Exception:
@@ -515,6 +585,25 @@ def create_app(
                         )
 
                 if stop_failures:
+                    deterministic_codes = {
+                        item["code"]
+                        for item in stop_failures
+                        if item["code"] == "keepalive_helper_incompatible"
+                    }
+                    if (
+                        len(deterministic_codes) == 1
+                        and all(
+                            item["code"] == "keepalive_helper_incompatible"
+                            for item in stop_failures
+                        )
+                    ):
+                        code = next(iter(deterministic_codes))
+                        raise BrokerError(
+                            code,
+                            "占卡 helper 版本或能力不匹配，请先完成该服务器的 helper 升级。",
+                            status_code=503,
+                            details={"failed_gpu_ids": [item["gpu_id"] for item in stop_failures]},
+                        )
                     raise BrokerError(
                         "keepalive_partial_stop",
                         "已逐卡结束占卡；仍有 GPU 未能确认释放，请确认这些 GPU 上没有运行中的进程后再清理。",
@@ -604,11 +693,7 @@ def create_app(
                         adapter_result = await adapter.set_enabled(endpoint, False, [gpu_uuid])
                         result_by_gpu_uuid(adapter_result, [gpu_uuid], enabled=False)
                     except AdapterCommandError as exc:
-                        adapter_code = (
-                            "keepalive_outcome_uncertain"
-                            if exc.uncertain
-                            else "keepalive_adapter_failed"
-                        )
+                        adapter_code = _keepalive_adapter_failure_code(exc)
                     except BrokerError as exc:
                         adapter_code = exc.code
                     except Exception:
@@ -812,6 +897,10 @@ def create_app(
     app.state.reconcile_endpoint_keepalive = reconcile_endpoint_keepalive
     limiter = RateLimiter(settings.rate_limit_per_minute)
     app.add_middleware(
+        RequestBodyLimitMiddleware,
+        max_bytes=settings.request_body_limit_bytes,
+    )
+    app.add_middleware(
         SessionMiddleware, secret_key=settings.session_secret or secrets.token_urlsafe(32)
     )
     app.mount(
@@ -819,19 +908,6 @@ def create_app(
         StaticFiles(directory=str(Path(__file__).parent / "web" / "static")),
         name="static",
     )
-
-    @app.middleware("http")
-    async def body_limit(request: Request, call_next):  # type: ignore[no-untyped-def]
-        length = request.headers.get("content-length")
-        if length and length.isdigit() and int(length) > settings.request_body_limit_bytes:
-            return JSONResponse(
-                status_code=413,
-                content={
-                    "schema_version": SCHEMA_VERSION,
-                    "error": {"code": "body_too_large", "message": "请求内容过大。"},
-                },
-            )
-        return await call_next(request)
 
     @app.exception_handler(BrokerError)
     async def broker_error_handler(_request: Request, exc: BrokerError) -> JSONResponse:
@@ -1097,7 +1173,18 @@ def create_app(
         )
         writer.writeheader()
         for value in values:
-            writer.writerow({**value, "summary": json_dump(value["summary"])})
+            writer.writerow(
+                {
+                    "id": value["id"],
+                    "created_at": value["created_at"],
+                    "actor_id": value["actor_id"],
+                    "action": value["action"],
+                    "resource_type": value["resource_type"],
+                    "resource_id": value["resource_id"],
+                    "result": value["result"],
+                    "summary": json_dump(value["summary"]),
+                }
+            )
         return PlainTextResponse(
             output.getvalue(),
             media_type="text/csv",
@@ -1267,13 +1354,14 @@ def create_app(
     async def routine_claim_now(
         request_data: RequestCreate,
         actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
         """Create a persistent routine GPU claim through the shared handoff."""
 
         return await claim_request_now(
             actor,
             request_data,
-            idempotency_key=None,
+            idempotency_key=idempotency_key,
             persistent_lease=True,
         )
 
@@ -1403,14 +1491,14 @@ def create_app(
             operator_override=True,
         )
 
-    @app.patch("/api/v1/leases/{lease_id}/gpus")
-    async def reassign_lease_gpus(
+    async def apply_lease_gpu_reassignment(
+        actor: ActorContext,
         lease_id: str,
         assignment: LeaseGPUAssignment,
-        actor: ApiActor,
-        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+        *,
+        mutation_key: str,
+        operator_override: bool,
     ) -> dict[str, Any]:
-        mutation_key = _idempotency_key(idempotency_key)
         endpoint_ids = {endpoint.id for endpoint in service.collector_endpoints()}
         async with keepalive_endpoint_locks(endpoint_ids):
             try:
@@ -1419,12 +1507,16 @@ def create_app(
                     lease_id,
                     assignment.gpu_ids,
                     idempotency_key=mutation_key,
+                    operator_override=operator_override,
                 )
             except BrokerError as exc:
                 if exc.code != "gpu_already_assigned":
                     raise
                 reclaim_request = service.keepalive_reclaim_request_for_reassignment(
-                    actor, lease_id, assignment.gpu_ids
+                    actor,
+                    lease_id,
+                    assignment.gpu_ids,
+                    operator_override=operator_override,
                 )
                 if reclaim_request is None:
                     raise exc
@@ -1436,6 +1528,7 @@ def create_app(
                         lease_id,
                         assignment.gpu_ids,
                         idempotency_key=mutation_key,
+                        operator_override=operator_override,
                     ),
                     idempotency_key=mutation_key,
                     locked_endpoint_ids=endpoint_ids,
@@ -1443,6 +1536,47 @@ def create_app(
                 if reassigned is None:
                     raise exc
                 return reassigned
+
+    @app.patch("/api/v1/leases/{lease_id}/gpus")
+    async def reassign_lease_gpus(
+        lease_id: str,
+        assignment: LeaseGPUAssignment,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return await apply_lease_gpu_reassignment(
+            actor,
+            lease_id,
+            assignment,
+            mutation_key=_idempotency_key(idempotency_key),
+            operator_override=False,
+        )
+
+    @app.patch("/api/v1/operator/leases/{lease_id}/gpus")
+    async def operator_reassign_lease_gpus(
+        request: Request,
+        lease_id: str,
+        assignment: LeaseGPUAssignment,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        """Human GPU reassignment correction surface for the loopback App."""
+
+        if request.headers.get("x-serverpilot-client") != "desktop-app":
+            raise BrokerError(
+                "operator_client_required",
+                "human lease correction is only available to the local App",
+                status_code=403,
+            )
+        label = request.headers.get("x-serverpilot-actor", "human").strip() or "human"
+        local = service.local_actor(label)
+        actor = ActorContext(id=local.id, role="operator", project_ids=local.project_ids)
+        return await apply_lease_gpu_reassignment(
+            actor,
+            lease_id,
+            assignment,
+            mutation_key=_idempotency_key(idempotency_key),
+            operator_override=True,
+        )
 
     @app.post("/api/v1/endpoints/{endpoint_id}/leases/{lease_id}/release-empty")
     @app.post("/api/v1/endpoints/{endpoint_id}/conflicted-leases/{lease_id}/release-empty")
@@ -2137,7 +2271,12 @@ def create_app(
         )
 
     @app.post("/ui/actor")
-    async def web_actor(request: Request, actor_id: Annotated[str, Form()]) -> RedirectResponse:
+    async def web_actor(
+        request: Request,
+        actor_id: Annotated[str, Form()],
+        csrf: Annotated[str, Form()],
+    ) -> RedirectResponse:
+        require_session_csrf(request, csrf)
         actor = service.local_actor(actor_id)
         request.session["actor_id"] = actor.id
         request.session.setdefault("csrf", secrets.token_urlsafe(24))

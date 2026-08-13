@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from serverpilot import server_collector
 from serverpilot.adapters import RAW_SSH_OBSERVATION_ADAPTER, RawSSHResult
 from serverpilot.collector import (
     COMBINED_QUERY,
@@ -23,13 +24,26 @@ from serverpilot.collector import (
     parse_server_script_snapshot,
 )
 from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig
-from serverpilot.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
+from serverpilot.collector_protocol import (
+    SERVER_SCRIPT_REMOTE_COMMAND,
+    SERVER_SCRIPT_SCHEMA_VERSION,
+)
 from serverpilot.importer import import_servers_files, parse_ssh_command
 
 
 def test_gpu_and_process_csv_parser() -> None:
-    samples = parse_gpu_csv("0, GPU-0, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0\n")
-    assert samples[0].gpu_uuid == "GPU-0"
+    samples = parse_gpu_csv(
+        "0, GPU-late, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0, "
+        "00000000:AF:00.0\n"
+        "7, GPU-early, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0, "
+        "00000000:01:00.0\n"
+    )
+    assert [
+        (sample.gpu_uuid, sample.gpu_index, sample.cuda_ordinal) for sample in samples
+    ] == [
+        ("GPU-early", 7, 0),
+        ("GPU-late", 0, 1),
+    ]
     assert samples[0].memory_free_mib == 100000
     assert parse_host_resources("64\n262144 196608\n4.25\n") == (64, 4.25, 262144, 196608)
     assert parse_host_resource_snapshot("64\n262144 196608\n4.25\n1000 750\n") == (
@@ -45,13 +59,42 @@ def test_gpu_and_process_csv_parser() -> None:
     assert parse_process_csv("No running processes found\n") == []
 
 
+def test_server_collector_assigns_cuda_ordinals_by_pci_bus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_query(argument: str) -> str:
+        if argument == server_collector.GPU_QUERY:
+            return (
+                "0, GPU-late, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0, "
+                "00000000:AF:00.0\n"
+                "7, GPU-early, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0, "
+                "00000000:01:00.0\n"
+            )
+        if argument == server_collector.PROCESS_QUERY:
+            return "No running processes found\n"
+        raise AssertionError(argument)
+
+    monkeypatch.setattr(server_collector, "_run_nvidia_smi", fake_query)
+
+    available, gpus, processes = server_collector._gpu_snapshot()
+
+    assert available is True
+    assert [
+        (gpu["gpu_uuid"], gpu["gpu_index"], gpu["cuda_ordinal"]) for gpu in gpus
+    ] == [
+        ("GPU-early", 7, 0),
+        ("GPU-late", 0, 1),
+    ]
+    assert processes == []
+
+
 def test_fake_collector_never_needs_a_shell(service, inventory) -> None:
     async def fake_runner(endpoint, command):  # type: ignore[no-untyped-def]
         assert endpoint.id == "endpoint-a"
         if command == COMBINED_QUERY:
             return (
                 "__SERVERPILOT_GPU__\n"
-                "0, GPU-endpoint-a-0, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0\n"
+                "0, GPU-endpoint-a-0, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0, 00000000:01:00.0\n"
                 "__SERVERPILOT_PROCESSES__\n"
                 "__SERVERPILOT_PROCESS_DETAILS__\n"
                 "__SERVERPILOT_IDENTITY__\n"
@@ -82,7 +125,7 @@ def test_collector_imports_process_details_with_one_combined_ssh(
         calls.append(command)
         return (
             "__SERVERPILOT_GPU__\n"
-            "0, GPU-endpoint-a-0, Test GPU, 100000, 1024, 98976, 10, 2, 35, 100.0, P0\n"
+            "0, GPU-endpoint-a-0, Test GPU, 100000, 1024, 98976, 10, 2, 35, 100.0, P0, 00000000:01:00.0\n"
             "__SERVERPILOT_PROCESSES__\n"
             "GPU-endpoint-a-0, 123, 1024, python-from-smi\n"
             "__SERVERPILOT_PROCESS_DETAILS__\n"
@@ -115,7 +158,7 @@ def test_collector_without_processes_uses_one_combined_ssh(
         calls.append(command)
         return (
             "__SERVERPILOT_GPU__\n"
-            "0, GPU-endpoint-a-0, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0\n"
+            "0, GPU-endpoint-a-0, Test GPU, 100000, 0, 100000, 0, 0, 35, 100.0, P0, 00000000:01:00.0\n"
             "__SERVERPILOT_PROCESSES__\n"
             "__SERVERPILOT_PROCESS_DETAILS__\n"
             "__SERVERPILOT_IDENTITY__\n"
@@ -231,6 +274,7 @@ def _server_script_snapshot(*, gpu_probe_available: bool = True) -> dict[str, ob
         gpus = [
             {
                 "gpu_index": 0,
+                "cuda_ordinal": 0,
                 "gpu_uuid": "GPU-script-0",
                 "name": "Script GPU",
                 "total_vram_mib": 80_000,
@@ -255,7 +299,7 @@ def _server_script_snapshot(*, gpu_probe_available: bool = True) -> dict[str, ob
             }
         ]
     return {
-        "schema_version": 1,
+        "schema_version": SERVER_SCRIPT_SCHEMA_VERSION,
         "identity": {"hostname": "script-host", "boot_id": "script-boot"},
         "host": {
             "cpu_count": 64,

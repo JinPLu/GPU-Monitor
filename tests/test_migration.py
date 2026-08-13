@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -35,7 +36,7 @@ def test_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
         inspect(database.engine).get_table_names()
     )
     gpu_columns = {column["name"] for column in inspect(database.engine).get_columns("gpu_devices")}
-    assert {"present", "absent_at"}.issubset(gpu_columns)
+    assert {"present", "absent_at", "cuda_ordinal"}.issubset(gpu_columns)
     endpoint_columns = {
         column["name"] for column in inspect(database.engine).get_columns("endpoints")
     }
@@ -74,6 +75,26 @@ def test_backup_and_safe_restore_target(tmp_path: Path) -> None:
     assert "endpoints" in inspect(Database(f"sqlite:///{restored}", root).engine).get_table_names()
 
 
+def test_backup_atomically_replaces_prior_output_and_refuses_live_database(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = tmp_path / "source.sqlite3"
+    database = Database(f"sqlite:///{source}", root)
+    database.migrate()
+    destination = tmp_path / "backups" / "snapshot.sqlite3"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"incomplete prior backup")
+
+    backup = database.backup(destination)
+
+    assert backup == destination.resolve()
+    assert "endpoints" in inspect(Database(f"sqlite:///{backup}", root).engine).get_table_names()
+    assert list(destination.parent.glob(f".{destination.name}.*.tmp")) == []
+    with pytest.raises(ValueError, match="must differ"):
+        database.backup(source)
+
+
 def test_migration_upgrades_existing_schema_to_endpoint_telemetry(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     database = Database(f"sqlite:///{tmp_path / 'upgrade.sqlite3'}", root)
@@ -96,7 +117,7 @@ def test_migration_upgrades_existing_schema_to_endpoint_telemetry(tmp_path: Path
     assert {"owner_project_id", "lifecycle_state"}.issubset(endpoint_columns)
     assert "workspace_path" in endpoint_columns
     gpu_columns = {column["name"] for column in inspect(database.engine).get_columns("gpu_devices")}
-    assert {"present", "absent_at"}.issubset(gpu_columns)
+    assert {"present", "absent_at", "cuda_ordinal"}.issubset(gpu_columns)
     assert "lease_endpoint_commitments" in inspect(database.engine).get_table_names()
     with database.engine.connect() as connection:
         assert connection.execute(
@@ -252,6 +273,9 @@ def test_keepalive_persistence_migration_changes_only_active_ownership(
         current_columns = {
             column["name"] for column in inspect(database.engine).get_columns("keepalive_current")
         }
+        migrated_cuda_ordinal = connection.execute(
+            text("SELECT cuda_ordinal FROM gpu_devices WHERE id = 'gpu-a'")
+        ).scalar_one()
 
     assert expiries["active-keeper"] is None
     assert expiries["released-keeper"] is not None
@@ -259,6 +283,7 @@ def test_keepalive_persistence_migration_changes_only_active_ownership(
     assert {"expected_pid", "expected_boot_id", "expected_process_started_at"}.issubset(
         current_columns
     )
+    assert migrated_cuda_ordinal is None
 
 
 def test_scheduler_transport_migration_scrubs_legacy_argv_and_disables_target(

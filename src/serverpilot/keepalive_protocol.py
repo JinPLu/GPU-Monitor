@@ -8,10 +8,17 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 
-KEEPALIVE_SCHEMA_VERSION = 2
+KEEPALIVE_SCHEMA_VERSION = 3
+KEEPALIVE_IMPLEMENTATION_VERSION = "1.5.5"
+KEEPALIVE_PROTOCOL_INFO_CAPABILITIES = (
+    "per_gpu_keepalive",
+    "pidfd_identity",
+    "pci_bus_id",
+)
 # Fixed layout under every endpoint workspace. This is deliberately not
 # configurable and is invoked directly instead of being found through PATH.
 KEEPALIVE_ENTRYPOINT = "./serverpilot-keepalive"
+KEEPALIVE_PROTOCOL_INFO_COMMAND = f"{KEEPALIVE_ENTRYPOINT} --protocol-info"
 KEEPALIVE_REMOTE_COMMAND = (
     f"{KEEPALIVE_ENTRYPOINT} --schema-version {KEEPALIVE_SCHEMA_VERSION}"
 )
@@ -43,7 +50,7 @@ def _validate_gpu_uuids(value: object, *, allow_empty: bool = False) -> tuple[st
 
 @dataclass(frozen=True, slots=True)
 class KeepaliveRequest:
-    """A v2 per-GPU request."""
+    """A v3 per-GPU request."""
 
     enabled: bool
     gpu_uuids: tuple[str, ...]
@@ -64,7 +71,10 @@ class KeepaliveRequest:
     def decode(cls, payload: bytes | str) -> KeepaliveRequest:
         value = _decode_object(payload)
         if value.get("schema_version") != KEEPALIVE_SCHEMA_VERSION:
-            raise KeepaliveProtocolError("only keepalive schema version 2 is supported")
+            raise KeepaliveProtocolError(
+                "keepalive schema version mismatch: "
+                f"expected {KEEPALIVE_SCHEMA_VERSION}, got {value.get('schema_version')!r}"
+            )
         try:
             enabled = value["enabled"]
             raw_gpu_uuids = value["gpu_uuids"]
@@ -116,7 +126,10 @@ class KeepaliveResponse:
     def decode(cls, payload: bytes | str) -> KeepaliveResponse:
         value = _decode_object(payload)
         if value.get("schema_version") != KEEPALIVE_SCHEMA_VERSION:
-            raise KeepaliveProtocolError("only keepalive schema version 2 is supported")
+            raise KeepaliveProtocolError(
+                "keepalive schema version mismatch: "
+                f"expected {KEEPALIVE_SCHEMA_VERSION}, got {value.get('schema_version')!r}"
+            )
         try:
             enabled = value["enabled"]
             raw_results = value["results"]
@@ -152,6 +165,17 @@ def _decode_gpu_result(value: object) -> KeepaliveGPUResult:
 
 def _encode(value: dict[str, Any]) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
+def keepalive_protocol_info() -> dict[str, Any]:
+    """Return the helper capability record used by adapter preflight."""
+
+    return {
+        "kind": "serverpilot-keepalive",
+        "schema_version": KEEPALIVE_SCHEMA_VERSION,
+        "implementation_version": KEEPALIVE_IMPLEMENTATION_VERSION,
+        "capabilities": list(KEEPALIVE_PROTOCOL_INFO_CAPABILITIES),
+    }
 
 
 def _decode_object(payload: bytes | str) -> dict[str, Any]:

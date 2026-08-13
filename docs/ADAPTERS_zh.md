@@ -6,7 +6,7 @@ ServerPilot。它不是第二个控制面，也不是远程命令入口。
 | Adapter | 能力 | 允许的工作 | 不允许 |
 | --- | --- | --- | --- |
 | `raw-ssh` | observation | 固定的主机/GPU telemetry 与已观测 PID 的进程详情 | 任意 shell、私钥读取、lease/claim 写入 |
-| `server-script-v1` | endpoint_keepalive | 固定 `serverpilot-keepalive --schema-version 2` 的空闲 GPU 保活 | 项目任务启停、调用方指定 GPU、路径或环境 |
+| `server-script-v1` | endpoint_keepalive | 先预检 `serverpilot-keepalive --protocol-info`，再执行固定 `serverpilot-keepalive --schema-version 3` 的空闲 GPU 保活 | 项目任务启停、调用方指定 GPU、路径或环境 |
 | `slurm-command` | scheduler | 固定的 Slurm 查询、提交、取消和上传 | 裸机分配、绕过 approval |
 
 未知 adapter、未知 capability、陈旧/冲突观测或不确定远端结果一律 fail closed。配置只能选择
@@ -21,6 +21,12 @@ Endpoint 不要求用户手工填写 adapter。ServerPilot 在用户明确点击
 ServerPilot 传入精确物理 UUID，helper 只能管理自己的 worker。
 
 每张 GPU 独立判断：一张 GPU 冲突不会阻断同一服务器上其它空闲 GPU 的占卡启动。
+
+Adapter 在任何启停 mutation 前先执行只读 `--protocol-info`，要求 helper 返回
+`kind=serverpilot-keepalive`、`schema_version=3` 及所需能力（helper 同时报告
+`implementation_version=1.5.5`），以及
+`per_gpu_keepalive`、`pidfd_identity`、`pci_bus_id` 能力；预检失败时返回
+`keepalive_helper_incompatible`，不会发送 mutation payload。旧 v2 wire/state 版本直接拒绝。
 若历史工作负载租约遗留为“归属待确认”，人类监控端可执行“清理遗留归属”；ServerPilot
 会先重新采集，确认相关 GPU 都没有进程后才释放，单看 0% 利用率不会直接释放。
 

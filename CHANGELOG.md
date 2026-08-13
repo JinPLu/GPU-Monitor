@@ -4,6 +4,19 @@
 
 这里只记录用户能感受到的变化；实现细节见 Git 提交。
 
+## 1.5.5 - 2026-08-14
+
+**ServerPilot 1.5.5 将占卡协议升级到 v3，并收紧不同 GPU/驱动环境中的设备选择与控制面可靠性。**
+
+- 占卡 adapter 启停前先执行只读 `--protocol-info` 预检，确认 v3、pidfd identity 与 PCI bus ID 能力；预检不通过时返回 `keepalive_helper_incompatible`，不发送 mutation。
+- 占卡 wire/state 使用 v3 与 `workers.v3.json`；旧 v2 payload/state 不读取、不删除、不停止，直接 fail closed。
+
+- `gpu_index` 只保留服务器显示编号；collector schema v2 另按 PCI bus 生成 `cuda_ordinal`。`gpu_apply` 返回 `cuda_device_order=PCI_BUS_ID`、租约 ordinal 集合和逐卡 ordinal，不再把 GPU UUID 当作 `CUDA_VISIBLE_DEVICES`。
+- 没有当前 CUDA ordinal 的 GPU 不参与分配；旧 collector schema 与旧 PID-only 占卡状态直接 fail closed，不再收养或降级处理。
+- 占卡 worker 持久保存 PID、Linux boot ID、进程启动 ticks 与固定 marker；停止时通过 pidfd 锁定进程。即使目标 Python 没有 pidfd 包装，仍调用 Linux pidfd syscall，不退回普通 PID signal。
+- 修正请求体实际限流与断连转发、并发限流、Web CSRF、CSV 字段投影和 SQLite 原子备份；普通 Agent 改派继续受 lease owner 限制，App operator 使用独立纠错路由。
+- CPU/内存 admission 同时计入 direct GPU commitments 与 generic host claims；routine MCP 的传输重试使用进程内调用命名空间，不会把后续同参数申请折叠为旧 lease。
+
 ## 1.5.3 - 2026-08-14
 
 **ServerPilot 1.5.3 让 Agent 可以直接连接服务器，同时不再混淆工作目录和代码路径。**

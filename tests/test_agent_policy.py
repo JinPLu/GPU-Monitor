@@ -131,6 +131,8 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "gpus[]",
         "cuda_visible_devices",
         "gpu_cuda_visible_devices",
+        "cuda_device_order=pci_bus_id",
+        "ordinal",
         "workspace_path",
         "gpu_release",
         "human-readable",
@@ -158,6 +160,7 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "heartbeat",
     ):
         assert removed_routine_step not in adapter
+    assert "one-uuid" not in adapter
 
     mcp_instructions = _plain_policy_text(mcp.instructions).lower()
     for runtime_contract in (

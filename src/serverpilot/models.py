@@ -158,6 +158,7 @@ class GPUDevice(Base):
     )
     gpu_uuid: Mapped[str] = mapped_column(String(160), nullable=False)
     gpu_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    cuda_ordinal: Mapped[int | None] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     total_vram_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     compute_capability: Mapped[str | None] = mapped_column(String(40))

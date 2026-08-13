@@ -667,7 +667,11 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "PATCH")
         XCTAssertEqual(
             StateRouteURLProtocol.lastRequest?.url?.path,
-            "/api/v1/leases/lease-manual-move/gpus"
+            "/api/v1/operator/leases/lease-manual-move/gpus"
+        )
+        XCTAssertEqual(
+            StateRouteURLProtocol.lastRequest?.value(forHTTPHeaderField: "X-ServerPilot-Client"),
+            "desktop-app"
         )
         let body = try XCTUnwrap(StateRouteURLProtocol.lastRequest?.httpBody)
         let payload = try XCTUnwrap(

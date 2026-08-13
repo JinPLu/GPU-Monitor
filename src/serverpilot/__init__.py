@@ -1,6 +1,6 @@
 """Global, cooperative GPU resource control plane."""
 
-__version__ = "1.5.3"
+__version__ = "1.5.5"
 SCHEMA_VERSION = "v1"
 
 # Lets an upgraded MCP fail clearly when the loopback service has not yet been
@@ -17,5 +17,8 @@ API_CAPABILITIES = (
     "endpoint_keepalive",
     "endpoint_conflict_cleanup",
     "operator_lease_release",
+    "operator_lease_reassignment",
+    "cuda_ordinal_selectors",
+    "keepalive_protocol_v3",
     "collector_settings",
 )

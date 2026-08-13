@@ -731,6 +731,7 @@ class ActorCreate(StrictModel):
 class TelemetryInput(StrictModel):
     gpu_uuid: str = Field(min_length=1, max_length=160)
     gpu_index: int = Field(ge=0, le=1024)
+    cuda_ordinal: int = Field(ge=0, le=1024)
     name: str = Field(min_length=1, max_length=255)
     total_vram_mib: int = Field(ge=1)
     memory_used_mib: int = Field(ge=0)
@@ -806,6 +807,9 @@ class EndpointObservation(StrictModel):
         gpu_indexes = [gpu.gpu_index for gpu in self.gpus]
         if len(gpu_indexes) != len(set(gpu_indexes)):
             raise ValueError("observation gpus must contain unique gpu_index values")
+        cuda_ordinals = [gpu.cuda_ordinal for gpu in self.gpus]
+        if len(cuda_ordinals) != len(set(cuda_ordinals)):
+            raise ValueError("observation gpus must contain unique cuda_ordinal values")
         return self
 
 

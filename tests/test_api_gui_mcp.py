@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -11,11 +14,12 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from serverpilot import API_CAPABILITIES, cli as cli_module, mcp_server
-from serverpilot.api import create_app
+from serverpilot.api import RateLimiter, RequestBodyLimitMiddleware, create_app
 from serverpilot.cli import app as cli_app
 from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig, Settings
 from serverpilot.mcp_server import ROUTINE_MCP_TOOL_NAMES, mcp, routine_mcp
 from serverpilot.schemas import EndpointUpsert, RequestCreate, ResourceClaim, ResourceQuantities
+from serverpilot.service import BrokerError
 from tests.helpers import observation, process_for_gpu
 
 
@@ -23,6 +27,133 @@ def _csrf(html: str) -> str:
     match = re.search(r'name="csrf" value="([^"]+)"', html)
     assert match is not None
     return match.group(1)
+
+
+def test_rate_limiter_serializes_concurrent_checks() -> None:
+    limiter = RateLimiter(1)
+
+    def check() -> bool:
+        try:
+            limiter.check("same-actor")
+        except BrokerError as exc:
+            assert exc.code == "rate_limited"
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        results = list(executor.map(lambda _index: check(), range(32)))
+
+    assert results.count(True) == 1
+
+
+def test_actual_request_body_limit_rejects_stream_without_content_length(
+    tmp_path: Path, inventory
+) -> None:
+    inventory_path = tmp_path / "body-limit.yaml"
+    inventory_path.write_text(
+        yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8"
+    )
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'body-limit.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+            request_body_limit_bytes=64,
+        )
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/api/v1/routine/claims",
+        content=iter([b'{"project_id":"project-a",', b'"padding":"' + b"x" * 128 + b'"}']),
+        headers={
+            "Content-Type": "application/json",
+            "Transfer-Encoding": "chunked",
+            "X-ServerPilot-Actor": "body-agent",
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "body_too_large"
+
+
+def test_request_body_limit_forwards_disconnect_after_replaying_body() -> None:
+    observed: list[dict[str, object]] = []
+    incoming = iter(
+        [
+            {"type": "http.request", "body": b"payload", "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive() -> dict[str, object]:
+        return next(incoming)
+
+    async def downstream(scope, replay_receive, send) -> None:  # type: ignore[no-untyped-def]
+        observed.append(await replay_receive())
+        observed.append(await replay_receive())
+
+    async def send(_message: dict[str, object]) -> None:
+        return None
+
+    asyncio.run(
+        RequestBodyLimitMiddleware(downstream, max_bytes=64)(
+            {"type": "http", "headers": []}, receive, send
+        )
+    )
+
+    assert observed == [
+        {"type": "http.request", "body": b"payload", "more_body": False},
+        {"type": "http.disconnect"},
+    ]
+
+
+def test_event_csv_export_projects_only_declared_columns(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "event-export.yaml"
+    inventory_path.write_text(
+        yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8"
+    )
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'event-export.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    service.ingest_observation(observation(count=1))
+    actor = service.local_actor("export-agent")
+    service.create_request(
+        actor,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "exported-task",
+                "purpose": "create an event with before and after payloads",
+                "constraints": {"gpu_count": 1},
+            }
+        ),
+        idempotency_key="event-export",
+    )
+
+    response = TestClient(app).get(
+        "/api/v1/events/export.csv",
+        headers={"X-ServerPilot-Actor": actor.id},
+    )
+
+    assert response.status_code == 200
+    rows = list(csv.DictReader(io.StringIO(response.text)))
+    assert rows
+    assert set(rows[0]) == {
+        "id",
+        "created_at",
+        "actor_id",
+        "action",
+        "resource_type",
+        "resource_id",
+        "result",
+        "summary",
+    }
 
 
 def test_web_dashboard_uses_the_canonical_public_capacity_projection() -> None:
@@ -189,6 +320,72 @@ def test_operator_release_can_correct_another_agents_lease_but_generic_release_c
     )
     assert released.status_code == 200
     assert released.json()["lease"]["state"] == "RELEASED"
+
+
+def test_operator_reassignment_uses_a_separate_app_correction_route(
+    tmp_path: Path, inventory
+) -> None:
+    inventory_path = tmp_path / "operator-reassign.yaml"
+    inventory_path.write_text(
+        yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8"
+    )
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'operator-reassign.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    service.ingest_observation(observation(count=2))
+    owner = service.local_actor("reassign-owner")
+    claimed = service.create_request(
+        owner,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "operator-reassign",
+                "purpose": "operator-reassign",
+                "constraints": {"gpu_count": 1},
+            }
+        ),
+        idempotency_key="operator-reassign-claim",
+    )
+    lease = claimed["lease"]
+    assert lease is not None
+    target_gpu = next(
+        gpu["id"]
+        for gpu in service.list_gpus(owner)["data"]
+        if gpu["id"] not in lease["gpu_ids"]
+    )
+    client = TestClient(app)
+    headers = {
+        "X-ServerPilot-Actor": "other-agent",
+        "Idempotency-Key": "operator-reassign",
+    }
+
+    forbidden = client.patch(
+        f"/api/v1/leases/{lease['id']}/gpus",
+        headers=headers,
+        json={"gpu_ids": [target_gpu]},
+    )
+    assert forbidden.status_code == 403
+    assert forbidden.json()["error"]["code"] == "lease_forbidden"
+    missing_app_marker = client.patch(
+        f"/api/v1/operator/leases/{lease['id']}/gpus",
+        headers=headers,
+        json={"gpu_ids": [target_gpu]},
+    )
+    assert missing_app_marker.status_code == 403
+    assert missing_app_marker.json()["error"]["code"] == "operator_client_required"
+    moved = client.patch(
+        f"/api/v1/operator/leases/{lease['id']}/gpus",
+        headers={**headers, "X-ServerPilot-Client": "desktop-app"},
+        json={"gpu_ids": [target_gpu]},
+    )
+    assert moved.status_code == 200
+    assert moved.json()["lease"]["actor_id"] == owner.id
+    assert moved.json()["lease"]["gpu_ids"] == [target_gpu]
 
 
 def test_generic_resource_claim_release_still_works_after_operator_route_change(
@@ -953,7 +1150,18 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
     }
     assert "click-server" in endpoints
 
-    switched = client.post("/ui/actor", data={"actor_id": "click-agent"}, follow_redirects=True)
+    actor_page = client.get("/")
+    rejected_switch = client.post(
+        "/ui/actor",
+        data={"actor_id": "click-agent", "csrf": "wrong"},
+        follow_redirects=False,
+    )
+    assert rejected_switch.status_code == 403
+    switched = client.post(
+        "/ui/actor",
+        data={"actor_id": "click-agent", "csrf": _csrf(actor_page.text)},
+        follow_redirects=True,
+    )
     assert switched.status_code == 200
     assert 'value="click-agent"' in switched.text
 
@@ -1146,7 +1354,7 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
                 "data": {},
             }
 
-        def post(self, path, body=None):  # type: ignore[no-untyped-def]
+        def post(self, path, body=None, *, idempotency_key=None):  # type: ignore[no-untyped-def]
             calls.append(("POST", path, body))
             return {
                 "lease": {
@@ -1154,8 +1362,12 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
                     "resources": [
                         {
                             "endpoint": {"id": "server-a", "workspace_path": "/srv/server-a"},
-                            "gpus": [{"gpu_uuid": "GPU-a"}, {"gpu_uuid": "GPU-b"}],
-                            "cuda_visible_devices": "GPU-a,GPU-b",
+                            "gpus": [
+                                {"gpu_uuid": "GPU-a", "gpu_index": 7, "cuda_ordinal": 0},
+                                {"gpu_uuid": "GPU-b", "gpu_index": 3, "cuda_ordinal": 1},
+                            ],
+                            "cuda_visible_devices": "0,1",
+                            "cuda_device_order": "PCI_BUS_ID",
                         }
                     ],
                 }
@@ -1189,23 +1401,30 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
         "server_id": "server-a",
         "workspace_path": "/srv/server-a",
         "workspace": workspace,
-        "cuda_visible_devices": "GPU-a,GPU-b",
+        "cuda_visible_devices": "0,1",
+        "cuda_device_order": "PCI_BUS_ID",
         "gpus": [
             {
                 "server_id": "server-a",
                 "workspace_path": "/srv/server-a",
                 "workspace": workspace,
                 "gpu_id": "GPU-a",
-                "cuda_visible_devices": "GPU-a,GPU-b",
-                "gpu_cuda_visible_devices": "GPU-a",
+                "gpu_index": 7,
+                "cuda_ordinal": 0,
+                "cuda_visible_devices": "0,1",
+                "gpu_cuda_visible_devices": "0",
+                "cuda_device_order": "PCI_BUS_ID",
             },
             {
                 "server_id": "server-a",
                 "workspace_path": "/srv/server-a",
                 "workspace": workspace,
                 "gpu_id": "GPU-b",
-                "cuda_visible_devices": "GPU-a,GPU-b",
-                "gpu_cuda_visible_devices": "GPU-b",
+                "gpu_index": 3,
+                "cuda_ordinal": 1,
+                "cuda_visible_devices": "0,1",
+                "gpu_cuda_visible_devices": "1",
+                "cuda_device_order": "PCI_BUS_ID",
             },
         ],
     }
@@ -1238,8 +1457,11 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
                             "id": "server-a",
                             "workspace_path": "/srv/server-a",
                         },
-                        "gpus": [{"gpu_uuid": "GPU-a"}],
-                        "cuda_visible_devices": "GPU-a",
+                        "gpus": [
+                            {"gpu_uuid": "GPU-a", "gpu_index": 7, "cuda_ordinal": 0}
+                        ],
+                        "cuda_visible_devices": "0",
+                        "cuda_device_order": "PCI_BUS_ID",
                     }
                 ],
             }
@@ -1250,15 +1472,19 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
         "server_id": "server-a",
         "workspace_path": "/srv/server-a",
         "workspace": workspace_a,
-        "cuda_visible_devices": "GPU-a",
+        "cuda_visible_devices": "0",
+        "cuda_device_order": "PCI_BUS_ID",
         "gpus": [
             {
                 "server_id": "server-a",
                 "workspace_path": "/srv/server-a",
                 "workspace": workspace_a,
                 "gpu_id": "GPU-a",
-                "cuda_visible_devices": "GPU-a",
-                "gpu_cuda_visible_devices": "GPU-a",
+                "gpu_index": 7,
+                "cuda_ordinal": 0,
+                "cuda_visible_devices": "0",
+                "gpu_cuda_visible_devices": "0",
+                "cuda_device_order": "PCI_BUS_ID",
             }
         ],
     }
@@ -1273,16 +1499,22 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
                             "id": "server-a",
                             "workspace_path": "/srv/server-a",
                         },
-                        "gpus": [{"gpu_uuid": "GPU-a"}],
-                        "cuda_visible_devices": "GPU-a",
+                        "gpus": [
+                            {"gpu_uuid": "GPU-a", "gpu_index": 7, "cuda_ordinal": 0}
+                        ],
+                        "cuda_visible_devices": "0",
+                        "cuda_device_order": "PCI_BUS_ID",
                     },
                     {
                         "endpoint": {
                             "id": "server-b",
                             "workspace_path": "/srv/server-b",
                         },
-                        "gpus": [{"gpu_uuid": "GPU-b"}],
-                        "cuda_visible_devices": "GPU-b",
+                        "gpus": [
+                            {"gpu_uuid": "GPU-b", "gpu_index": 3, "cuda_ordinal": 0}
+                        ],
+                        "cuda_visible_devices": "0",
+                        "cuda_device_order": "PCI_BUS_ID",
                     },
                 ],
             }
@@ -1296,8 +1528,11 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
                 "workspace_path": "/srv/server-a",
                 "workspace": workspace_a,
                 "gpu_id": "GPU-a",
-                "cuda_visible_devices": "GPU-a",
-                "gpu_cuda_visible_devices": "GPU-a",
+                "gpu_index": 7,
+                "cuda_ordinal": 0,
+                "cuda_visible_devices": "0",
+                "gpu_cuda_visible_devices": "0",
+                "cuda_device_order": "PCI_BUS_ID",
             },
             {
                 "server_id": "server-b",
@@ -1309,8 +1544,11 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
                     "code_location": "not_provided",
                 },
                 "gpu_id": "GPU-b",
-                "cuda_visible_devices": "GPU-b",
-                "gpu_cuda_visible_devices": "GPU-b",
+                "gpu_index": 3,
+                "cuda_ordinal": 0,
+                "cuda_visible_devices": "0",
+                "gpu_cuda_visible_devices": "0",
+                "cuda_device_order": "PCI_BUS_ID",
             },
         ],
     }
@@ -1363,8 +1601,11 @@ def test_routine_projects_registered_ssh_connection_without_a_shell_command() ->
                 "resources": [
                     {
                         "endpoint": endpoint,
-                        "gpus": [{"gpu_uuid": "GPU-a"}],
-                        "cuda_visible_devices": "GPU-a",
+                        "gpus": [
+                            {"gpu_uuid": "GPU-a", "gpu_index": 7, "cuda_ordinal": 0}
+                        ],
+                        "cuda_visible_devices": "0",
+                        "cuda_device_order": "PCI_BUS_ID",
                     }
                 ],
             }

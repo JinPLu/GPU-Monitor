@@ -23,7 +23,7 @@ public struct ServiceInfo: Equatable, Sendable {
     public static let fixture = ServiceInfo(
         schemaVersion: "v1",
         version: "fixture",
-        capabilities: ["instant_claims", "endpoint_update", "endpoint_keepalive", "endpoint_conflict_cleanup", "operator_lease_release", "collector_settings"]
+        capabilities: ["instant_claims", "endpoint_update", "endpoint_keepalive", "endpoint_conflict_cleanup", "operator_lease_release", "operator_lease_reassignment", "collector_settings"]
     )
 
     public var supportsEndpointUpdate: Bool {
@@ -48,6 +48,10 @@ public struct ServiceInfo: Equatable, Sendable {
 
     public var supportsOperatorLeaseRelease: Bool {
         supports("operator_lease_release")
+    }
+
+    public var supportsOperatorLeaseReassignment: Bool {
+        supports("operator_lease_reassignment")
     }
 
     public var supportsCollectorSettings: Bool {

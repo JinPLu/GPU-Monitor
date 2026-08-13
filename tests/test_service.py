@@ -16,6 +16,7 @@ from serverpilot.models import (
     AuditEvent,
     EndpointTelemetryCurrent,
     EndpointTelemetrySnapshot,
+    GPUDevice,
     Lease,
     LeaseResource,
     TelemetryCurrent,
@@ -141,13 +142,18 @@ def test_incomplete_observation_does_not_mark_prior_gpus_absent(service, admin) 
     ]
 
 
-def test_observation_gpu_uuid_and_index_must_be_unique() -> None:
+def test_observation_gpu_uuid_index_and_cuda_ordinal_must_be_unique() -> None:
     with pytest.raises(ValidationError, match="unique gpu_uuid"):
         observation(gpu_uuids=["GPU-dup", "GPU-dup"])
 
     base = observation(gpu_uuids=["GPU-a", "GPU-b"]).model_dump()
     base["gpus"][1]["gpu_index"] = base["gpus"][0]["gpu_index"]
     with pytest.raises(ValidationError, match="unique gpu_index"):
+        EndpointObservation.model_validate(base)
+
+    base = observation(gpu_uuids=["GPU-a", "GPU-b"]).model_dump()
+    base["gpus"][1]["cuda_ordinal"] = base["gpus"][0]["cuda_ordinal"]
+    with pytest.raises(ValidationError, match="unique cuda_ordinal"):
         EndpointObservation.model_validate(base)
 
 
@@ -738,6 +744,81 @@ def test_collector_auto_binds_new_process_to_its_exact_workload_lease(service, a
     assert states[claimed_gpu_uuid] == "RUNNING_MANAGED"
     assert states[other_gpu_uuid] == "BUSY_UNMANAGED"
     assert service.list_requests(admin)["data"][0]["state"] == "ACTIVE"
+
+
+def test_bound_workload_clears_historical_keepalive_error_without_mutating_lease(
+    service, admin
+) -> None:
+    service.ingest_observation(observation(count=1))
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    service.set_keepalive_error("endpoint-a", ["endpoint-a:" + gpu_uuid], "start failed")
+    claimed = service.create_request(
+        admin,
+        request_data("workload-after-keepalive-error"),
+        idempotency_key="workload-after-keepalive-error-claim",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+    process = process_for_gpu(gpu_uuid, pid=4401)
+
+    service.ingest_observation(observation(count=1, processes=[process]))
+
+    gpu = service.list_gpus(admin)["data"][0]
+    assert gpu["keepalive"]["actual"] == "OFF"
+    assert gpu["keepalive"]["reason"] is None
+    assert gpu["state"] == "RUNNING_MANAGED"
+    lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
+    assert lease["state"] == "ACTIVE"
+    assert lease["gpu_ids"] == [gpu["id"]]
+    assert lease["workloads"][0]["process_keys"] == [gpu["processes"][0]["process_key"]]
+
+
+def test_unbound_or_unknown_process_does_not_clear_keepalive_error(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    gpu_id = "endpoint-a:" + gpu_uuid
+    service.set_keepalive_error("endpoint-a", [gpu_id], "ordinary keepalive failure")
+
+    service.ingest_observation(
+        observation(count=1, processes=[process_for_gpu(gpu_uuid, pid=4402)])
+    )
+
+    gpu = service.list_gpus(admin)["data"][0]
+    assert gpu["state"] == "BUSY_UNMANAGED"
+    assert gpu["keepalive"]["actual"] == "ERROR"
+    assert gpu["keepalive"]["reason"] == "ordinary keepalive failure"
+
+
+def test_bound_workload_keeps_error_for_an_unknown_process(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    claimed = service.create_request(
+        admin,
+        request_data("unknown-after-bound"),
+        idempotency_key="unknown-after-bound-claim",
+        activate_if_allocated=True,
+    )
+    gpu_uuid = service.list_gpus(admin)["data"][0]["gpu_uuid"]
+    initial = process_for_gpu(gpu_uuid, pid=4403)
+    service.ingest_observation(observation(count=1, processes=[initial]))
+    service.bind_observed_workload(
+        admin,
+        claimed["lease"]["id"],
+        LeaseObservedBind(run_id="known-workload"),
+        idempotency_key="known-workload-bind",
+    )
+    service.set_keepalive_error(
+        "endpoint-a",
+        ["endpoint-a:" + gpu_uuid],
+        "ordinary keepalive failure",
+    )
+
+    replacement = process_for_gpu(gpu_uuid, pid=4404)
+    service.ingest_observation(observation(count=1, processes=[replacement]))
+
+    gpu = service.list_gpus(admin)["data"][0]
+    assert gpu["state"] == "BUSY_UNMANAGED"
+    assert gpu["keepalive"]["actual"] == "ERROR"
+    assert gpu["keepalive"]["reason"] == "ordinary keepalive failure"
 
 
 def test_observed_workload_binding_survives_one_second_process_start_jitter(service, admin) -> None:
@@ -1819,7 +1900,8 @@ def test_direct_lease_returns_executable_resources_and_accounts_endpoint_commitm
         "workspace_path": "/srv/project-a",
     }
     assert resource["gpus"][0]["gpu_uuid"].startswith("GPU-")
-    assert resource["cuda_visible_devices"] == resource["gpus"][0]["gpu_uuid"]
+    assert resource["cuda_visible_devices"] == str(resource["gpus"][0]["cuda_ordinal"])
+    assert resource["cuda_device_order"] == "PCI_BUS_ID"
     assert resource["commitment"] == {"cpu_cores": 40.0, "memory_mib": 200_000}
     with pytest.raises(BrokerError) as error:
         service.create_request(
@@ -1834,6 +1916,24 @@ def test_direct_lease_returns_executable_resources_and_accounts_endpoint_commitm
             ),
             idempotency_key="commitment-two",
         )
+    assert error.value.code == "no_capacity"
+
+
+def test_gpu_without_current_cuda_ordinal_is_not_allocated(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    with service.database.session() as session:
+        gpu = session.get(GPUDevice, "endpoint-a:GPU-endpoint-a-0")
+        assert gpu is not None
+        gpu.cuda_ordinal = None
+        session.commit()
+
+    with pytest.raises(BrokerError) as error:
+        service.create_request(
+            admin,
+            request_data("missing-cuda-selector"),
+            idempotency_key="missing-cuda-selector",
+        )
+
     assert error.value.code == "no_capacity"
 
 
@@ -1857,10 +1957,85 @@ def test_human_can_reassign_a_task_to_an_exact_gpu(service, admin) -> None:
 
     assert moved["restart_required"] is True
     assert moved["lease"]["gpu_ids"] == ["endpoint-a:GPU-endpoint-a-1"]
-    assert moved["lease"]["resources"][0]["cuda_visible_devices"] == "GPU-endpoint-a-1"
+    assert moved["lease"]["resources"][0]["cuda_visible_devices"] == "1"
+    assert moved["lease"]["resources"][0]["cuda_device_order"] == "PCI_BUS_ID"
     gpus = {gpu["id"]: gpu for gpu in service.list_gpus(admin)["data"]}
     assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "AVAILABLE"
     assert gpus["endpoint-a:GPU-endpoint-a-1"]["lease"]["id"] == lease["id"]
+
+
+def test_lease_gpu_reassignment_requires_the_lease_owner(service) -> None:
+    service.ingest_observation(observation(count=2))
+    owner = service.local_actor("reassignment-owner")
+    other = service.local_actor("reassignment-other")
+    claimed = service.create_request(
+        owner,
+        request_data("owner-reassignment-only"),
+        idempotency_key="owner-reassignment-only-claim",
+    )
+    lease = claimed["lease"]
+    assert lease is not None
+    target_gpu_id = "endpoint-a:GPU-endpoint-a-1"
+
+    with pytest.raises(BrokerError) as planning_error:
+        service.keepalive_reclaim_request_for_reassignment(
+            other,
+            lease["id"],
+            [target_gpu_id],
+        )
+    assert planning_error.value.code == "lease_forbidden"
+
+    with pytest.raises(BrokerError) as mutation_error:
+        service.reassign_lease_gpus(
+            other,
+            lease["id"],
+            [target_gpu_id],
+            idempotency_key="foreign-reassignment",
+        )
+    assert mutation_error.value.code == "lease_forbidden"
+    current = service.list_leases(owner)["data"][0]
+    assert current["gpu_ids"] == ["endpoint-a:GPU-endpoint-a-0"]
+
+
+def test_operator_override_can_plan_and_reassign_a_foreign_lease(service, admin) -> None:
+    service.ingest_observation(observation(count=2))
+    owner = service.local_actor("operator-correction-owner")
+    allocator = service.local_actor("operator-correction-allocator")
+    claimed = service.create_request(
+        owner,
+        request_data("operator-correction"),
+        idempotency_key="operator-correction-claim",
+    )
+    lease = claimed["lease"]
+    assert lease is not None
+    target_gpu_id = "endpoint-a:GPU-endpoint-a-1"
+
+    with pytest.raises(BrokerError) as role_error:
+        service.reassign_lease_gpus(
+            allocator,
+            lease["id"],
+            [target_gpu_id],
+            idempotency_key="allocator-override-rejected",
+            operator_override=True,
+        )
+    assert role_error.value.code == "operator_role_required"
+
+    reclaim_request = service.keepalive_reclaim_request_for_reassignment(
+        admin,
+        lease["id"],
+        [target_gpu_id],
+        operator_override=True,
+    )
+    assert reclaim_request is None
+
+    moved = service.reassign_lease_gpus(
+        admin,
+        lease["id"],
+        [target_gpu_id],
+        idempotency_key="operator-override-reassignment",
+        operator_override=True,
+    )
+    assert moved["lease"]["gpu_ids"] == [target_gpu_id]
 
 
 def test_reassigned_active_task_auto_binds_process_on_its_new_gpu(service, admin) -> None:

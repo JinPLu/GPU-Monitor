@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -9,9 +10,9 @@ import secrets
 import time
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
-from serverpilot.client import BrokerClient
+from serverpilot.client import BrokerClient, BrokerClientError
 from serverpilot.daemon import ensure_broker_ready_for_mcp
 
 
@@ -20,14 +21,15 @@ TERMINAL_REQUEST_STATES = {"CANCELLED", "EXPIRED", "REJECTED", "RELEASED"}
 TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
 RESOURCE_MARGINAL_MIN_SAVED_RATIO = 0.10
 RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
+_ROUTINE_MCP_INSTANCE_ID = secrets.token_hex(16)
 
 MCP_INSTRUCTIONS = """常规 GPU 任务只用三个工具：gpu_status；gpu_apply 自动选卡，task=任务名，不读取客户端 UI 标题；gpu_release。
-ssh=连接；workspace.path/workspace_path=远端 cwd；kind=working_directory、use_as_cwd=true；
-code_location=not_provided，不得把 workspace_path 当代码仓库路径；cuda_visible_devices=租约，
-gpus[].gpu_cuda_visible_devices=单卡。按 ssh 直连，无需主机设置；cd workspace.path，以它为工作目录。
-CUDA gate/启动失败或结束均释放。gpu_status(include_busy=true) 查看 task；空闲占卡可用。无容量直接失败，不排队；
-同 turn 刷新一次；Transport closed 重试一次。只协调 GPU；不得用 SSH、SQLite、inventory 或
-nvidia-smi 绕过协调。非 GPU 远端操作（Git 同步）无需 GPU 租约。"""
+ssh=连接；workspace.path（workspace_path）=cwd，以它为工作目录；kind=working_directory；
+use_as_cwd=true、code_location=not_provided，不得把 workspace_path 当代码仓库路径。
+cuda_device_order=PCI_BUS_ID；cuda_visible_devices=租约 ordinal；gpus[].gpu_cuda_visible_devices=单卡 ordinal。
+CUDA gate/启动失败即 gpu_release。gpu_status(include_busy=true) 看 task、空闲占卡。无容量直接失败，不排队；
+Transport closed 重试一次。只协调 GPU；不得用 SSH、SQLite、inventory、nvidia-smi 绕过协调。
+非 GPU 远端操作（Git 同步）无需 GPU 租约。"""
 
 
 mcp = FastMCP(
@@ -56,6 +58,15 @@ def _routine_task(task: str | None) -> str:
     if len(value) > 120:
         raise ValueError("task 最长 120 个字符")
     return value
+
+
+def _routine_request_key(context: Context | None) -> str | None:
+    """Map one MCP invocation to a private, stable REST replay key."""
+
+    if context is None:
+        return None
+    request_id = f"{_ROUTINE_MCP_INSTANCE_ID}:{context.request_id}".encode("utf-8")
+    return f"mcp-request:{hashlib.sha256(request_id).hexdigest()}"
 
 
 def _routine_ssh(endpoint: Any) -> dict[str, Any] | None:
@@ -423,9 +434,8 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
     """Project a lease for routine use without conflating lease and GPU scope.
 
     A single-endpoint lease keeps its complete CUDA device set at the top level.
-    Each ``gpus`` row retains the resource-wide ``cuda_visible_devices`` for
-    compatibility and adds ``gpu_cuda_visible_devices`` for one-process-per-GPU
-    launches while retaining endpoint metadata.
+    Each ``gpus`` row carries both the resource-wide selector and its own
+    one-GPU selector while retaining the UUID as the physical identity.
     """
 
     lease = payload.get("lease")
@@ -441,24 +451,35 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
         workspace_path = endpoint.get("workspace_path") if isinstance(endpoint, dict) else None
         ssh = _routine_ssh(endpoint)
         cuda_visible_devices = resource.get("cuda_visible_devices")
+        cuda_device_order = resource.get("cuda_device_order")
+        if cuda_device_order != "PCI_BUS_ID" or not isinstance(cuda_visible_devices, str):
+            raise ValueError("ServerPilot 返回了无效的 CUDA 执行 selector")
         resource_projection = {
             "server_id": server_id,
             "workspace_path": workspace_path,
             "workspace": _routine_workspace(workspace_path),
             "cuda_visible_devices": cuda_visible_devices,
+            "cuda_device_order": cuda_device_order,
         }
         if ssh is not None:
             resource_projection["ssh"] = ssh
         resources.append(resource_projection)
         for gpu in resource.get("gpus", []):
             if isinstance(gpu, dict):
+                gpu_index = gpu.get("gpu_index")
+                cuda_ordinal = gpu.get("cuda_ordinal")
+                if isinstance(cuda_ordinal, bool) or not isinstance(cuda_ordinal, int) or cuda_ordinal < 0:
+                    raise ValueError("ServerPilot 返回了无效的 GPU CUDA ordinal")
                 row = {
                     "server_id": server_id,
                     "workspace_path": workspace_path,
                     "workspace": _routine_workspace(workspace_path),
                     "gpu_id": gpu.get("gpu_uuid"),
+                    "gpu_index": gpu_index,
+                    "cuda_ordinal": cuda_ordinal,
                     "cuda_visible_devices": cuda_visible_devices,
-                    "gpu_cuda_visible_devices": gpu.get("gpu_uuid"),
+                    "gpu_cuda_visible_devices": str(cuda_ordinal),
+                    "cuda_device_order": cuda_device_order,
                 }
                 if ssh is not None:
                     row["ssh"] = ssh
@@ -1243,6 +1264,7 @@ def gpu_apply(
     server_id: str | None = None,
     gpu_count: int = 1,
     task: str | None = None,
+    context: Context | None = None,
 ) -> dict[str, Any]:
     """立即申请 GPU；返回 SSH、结构化远端工作目录和 CUDA selector；no_capacity 不排队。"""
 
@@ -1256,15 +1278,31 @@ def gpu_apply(
     if server_id is not None:
         constraints["endpoint_ids"] = [server_id]
     task_ref = _routine_task(task)
-    payload = _routine_client().post(
-        "/api/v1/routine/claims",
-        {
-            "project_id": "agent",
-            "task_ref": task_ref,
-            "purpose": task_ref,
-            "constraints": constraints,
-        },
-    )
+    body = {
+        "project_id": "agent",
+        "task_ref": task_ref,
+        "purpose": task_ref,
+        "constraints": constraints,
+    }
+    replay_key = _routine_request_key(context) or f"mcp-call:{secrets.token_hex(16)}"
+    client = _routine_client()
+    try:
+        payload = client.post(
+            "/api/v1/routine/claims",
+            body,
+            idempotency_key=replay_key,
+        )
+    except BrokerClientError as exc:
+        if not str(exc).startswith("broker request failed:"):
+            raise
+        # The broker may have committed before the local HTTP response was
+        # interrupted. Retry once with the same key so it cannot allocate a
+        # second lease for this tool invocation.
+        payload = client.post(
+            "/api/v1/routine/claims",
+            body,
+            idempotency_key=replay_key,
+        )
     return _routine_gpu_allocation(payload)
 
 

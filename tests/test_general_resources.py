@@ -189,6 +189,49 @@ def test_host_capacity_accounts_existing_direct_lease_commitments(service, admin
     assert monitor["capacity"]["available_cpu_cores"] == 20.0
 
 
+@pytest.mark.parametrize(
+    ("generic_cpu", "generic_memory", "direct_cpu", "direct_memory"),
+    [
+        (30.0, 1, 40.0, 1),
+        (1.0, 100_000, 1.0, 170_000),
+    ],
+)
+def test_direct_lease_accounts_existing_generic_host_commitments(
+    service,
+    admin,
+    generic_cpu: float,
+    generic_memory: int,
+    direct_cpu: float,
+    direct_memory: int,
+) -> None:
+    service.ingest_observation(observation(count=1))
+    generic = service.create_resource_claim(
+        admin,
+        host_claim(cpu_cores=generic_cpu, memory_mib=generic_memory),
+        idempotency_key=f"generic-first-{generic_cpu}-{generic_memory}",
+    )
+    assert generic["claim"]["state"] == "active"
+
+    with pytest.raises(BrokerError) as error:
+        service.create_request(
+            admin,
+            RequestCreate.model_validate(
+                {
+                    "project_id": "project-a",
+                    "task_ref": "direct-after-generic",
+                    "purpose": "must not overcommit generic host capacity",
+                    "constraints": {
+                        "gpu_count": 1,
+                        "cpu_cores": direct_cpu,
+                        "memory_mib": direct_memory,
+                    },
+                }
+            ),
+            idempotency_key=f"direct-after-{generic_cpu}-{generic_memory}",
+        )
+    assert error.value.code == "no_capacity"
+
+
 def test_snapshot_correlates_generic_claim_with_native_lease_and_request(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     lease_result = service.create_request(

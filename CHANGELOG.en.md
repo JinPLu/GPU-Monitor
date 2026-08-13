@@ -4,6 +4,23 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## 1.5.5 - 2026-08-14
+
+**ServerPilot 1.5.5 upgrades the keepalive protocol to v3 and tightens GPU/control-plane reliability.**
+
+- The keepalive adapter performs a read-only `--protocol-info` preflight before every mutation and requires v3, pidfd identity, and PCI bus ID capabilities; incompatible helpers return `keepalive_helper_incompatible` without receiving a mutation payload.
+- Keepalive wire/state use v3 and `workers.v3.json`; v2 payloads/state are rejected fail-closed and are never adopted, deleted, or signaled.
+
+## 1.5.4 - 2026-08-14
+
+**ServerPilot 1.5.4 fixes device selection across GPU and driver environments and tightens occupancy and control-plane reliability.**
+
+- `gpu_index` remains the server's display index, while collector schema v2 derives a separate PCI-bus-ordered `cuda_ordinal`. `gpu_apply` returns `cuda_device_order=PCI_BUS_ID`, a lease-wide ordinal set, and per-GPU ordinals instead of placing GPU UUIDs in `CUDA_VISIBLE_DEVICES`.
+- GPUs without a current CUDA ordinal are not allocated. Old collector schemas and PID-only occupancy state fail closed instead of being adopted or downgraded.
+- Occupancy workers persist PID, Linux boot ID, process start ticks, and a fixed marker. Stops pin the process with pidfd; endpoints whose Python lacks pidfd wrappers use the Linux pidfd syscalls and never fall back to signaling a bare PID.
+- The release also fixes actual request-body limiting and disconnect forwarding, concurrent rate limiting, Web CSRF, CSV field projection, and atomic SQLite backup. Routine reassignment remains lease-owner-only, with a separate App operator correction route.
+- CPU and memory admission accounts for both direct GPU commitments and generic host claims. Routine MCP transport retries use a process-scoped call namespace without collapsing later same-parameter claims into an old lease.
+
 ## 1.5.3 - 2026-08-14
 
 **ServerPilot 1.5.3 lets Agents connect directly without conflating a working directory with a code path.**

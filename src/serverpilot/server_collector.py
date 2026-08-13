@@ -1,7 +1,7 @@
 """Reference implementation of the fixed ``serverpilot-collect`` entry point.
 
 It is intended to run *on* an observed server.  The broker invokes it with
-``--schema-version 1`` and accepts only the single JSON object emitted here.
+the current fixed schema version and accepts only the single JSON object emitted here.
 Deployments may maintain an equivalent local wrapper for a containerized GPU
 runtime or a custom executable prefix, provided that wrapper preserves the
 same fixed CLI and JSON contract.
@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -26,10 +27,14 @@ from serverpilot.collector_protocol import SERVER_SCRIPT_SCHEMA_VERSION
 
 GPU_QUERY = (
     "--query-gpu=index,uuid,name,memory.total,memory.used,memory.free,"
-    "utilization.gpu,utilization.memory,temperature.gpu,power.draw,pstate"
+    "utilization.gpu,utilization.memory,temperature.gpu,power.draw,pstate,pci.bus_id"
 )
 PROCESS_QUERY = "--query-compute-apps=gpu_uuid,pid,used_memory,process_name"
 NVIDIA_FORMAT = "--format=csv,noheader,nounits"
+_PCI_BUS_ID_PATTERN = re.compile(
+    r"^(?P<domain>[0-9A-Fa-f]{4,8}):(?P<bus>[0-9A-Fa-f]{2}):"
+    r"(?P<device>[0-9A-Fa-f]{2})\.(?P<function>[0-7])$"
+)
 
 
 def _parse_value(value: str) -> str | None:
@@ -53,6 +58,15 @@ def _number(value: str | None) -> float | None:
         return float(value.replace("W", "").strip())
     except ValueError:
         return None
+
+
+def _pci_bus_key(value: str | None) -> tuple[int, int, int, int]:
+    match = _PCI_BUS_ID_PATTERN.fullmatch(value or "")
+    if match is None:
+        raise RuntimeError("invalid nvidia-smi GPU PCI bus ID")
+    return tuple(
+        int(match.group(name), 16) for name in ("domain", "bus", "device", "function")
+    )
 
 
 def _run_nvidia_smi(*arguments: str) -> str | None:
@@ -118,19 +132,23 @@ def _gpu_snapshot() -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
     if raw_gpus is None or not raw_gpus.strip():
         return False, [], []
 
-    gpus: list[dict[str, Any]] = []
+    observed_gpus: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
+    seen_indices: set[int] = set()
+    seen_uuids: set[str] = set()
+    seen_bus_ids: set[tuple[int, int, int, int]] = set()
     for row in csv.reader(raw_gpus.splitlines()):
         if not row or not any(value.strip() for value in row):
             continue
         values = [_parse_value(value) for value in row]
-        if len(values) != 11:
+        if len(values) != 12:
             raise RuntimeError("unexpected nvidia-smi GPU column count")
-        gpu_index = _integer(values[0])
+        nvidia_index = _integer(values[0])
+        bus_id = _pci_bus_key(values[11])
         total = _integer(values[3])
         used = _integer(values[4])
         free = _integer(values[5])
         if (
-            gpu_index is None
+            nvidia_index is None
             or values[1] is None
             or values[2] is None
             or total is None
@@ -138,22 +156,34 @@ def _gpu_snapshot() -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
             or free is None
         ):
             raise RuntimeError("incomplete nvidia-smi GPU telemetry")
-        gpus.append(
-            {
-                "gpu_index": gpu_index,
-                "gpu_uuid": values[1],
-                "name": values[2],
-                "total_vram_mib": total,
-                "memory_used_mib": used,
-                "memory_free_mib": free,
-                "gpu_utilization_pct": _integer(values[6]),
-                "memory_utilization_pct": _integer(values[7]),
-                "temperature_c": _integer(values[8]),
-                "power_watts": _number(values[9]),
-                "pstate": values[10],
-                "health": "OK",
-            }
+        if nvidia_index in seen_indices or values[1] in seen_uuids or bus_id in seen_bus_ids:
+            raise RuntimeError("duplicate nvidia-smi GPU identity")
+        seen_indices.add(nvidia_index)
+        seen_uuids.add(values[1])
+        seen_bus_ids.add(bus_id)
+        observed_gpus.append(
+            (
+                bus_id,
+                {
+                    "gpu_uuid": values[1],
+                    "gpu_index": nvidia_index,
+                    "name": values[2],
+                    "total_vram_mib": total,
+                    "memory_used_mib": used,
+                    "memory_free_mib": free,
+                    "gpu_utilization_pct": _integer(values[6]),
+                    "memory_utilization_pct": _integer(values[7]),
+                    "temperature_c": _integer(values[8]),
+                    "power_watts": _number(values[9]),
+                    "pstate": values[10],
+                    "health": "OK",
+                },
+            )
         )
+    gpus = [
+        {"cuda_ordinal": ordinal, **gpu}
+        for ordinal, (_bus_id, gpu) in enumerate(sorted(observed_gpus))
+    ]
 
     raw_processes = _run_nvidia_smi(PROCESS_QUERY)
     if raw_processes is None:
@@ -218,7 +248,7 @@ def _with_process_details(processes: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def collect_snapshot() -> dict[str, Any]:
-    """Collect one schema-v1 snapshot without accepting caller-controlled I/O."""
+    """Collect one current-schema snapshot without caller-controlled I/O."""
 
     gpu_probe_available, gpus, processes = _gpu_snapshot()
     return {

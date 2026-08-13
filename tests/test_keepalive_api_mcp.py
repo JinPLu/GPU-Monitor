@@ -833,6 +833,75 @@ def test_keepalive_api_failures_are_reported_as_errors(
     assert app.state.service.list_leases(app.state.service.local_actor("agent-a"))["data"] == []
 
 
+def test_incompatible_helper_is_reported_without_cleanup_mutation(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    adapter = FakeKeepaliveAdapter(
+        failure=AdapterCommandError(
+            "keepalive_helper_incompatible: expected schema 3",
+            uncertain=False,
+        )
+    )
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+
+    response = TestClient(app).post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("incompatible-helper"),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "keepalive_helper_incompatible"
+    assert adapter.calls == [("endpoint-a", True, GPU_UUIDS)]
+    summary = app.state.service.get_endpoint_keepalive_summary("endpoint-a")["keepalive"]
+    assert summary["actual"] == "ERROR"
+    assert summary["reasons"][0]["reason"] == (
+        "远端占卡 helper 版本或能力不匹配；请先完成该服务器的 helper 升级。"
+    )
+
+
+def test_incompatible_helper_on_stop_is_not_collapsed_to_partial_stop(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    class StopIncompatibleAdapter(FakeKeepaliveAdapter):
+        async def set_enabled(  # type: ignore[no-untyped-def]
+            self, endpoint, enabled: bool, gpu_uuids: list[str]
+        ) -> KeepaliveResponse:
+            if not enabled:
+                self.calls.append((endpoint.id, enabled, tuple(gpu_uuids)))
+                raise AdapterCommandError(
+                    "keepalive_helper_incompatible: expected schema 3",
+                    uncertain=False,
+                )
+            return await super().set_enabled(endpoint, enabled, gpu_uuids)
+
+    adapter = StopIncompatibleAdapter()
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+    client = TestClient(app)
+
+    enabled = client.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("incompatible-stop-on"),
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    disabled = client.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": False},
+        headers=_headers("incompatible-stop-off"),
+    )
+    assert disabled.status_code == 503, disabled.text
+    assert disabled.json()["error"]["code"] == "keepalive_helper_incompatible"
+    assert adapter.calls == [
+        ("endpoint-a", True, GPU_UUIDS),
+        ("endpoint-a", False, (GPU_UUIDS[0],)),
+        ("endpoint-a", False, (GPU_UUIDS[1],)),
+    ]
+
+
 def test_keepalive_api_reports_known_cuda_worker_failure_in_chinese_without_remote_stderr(
     tmp_path: Path, inventory: InventoryConfig
 ) -> None:
@@ -884,6 +953,7 @@ def test_keepalive_api_reports_known_cuda_worker_failure_in_chinese_without_remo
 @pytest.mark.parametrize(
     ("remote_failure", "expected_code"),
     [
+        ("keepalive_helper_incompatible: expected schema 3", "keepalive_helper_incompatible"),
         ("PyTorch with CUDA support is required", "keepalive_pytorch_cuda_required"),
         (
             "PyTorch CUDA runtime could not initialize the selected GPU",
@@ -921,6 +991,18 @@ def test_keepalive_unknown_uuid_has_specific_public_chinese_message() -> None:
     )
 
     assert _public_error_message(failure) == "远端当前 PCI GPU 清单中找不到目标 GPU UUID。"
+
+
+def test_keepalive_helper_incompatibility_has_specific_public_message() -> None:
+    failure = BrokerError(
+        "keepalive_helper_incompatible",
+        "remote detail is not public",
+        status_code=503,
+    )
+
+    assert _public_error_message(failure) == (
+        "远端占卡 helper 版本或能力不匹配；请先完成该服务器的 helper 升级。"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1423,8 +1505,11 @@ def test_routine_agent_path_handles_keepalive_on_and_off(
             assert response.status_code == 200, response.text
             return response.json()
 
-        def post(self, path, body=None):  # type: ignore[no-untyped-def]
-            response = rest.post(path, json=body, headers=headers)
+        def post(self, path, body=None, *, idempotency_key=None):  # type: ignore[no-untyped-def]
+            request_headers = dict(headers)
+            if idempotency_key is not None:
+                request_headers["Idempotency-Key"] = idempotency_key
+            response = rest.post(path, json=body, headers=request_headers)
             assert response.status_code == 200, response.text
             return response.json()
 
