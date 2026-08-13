@@ -4,6 +4,15 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## 1.5.2 - 2026-08-13
+
+**ServerPilot 1.5.2 removes false ownership-conflict errors and restores human correction in the App.**
+
+- **Routine workload restarts no longer become false conflicts.** When every old process has exited and one complete observation sees a wholly new cohort on every leased GPU, ServerPilot refreshes the routine Agent's observed ownership. A newcomer must itself be observed repeatedly before it can trigger conflict, while a complete empty retry window keeps the lease and clears the transient conflict. Stable mixed cohorts, incomplete observations, and advanced explicit bindings remain fail closed.
+- **Historical errors actually end.** Releasing a lease or removing its active resources closes `lease_process_conflict` and `orphaned_busy`; startup and reconciliation repair stale alerts left by older versions.
+- **The App follows the broker's canonical status.** The native App consumes `desired / actual / publicly_available / public_status`, never labels an unavailable GPU as available, and shows `desired=ON, actual=OFF` as occupancy not running.
+- **Humans can release orphaned Agent leases.** The App uses a dedicated operator correction route after confirming a task has ended; routine Agents remain limited to their own leases.
+
 ## 1.5.1 - 2026-08-13
 
 **ServerPilot 1.5.1 makes it easier for Agents to turn GPU leases into correct remote single-GPU and multi-GPU workloads.**

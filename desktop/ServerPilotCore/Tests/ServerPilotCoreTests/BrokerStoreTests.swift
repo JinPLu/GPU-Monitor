@@ -677,6 +677,59 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertTrue(store.notice?.contains("对应 Agent") == true)
     }
 
+    func testHumanReleaseUsesOperatorCorrectionRoute() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StateRouteURLProtocol.self]
+        let mutationSession = URLSession(configuration: configuration)
+        let snapshot = try Self.snapshot(named: "1")
+        let lease = try XCTUnwrap(LeaseRecord(raw: [
+            "id": "lease-owned-by-agent",
+            "actor_id": "agent-a",
+            "project_id": "project-a",
+            "kind": "workload",
+            "state": "HELD",
+            "gpu_ids": ["fixture-1:GPU-old"],
+        ]))
+        let store = BrokerStore(
+            actorID: "human",
+            refreshTimeoutSeconds: 1,
+            refreshIntervalSeconds: 0,
+            mutationSession: mutationSession
+        )
+        StateRouteURLProtocol.responseData = try JSONSerialization.data(
+            withJSONObject: ["snapshot_revision": 104]
+        )
+        defer { StateRouteURLProtocol.reset() }
+        store.connectForTesting(
+            snapshotClient: ScriptedClient(results: [.success(snapshot), .success(snapshot)]),
+            serviceInfo: ServiceInfo(schemaVersion: "v1", capabilities: []),
+            baseURL: URL(string: "http://broker.test/")!
+        )
+        try await waitUntil { store.freshness == .fresh && !store.isRefreshing }
+
+        let recorder = CompletionRecorder()
+        store.releaseLease(lease) { success, message in
+            recorder.success = success
+            recorder.message = message
+        }
+
+        try await waitUntil { recorder.success != nil }
+        XCTAssertEqual(recorder.success, true)
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "POST")
+        XCTAssertEqual(
+            StateRouteURLProtocol.lastRequest?.url?.path,
+            "/api/v1/operator/leases/lease-owned-by-agent/release"
+        )
+        XCTAssertEqual(
+            StateRouteURLProtocol.lastRequest?.value(forHTTPHeaderField: "X-ServerPilot-Actor"),
+            "human"
+        )
+        XCTAssertEqual(
+            StateRouteURLProtocol.lastRequest?.value(forHTTPHeaderField: "X-ServerPilot-Client"),
+            "desktop-app"
+        )
+    }
+
     func testCollectorIntervalReadsAndUpdatesServerSetting() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StateRouteURLProtocol.self]
@@ -776,6 +829,7 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(endpoint.keepalive.coverageSummary(totalGPUCount: 0, taskGPUCount: 0), "无 GPU")
         XCTAssertEqual(fixture.gpus.map(\.state), ["KEEPALIVE", "RUNNING_MANAGED"])
         XCTAssertTrue(try XCTUnwrap(fixture.gpus.first).isPubliclyAvailable)
+        XCTAssertEqual(fixture.gpus.first?.keepalive.desired, "ON")
         XCTAssertEqual(fixture.gpus.first?.keepalive.presentationLabel, "空闲占卡")
         XCTAssertEqual(fixture.gpus.last?.keepalive.reason, "managed workload is running")
         XCTAssertTrue(fixture.leases.isEmpty)
@@ -799,8 +853,53 @@ final class BrokerStoreTests: XCTestCase {
         ]))
         XCTAssertFalse(missingKeeper.isTaskOccupancy)
         XCTAssertTrue(missingKeeper.isPubliclyAvailable)
+        XCTAssertEqual(missingKeeper.keepalive.desired, "ON")
+        XCTAssertEqual(missingKeeper.keepalive.presentationLabel, "占卡未运行")
         XCTAssertEqual(missingKeeper.keepalive.leaseID, "keepalive-missing-lease")
         XCTAssertTrue(try XCTUnwrap(fixture.gpus.last).isTaskOccupancy)
+
+        let conflictedKeeper = try XCTUnwrap(GPURecord(raw: [
+            "id": "fixture-1:GPU-conflicted-keeper",
+            "endpoint_id": "fixture-1",
+            "gpu_uuid": "GPU-conflicted-keeper",
+            "gpu_index": 3,
+            "name": "Fixture GPU",
+            "total_vram_mib": 81920,
+            "state": "CONFLICT",
+            "publicly_available": false,
+            "public_status": "任务使用中",
+            "keepalive": [
+                "configured": true,
+                "policy": "idle_keepalive",
+                "desired": "ON",
+                "actual": "ERROR",
+                "reason": "占卡进程身份尚未建立",
+                "lease_id": "keepalive-conflicted-lease"
+            ],
+        ]))
+        XCTAssertEqual(conflictedKeeper.publicStatus, "任务使用中")
+        XCTAssertEqual(conflictedKeeper.projectedPubliclyAvailable, false)
+        XCTAssertFalse(conflictedKeeper.isPubliclyAvailable)
+        XCTAssertEqual(conflictedKeeper.keepalive.desired, "ON")
+        XCTAssertEqual(conflictedKeeper.keepalive.state, "ERROR")
+
+        XCTAssertNil(GPURecord(raw: [
+            "id": "fixture-1:GPU-invalid-public-projection",
+            "endpoint_id": "fixture-1",
+            "gpu_uuid": "GPU-invalid-public-projection",
+            "gpu_index": 4,
+            "name": "Fixture GPU",
+            "total_vram_mib": 81920,
+            "state": "CONFLICT",
+            "publicly_available": false,
+            "public_status": "可用 · 占卡异常",
+            "keepalive": [
+                "configured": true,
+                "policy": "idle_keepalive",
+                "desired": "ON",
+                "actual": "ERROR"
+            ],
+        ]))
 
         let defensiveSnapshot = BrokerSnapshot(envelope: [
             "data": [
@@ -835,6 +934,11 @@ final class BrokerStoreTests: XCTestCase {
         ))
         XCTAssertNil(GPUKeepaliveStatus(
             raw: ["policy": "disabled", "state": "UNKNOWN"],
+            fallbackConfigured: true,
+            fallbackState: "OFF"
+        ))
+        XCTAssertNil(GPUKeepaliveStatus(
+            raw: ["policy": "idle_keepalive", "desired": "UNKNOWN", "state": "OFF"],
             fallbackConfigured: true,
             fallbackState: "OFF"
         ))

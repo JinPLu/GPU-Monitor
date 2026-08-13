@@ -210,6 +210,10 @@ public final class BrokerStore: ObservableObject {
         serviceInfo?.supportsEndpointConflictCleanup == true
     }
 
+    public var supportsOperatorLeaseRelease: Bool {
+        serviceInfo?.supportsOperatorLeaseRelease == true
+    }
+
     public var supportsCollectorSettings: Bool {
         serviceInfo?.supportsCollectorSettings == true
     }
@@ -720,6 +724,12 @@ public final class BrokerStore: ObservableObject {
     }
 
     public func releaseLease(_ lease: LeaseRecord, completion: @escaping @MainActor @Sendable (Bool, String?) -> Void) {
+        guard supportsOperatorLeaseRelease else {
+            let message = "当前本机服务版本不支持人工释放其他 Agent 的租约，请先升级并重启 ServerPilot。"
+            errorMessage = message
+            completion(false, message)
+            return
+        }
         guard allowsMutations else {
             let message = mutationUnavailableMessage
             errorMessage = message
@@ -727,7 +737,7 @@ public final class BrokerStore: ObservableObject {
             return
         }
         guard let url = baseURL?
-            .appendingPathComponent("api/v1/leases")
+            .appendingPathComponent("api/v1/operator/leases")
             .appendingPathComponent(lease.id)
             .appendingPathComponent("release")
         else {
@@ -749,6 +759,7 @@ public final class BrokerStore: ObservableObject {
         request.timeoutInterval = 10
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(actorID, forHTTPHeaderField: "X-ServerPilot-Actor")
+        request.setValue("desktop-app", forHTTPHeaderField: "X-ServerPilot-Client")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "Idempotency-Key")
         mutationSession.dataTask(with: request) { [weak self] data, response, error in
             Task { @MainActor in

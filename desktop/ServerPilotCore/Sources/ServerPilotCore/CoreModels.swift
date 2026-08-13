@@ -23,7 +23,7 @@ public struct ServiceInfo: Equatable, Sendable {
     public static let fixture = ServiceInfo(
         schemaVersion: "v1",
         version: "fixture",
-        capabilities: ["instant_claims", "endpoint_update", "endpoint_keepalive", "endpoint_conflict_cleanup", "collector_settings"]
+        capabilities: ["instant_claims", "endpoint_update", "endpoint_keepalive", "endpoint_conflict_cleanup", "operator_lease_release", "collector_settings"]
     )
 
     public var supportsEndpointUpdate: Bool {
@@ -44,6 +44,10 @@ public struct ServiceInfo: Equatable, Sendable {
 
     public var supportsEndpointConflictCleanup: Bool {
         supports("endpoint_conflict_cleanup")
+    }
+
+    public var supportsOperatorLeaseRelease: Bool {
+        supports("operator_lease_release")
     }
 
     public var supportsCollectorSettings: Bool {
@@ -465,6 +469,7 @@ public struct EndpointKeepaliveSummary: Equatable, Sendable {
 public struct GPUKeepaliveStatus: Equatable, Sendable {
     public let configured: Bool
     public let policy: String
+    public let desired: String
     public let state: String
     public let leaseID: String?
     public let reason: String?
@@ -474,6 +479,11 @@ public struct GPUKeepaliveStatus: Equatable, Sendable {
         let suppliedPolicy = (raw.string("policy") ?? "disabled").lowercased()
         guard ["disabled", "idle_keepalive"].contains(suppliedPolicy) else { return nil }
         policy = suppliedPolicy
+        let suppliedDesired = (
+            raw.string("desired") ?? (suppliedPolicy == "idle_keepalive" ? "ON" : "OFF")
+        ).uppercased()
+        guard ["OFF", "ON"].contains(suppliedDesired) else { return nil }
+        desired = suppliedDesired
         let suppliedState = (raw.string("actual") ?? raw.string("state") ?? fallbackState).uppercased()
         guard ["OFF", "ON", "ERROR"].contains(suppliedState) else { return nil }
         state = suppliedState
@@ -487,7 +497,7 @@ public struct GPUKeepaliveStatus: Equatable, Sendable {
         switch state {
         case "ON": return "空闲占卡"
         case "ERROR": return "占卡异常"
-        default: return "未占卡"
+        default: return desired == "ON" ? "占卡未运行" : "未占卡"
         }
     }
 
@@ -641,6 +651,10 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
     public let taskReference: String?
     public let leaseID: String?
     public let keepalive: GPUKeepaliveStatus
+    /// Canonical short Chinese projection supplied by the broker.
+    public let publicStatus: String?
+    /// Broker-owned availability takes precedence over a local state inference.
+    public let projectedPubliclyAvailable: Bool?
 
     public init?(raw: [String: Any]) {
         guard
@@ -672,6 +686,16 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
         self.leaseID = lease.string("id")
         self.owner = lease.string("actor_id")
         self.taskReference = lease.string("task_ref")
+        let suppliedPublicStatus = raw.string("public_status")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.publicStatus = suppliedPublicStatus?.isEmpty == false ? suppliedPublicStatus : nil
+        self.projectedPubliclyAvailable = raw["publicly_available"] == nil
+            ? nil
+            : raw.bool("publicly_available", default: false)
+        if self.projectedPubliclyAvailable == false,
+           self.publicStatus?.hasPrefix("可用") == true {
+            return nil
+        }
         guard let keepalive = GPUKeepaliveStatus(
             raw: raw["keepalive"] as? [String: Any] ?? [:],
             fallbackConfigured: false,
@@ -698,8 +722,8 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
     }
 
     public var isPubliclyAvailable: Bool {
-        state == "AVAILABLE"
-            || state == "KEEPALIVE"
+        projectedPubliclyAvailable
+            ?? (state == "AVAILABLE" || state == "KEEPALIVE")
     }
 
     public var memoryLabel: String {

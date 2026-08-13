@@ -4,6 +4,15 @@
 
 这里只记录用户能感受到的变化；实现细节见 Git 提交。
 
+## 1.5.2 - 2026-08-13
+
+**ServerPilot 1.5.2 清理了“归属待确认”的误报，并恢复 App 的人工纠错能力。**
+
+- **任务正常重启不再误报归属冲突。** routine Agent 的旧进程已经全部退出、且完整采集确认每张租用 GPU 都出现同一轮新进程时，ServerPilot 自动更新观察归属；新进程只有稳定出现才会触发冲突，完整采集确认重试间隙为空时会保留租约并清除瞬态冲突；旧新进程稳定并存、不完整采集和高级显式 binding 仍然 fail closed。
+- **历史错误会真正结束。** 租约释放或失去活动资源后，`lease_process_conflict` 与 `orphaned_busy` 告警立即关闭；升级启动与 reconcile 会清理旧版本遗留的陈旧告警。
+- **App 状态与 broker 保持一致。** 原生 App 直接采用 `desired / actual / publicly_available / public_status`，不可申请的卡不再显示“可用”，`desired=ON, actual=OFF` 明确显示“占卡未运行”。
+- **人类可以释放孤立的 Agent 租约。** App 使用独立的 operator 纠错路由释放确认已结束的任务；日常 Agent 仍只能释放自己的 lease。
+
 ## 1.5.1 - 2026-08-13
 
 **ServerPilot 1.5.1 让 Agent 更容易把 GPU 租约正确转换为远端单卡或多卡工作负载。**

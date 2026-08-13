@@ -223,7 +223,8 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
                 completion(.incompatible("127.0.0.1:\(port) 上有服务响应，但它不是当前 ServerPilot 服务。桌面应用不会关闭或替换这个外部服务。"))
                 return
             }
-            guard info.capabilities.contains("endpoint_conflict_cleanup") else {
+            guard info.capabilities.contains("endpoint_conflict_cleanup"),
+                  info.capabilities.contains("operator_lease_release") else {
                 completion(.unavailable)
                 return
             }
@@ -3288,11 +3289,20 @@ private func gpuStateLabel(_ state: String) -> String {
 }
 
 func gpuPresentationLabel(_ gpu: GPURecord) -> String {
+    if let publicStatus = gpu.publicStatus {
+        return publicStatus
+    }
     if gpu.keepalive.state == "ERROR" {
         let reason = gpu.keepalive.reason.map(localizedStateReason) ?? "未知原因"
-        return "可用 · 占卡异常：\(reason)"
+        return gpu.isPubliclyAvailable
+            ? "可用 · 占卡异常：\(reason)"
+            : "占卡异常：\(reason)"
     }
-    if gpu.state == "AVAILABLE" { return "可用 · 未开启占卡" }
+    if gpu.state == "AVAILABLE" {
+        return gpu.keepalive.desired == "ON"
+            ? "可用 · 占卡未运行"
+            : "可用 · 未开启占卡"
+    }
     if gpu.state == "KEEPALIVE" { return "可用 · 空闲占卡" }
     if ["HELD", "LEASED_IDLE", "RUNNING_MANAGED"].contains(gpu.state) {
         let task = gpu.taskReference?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4163,7 +4173,7 @@ private struct GPUUsageRing: View {
         }
         .buttonStyle(.plain)
         .help(gpuTooltip)
-        .accessibilityLabel("GPU \(gpu.index)，\(gpuStateLabel(gpu.state))，使用率 \(Int((usageFraction * 100).rounded()))%")
+        .accessibilityLabel("GPU \(gpu.index)，\(gpuPresentationLabel(gpu))，使用率 \(Int((usageFraction * 100).rounded()))%")
     }
 
     private var usageFraction: Double {
@@ -4175,7 +4185,7 @@ private struct GPUUsageRing: View {
     }
 
     private var gpuTooltip: String {
-        var details = "\(gpu.name) · \(gpuStateLabel(gpu.state)) · 显存 \(gpu.memoryLabel)"
+        var details = "\(gpu.name) · \(gpuPresentationLabel(gpu)) · 显存 \(gpu.memoryLabel)"
         if let utilization = gpu.utilization { details += " · 利用率 \(utilization)%" }
         if let task = gpu.taskReference { details += " · \(task)" }
         return details
@@ -4309,7 +4319,7 @@ private struct GPUAccessoryChip: View {
     }
 
     private var gpuTooltip: String {
-        var details = "\(gpu.name) · \(gpu.vramLabel) · \(gpuStateLabel(gpu.state))"
+        var details = "\(gpu.name) · \(gpu.vramLabel) · \(gpuPresentationLabel(gpu))"
         if let task = gpu.taskReference { details += " · \(task)" }
         return details
     }
@@ -5025,7 +5035,7 @@ private struct GPUAccessoryTile: View {
     }
 
     private var gpuTooltip: String {
-        var details = "\(gpu.name) · \(gpu.vramLabel) · \(gpuStateLabel(gpu.state))"
+        var details = "\(gpu.name) · \(gpu.vramLabel) · \(gpuPresentationLabel(gpu))"
         if let task = gpu.taskReference { details += " · \(task)" }
         return details
     }
@@ -5086,7 +5096,7 @@ private struct GPUDetailSheet: View {
         return "\(value)°C"
     }
 
-    private var stateLabel: String { gpuStateLabel(gpu.state) }
+    private var stateLabel: String { gpuPresentationLabel(gpu) }
 
     private var stateIcon: String {
         switch gpu.state {

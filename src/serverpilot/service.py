@@ -99,6 +99,7 @@ ACTIVE_LEASE_STATES = {"HELD", "ACTIVE", "ORPHANED_BUSY", "CONFLICT"}
 SYSTEM_ACTOR_ID = RESERVED_SYSTEM_ID
 SYSTEM_PROJECT_ID = RESERVED_SYSTEM_ID
 TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
+LEASE_SCOPED_BLOCKING_ALERT_TYPES = {"lease_process_conflict", "orphaned_busy"}
 TERMINAL_SCHEDULER_JOB_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}
 TERMINAL_SCHEDULER_TRANSFER_STATES = {"COMPLETED", "FAILED", "DEFERRED"}
 TELEMETRY_HISTORY_INTERVAL_SECONDS = 60
@@ -217,6 +218,7 @@ class BrokerService:
                 self._upsert_inventory(session, now)
             self._ensure_system_identity(session, now)
             self._defer_interrupted_scheduler_transfers(session, now)
+            self._resolve_stale_lease_alerts(session, now)
             self._bump_revision(session, now)
 
         self._write(operation)
@@ -399,9 +401,10 @@ class BrokerService:
                     for field, value in protected_values.items()
                     if value != getattr(endpoint, field)
                 )
-                if changed_protected_fields and self._active_keepalive_for_endpoint(
-                    session, endpoint.id
-                ) is not None:
+                if (
+                    changed_protected_fields
+                    and self._active_keepalive_for_endpoint(session, endpoint.id) is not None
+                ):
                     raise BrokerError(
                         "keepalive_endpoint_connection_in_use",
                         "stop the active endpoint keepalive before synchronizing changed connection or verification settings",
@@ -657,6 +660,7 @@ class BrokerService:
                 "actor name must start with a letter and contain 2-128 letters, numbers, '.', '_' or '-'",
                 status_code=422,
             )
+
         def resolve(session: Session) -> ActorContext | None:
             stored_actor = session.get(Actor, normalized)
             if stored_actor is None:
@@ -770,6 +774,60 @@ class BrokerService:
         session.add(event)
         session.flush()
         return event
+
+    @staticmethod
+    def _resolve_lease_alerts(session: Session, lease_id: str, now: datetime) -> int:
+        """Close blocking alerts once their lease can no longer own resources."""
+
+        alerts = session.scalars(
+            select(Alert).where(
+                Alert.alert_type.in_(LEASE_SCOPED_BLOCKING_ALERT_TYPES),
+                Alert.resource_type == "lease",
+                Alert.resource_id == lease_id,
+                Alert.active.is_(True),
+            )
+        ).all()
+        for alert in alerts:
+            alert.active = False
+            alert.last_seen_at = now
+        return len(alerts)
+
+    @classmethod
+    def _resolve_stale_lease_alerts(cls, session: Session, now: datetime) -> int:
+        """Repair alerts whose lease is terminal, absent, or owns no live resource."""
+
+        alerts = session.scalars(
+            select(Alert).where(
+                Alert.alert_type.in_(LEASE_SCOPED_BLOCKING_ALERT_TYPES),
+                Alert.resource_type == "lease",
+                Alert.active.is_(True),
+            )
+        ).all()
+        if not alerts:
+            return 0
+        lease_ids = {alert.resource_id for alert in alerts}
+        leases = {
+            lease.id: lease
+            for lease in session.scalars(select(Lease).where(Lease.id.in_(lease_ids))).all()
+        }
+        live_resource_lease_ids = set(
+            session.scalars(
+                select(LeaseResource.lease_id).where(
+                    LeaseResource.lease_id.in_(lease_ids),
+                    LeaseResource.active.is_(True),
+                )
+            ).all()
+        )
+        resolved = 0
+        for lease_id in lease_ids:
+            lease = leases.get(lease_id)
+            if (
+                lease is None
+                or lease.state in TERMINAL_LEASE_STATES
+                or lease_id not in live_resource_lease_ids
+            ):
+                resolved += cls._resolve_lease_alerts(session, lease_id, now)
+        return resolved
 
     def _idempotent(
         self,
@@ -1688,9 +1746,7 @@ class BrokerService:
         keepalive = keepalive if isinstance(keepalive, dict) else {}
         if monitor_status in {"ERROR", "STALE"}:
             status = "连接失败"
-        elif available and (
-            gpu.get("state") == "KEEPALIVE" or keepalive.get("actual") == "ON"
-        ):
+        elif available and (gpu.get("state") == "KEEPALIVE" or keepalive.get("actual") == "ON"):
             status = "可用 · 空闲占卡"
         elif available and keepalive.get("actual") == "ERROR":
             status = f"可用 · 占卡异常：{keepalive.get('reason') or '未知原因'}"
@@ -1956,13 +2012,10 @@ class BrokerService:
                     lease = self._active_lease_for_gpu(session, gpu.id)
                     if lease is not None:
                         current = session.get(KeepaliveCurrent, gpu.id)
-                        if (
-                            lease.kind == "keepalive"
-                            and (
-                                lease.state != "ACTIVE"
-                                or not self._current_processes(session, gpu.id, now)
-                                or self._keepalive_expected_process_key(current) is None
-                            )
+                        if lease.kind == "keepalive" and (
+                            lease.state != "ACTIVE"
+                            or not self._current_processes(session, gpu.id, now)
+                            or self._keepalive_expected_process_key(current) is None
                         ):
                             transitions.append(
                                 {
@@ -2500,10 +2553,14 @@ class BrokerService:
             self._require_endpoint_manager(actor, endpoint)
             lease = session.get(Lease, lease_id)
             if lease is None or lease.kind != "keepalive":
-                raise BrokerError("keepalive_not_found", "keepalive lease does not exist", status_code=404)
+                raise BrokerError(
+                    "keepalive_not_found", "keepalive lease does not exist", status_code=404
+                )
             if lease.state not in {"HELD", "ACTIVE", "CONFLICT", "ORPHANED_BUSY"}:
                 raise BrokerError(
-                    "keepalive_not_stoppable", "keepalive lease is already terminal", status_code=409
+                    "keepalive_not_stoppable",
+                    "keepalive lease is already terminal",
+                    status_code=409,
                 )
             resources = self._keepalive_resources(session, lease.id)
             if len(resources) != 1:
@@ -2544,6 +2601,7 @@ class BrokerService:
             if request is not None:
                 request.state = "RELEASED"
                 request.updated_at = now
+            self._resolve_lease_alerts(session, lease.id, now)
             self._set_keepalive_current(session, gpu_ids[0], "OFF", now=now)
             event = self._audit(
                 session,
@@ -2640,9 +2698,7 @@ class BrokerService:
         if lease is not None and lease.state == "ORPHANED_BUSY":
             return "ORPHANED_BUSY", "lease expired while a compute process remains"
         if lease is not None and lease.kind == "keepalive":
-            keepalive_state, keepalive_reason = self._keepalive_gpu_status(
-                session, gpu, lease, now
-            )
+            keepalive_state, keepalive_reason = self._keepalive_gpu_status(session, gpu, lease, now)
             if keepalive_state == "ON":
                 return "KEEPALIVE", "per-GPU keepalive is active"
             if keepalive_state == "OFF" and not self._current_processes(session, gpu.id, now):
@@ -2942,9 +2998,7 @@ class BrokerService:
                     # Filled from the final per-GPU projection below, so a
                     # busy sibling GPU never invalidates an independent
                     # keepalive worker.
-                    "keepalive": self._keepalive_aggregate(
-                        endpoint, (), eligible_idle_gpu_count=0
-                    ),
+                    "keepalive": self._keepalive_aggregate(endpoint, (), eligible_idle_gpu_count=0),
                     "host_telemetry": self._host_telemetry_dict(
                         host_telemetry_by_endpoint.get(endpoint.id)
                     ),
@@ -3109,8 +3163,7 @@ class BrokerService:
                 gpu_payloads.append(payload)
 
             endpoint_monitor_by_id = {
-                endpoint["id"]: endpoint["monitor"]["status"]
-                for endpoint in endpoint_payloads
+                endpoint["id"]: endpoint["monitor"]["status"] for endpoint in endpoint_payloads
             }
             for payload in gpu_payloads:
                 payload.update(
@@ -3161,9 +3214,7 @@ class BrokerService:
             counts = defaultdict(int)
             for gpu in all_gpu_payloads:
                 counts[gpu["state"]] += 1
-            workload_claimed_gpu_count = sum(
-                item["lease"] is not None for item in all_gpu_payloads
-            )
+            workload_claimed_gpu_count = sum(item["lease"] is not None for item in all_gpu_payloads)
             keepalive_owned_gpu_count = sum(
                 item["keepalive"]["lease_id"] is not None for item in all_gpu_payloads
             )
@@ -3200,8 +3251,7 @@ class BrokerService:
                 "total_servers": len(endpoint_payloads),
                 "total_gpus": len(all_gpu_payloads),
                 "available_gpus": sum(
-                    self._gpu_payload_is_publicly_available(item)
-                    for item in all_gpu_payloads
+                    self._gpu_payload_is_publicly_available(item) for item in all_gpu_payloads
                 ),
                 "busy_gpus": counts["BUSY_UNMANAGED"] + counts["RUNNING_MANAGED"],
                 "claimed_gpus": sum(
@@ -4057,9 +4107,7 @@ class BrokerService:
                 gpu["telemetry"] for gpu in endpoint_gpus if gpu["telemetry"] is not None
             ]
             state_counts = gpu_state_counts(endpoint_gpus)
-            workload_leased_gpu_count = sum(
-                gpu["lease"] is not None for gpu in endpoint_gpus
-            )
+            workload_leased_gpu_count = sum(gpu["lease"] is not None for gpu in endpoint_gpus)
             keepalive_owned_gpu_count = sum(
                 gpu["keepalive"]["lease_id"] is not None for gpu in endpoint_gpus
             )
@@ -4073,8 +4121,7 @@ class BrokerService:
                     "capacity": {
                         "total_gpus": len(endpoint_gpus),
                         "available_gpus": sum(
-                            self._gpu_payload_is_publicly_available(gpu)
-                            for gpu in endpoint_gpus
+                            self._gpu_payload_is_publicly_available(gpu) for gpu in endpoint_gpus
                         ),
                         # Compatibility: leased_gpus has always meant visible
                         # workload leases. Internal keepalive ownership is
@@ -4497,9 +4544,7 @@ class BrokerService:
             event = self._audit(
                 session,
                 actor_id=actor.id,
-                action=(
-                    "resource_claim.allocated"
-                ),
+                action=("resource_claim.allocated"),
                 resource_type="resource_claim",
                 resource_id=claim.id,
                 result="success",
@@ -5569,6 +5614,7 @@ class BrokerService:
             self._bind_new_workload_processes(
                 session,
                 endpoint_id=endpoint.id,
+                observation_complete=observation.observation_complete,
                 now=now,
             )
             self._reconcile_leases(session, now, actor_id=f"collector:{endpoint.id}")
@@ -5610,9 +5656,18 @@ class BrokerService:
         session: Session,
         *,
         endpoint_id: str,
+        observation_complete: bool,
         now: datetime,
     ) -> None:
-        """Attach newly observed compute to its exact unbound workload lease."""
+        """Attach a complete observed workload cohort to its routine lease.
+
+        A routine Agent may restart a failed worker without releasing the GPU
+        lease.  When a complete endpoint observation shows that every old
+        bound process has gone and every leased GPU has a wholly new process
+        cohort, keep the durable task ownership and replace its observed
+        process keys.  Mixed old/new cohorts remain fail closed because they
+        can represent an unrelated process entering an assigned GPU.
+        """
 
         lease_ids = session.scalars(
             select(LeaseResource.lease_id)
@@ -5628,14 +5683,13 @@ class BrokerService:
             select(Lease).where(
                 Lease.id.in_(lease_ids),
                 Lease.kind == "workload",
-                Lease.state.in_({"HELD", "ACTIVE"}),
+                Lease.state.in_({"HELD", "ACTIVE", "CONFLICT"}),
             )
         ).all()
         for lease in leases:
-            if session.scalar(
-                select(WorkloadBinding.id).where(WorkloadBinding.lease_id == lease.id)
-            ) is not None:
-                continue
+            bindings = session.scalars(
+                select(WorkloadBinding).where(WorkloadBinding.lease_id == lease.id)
+            ).all()
             resources = session.scalars(
                 select(LeaseResource).where(
                     LeaseResource.lease_id == lease.id,
@@ -5646,7 +5700,76 @@ class BrokerService:
                 resource.gpu_id: self._current_processes(session, resource.gpu_id, now)
                 for resource in resources
             }
-            if not resources or any(not processes_by_gpu[resource.gpu_id] for resource in resources):
+            resource_endpoint_ids = {
+                gpu.endpoint_id
+                for resource in resources
+                if (gpu := session.get(GPUDevice, resource.gpu_id)) is not None
+            }
+            legacy_binding_was_collector_owned = False
+            if len(bindings) == 1 and bindings[0].run_id == f"lease:{lease.id}":
+                legacy_binding_events = session.scalars(
+                    select(AuditEvent)
+                    .where(
+                        AuditEvent.action == "lease.workload_bound",
+                        AuditEvent.resource_type == "lease",
+                        AuditEvent.resource_id == lease.id,
+                    )
+                    .order_by(AuditEvent.id.desc())
+                ).all()
+                latest_legacy_binding_event = next(
+                    (
+                        event
+                        for event in legacy_binding_events
+                        if json_load(event.summary_json).get("run_id") in {None, bindings[0].run_id}
+                    ),
+                    None,
+                )
+                legacy_binding_was_collector_owned = bool(
+                    latest_legacy_binding_event is not None
+                    and json_load(latest_legacy_binding_event.summary_json).get("source")
+                    == "collector_observed"
+                    and latest_legacy_binding_event.actor_id == f"collector:{endpoint_id}"
+                )
+            collector_owned_routine_binding = bool(
+                len(bindings) == 1
+                and (
+                    bindings[0].run_id == f"collector:lease:{lease.id}"
+                    or legacy_binding_was_collector_owned
+                )
+                and lease.project_id == "agent"
+                and resource_endpoint_ids == {endpoint_id}
+            )
+            if (
+                resources
+                and observation_complete
+                and collector_owned_routine_binding
+                and lease.state == "CONFLICT"
+                and all(not processes_by_gpu[resource.gpu_id] for resource in resources)
+            ):
+                before = self._lease_dict(session, lease)
+                lease.state = "ACTIVE"
+                lease.last_heartbeat_at = now
+                request = session.get(AllocationRequest, lease.request_id)
+                if request is not None:
+                    request.state = "ACTIVE"
+                    request.updated_at = now
+                self._resolve_lease_alerts(session, lease.id, now)
+                self._audit(
+                    session,
+                    actor_id=f"collector:{endpoint_id}",
+                    action="lease.conflict_resolved",
+                    resource_type="lease",
+                    resource_id=lease.id,
+                    result="success",
+                    before=before,
+                    after=self._lease_dict(session, lease),
+                    summary={"source": "complete_empty_routine_retry_window"},
+                    now=now,
+                )
+                continue
+            if not resources or any(
+                not processes_by_gpu[resource.gpu_id] for resource in resources
+            ):
                 continue
             process_keys = sorted(
                 {
@@ -5655,16 +5778,33 @@ class BrokerService:
                     for process in processes
                 }
             )
-            run_id = f"lease:{lease.id}"
-            before = self._lease_dict(session, lease)
-            session.add(
-                WorkloadBinding(
-                    lease_id=lease.id,
-                    run_id=run_id,
-                    process_keys_json=json_dump(process_keys),
-                    created_at=now,
-                )
+            known_process_keys = {
+                process_key
+                for binding in bindings
+                for process_key in json_load(binding.process_keys_json)
+            }
+            replacing_complete_routine_cohort = bool(
+                collector_owned_routine_binding
+                and observation_complete
+                and known_process_keys.isdisjoint(process_keys)
             )
+            if bindings and not replacing_complete_routine_cohort:
+                continue
+            run_id = f"collector:lease:{lease.id}"
+            before = self._lease_dict(session, lease)
+            if replacing_complete_routine_cohort:
+                bindings[0].process_keys_json = json_dump(process_keys)
+                bindings[0].created_at = now
+                self._resolve_lease_alerts(session, lease.id, now)
+            else:
+                session.add(
+                    WorkloadBinding(
+                        lease_id=lease.id,
+                        run_id=run_id,
+                        process_keys_json=json_dump(process_keys),
+                        created_at=now,
+                    )
+                )
             lease.state = "ACTIVE"
             lease.activated_at = now
             lease.last_heartbeat_at = now
@@ -5694,9 +5834,14 @@ class BrokerService:
                 result="success",
                 after={"run_id": run_id, "process_key_count": len(process_keys)},
                 summary={
-                    "source": "collector_observed",
+                    "source": (
+                        "collector_observed_process_turnover"
+                        if replacing_complete_routine_cohort
+                        else "collector_observed"
+                    ),
                     "gpu_count": len(resources),
-                    "resolved_conflict": False,
+                    "resolved_conflict": replacing_complete_routine_cohort
+                    and before.get("state") == "CONFLICT",
                 },
                 now=now,
             )
@@ -6254,10 +6399,7 @@ class BrokerService:
                 # normal claim path never treats keepalive capacity as free:
                 # an adapter stop plus fresh empty observation must occur
                 # before the caller runs its ordinary claim.
-                if (
-                    not include_reclaimable_keepalive
-                    or state not in {"KEEPALIVE", "CONFLICT"}
-                ):
+                if not include_reclaimable_keepalive or state not in {"KEEPALIVE", "CONFLICT"}:
                     excluded[state.lower()] += 1
                     continue
                 excluded[state.lower()] += 1
@@ -6330,9 +6472,7 @@ class BrokerService:
                 if lease is None or lease.kind != "keepalive":
                     continue
                 status, _reason = self._keepalive_gpu_status(session, gpu, lease, now)
-                if (
-                    lease.state != "ACTIVE" or status not in {"ON", "OFF"}
-                ):
+                if lease.state != "ACTIVE" or status not in {"ON", "OFF"}:
                     return {
                         "snapshot_revision": self._revision(session),
                         "complete": False,
@@ -6509,9 +6649,7 @@ class BrokerService:
             return []
         allocated: list[str] = []
         requests = [
-            request
-            for request in self._queue_candidates(session, now)
-            if request.id in request_ids
+            request for request in self._queue_candidates(session, now) if request.id in request_ids
         ]
         for request in self._fair_order(session, requests, now):
             project = session.get(Project, request.project_id)
@@ -6946,12 +7084,17 @@ class BrokerService:
         *,
         reason: str,
         idempotency_key: str | None,
+        operator_override: bool = False,
     ) -> dict[str, Any]:
         self._require_role(actor, MUTATING_ROLES)
-        if not reason.strip():
+        if operator_override and actor.role not in {"operator", "admin"}:
             raise BrokerError(
-                "release_reason_required", "释放 GPU 时需要提供原因", status_code=422
+                "operator_role_required",
+                "human lease correction requires an operator role",
+                status_code=403,
             )
+        if not reason.strip():
+            raise BrokerError("release_reason_required", "释放 GPU 时需要提供原因", status_code=422)
 
         def operation(session: Session) -> dict[str, Any]:
             lease = session.get(Lease, lease_id)
@@ -6964,7 +7107,7 @@ class BrokerService:
                 )
                 if existing is not None:
                     return existing
-            if not self._can_manage_lease(actor, lease):
+            if not self._can_manage_lease(actor, lease) and not operator_override:
                 raise BrokerError(
                     "lease_forbidden", "不能释放其他 Agent 的 GPU 租约", status_code=403
                 )
@@ -6989,6 +7132,7 @@ class BrokerService:
             if request is not None:
                 request.state = "RELEASED"
                 request.updated_at = now
+            self._resolve_lease_alerts(session, lease.id, now)
             event = self._audit(
                 session,
                 actor_id=actor.id,
@@ -7174,9 +7318,7 @@ class BrokerService:
                     resource.released_at = None
             session.execute(delete(WorkloadBinding).where(WorkloadBinding.lease_id == lease.id))
             session.execute(
-                delete(LeaseEndpointCommitment).where(
-                    LeaseEndpointCommitment.lease_id == lease.id
-                )
+                delete(LeaseEndpointCommitment).where(LeaseEndpointCommitment.lease_id == lease.id)
             )
             request = session.get(AllocationRequest, lease.request_id)
             constraints = (
@@ -7190,8 +7332,12 @@ class BrokerService:
                     LeaseEndpointCommitment(
                         lease_id=lease.id,
                         endpoint_id=endpoint_id,
-                        cpu_cores=constraints.cpu_cores if constraints and constraints.cpu_cores else 0.0,
-                        memory_mib=constraints.memory_mib if constraints and constraints.memory_mib else 0,
+                        cpu_cores=constraints.cpu_cores
+                        if constraints and constraints.cpu_cores
+                        else 0.0,
+                        memory_mib=constraints.memory_mib
+                        if constraints and constraints.memory_mib
+                        else 0,
                         created_at=now,
                     )
                 )
@@ -7380,16 +7526,7 @@ class BrokerService:
             if request is not None:
                 request.state = "RELEASED"
                 request.updated_at = now
-            for alert in session.scalars(
-                select(Alert).where(
-                    Alert.alert_type == "lease_process_conflict",
-                    Alert.resource_type == "lease",
-                    Alert.resource_id == lease.id,
-                    Alert.active.is_(True),
-                )
-            ).all():
-                alert.active = False
-                alert.last_seen_at = now
+            self._resolve_lease_alerts(session, lease.id, now)
             event = self._audit(
                 session,
                 actor_id=actor.id,
@@ -7543,9 +7680,7 @@ class BrokerService:
                 )
             ).all()
             if not gpu_ids:
-                raise BrokerError(
-                    "lease_has_no_resources", "这个租约没有活动 GPU", status_code=409
-                )
+                raise BrokerError("lease_has_no_resources", "这个租约没有活动 GPU", status_code=409)
             now = utcnow()
             cutoff = now - timedelta(seconds=self.inventory.collector.stale_after_seconds)
             processes = session.scalars(
@@ -7567,8 +7702,21 @@ class BrokerService:
                     details={"missing_gpu_ids": missing_gpu_ids},
                 )
             process_keys = sorted({self._process_key(process) for process in processes})
-            run_id = binding.run_id or f"lease:{lease.id}"
+            run_id = binding.run_id or f"explicit:lease:{lease.id}"
             revision = self._bump_revision(session, now)
+            if binding.run_id is None:
+                collector_bindings = session.scalars(
+                    select(WorkloadBinding).where(
+                        WorkloadBinding.lease_id == lease.id,
+                        WorkloadBinding.run_id.in_(
+                            {f"collector:lease:{lease.id}", f"lease:{lease.id}"}
+                        ),
+                    )
+                ).all()
+                for collector_binding in collector_bindings:
+                    session.delete(collector_binding)
+                if collector_bindings:
+                    session.flush()
             existing_binding = session.scalar(
                 select(WorkloadBinding).where(
                     WorkloadBinding.lease_id == lease.id, WorkloadBinding.run_id == run_id
@@ -7673,6 +7821,7 @@ class BrokerService:
     def _reconcile_leases(self, session: Session, now: datetime, *, actor_id: str) -> None:
         """Fail closed on expiry and unexpected compute processes; never kill/restart anything."""
 
+        self._resolve_stale_lease_alerts(session, now)
         leases = session.scalars(select(Lease).where(Lease.state.in_(ACTIVE_LEASE_STATES))).all()
         expired_released = False
         for lease in leases:
@@ -7693,11 +7842,7 @@ class BrokerService:
                 for process in self._current_processes(session, resource.gpu_id, now)
             ]
             expires_at = _as_utc(lease.expires_at)
-            if (
-                lease.state in {"HELD", "ACTIVE"}
-                and expires_at is not None
-                and expires_at <= now
-            ):
+            if lease.state in {"HELD", "ACTIVE"} and expires_at is not None and expires_at <= now:
                 before = self._lease_dict(session, lease)
                 if processes:
                     lease.state = "ORPHANED_BUSY"
@@ -7736,12 +7881,15 @@ class BrokerService:
                 )
             elif lease.state in {"HELD", "ACTIVE"} and processes:
                 known_process_keys = self._binding_process_keys(session, lease.id)
+                unexpected_processes = [
+                    process
+                    for process in processes
+                    if self._process_key(process) not in known_process_keys
+                ]
                 if (
                     known_process_keys
-                    and not all(
-                        self._process_key(process) in known_process_keys for process in processes
-                    )
-                    and any(process.observations >= 2 for process in processes)
+                    and unexpected_processes
+                    and any(process.observations >= 2 for process in unexpected_processes)
                 ):
                     before = self._lease_dict(session, lease)
                     lease.state = "CONFLICT"
@@ -7765,6 +7913,7 @@ class BrokerService:
                         after=self._lease_dict(session, lease),
                         now=now,
                     )
+        self._resolve_stale_lease_alerts(session, now)
         if expired_released:
             self._allocate_queued(session, now, self._revision(session))
 
@@ -7912,8 +8061,7 @@ class BrokerService:
                     )
                 ).all()
                 if any(
-                    (expires_at := _as_utc(lease.expires_at)) is None
-                    or expires_at > start_at
+                    (expires_at := _as_utc(lease.expires_at)) is None or expires_at > start_at
                     for lease in leases
                 ):
                     raise BrokerError(
@@ -9030,6 +9178,7 @@ class BrokerService:
                     "access_hint": target["access_hint"],
                 },
             )
+
         def prepare(
             session: Session,
         ) -> tuple[str, bool, bool, dict[str, Any] | None]:
@@ -9807,9 +9956,10 @@ class BrokerService:
                 for field in fields.intersection(protected_keepalive_fields)
                 if values[field] != getattr(endpoint, field)
             )
-            if changed_protected_fields and self._active_keepalive_for_endpoint(
-                session, endpoint.id
-            ) is not None:
+            if (
+                changed_protected_fields
+                and self._active_keepalive_for_endpoint(session, endpoint.id) is not None
+            ):
                 raise BrokerError(
                     "keepalive_endpoint_connection_in_use",
                     "stop the active endpoint keepalive before changing its connection or verification settings",
@@ -10009,7 +10159,6 @@ class BrokerService:
 
         return self._write(operation)
 
-
     def upsert_endpoint(
         self, actor: ActorContext, endpoint_data: EndpointUpsert, *, idempotency_key: str
     ) -> dict[str, Any]:
@@ -10088,9 +10237,10 @@ class BrokerService:
                     for field, value in protected_values.items()
                     if value != getattr(endpoint, field)
                 )
-                if changed_protected_fields and self._active_keepalive_for_endpoint(
-                    session, endpoint.id
-                ) is not None:
+                if (
+                    changed_protected_fields
+                    and self._active_keepalive_for_endpoint(session, endpoint.id) is not None
+                ):
                     raise BrokerError(
                         "keepalive_endpoint_connection_in_use",
                         "stop the active endpoint keepalive before changing its connection or verification settings",
@@ -10454,9 +10604,7 @@ class BrokerService:
                 project_ids = session.scalars(
                     select(ActorProject.project_id).where(ActorProject.actor_id == item.id)
                 ).all()
-                values.append(
-                    self._actor_dict(item, project_ids)
-                )
+                values.append(self._actor_dict(item, project_ids))
             return self.envelope(session, values)
 
         return self._read(operation)

@@ -20,7 +20,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import Depends, FastAPI, Form, Header, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
@@ -109,15 +115,11 @@ def _public_error_message(exc: BrokerError) -> str:
         "keepalive_cuda_architecture_unsupported": (
             "远端 PyTorch 的 CUDA 内核不支持这台服务器的 GPU 架构。"
         ),
-        "keepalive_pytorch_cuda_required": (
-            "远端占卡程序使用的 Python 缺少支持 CUDA 的 PyTorch。"
-        ),
+        "keepalive_pytorch_cuda_required": ("远端占卡程序使用的 Python 缺少支持 CUDA 的 PyTorch。"),
         "keepalive_cuda_index_mapping_failed": (
             "远端占卡程序无法把目标 GPU UUID 映射到当前 CUDA 设备编号。"
         ),
-        "keepalive_cuda_uuid_not_found": (
-            "远端当前 PCI GPU 清单中找不到目标 GPU UUID。"
-        ),
+        "keepalive_cuda_uuid_not_found": ("远端当前 PCI GPU 清单中找不到目标 GPU UUID。"),
         "keepalive_outcome_uncertain": "占卡程序返回结果不确定，本次没有分配任务。",
         "keepalive_adapter_failed": "占卡程序启动或停止失败；下一采集周期会继续尝试。",
         "keepalive_cleanup_failed": "占卡异常且未能完成清理；请在 APP 中确认该 GPU 的实际状态。",
@@ -345,7 +347,9 @@ def create_app(
                 for transition in transitions
                 if isinstance(transition, dict) and transition.get("endpoint_id") == endpoint_id
             ]
-            starts = [transition for transition in transitions if transition.get("action") == "start"]
+            starts = [
+                transition for transition in transitions if transition.get("action") == "start"
+            ]
             stops = [transition for transition in transitions if transition.get("action") == "stop"]
             if not starts and not stops:
                 return service.get_endpoint_keepalive_summary(endpoint_id)
@@ -504,7 +508,10 @@ def create_app(
                         )
                     except BrokerError as exc:
                         stop_failures.append(
-                            {"gpu_id": gpu_id, "code": exc.code if adapter_code == "" else adapter_code}
+                            {
+                                "gpu_id": gpu_id,
+                                "code": exc.code if adapter_code == "" else adapter_code,
+                            }
                         )
 
                 if stop_failures:
@@ -804,7 +811,9 @@ def create_app(
     # identity, and all execution stays behind the service transition plan.
     app.state.reconcile_endpoint_keepalive = reconcile_endpoint_keepalive
     limiter = RateLimiter(settings.rate_limit_per_minute)
-    app.add_middleware(SessionMiddleware, secret_key=settings.session_secret or secrets.token_urlsafe(32))
+    app.add_middleware(
+        SessionMiddleware, secret_key=settings.session_secret or secrets.token_urlsafe(32)
+    )
     app.mount(
         "/static",
         StaticFiles(directory=str(Path(__file__).parent / "web" / "static")),
@@ -839,7 +848,9 @@ def create_app(
         )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    async def validation_error_handler(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
         return JSONResponse(
             status_code=422,
             content={
@@ -904,7 +915,11 @@ def create_app(
             None,
         )
         id_owner = next(
-            (endpoint for endpoint in endpoints if endpoint["id"] == (endpoint_id or parsed.endpoint_id)),
+            (
+                endpoint
+                for endpoint in endpoints
+                if endpoint["id"] == (endpoint_id or parsed.endpoint_id)
+            ),
             None,
         )
         id_collision = id_owner if id_owner is not None and id_owner is not same_address else None
@@ -1016,7 +1031,9 @@ def create_app(
         values = service.list_gpus(actor)["data"]
         value = next((item for item in values if item["id"] == gpu_id), None)
         if value is None:
-            raise BrokerError("gpu_not_found", "GPU is not visible or does not exist", status_code=404)
+            raise BrokerError(
+                "gpu_not_found", "GPU is not visible or does not exist", status_code=404
+            )
         return {"schema_version": SCHEMA_VERSION, "data": value}
 
     @app.get("/api/v1/gpus/{gpu_id}/history")
@@ -1067,7 +1084,16 @@ def create_app(
         output = io.StringIO()
         writer = csv.DictWriter(
             output,
-            fieldnames=["id", "created_at", "actor_id", "action", "resource_type", "resource_id", "result", "summary"],
+            fieldnames=[
+                "id",
+                "created_at",
+                "actor_id",
+                "action",
+                "resource_type",
+                "resource_id",
+                "result",
+                "summary",
+            ],
         )
         writer.writeheader()
         for value in values:
@@ -1083,9 +1109,7 @@ def create_app(
         return service.list_projects(actor)
 
     @app.get("/api/v1/workload-profiles")
-    def workload_profiles(
-        actor: ApiActor, project_id: str | None = None
-    ) -> dict[str, Any]:
+    def workload_profiles(actor: ApiActor, project_id: str | None = None) -> dict[str, Any]:
         return service.list_workload_profiles(actor, project_id=project_id)
 
     @app.get("/api/v1/scheduler-targets")
@@ -1313,7 +1337,9 @@ def create_app(
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        return service.activate_lease(actor, lease_id, idempotency_key=_idempotency_key(idempotency_key))
+        return service.activate_lease(
+            actor, lease_id, idempotency_key=_idempotency_key(idempotency_key)
+        )
 
     @app.post("/api/v1/leases/{lease_id}/renew")
     def renew_lease(
@@ -1321,7 +1347,9 @@ def create_app(
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        return service.renew_lease(actor, lease_id, idempotency_key=_idempotency_key(idempotency_key))
+        return service.renew_lease(
+            actor, lease_id, idempotency_key=_idempotency_key(idempotency_key)
+        )
 
     @app.post("/api/v1/leases/{lease_id}/release")
     def release_lease(
@@ -1347,6 +1375,32 @@ def create_app(
             lease_id,
             reason="workload_completed",
             idempotency_key=None,
+        )
+
+    @app.post("/api/v1/operator/leases/{lease_id}/release")
+    def operator_release_lease(
+        request: Request,
+        lease_id: str,
+        body: dict[str, str],
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        """Human correction surface for the loopback App only."""
+
+        if request.headers.get("x-serverpilot-client") != "desktop-app":
+            raise BrokerError(
+                "operator_client_required",
+                "human lease correction is only available to the local App",
+                status_code=403,
+            )
+        label = request.headers.get("x-serverpilot-actor", "human").strip() or "human"
+        local = service.local_actor(label)
+        actor = ActorContext(id=local.id, role="operator", project_ids=local.project_ids)
+        return service.release_lease(
+            actor,
+            lease_id,
+            reason=body.get("reason", ""),
+            idempotency_key=_idempotency_key(idempotency_key),
+            operator_override=True,
         )
 
     @app.patch("/api/v1/leases/{lease_id}/gpus")
@@ -1633,7 +1687,9 @@ def create_app(
         parsed = parsed_ssh_command(preview.command)
         project_ids = ssh_projects(preview.project_ids)
         existing_endpoint, id_collision = ssh_endpoint_state(actor, parsed)
-        endpoint_id = existing_endpoint["id"] if existing_endpoint is not None else parsed.endpoint_id
+        endpoint_id = (
+            existing_endpoint["id"] if existing_endpoint is not None else parsed.endpoint_id
+        )
         endpoint = {
             "id": endpoint_id,
             "host": parsed.host,
@@ -1648,7 +1704,13 @@ def create_app(
             "project_ids": project_ids,
             "enabled": True,
         }
-        status = "existing" if existing_endpoint is not None else "id_collision" if id_collision else "new"
+        status = (
+            "existing"
+            if existing_endpoint is not None
+            else "id_collision"
+            if id_collision
+            else "new"
+        )
         return {
             "data": {
                 "status": status,
@@ -1723,18 +1785,48 @@ def create_app(
             try:
                 parsed = parsed_ssh_command(command)
             except BrokerError as exc:
-                entries.append({"line": line_number, "command": command, "status": "invalid", "error": _public_error_message(exc)})
+                entries.append(
+                    {
+                        "line": line_number,
+                        "command": command,
+                        "status": "invalid",
+                        "error": _public_error_message(exc),
+                    }
+                )
                 continue
             address = (parsed.host, parsed.port)
             if address in seen_addresses:
-                entries.append({"line": line_number, "command": command, "status": "duplicate", "error": "同一 host:port 已在本次粘贴中出现"})
+                entries.append(
+                    {
+                        "line": line_number,
+                        "command": command,
+                        "status": "duplicate",
+                        "error": "同一 host:port 已在本次粘贴中出现",
+                    }
+                )
                 continue
             seen_addresses.add(address)
-            existing = next((endpoint for endpoint in endpoints if (endpoint["host"], endpoint["port"]) == address), None)
-            id_owner = next((endpoint for endpoint in endpoints if endpoint["id"] == parsed.endpoint_id), None)
+            existing = next(
+                (
+                    endpoint
+                    for endpoint in endpoints
+                    if (endpoint["host"], endpoint["port"]) == address
+                ),
+                None,
+            )
+            id_owner = next(
+                (endpoint for endpoint in endpoints if endpoint["id"] == parsed.endpoint_id), None
+            )
             id_collision = id_owner if id_owner is not None and id_owner is not existing else None
             if id_collision is not None:
-                entries.append({"line": line_number, "command": command, "status": "id_collision", "error": "服务器名称与另一台服务器冲突"})
+                entries.append(
+                    {
+                        "line": line_number,
+                        "command": command,
+                        "status": "id_collision",
+                        "error": "服务器名称与另一台服务器冲突",
+                    }
+                )
                 continue
             endpoint_id = existing["id"] if existing is not None else parsed.endpoint_id
             entries.append(
@@ -1775,17 +1867,40 @@ def create_app(
             try:
                 parsed = parsed_ssh_command(command)
             except BrokerError as exc:
-                results.append({"line": line_number, "status": "invalid", "error": _public_error_message(exc)})
+                results.append(
+                    {"line": line_number, "status": "invalid", "error": _public_error_message(exc)}
+                )
                 continue
             address = (parsed.host, parsed.port)
             if address in seen_addresses:
-                results.append({"line": line_number, "status": "duplicate", "error": "同一 host:port 已在本次粘贴中出现"})
+                results.append(
+                    {
+                        "line": line_number,
+                        "status": "duplicate",
+                        "error": "同一 host:port 已在本次粘贴中出现",
+                    }
+                )
                 continue
             seen_addresses.add(address)
-            existing = next((endpoint for endpoint in endpoints if (endpoint["host"], endpoint["port"]) == address), None)
-            id_owner = next((endpoint for endpoint in endpoints if endpoint["id"] == parsed.endpoint_id), None)
+            existing = next(
+                (
+                    endpoint
+                    for endpoint in endpoints
+                    if (endpoint["host"], endpoint["port"]) == address
+                ),
+                None,
+            )
+            id_owner = next(
+                (endpoint for endpoint in endpoints if endpoint["id"] == parsed.endpoint_id), None
+            )
             if id_owner is not None and id_owner is not existing:
-                results.append({"line": line_number, "status": "id_collision", "error": "服务器名称与另一台服务器冲突"})
+                results.append(
+                    {
+                        "line": line_number,
+                        "status": "id_collision",
+                        "error": "服务器名称与另一台服务器冲突",
+                    }
+                )
                 continue
             endpoint_id = existing["id"] if existing is not None else parsed.endpoint_id
             try:
@@ -1807,13 +1922,27 @@ def create_app(
                     idempotency_key=secrets.token_hex(16),
                 )
             except BrokerError as exc:
-                results.append({"line": line_number, "status": "error", "error": _public_error_message(exc)})
+                results.append(
+                    {"line": line_number, "status": "error", "error": _public_error_message(exc)}
+                )
                 continue
             endpoints.append(result["endpoint"])
-            results.append({"line": line_number, "status": "updated" if existing is not None else "registered", "endpoint": result["endpoint"]})
+            results.append(
+                {
+                    "line": line_number,
+                    "status": "updated" if existing is not None else "registered",
+                    "endpoint": result["endpoint"],
+                }
+            )
         registered_count = sum(result["status"] == "registered" for result in results)
         updated_count = sum(result["status"] == "updated" for result in results)
-        return {"data": {"entries": results, "registered_count": registered_count, "updated_count": updated_count}}
+        return {
+            "data": {
+                "entries": results,
+                "registered_count": registered_count,
+                "updated_count": updated_count,
+            }
+        }
 
     @app.post("/api/v1/actors")
     def create_actor(
@@ -1821,7 +1950,9 @@ def create_app(
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        return service.create_actor(actor, actor_data, idempotency_key=_idempotency_key(idempotency_key))
+        return service.create_actor(
+            actor, actor_data, idempotency_key=_idempotency_key(idempotency_key)
+        )
 
     @app.post("/api/v1/retention/prune")
     def prune_telemetry(
@@ -1840,7 +1971,9 @@ def create_app(
         actor: ApiActor,
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     ) -> dict[str, Any]:
-        _idempotency_key(idempotency_key)  # reconciliation is auditable but not re-run by the service yet.
+        _idempotency_key(
+            idempotency_key
+        )  # reconciliation is auditable but not re-run by the service yet.
         return service.reconcile(actor)
 
     # ---- Server-sent event replay ---------------------------------------------
@@ -1852,14 +1985,18 @@ def create_app(
         last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
     ) -> StreamingResponse:
         try:
-            actor = session_actor(request) if request.session.get("actor_id") else api_actor(request)
+            actor = (
+                session_actor(request) if request.session.get("actor_id") else api_actor(request)
+            )
         except BrokerError:
             raise
 
         try:
             replay_cursor = max(after_id, int(last_event_id or "0"))
         except ValueError:
-            raise BrokerError("invalid_event_cursor", "Last-Event-ID must be an integer", status_code=422) from None
+            raise BrokerError(
+                "invalid_event_cursor", "Last-Event-ID must be an integer", status_code=422
+            ) from None
 
         async def generator() -> AsyncIterator[str]:
             cursor = replay_cursor
@@ -1878,7 +2015,9 @@ def create_app(
 
     # ---- Functional web GUI ----------------------------------------------------
 
-    def ui_context(request: Request, actor: ActorContext | None, *, page: str, payload: Any = None) -> dict[str, Any]:
+    def ui_context(
+        request: Request, actor: ActorContext | None, *, page: str, payload: Any = None
+    ) -> dict[str, Any]:
         return {
             "request": request,
             "page": page,
@@ -1944,20 +2083,29 @@ def create_app(
         if page == "leases":
             return {"leases": service.list_leases(actor)["data"]}
         if page == "reservations":
-            return {**ui_reference_data(actor), "reservations": service.list_reservations(actor)["data"]}
+            return {
+                **ui_reference_data(actor),
+                "reservations": service.list_reservations(actor)["data"],
+            }
         if page == "identities":
             return {
                 **ui_reference_data(actor),
                 "actors": service.list_actors(actor)["data"] if actor.is_admin else [],
             }
         if page == "maintenance":
-            return {**ui_reference_data(actor), "maintenance": service.list_maintenance(actor)["data"]}
+            return {
+                **ui_reference_data(actor),
+                "maintenance": service.list_maintenance(actor)["data"],
+            }
         if page == "alerts":
             return {"alerts": service.list_alerts(actor)["data"]}
         if page == "audit":
             return {"events": service.list_events(actor, latest_first=True)["data"]}
         if page == "doctor":
-            return {"doctor": service.doctor(actor)["data"], "config": service.effective_config(actor)["data"]}
+            return {
+                "doctor": service.doctor(actor)["data"],
+                "config": service.effective_config(actor)["data"],
+            }
         raise BrokerError("page_not_found", "web page does not exist", status_code=404)
 
     @app.get("/", response_class=HTMLResponse)
@@ -1975,9 +2123,13 @@ def create_app(
     @app.get("/ui/gpus/{gpu_id}", response_class=HTMLResponse)
     def web_gpu_detail(gpu_id: str, request: Request) -> HTMLResponse:
         actor = session_actor(request)
-        data = next((item for item in service.list_gpus(actor)["data"] if item["id"] == gpu_id), None)
+        data = next(
+            (item for item in service.list_gpus(actor)["data"] if item["id"] == gpu_id), None
+        )
         if data is None:
-            raise BrokerError("gpu_not_found", "GPU is not visible or does not exist", status_code=404)
+            raise BrokerError(
+                "gpu_not_found", "GPU is not visible or does not exist", status_code=404
+            )
         return templates.TemplateResponse(
             request,
             "page.html",
@@ -2042,9 +2194,13 @@ def create_app(
         except ValueError as exc:
             raise BrokerError("invalid_form_number", f"{name} 必须是数字", status_code=422) from exc
         if minimum is not None and number < minimum:
-            raise BrokerError("invalid_form_number", f"{name} 不能小于 {minimum:g}", status_code=422)
+            raise BrokerError(
+                "invalid_form_number", f"{name} 不能小于 {minimum:g}", status_code=422
+            )
         if maximum is not None and number > maximum:
-            raise BrokerError("invalid_form_number", f"{name} 不能大于 {maximum:g}", status_code=422)
+            raise BrokerError(
+                "invalid_form_number", f"{name} 不能大于 {maximum:g}", status_code=422
+            )
         return number
 
     def _form_boolean(form: Any, name: str) -> bool:
@@ -2096,7 +2252,9 @@ def create_app(
             return {
                 "project_id": _form_value(form, "project_id", required=True),
                 "task_ref": task_ref,
-                "purpose": task_ref if action == "quick-claim" else _form_value(form, "purpose", required=True),
+                "purpose": task_ref
+                if action == "quick-claim"
+                else _form_value(form, "purpose", required=True),
                 "gpu_count": len(gpu_ids) or _form_int(form, "gpu_count", required=True, minimum=1),
                 "min_available_cpu_cores": _form_float(form, "min_available_cpu_cores", minimum=0),
                 "min_available_memory_mib": min_available_memory_gib * 1024
@@ -2143,9 +2301,13 @@ def create_app(
             assert target is not None
             target_type, separator, target_id = target.partition("|")
             if not separator or not target_id:
-                raise BrokerError("invalid_maintenance_target", "请选择有效的维护对象", status_code=422)
+                raise BrokerError(
+                    "invalid_maintenance_target", "请选择有效的维护对象", status_code=422
+                )
             if target_type not in {"endpoint", "gpu"}:
-                raise BrokerError("invalid_maintenance_target", "维护对象必须是 endpoint 或 GPU", status_code=422)
+                raise BrokerError(
+                    "invalid_maintenance_target", "维护对象必须是 endpoint 或 GPU", status_code=422
+                )
             return {
                 "endpoint_id": target_id if target_type == "endpoint" else None,
                 "gpu_id": target_id if target_type == "gpu" else None,
@@ -2159,7 +2321,9 @@ def create_app(
                 "note": _form_value(form, "note"),
             }
         if action == "workload-profile":
-            duration_hours = _form_int(form, "duration_hours", required=True, minimum=1, maximum=720)
+            duration_hours = _form_int(
+                form, "duration_hours", required=True, minimum=1, maximum=720
+            )
             gpu_count = _form_int(form, "gpu_count", required=True, minimum=1)
             min_available_memory_gib = _form_int(form, "min_available_memory_gib", minimum=0)
             min_total_gib = _form_int(form, "min_total_vram_gib", minimum=1)
@@ -2173,11 +2337,15 @@ def create_app(
                 "duration_seconds": duration_hours * 3600,
                 "constraints": {
                     "gpu_count": gpu_count,
-                    "min_available_cpu_cores": _form_float(form, "min_available_cpu_cores", minimum=0),
+                    "min_available_cpu_cores": _form_float(
+                        form, "min_available_cpu_cores", minimum=0
+                    ),
                     "min_available_memory_mib": min_available_memory_gib * 1024
                     if min_available_memory_gib is not None
                     else None,
-                    "min_total_vram_mib": min_total_gib * 1024 if min_total_gib is not None else None,
+                    "min_total_vram_mib": min_total_gib * 1024
+                    if min_total_gib is not None
+                    else None,
                     "min_free_vram_mib": min_free_gib * 1024 if min_free_gib is not None else None,
                     "placement": "pack",
                     "endpoint_ids": _form_list(form, "endpoint_ids"),
@@ -2211,7 +2379,9 @@ def create_app(
                 "labels": _csv_values(_form_value(form, "labels")),
                 "storage_group": _form_value(form, "storage_group"),
                 "expected_gpu_count": _form_int(form, "expected_gpu_count", minimum=1),
-                "expected_gpu_total_vram_mib": _form_int(form, "expected_gpu_total_vram_mib", minimum=1),
+                "expected_gpu_total_vram_mib": _form_int(
+                    form, "expected_gpu_total_vram_mib", minimum=1
+                ),
                 # Project ownership is the endpoint mutation boundary.  The
                 # legacy list stays populated for older REST clients.
                 "owner_project_id": owner_project_id,
@@ -2262,14 +2432,20 @@ def create_app(
         try:
             actor = session_actor(request)
             if not csrf or csrf != request.session.get("csrf"):
-                raise BrokerError("csrf_failed", "表单会话已失效，请刷新页面后重试", status_code=403)
+                raise BrokerError(
+                    "csrf_failed", "表单会话已失效，请刷新页面后重试", status_code=403
+                )
             if confirmed != "yes":
-                raise BrokerError("confirmation_required", "请先确认本次操作的影响范围", status_code=422)
+                raise BrokerError(
+                    "confirmation_required", "请先确认本次操作的影响范围", status_code=422
+                )
             if payload and payload.strip():
                 try:
                     data = json.loads(payload)
                 except json.JSONDecodeError as exc:
-                    raise BrokerError("invalid_json", "高级模式的 JSON payload 无效", status_code=422) from exc
+                    raise BrokerError(
+                        "invalid_json", "高级模式的 JSON payload 无效", status_code=422
+                    ) from exc
             else:
                 data = ui_form_payload(action, await request.form())
             key = secrets.token_hex(16)
@@ -2311,7 +2487,9 @@ def create_app(
                 result = service.bind_workload(
                     actor,
                     data["lease_id"],
-                    LeaseBind.model_validate({"run_id": data["run_id"], "process_keys": data.get("process_keys", [])}),
+                    LeaseBind.model_validate(
+                        {"run_id": data["run_id"], "process_keys": data.get("process_keys", [])}
+                    ),
                     idempotency_key=key,
                 )
             elif action == "ack-alert":
@@ -2328,7 +2506,9 @@ def create_app(
                     idempotency_key=key,
                 )
             elif action == "actor":
-                result = service.create_actor(actor, ActorCreate.model_validate(data), idempotency_key=key)
+                result = service.create_actor(
+                    actor, ActorCreate.model_validate(data), idempotency_key=key
+                )
             elif action == "reconcile":
                 result = service.reconcile(actor)
             elif action == "prune-telemetry":

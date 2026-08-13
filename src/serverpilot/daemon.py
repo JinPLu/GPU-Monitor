@@ -35,7 +35,9 @@ LEGACY_DAEMON_LABEL = "local.gpu-broker.daemon"
 # process as stale and restarts the owned LaunchAgent.  This is deliberately a
 # feature capability (rather than a timestamp or package version): it is
 # stable across installs and cannot be spoofed by an unchanged semver.
-EXPECTED_CAPABILITIES = frozenset({"coordination_board", "endpoint_conflict_cleanup"})
+EXPECTED_CAPABILITIES = frozenset(
+    {"coordination_board", "endpoint_conflict_cleanup", "operator_lease_release"}
+)
 DAEMON_PROTOCOL = "macos-launchagent-v1"
 
 

@@ -155,6 +155,39 @@ final class FixtureModeUITests: XCTestCase {
         )
     }
 
+    func testKeepaliveRecoveryUsesCanonicalAvailabilityAndDesiredState() {
+        relaunch(fixture: "keepalive-recovery", section: "server-pool")
+
+        let serverRow = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label CONTAINS %@", "ssh -p 2235 gpu@10.20.0.33")
+        ).firstMatch
+        XCTAssertTrue(serverRow.waitForExistence(timeout: 5))
+        serverRow.click()
+
+        let conflictedKeeper = app.buttons.matching(
+            NSPredicate(format: "label == %@", "GPU 0")
+        ).firstMatch
+        XCTAssertTrue(conflictedKeeper.waitForExistence(timeout: 2))
+        let conflictedValue = String(describing: conflictedKeeper.value)
+        XCTAssertTrue(
+            conflictedValue.contains("任务使用中"),
+            "A fail-closed keeper must prefer the broker's canonical public status"
+        )
+        XCTAssertFalse(
+            conflictedValue.contains("可用"),
+            "A CONFLICT GPU must never be presented as available"
+        )
+
+        let stoppedKeeper = app.buttons.matching(
+            NSPredicate(format: "label == %@", "GPU 1")
+        ).firstMatch
+        XCTAssertTrue(stoppedKeeper.waitForExistence(timeout: 2))
+        XCTAssertTrue(
+            String(describing: stoppedKeeper.value).contains("可用 · 占卡未运行"),
+            "desired=ON and actual=OFF must remain distinct from an unopened occupancy policy"
+        )
+    }
+
     func testResourceTableHeadersToggleSortDirection() {
         let gpuSort = app.buttons["按GPU 利用排序"]
         XCTAssertTrue(gpuSort.waitForExistence(timeout: 5), "GPU utilization header must be directly sortable")

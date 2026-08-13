@@ -29,7 +29,7 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `382` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过；覆盖 endpoint workspace 投影、迁移保留旧记录、workspace 内固定 helper 入口、三工具 MCP、占卡 ON/OFF 下的 routine 工具调用、daemon 重启不扰动 helper、业务进程替代 keeper 时 fail closed、keeper 启动与 Agent 申请串行，以及无容量重试、同机双卡、顶层/逐行兼容集合投影、逐卡单 UUID 新字段、跨 endpoint 去歧义、申请、释放和让位路径 |
+| Python 全量测试 | `393` 项 collected，`PYTHONPATH=src uv run --reinstall-package serverpilot pytest -q` 通过；覆盖 endpoint workspace 投影、迁移保留旧记录、workspace 内固定 helper 入口、三工具 MCP、占卡 ON/OFF 下的 routine 工具调用、daemon 重启不扰动 helper、业务进程替代 keeper 时 fail closed、routine 完整进程换代自动恢复、终态 lease 告警自愈、APP operator 释放、keeper 启动与 Agent 申请串行，以及无容量重试、同机双卡、顶层/逐行兼容集合投影、逐卡单 UUID 新字段、跨 endpoint 去歧义、申请、释放和让位路径 |
 | Ruff | `.venv/bin/ruff check src tests` 通过 |
 | 数据迁移 | 当前源码迁移头 `20260813_0024`；`keepalive_current` 保存 `actual/error_reason` 与逐卡唯一进程身份，只把仍有 active resource 的活动 keepalive lease 转为无 TTL，保留 terminal keeper 与 workload 历史 expiry |
 | MCP 上下文 | 默认发现结果严格为 3 个工具；instructions 直接说明远端 workspace、顶层完整 selector、逐卡 selector、CUDA gate、失败释放和有限重试；schema 和返回投影都有字段白名单测试 |
@@ -43,6 +43,8 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 四项核心功能的收敛决定记录在 `docs/teamwork/cases/c-f379fac55e2c1c893405737d74f7bdc3c2f3615e8a9fbb15e1aeff3b9c389dca/decision.md`。
 
 service 快照直接提供统一的 `publicly_available` 和简短中文 `public_status`；routine MCP 与 Web 只投影这份结果，不再各自判断占卡容量。API 与 Swift 模型分别校验 `desired=ON/OFF` 与 `actual=ON/OFF/ERROR`，遇到未知值会明确拒绝。
+
+原生 APP 同样直接读取 `desired / actual / publicly_available / public_status`；`CONFLICT` 或其他不可申请状态不会再显示“可用”，`desired=ON, actual=OFF` 显示“占卡未运行”。普通 routine Agent 在同一 lease 内完整换代进程时会自动更新 collector binding；只有旧进程已经全部退出、完整 endpoint 采集确认每张租用 GPU 都出现新进程、且 binding 是 collector 自动建立时才恢复。新进程必须自身连续观测两次才触发冲突；完整采集确认重试窗口暂时为空时保留 lease 并清掉瞬态冲突。旧新进程稳定并存、不完整采集、非 routine 项目和显式高级 binding 仍保持 fail closed。租约终止或不再拥有活动资源时，lease-scoped 冲突/孤儿告警会立即关闭；初始化与 reconcile 会自愈历史陈旧告警。APP 通过独立 operator 路由释放用户已确认结束的 Agent 租约，routine Agent 仍只能释放自己的 lease。
 
 ## 已完成现场验收
 

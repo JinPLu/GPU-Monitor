@@ -1,0 +1,139 @@
+{
+  "schema_version": "v1",
+  "snapshot_revision": 212,
+  "server_time": "2026-08-13T12:00:00Z",
+  "data": {
+    "current": {
+      "summary": {
+        "online_servers": 1,
+        "total_servers": 1,
+        "total_gpus": 2,
+        "available_gpus": 1,
+        "busy_gpus": 1,
+        "claimed_gpus": 0,
+        "abnormal_gpus": 1
+      },
+      "endpoints": [
+        {
+          "id": "keepalive-recovery-node",
+          "host": "10.20.0.33",
+          "port": 2235,
+          "ssh_user": "gpu",
+          "workspace_path": "/srv/serverpilot-fixtures",
+          "observation_profile": "server-script-v1",
+          "keepalive_adapter_id": "server-script-v1",
+          "keepalive": {
+            "configured": true,
+            "policy": "idle_keepalive",
+            "desired": "ON",
+            "actual": "ERROR",
+            "state": "ERROR",
+            "active_gpu_count": 0,
+            "error_gpu_count": 1,
+            "eligible_idle_gpu_count": 1,
+            "reasons": [
+              {
+                "gpu_id": "keepalive-recovery-node:GPU-KEEPALIVE-CONFLICT",
+                "reason": "占卡进程身份尚未建立"
+              }
+            ]
+          },
+          "enabled": true,
+          "lifecycle_state": "active",
+          "monitor": {
+            "status": "ONLINE",
+            "last_success_at": "2026-08-13T11:59:58Z"
+          },
+          "host_telemetry": {
+            "cpu_count": 64,
+            "load_1m": 8.0,
+            "memory_total_mib": 262144,
+            "memory_available_mib": 196608
+          }
+        }
+      ],
+      "gpus": [
+        {
+          "id": "keepalive-recovery-node:GPU-KEEPALIVE-CONFLICT",
+          "endpoint_id": "keepalive-recovery-node",
+          "gpu_uuid": "GPU-KEEPALIVE-CONFLICT",
+          "gpu_index": 0,
+          "name": "NVIDIA A100-SXM4-80GB",
+          "total_vram_mib": 81920,
+          "enabled": true,
+          "state": "CONFLICT",
+          "state_reason": "lease/process attribution conflict",
+          "publicly_available": false,
+          "public_status": "任务使用中",
+          "keepalive": {
+            "configured": true,
+            "policy": "idle_keepalive",
+            "desired": "ON",
+            "actual": "ERROR",
+            "state": "ERROR",
+            "reason": "占卡进程身份尚未建立",
+            "lease_id": "keepalive-recovery-lease"
+          },
+          "telemetry": {
+            "memory_used_mib": 25395,
+            "gpu_utilization_pct": 35,
+            "temperature_c": 52
+          },
+          "processes": [
+            {
+              "pid": 4300,
+              "username": "gpu",
+              "executable": "python",
+              "used_memory_mib": 25395
+            }
+          ]
+        },
+        {
+          "id": "keepalive-recovery-node:GPU-KEEPALIVE-OFF",
+          "endpoint_id": "keepalive-recovery-node",
+          "gpu_uuid": "GPU-KEEPALIVE-OFF",
+          "gpu_index": 1,
+          "name": "NVIDIA A100-SXM4-80GB",
+          "total_vram_mib": 81920,
+          "enabled": true,
+          "state": "AVAILABLE",
+          "publicly_available": true,
+          "public_status": "可用 · 占卡未运行",
+          "keepalive": {
+            "configured": true,
+            "policy": "idle_keepalive",
+            "desired": "ON",
+            "actual": "OFF",
+            "state": "OFF"
+          },
+          "telemetry": {
+            "memory_used_mib": 0,
+            "gpu_utilization_pct": 0,
+            "temperature_c": 34
+          },
+          "processes": []
+        }
+      ],
+      "leases": [],
+      "requests": [],
+      "reservations": [],
+      "data_age_seconds": 2,
+      "freshness_seconds": 30,
+      "admission_boundary": "Fixture: allocation only.",
+      "absent_gpu_ids": [],
+      "maintenance": [],
+      "alerts": [],
+      "resource_providers": [],
+      "allocatable_units": [],
+      "resource_claims": [],
+      "scheduler_targets": [],
+      "scheduler_jobs": [],
+      "scheduler_transfers": [],
+      "workload_profiles": []
+    },
+    "history": {
+      "resource_plan_evaluations": [],
+      "resource_run_actuals": []
+    }
+  }
+}
