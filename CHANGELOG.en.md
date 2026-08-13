@@ -22,3 +22,60 @@ This changelog records user-visible changes; implementation details belong in Gi
 - **Runtime failures yield GPUs sooner.** Agent guidance now requires a minimal CUDA initialization with the returned selector before the workload, immediate release on failure, and avoiding the incompatible server within the current task.
 - **Capacity and transport failures no longer invite unproductive polling.** `no_capacity` waits for a later turn or work cycle; a transport failure is retried at most once and is never reported as a capacity shortage.
 - **Parallel lease ownership is easier to finish correctly.** The requester explicitly tracks each `lease_id` and waits for `released=true` from every lease, including leases handed to child tasks.
+
+## 1.5.0 - 2026-08-12
+
+**ServerPilot 1.5.0 makes routine GPU coordination and native monitoring more direct.**
+
+- **Idle occupancy is managed per GPU.** Each endpoint retains one persistent policy switch while ServerPilot manages one worker per eligible idle GPU. A claim yields only the selected workers and leaves other GPUs untouched.
+- **Capacity failure is explicit.** A direct GPU request returns a lease immediately or `no_capacity`; it does not create a hidden queue. Agents use only the returned endpoint, GPUs, and CUDA selector.
+- **Projects can declare resource cards.** A validated `.serverpilot/resource-card.json` stores a direct-GPU preset contract so Agents do not infer configuration from task names or current free capacity.
+- **The App focuses on daily monitoring.** The native UI is organized around Servers, Usage, and Settings, with shared server resources, current projects and tasks, per-GPU state, and history.
+- **Ownership, collection, and occupancy remain fail closed.** Stale, unknown, unmanaged, conflicting, or maintained GPUs are never projected as claimable.
+
+## 1.4.0 - 2026-08-10
+
+**ServerPilot 1.4.0 establishes a unified resource control plane and a standalone native desktop experience.**
+
+- **GPU, CPU, memory, and external scheduler targets share resource contracts.** The service computes capacity, used, claimed, and available once; the GUI, CLI, and MCP no longer derive availability independently.
+- **Server collection gains a constrained script protocol.** `server-script-v1` accepts validated read-only snapshots from a fixed entry point; missing, oversized, or malformed output fails closed.
+- **The native App provides a complete resource overview.** Servers are searchable, filterable, and sortable, with per-endpoint 1h / 6h / 24h histories for CPU, memory, GPU utilization, and GPU memory.
+- **The daemon outlives the App.** A user LaunchAgent owns durable state, closing the GUI does not stop the control plane, and the App bundles its backend and migrations for standalone build verification.
+- **Ownership and external scheduling boundaries are explicit.** Projects, Agents, tasks, empty leases, and queues share one projection, while Slurm remains a separate constrained adapter instead of masquerading as a direct GPU server.
+
+## 1.3.0 - 2026-08-10
+
+**ServerPilot 1.3.0 removes server- and cluster-specific behavior from runtime policy.**
+
+- Endpoints use fixed `observation_profile` values, while external schedulers use constrained transport and inspection profiles.
+- A local administrator maps profiles to trusted absolute-path wrappers; the API, App, and MCP cannot submit arbitrary shell, argv, or environment values.
+- Unknown or missing profiles fail closed. Legacy scheduler command configuration is disabled during upgrade until an administrator selects a safe profile.
+- Documentation and runtime guidance now describe a generic adapter model instead of naming one cluster.
+
+## 1.2.0 - 2026-08-10
+
+**GPU Broker becomes ServerPilot.**
+
+- The GitHub repository, macOS and Windows Apps, Web UI, documentation, and public API title adopt the ServerPilot name.
+- New `serverpilot` and `serverpilot-mcp` command entry points are available.
+- The old `gpu-broker`, `gpu-broker-mcp`, `GPU_BROKER_*`, daemon identity, and data directories remain compatible, preserving inventory, history, leases, and MCP registrations across the upgrade.
+- `/api/v1/state` and existing scheduler semantics remain compatible.
+
+## 1.1.0 - 2026-08-10
+
+**GPU Broker 1.1.0 expands server telemetry and native resource monitoring.**
+
+- Sealed observation and scheduler adapter boundaries are introduced without opening another authentication or remote-command control plane.
+- CPU, memory, GPU, claim, and availability projections fail closed, while CPU-only endpoints remain observable without fabricated GPU capacity.
+- Bounded endpoint telemetry history includes stable per-GPU UUID series.
+- The macOS resource workflow adds on-demand CPU, memory, GPU utilization, and GPU-memory charts with lower-cost hover rendering.
+- `/api/v1/state` remains the authoritative allocation snapshot, preserving existing leases, CLI, MCP, and Slurm semantics.
+
+## 1.0.0 - 2026-08-06
+
+**The first stable GPU Broker release.**
+
+- The App, CLI, and MCP share the authoritative `/api/v1/state` snapshot.
+- The native macOS App coordinates servers, projects, and resource state by stable ID; removing a server updates related views together.
+- Revisions and resource usage come from one committed control-plane snapshot, reducing divergence between views and clients.
+- Loopback REST and the domain service are the only public business path.
