@@ -1063,12 +1063,14 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
                 "workspace_path": "/srv/server-a",
                 "gpu_id": "GPU-a",
                 "cuda_visible_devices": "GPU-a,GPU-b",
+                "gpu_cuda_visible_devices": "GPU-a",
             },
             {
                 "server_id": "server-a",
                 "workspace_path": "/srv/server-a",
                 "gpu_id": "GPU-b",
                 "cuda_visible_devices": "GPU-a,GPU-b",
+                "gpu_cuda_visible_devices": "GPU-b",
             },
         ],
     }
@@ -1082,6 +1084,86 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
     assert body["project_id"] == "agent"
     assert body["purpose"] == "训练"
     assert body["task_ref"] == "训练"
+
+
+def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> None:
+    single = mcp_server._routine_gpu_allocation(
+        {
+            "lease": {
+                "id": "lease-single",
+                "resources": [
+                    {
+                        "endpoint": {
+                            "id": "server-a",
+                            "workspace_path": "/srv/server-a",
+                        },
+                        "gpus": [{"gpu_uuid": "GPU-a"}],
+                        "cuda_visible_devices": "GPU-a",
+                    }
+                ],
+            }
+        }
+    )
+    assert single == {
+        "lease_id": "lease-single",
+        "server_id": "server-a",
+        "workspace_path": "/srv/server-a",
+        "cuda_visible_devices": "GPU-a",
+        "gpus": [
+            {
+                "server_id": "server-a",
+                "workspace_path": "/srv/server-a",
+                "gpu_id": "GPU-a",
+                "cuda_visible_devices": "GPU-a",
+                "gpu_cuda_visible_devices": "GPU-a",
+            }
+        ],
+    }
+
+    multiple_endpoints = mcp_server._routine_gpu_allocation(
+        {
+            "lease": {
+                "id": "lease-spread",
+                "resources": [
+                    {
+                        "endpoint": {
+                            "id": "server-a",
+                            "workspace_path": "/srv/server-a",
+                        },
+                        "gpus": [{"gpu_uuid": "GPU-a"}],
+                        "cuda_visible_devices": "GPU-a",
+                    },
+                    {
+                        "endpoint": {
+                            "id": "server-b",
+                            "workspace_path": "/srv/server-b",
+                        },
+                        "gpus": [{"gpu_uuid": "GPU-b"}],
+                        "cuda_visible_devices": "GPU-b",
+                    },
+                ],
+            }
+        }
+    )
+    assert multiple_endpoints == {
+        "lease_id": "lease-spread",
+        "gpus": [
+            {
+                "server_id": "server-a",
+                "workspace_path": "/srv/server-a",
+                "gpu_id": "GPU-a",
+                "cuda_visible_devices": "GPU-a",
+                "gpu_cuda_visible_devices": "GPU-a",
+            },
+            {
+                "server_id": "server-b",
+                "workspace_path": "/srv/server-b",
+                "gpu_id": "GPU-b",
+                "cuda_visible_devices": "GPU-b",
+                "gpu_cuda_visible_devices": "GPU-b",
+            },
+        ],
+    }
 
 
 def test_mcp_default_task_is_harness_neutral() -> None:

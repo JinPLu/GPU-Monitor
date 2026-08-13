@@ -227,6 +227,9 @@ def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
     assert {gpu["cuda_visible_devices"] for gpu in claimed["gpus"]} == {
         expected_visible_devices
     }
+    assert {gpu["gpu_cuda_visible_devices"] for gpu in claimed["gpus"]} == {
+        gpu["gpu_id"] for gpu in claimed["gpus"]
+    }
 
     assert mcp_server.gpu_release(claimed["lease_id"]) == {"released": True}
     leases = app.state.service.list_leases(

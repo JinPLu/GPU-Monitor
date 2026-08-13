@@ -77,7 +77,9 @@ codex mcp add serverpilot \
 python3 scripts/install_agent_policy.py codex --install
 ```
 
-默认 MCP 只有三个工具：`gpu_status` 返回“哪台服务器的哪张 GPU 可用”、该服务器的 `workspace_path` 及简短中文状态，`gpu_apply` 返回 `lease_id` 和选中的 `gpus[]`（每项含 `workspace_path`），`gpu_release` 归还租约。调用 `gpu_apply` 时，`task` 使用用户给定的任务名或当前目标的简短人类可读概括，不读取客户端 UI 标题；未提供时记录为“未命名任务”。Agent 应先进入返回路径，再按 `cuda_visible_devices` 启动自己的 workload。需要查看占用者或连接失败卡时用 `gpu_status(include_busy=true)`；忙卡返回 `task`。例行申请不需要绑定、续租、协调工具或 `idempotency_key`；租约持续到显式释放或在 App 中人工处理。
+默认 MCP 只有三个工具：`gpu_status` 返回“哪台服务器的哪张 GPU 可用”、该服务器的 `workspace_path` 及简短中文状态，`gpu_apply` 返回 `lease_id` 和选中的 `gpus[]`（每项含 `workspace_path`），`gpu_release` 归还租约。调用 `gpu_apply` 时，`task` 使用用户给定的任务名或当前目标的简短人类可读概括，不读取客户端 UI 标题；未提供时记录为“未命名任务”。`workspace_path` 是所选服务器的远端路径，Agent 要通过当前授权的远端 endpoint 进入，不能在本地 worktree 直接进入。单 endpoint 租约的顶层 `cuda_visible_devices` 是完整集合，适合一个多卡进程；`gpus[]` 中每项保留这一兼容字段，并新增只含该卡 UUID 的 `gpu_cuda_visible_devices`，适合每卡一个进程。随后按对应 selector 做最小 CUDA gate 并启动 workload；gate 或启动失败须立即释放，并在当前任务内记下服务器与失败原因以避开同一环境。需要查看占用者或连接失败卡时用 `gpu_status(include_busy=true)`；忙卡返回 `task`。
+
+`no_capacity` 没有分配也不排队：同一 turn 最多刷新一次，后续交给下一 turn 或工作周期；`Transport closed` 是传输错误，最多重试一次，不能当作无容量。例行申请不需要绑定、续租、协调工具或 `idempotency_key`；租约持续到显式释放或在 App 中人工处理。多个 lease 必须用显式清单跟踪，申请者负责逐个确认已 `released`。
 
 ServerPilot 的约束只覆盖 GPU 协调：不得通过 SSH、静态 inventory、SQLite 或 `nvidia-smi` 绕过它发现、指定、申请或释放 GPU。已获得当前授权端点的 Git 同步、文件维护和只读环境检查等非 GPU 操作不需要 GPU lease；`workspace_path` 也不提供或替代项目自己的远端命令权限。
 

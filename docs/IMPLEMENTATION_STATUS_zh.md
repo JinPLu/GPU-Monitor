@@ -8,7 +8,7 @@
 
 1. **信息采集**：固定只读探针采集服务器 CPU、内存、GPU、进程和历史趋势；APP 刷新只读取这份状态。
 2. **人类监控与纠错**：APP 展示服务器、任务与 GPU。任务详情允许人保持卡数不变，直接选择新的 GPU；目标 GPU 正在占卡时先按卡停止并刷新确认，再更新分配，随后提示对应 Agent 按返回的 `CUDA_VISIBLE_DEVICES` 重启任务。
-3. **Agent 操作**：默认 MCP 只有 `gpu_status`、`gpu_apply`、`gpu_release`。申请返回 `lease_id` 与选中的服务器/GPU/`CUDA_VISIBLE_DEVICES`；租约持续到显式释放或 App 人工处理，容量不足直接返回 `no_capacity`，不排队。
+3. **Agent 操作**：默认 MCP 只有 `gpu_status`、`gpu_apply`、`gpu_release`。单 endpoint 申请的顶层与逐行兼容字段 `cuda_visible_devices` 是完整资源集合；`gpus[]` 中每项新增 `gpu_cuda_visible_devices`，只含该卡 UUID，分别支持一个多卡进程与每卡一个进程。`workspace_path` 是远端路径，须经当前授权 endpoint 进入；启动前做最小 CUDA gate，失败立即释放并在当前任务内避开同一环境。租约持续到显式释放或 App 人工处理，容量不足直接返回 `no_capacity`，不排队且同一 turn 不反复轮询；多个 lease 由申请者逐个确认释放。
 4. **空闲 GPU 占卡**：明确分开持久意图与当前进程状态。endpoint 的 `desired` 只有 `ON / OFF`，只随用户开关改变；逐卡 `actual` 只有 `ON / OFF / ERROR`，由 helper 操作与新鲜采集更新。内部逐卡归属不再使用 TTL，并持久保存唯一的 PID、boot ID 和进程启动时间；只有新鲜采集与该身份完全匹配才是 `actual=ON`。无进程为 `OFF`，额外或替代业务进程为 `ERROR/CONFLICT` 并 fail closed。正常启动直接读取持久 ownership，采集后原地更新 `actual`，不会为了重建归属而停止或重启远端 helper。
 
 每个 endpoint 现在只有一个 canonical `workspace_path` 字段。新增服务器时 REST、MCP advanced 管理工具、Web 和原生 APP 都要求填写绝对远端路径；endpoint 快照、Agent 状态和 GPU 申请结果沿既有投影返回同一字段。用户已确认当前共用目录为 `/media/datasets/OminiEWM_Data/tmp/ljp`。历史记录迁移保留且未知路径保持空值，不猜测项目子目录。该字段只是元数据和操作指引，不创建/删除远端目录、不授权启动 workload；密封占卡 helper 固定布局为 `${workspace_path}/serverpilot-keepalive`，adapter 直接执行 `./serverpilot-keepalive --schema-version 2`，不依赖远端 `PATH`。
@@ -21,7 +21,7 @@ loopback 控制面不使用登录 token：没有 token model、登录页面、�
 
 项目明确要求的资源正确性边界仍保留：过期采集不能被当成可用 GPU，Agent 只能使用实际返回的 lease 资源。这两项来自当前项目合同，不新增状态机。
 
-Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕过的对象是 GPU 发现、选卡、申请和释放；已获得当前授权端点的 Git 同步、文件维护与只读环境检查不需要 GPU lease。`workspace_path` 仍只是元数据，不提供远端 shell 或额外授权。
+Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕过的对象是 GPU 发现、选卡、申请和释放；已获得当前授权端点的 Git 同步、文件维护与只读环境检查不需要 GPU lease。`workspace_path` 仍只是元数据，不提供远端 shell 或额外授权。`Transport closed` 与 `no_capacity` 分开处理，前者最多重试一次；同一任务内的 CUDA 初始化失败不会立即重试同一 server。
 
 ## 已完成验证
 
@@ -29,10 +29,10 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `381` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过；覆盖 endpoint workspace 投影、迁移保留旧记录、workspace 内固定 helper 入口、三工具 MCP、占卡 ON/OFF 下的 routine 工具调用、daemon 重启不扰动 helper、业务进程替代 keeper 时 fail closed、keeper 启动与 Agent 申请串行，以及无容量重试、同机双卡、顶层 workspace/CUDA 投影、申请、释放和让位路径 |
+| Python 全量测试 | `382` 项 collected，`PYTHONPATH=src uv run pytest -q` 通过；覆盖 endpoint workspace 投影、迁移保留旧记录、workspace 内固定 helper 入口、三工具 MCP、占卡 ON/OFF 下的 routine 工具调用、daemon 重启不扰动 helper、业务进程替代 keeper 时 fail closed、keeper 启动与 Agent 申请串行，以及无容量重试、同机双卡、顶层/逐行兼容集合投影、逐卡单 UUID 新字段、跨 endpoint 去歧义、申请、释放和让位路径 |
 | Ruff | `.venv/bin/ruff check src tests` 通过 |
 | 数据迁移 | 当前源码迁移头 `20260813_0024`；`keepalive_current` 保存 `actual/error_reason` 与逐卡唯一进程身份，只把仍有 active resource 的活动 keepalive lease 转为无 TTL，保留 terminal keeper 与 workload 历史 expiry |
-| MCP 上下文 | 默认发现结果严格为 3 个工具；instructions 为 `291` 字；schema 和返回投影都有字段白名单测试 |
+| MCP 上下文 | 默认发现结果严格为 3 个工具；instructions 直接说明远端 workspace、顶层完整 selector、逐卡 selector、CUDA gate、失败释放和有限重试；schema 和返回投影都有字段白名单测试 |
 | Agent 任务说明 | 默认 MCP 不依赖客户端身份、UI 标题或专用环境变量。`gpu_apply(task?)` 接收用户任务名或当前目标的简短人类可读概括；未提供时使用“未命名任务”。`gpu_status(include_busy=true)` 为忙卡返回人类可读 `task` |
 | macOS App 构建 | `zsh desktop/build-macos-app.sh` 通过，包含 Swift 桌面端编译 |
 | standalone 验证 | `zsh desktop/verify-macos-app.sh` 通过 |

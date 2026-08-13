@@ -21,13 +21,14 @@ TERMINAL_LEASE_STATES = {"RELEASED", "EXPIRED_EMPTY"}
 RESOURCE_MARGINAL_MIN_SAVED_RATIO = 0.10
 RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
 
-MCP_INSTRUCTIONS = """常规 GPU 任务只使用三个工具：gpu_status 查看可用 GPU；gpu_apply 由 ServerPilot
-自动选卡；task 应写用户给定的任务名或当前目标的简短人类可读概括，不读取客户端 UI 标题。成功后先进入返回的
-workspace_path，再使用 cuda_visible_devices；任务结束或启动失败时 gpu_release。需要检查占用情况时调用
-gpu_status(include_busy=true) 读取 task。空闲占卡仍算可用，申请时
-自动让位。无容量直接失败，不排队。ServerPilot 只协调 GPU；不得通过 SSH、SQLite、inventory 或 nvidia-smi
-绕过 GPU 发现、选卡、申请或释放。已获授权的非 GPU 远端操作（Git 同步、文件维护、只读环境检查）无需 GPU
-租约，但仍须使用当前获授权端点。"""
+MCP_INSTRUCTIONS = """常规 GPU 任务只使用三个工具：gpu_status 查看可用 GPU；gpu_apply 由 ServerPilot 自动选卡，task
+写任务名或目标，不读取客户端 UI 标题。workspace_path 是远端路径，经 endpoint 进入。
+单 endpoint 的 cuda_visible_devices 是完整集合；gpus[] 新增单 UUID 的 gpu_cuda_visible_devices，分别用于多卡
+与逐卡进程。启动前做 CUDA gate；失败立即 gpu_release，避开同一 server；结束 release，多 lease 确认。
+gpu_status(include_busy=true) 读取 task。空闲占卡可用。无容量直接失败，不排队；同 turn 最多刷新一次；
+Transport closed 重试一次。ServerPilot 只协调 GPU；不得用 SSH、SQLite、inventory 或
+nvidia-smi 绕过 GPU 发现、选卡、申请、释放。非 GPU 远端操作（Git 同步、维护）无需 GPU 租约，
+需授权 endpoint。"""
 
 
 mcp = FastMCP(
@@ -360,6 +361,14 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
 
 
 def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
+    """Project a lease for routine use without conflating lease and GPU scope.
+
+    A single-endpoint lease keeps its complete CUDA device set at the top level.
+    Each ``gpus`` row retains the resource-wide ``cuda_visible_devices`` for
+    compatibility and adds ``gpu_cuda_visible_devices`` for one-process-per-GPU
+    launches while retaining endpoint metadata.
+    """
+
     lease = payload.get("lease")
     if not isinstance(lease, dict):
         raise ValueError("ServerPilot 没有返回 GPU 租约")
@@ -387,6 +396,7 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
                         "workspace_path": workspace_path,
                         "gpu_id": gpu.get("gpu_uuid"),
                         "cuda_visible_devices": cuda_visible_devices,
+                        "gpu_cuda_visible_devices": gpu.get("gpu_uuid"),
                     }
                 )
     result: dict[str, Any] = {"lease_id": lease.get("id"), "gpus": rows}
@@ -1157,7 +1167,7 @@ def gpu_apply(
     gpu_count: int = 1,
     task: str | None = None,
 ) -> dict[str, Any]:
-    """立即申请 GPU；task 填用户任务名或当前目标概括；自动选卡，无容量返回 no_capacity 且不排队。"""
+    """立即申请 GPU；不排队，无容量返回 no_capacity；顶层 CUDA 值完整，gpus[] 另给逐卡 CUDA 值。"""
 
     if isinstance(gpu_count, bool) or not isinstance(gpu_count, int) or gpu_count < 1:
         raise ValueError("gpu_count 必须是正整数")

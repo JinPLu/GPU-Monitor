@@ -313,52 +313,6 @@ wheels = [
 ]
 
 [[package]]
-name = "serverpilot"
-version = "1.5.0"
-source = { editable = "." }
-dependencies = [
-    { name = "alembic" },
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "itsdangerous" },
-    { name = "jinja2" },
-    { name = "mcp" },
-    { name = "prometheus-client" },
-    { name = "pydantic" },
-    { name = "pyyaml" },
-    { name = "sqlalchemy" },
-    { name = "typer" },
-    { name = "uvicorn", extra = ["standard"] },
-]
-
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "alembic", specifier = ">=1.14,<2" },
-    { name = "fastapi", specifier = ">=0.115,<1" },
-    { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "itsdangerous", specifier = ">=2.2,<3" },
-    { name = "jinja2", specifier = ">=3.1,<4" },
-    { name = "mcp", specifier = ">=1.27,<2" },
-    { name = "prometheus-client", specifier = ">=0.21,<1" },
-    { name = "pydantic", specifier = ">=2.10,<3" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3,<9" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6,<7" },
-    { name = "pyyaml", specifier = ">=6,<7" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
-    { name = "sqlalchemy", specifier = ">=2.0,<3" },
-    { name = "typer", specifier = ">=0.15,<1" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
-]
-provides-extras = ["dev"]
-
-[[package]]
 name = "greenlet"
 version = "3.5.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1105,6 +1059,52 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/46/4965251734c2b6fcdca1b1b187d20bcac3af0ee5b083b89c910bb961ce3a/ruff-0.15.22-py3-none-win_amd64.whl", hash = "sha256:9be63ba1eb936acd2d1342fb8337c356353706fce233b2a15a09a97037e6acde", size = 11938297, upload-time = "2026-07-16T15:14:07.316Z" },
     { url = "https://files.pythonhosted.org/packages/57/c9/e69b1ff4c8b69093ef08b8919ab767af0569666865b39c30a8795d88d3c6/ruff-0.15.22-py3-none-win_arm64.whl", hash = "sha256:e1168075b72158510839f250027659cdd78476f40507dd517892304c41318661", size = 11298172, upload-time = "2026-07-16T15:14:10.51Z" },
 ]
+
+[[package]]
+name = "serverpilot"
+version = "1.5.1"
+source = { editable = "." }
+dependencies = [
+    { name = "alembic" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "itsdangerous" },
+    { name = "jinja2" },
+    { name = "mcp" },
+    { name = "prometheus-client" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+    { name = "sqlalchemy" },
+    { name = "typer" },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "alembic", specifier = ">=1.14,<2" },
+    { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "itsdangerous", specifier = ">=2.2,<3" },
+    { name = "jinja2", specifier = ">=3.1,<4" },
+    { name = "mcp", specifier = ">=1.27,<2" },
+    { name = "prometheus-client", specifier = ">=0.21,<1" },
+    { name = "pydantic", specifier = ">=2.10,<3" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3,<9" },
+    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6,<7" },
+    { name = "pyyaml", specifier = ">=6,<7" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
+    { name = "sqlalchemy", specifier = ">=2.0,<3" },
+    { name = "typer", specifier = ">=0.15,<1" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
+]
+provides-extras = ["dev"]
 
 [[package]]
 name = "shellingham"
