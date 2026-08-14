@@ -4,6 +4,14 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## Unreleased
+
+**GPU and CPU-only server resource states now appear consistently from one live snapshot.**
+
+- `gpu_status` returns each GPU's latest observation and a rolling ten-minute average of memory, GPU/memory-controller utilization, and temperature, alongside a summary of the visible cards to distinguish sustained load from a momentary spike.
+- The GUI and MCP share the daemon REST snapshot rather than collecting over SSH separately; the GPU detail view displays that same per-GPU average.
+- A new server's first read-only collection identifies it as GPU, CPU-only, or unconfirmed. Confirmed CPU-only servers retain CPU/memory monitoring and are explicitly shown in the GUI and `gpu_status.cpu_only_servers`, but are never GPU allocation targets.
+
 ## 1.5.6 - 2026-08-15
 
 **ServerPilot 1.5.6 fixes idle keepalive workers being misreported as running workloads after a task releases its GPU lease.**

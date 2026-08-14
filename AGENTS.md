@@ -20,6 +20,12 @@
 - 仓库中的唯一桌面应用固定为根目录 `ServerPilot.app`。不得在 `dist/`、`build/`、`~/Applications` 或仓库其他位置创建、复制或保留第二个 `ServerPilot*.app`，也不得用编号副本规避覆盖。
 - 每次桌面端修改后必须运行 `zsh desktop/build-macos-app.sh`，该脚本原地替换根目录 `ServerPilot.app`；随后运行 `zsh desktop/verify-macos-app.sh`。评审和启动一律使用根目录这一份，不能打开旧路径或缓存副本。
 
+## 发布与版本
+
+- 推送含用户可见行为的改动前，先在 `CHANGELOG.md` 和 `CHANGELOG.en.md` 的 `Unreleased` 中用简短、面向结果的文字记录；不要把测试、内部 gate 或提交历史写成发布说明。
+- 仅推送提交不等于正式发布。正式版本发布须经用户明确要求，并完成所需验证、同步 `VERSION` 与 `pyproject.toml`（以及适用的桌面版本）、将 `Unreleased` 归入版本条目、提交、tag 和 GitHub Release。
+- 获准正式发布时默认使用 `master`；其他 Git 工作流、分支、PR 或发布目标须由用户明确指定。
+
 <!-- TEAMWORK_PROJECT_START -->
 ## Teamwork Project Instructions
 
