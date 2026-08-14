@@ -46,6 +46,27 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 - 在一台空闲 A800 endpoint 上用 routine MCP 完成 `gpu_status → gpu_apply → 远端 workspace cwd 下 CUDA gate → gpu_release → 下一次采集恢复`。gate 仅使用申请返回的 SSH、workspace 和 selector，确认 CUDA 可用且只可见一张已申请 GPU；释放后 keeper 回到 `desired=ON / actual=ON`。
 - 已启动根目录 `ServerPilot.app` 读取实际 daemon 状态。当前 8 卡业务 workload 被逐卡显示为“任务使用中”，申请按钮禁用；没有显示为“归属待确认”或“可用”。
 
+### 1.5.6 后续实机验收（同一已发布提交）
+
+以下证据针对 Git 提交 `108750c`；只在两个确认空闲的 A800 endpoint 上使用正常 MCP 申请/归还路径。全程没有操作第三个 endpoint 上的八卡真实业务 workload，且每一个测试 lease 都已显式返回 `released=true`。
+
+- **固定 helper 协议与 namespace 身份**：两台空闲 endpoint 都返回 `schema_version=3`、`implementation_version=1.5.6` 与 `per_gpu_keepalive / pidfd_identity / pci_bus_id / worker_attestation`。下列固定只读命令向 `--inspect` 提供精确 UUID 请求，1、2、4 卡分别在 0.79、0.84、1.06 秒内返回与请求数相同的 v3 worker attestation：
+
+  ```sh
+  # 将尖括号替换为已登记 endpoint 的值与绝对远端 workspace。
+  printf '%s\n' '{"schema_version":3,"gpu_uuids":["GPU-…"]}' |
+    ssh -p <port> <user>@<host> \
+      'cd -- <absolute-workspace-path> && ./serverpilot-keepalive --inspect --schema-version 3'
+  ```
+
+  其中一个 endpoint 实际出现 helper namespace PID 与 NVIDIA driver PID 不同；attestation 仍以其唯一 driver-visible PID 和新鲜 collector 的 PID/boot ID 成功关联，证明该适配覆盖真实 namespace 差异。空 stdin 被 helper 拒绝为无效 JSON，是预期的只读 fail-closed 行为，不是 worker 异常。
+- **单卡完整路径**：`gpu_status → gpu_apply(1) → CUDA gate → gpu_release → 采集恢复` 通过。gate 严格采用申请结果中的 SSH、远端 cwd 与 `CUDA_VISIBLE_DEVICES=0`，在已部署 PyTorch runtime 中得到 `torch 2.7.1+cu128`、`device_count=1`、A800 与 CUDA tensor 初始化成功；释放后 35 秒内由 `desired=ON / actual=OFF` 过渡回 `ON / ON`。恢复前后 inspect 都成功，被测试卡获得新的 helper/driver PID 与 ticks，未测试卡不变。
+- **两卡与逐卡 selector**：`gpu_apply(2)` 返回完整 `CUDA_VISIBLE_DEVICES=0,1`；一个进程实际看到两张 A800，随后以 `0`、`1` 分别做 CUDA tensor 初始化与同步，都只看到一张 A800。释放后，未选两张卡始终 `ON / ON`，被选两张在 25 秒内恢复为 `ON / ON`。
+- **daemon 与已安装 MCP stdio**：执行可逆的 `serverpilot daemon stop → serverpilot daemon start` 后，daemon 再次为 `live=true / ready=true`；一轮采集后六张空闲 A800 均为 `ON / ON`，真实八卡任务仍显示“任务使用中”。随后以已安装的 `serverpilot-mcp` 子进程完成真实 JSON-RPC initialize、工具发现和 `gpu_status(false)`：默认只发现 `gpu_status / gpu_apply / gpu_release`，并实际得到 loopback `/health/live`、`/health/ready` 与 snapshot 的 HTTP 200 响应。
+- **错误路径自动化证据**：在临时数据库/fake adapter 中，旧 v2 helper 预检拒绝且不发送 mutation、attestation timeout、非唯一或格式错误 driver PID、helper 不兼容与 helper/collector 身份不匹配均 fail closed；重点组分别为 9 passed 与 6 passed。故意在共享 endpoint 注入外部进程、杀 worker、损坏状态或断网不属于本轮实机范围。
+
+当前 inspect 为每张目标 GPU 串行执行一次固定的全机 NVIDIA compute-process 查询，而不是单次批量映射。现场 1–4 卡样本远低于 45 秒 adapter 预算，但样本量不足以说明高峰 P99；若后续有性能证据，再以保持“每张目标卡恰好一个 PID”与 fail-closed 解析为前提评估批量化。
+
 四项核心功能的收敛决定记录在 `docs/teamwork/cases/c-f379fac55e2c1c893405737d74f7bdc3c2f3615e8a9fbb15e1aeff3b9c389dca/decision.md`。该历史决定未覆盖本候选新增的 worker 身份校验；在建立明确的后继决定前，不能把它当作 `1.5.6` 的完整范围依据。
 
 service 快照直接提供统一的 `publicly_available` 和简短中文 `public_status`；routine MCP 与 Web 只投影这份结果，不再各自判断占卡容量。API 与 Swift 模型分别校验 `desired=ON/OFF` 与 `actual=ON/OFF/ERROR`，遇到未知值会明确拒绝。
