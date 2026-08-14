@@ -1,4 +1,4 @@
-"""Small JSON contract for per-GPU occupancy start and stop."""
+"""Small JSON contracts for sealed per-GPU keepalive operations."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ from typing import Any, Literal
 
 
 KEEPALIVE_SCHEMA_VERSION = 3
-KEEPALIVE_IMPLEMENTATION_VERSION = "1.5.5"
+KEEPALIVE_IMPLEMENTATION_VERSION = "1.5.6"
 KEEPALIVE_PROTOCOL_INFO_CAPABILITIES = (
     "per_gpu_keepalive",
     "pidfd_identity",
     "pci_bus_id",
+    "worker_attestation",
 )
 # Fixed layout under every endpoint workspace. This is deliberately not
 # configurable and is invoked directly instead of being found through PATH.
@@ -22,6 +23,10 @@ KEEPALIVE_PROTOCOL_INFO_COMMAND = f"{KEEPALIVE_ENTRYPOINT} --protocol-info"
 KEEPALIVE_REMOTE_COMMAND = (
     f"{KEEPALIVE_ENTRYPOINT} --schema-version {KEEPALIVE_SCHEMA_VERSION}"
 )
+KEEPALIVE_INSPECT_COMMAND = (
+    f"{KEEPALIVE_ENTRYPOINT} --inspect --schema-version {KEEPALIVE_SCHEMA_VERSION}"
+)
+KEEPALIVE_WORKER_MARKER = "serverpilot-keepalive-worker-v3"
 
 GPU_UUID_PATTERN = re.compile(
     r"GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
@@ -84,6 +89,37 @@ class KeepaliveRequest:
             raise KeepaliveProtocolError("keepalive enabled must be a boolean")
         return cls(enabled=enabled, gpu_uuids=_validate_gpu_uuids(raw_gpu_uuids))
 
+
+@dataclass(frozen=True, slots=True)
+class KeepaliveAttestationRequest:
+    """Ask the sealed helper to attest its recorded v3 workers.
+
+    GPU UUIDs are the only request values.  The command, state path, process
+    marker, and all process identity fields remain fixed server policy.
+    """
+
+    gpu_uuids: tuple[str, ...]
+
+    def encode(self) -> bytes:
+        return _encode(
+            {
+                "schema_version": KEEPALIVE_SCHEMA_VERSION,
+                "gpu_uuids": list(_validate_gpu_uuids(list(self.gpu_uuids))),
+            }
+        )
+
+    @classmethod
+    def decode(cls, payload: bytes | str) -> KeepaliveAttestationRequest:
+        value = _decode_object(payload)
+        if value.get("schema_version") != KEEPALIVE_SCHEMA_VERSION:
+            raise KeepaliveProtocolError(
+                "keepalive schema version mismatch: "
+                f"expected {KEEPALIVE_SCHEMA_VERSION}, got {value.get('schema_version')!r}"
+            )
+        if set(value) != {"schema_version", "gpu_uuids"}:
+            raise KeepaliveProtocolError("keepalive attestation request fields are invalid")
+        return cls(gpu_uuids=_validate_gpu_uuids(value["gpu_uuids"]))
+
 KeepaliveStatus = Literal["running", "stopped"]
 KeepaliveOutcome = Literal["started", "stopped", "unchanged"]
 
@@ -143,6 +179,58 @@ class KeepaliveResponse:
         return cls(enabled=enabled, results=results)
 
 
+@dataclass(frozen=True, slots=True)
+class KeepaliveWorkerAttestation:
+    """The helper's exact, live identity proof for one v3 worker."""
+
+    gpu_uuid: str
+    pid: int
+    driver_pid: int
+    boot_id: str
+    start_time_ticks: int
+    worker_marker: str
+
+
+@dataclass(frozen=True, slots=True)
+class KeepaliveAttestationResponse:
+    """Exact worker identity evidence returned by the sealed helper."""
+
+    workers: tuple[KeepaliveWorkerAttestation, ...]
+
+    def encode(self) -> bytes:
+        return _encode(
+            {
+                "schema_version": KEEPALIVE_SCHEMA_VERSION,
+                "workers": [
+                    {
+                        "gpu_uuid": worker.gpu_uuid,
+                        "pid": worker.pid,
+                        "driver_pid": worker.driver_pid,
+                        "boot_id": worker.boot_id,
+                        "start_time_ticks": worker.start_time_ticks,
+                        "worker_marker": worker.worker_marker,
+                    }
+                    for worker in self.workers
+                ],
+            }
+        )
+
+    @classmethod
+    def decode(cls, payload: bytes | str) -> KeepaliveAttestationResponse:
+        value = _decode_object(payload)
+        if value.get("schema_version") != KEEPALIVE_SCHEMA_VERSION:
+            raise KeepaliveProtocolError(
+                "keepalive schema version mismatch: "
+                f"expected {KEEPALIVE_SCHEMA_VERSION}, got {value.get('schema_version')!r}"
+            )
+        if set(value) != {"schema_version", "workers"}:
+            raise KeepaliveProtocolError("keepalive attestation response fields are invalid")
+        workers = value["workers"]
+        if not isinstance(workers, list):
+            raise KeepaliveProtocolError("keepalive attestation workers must be an array")
+        return cls(workers=tuple(_decode_worker_attestation(worker) for worker in workers))
+
+
 def _decode_gpu_result(value: object) -> KeepaliveGPUResult:
     if not isinstance(value, dict):
         raise KeepaliveProtocolError("keepalive GPU result fields are invalid")
@@ -160,6 +248,42 @@ def _decode_gpu_result(value: object) -> KeepaliveGPUResult:
         gpu_uuid=gpu_uuid,
         status=status,  # type: ignore[arg-type]
         outcome=outcome,  # type: ignore[arg-type]
+    )
+
+
+def _decode_worker_attestation(value: object) -> KeepaliveWorkerAttestation:
+    if not isinstance(value, dict) or set(value) != {
+        "gpu_uuid",
+        "pid",
+        "driver_pid",
+        "boot_id",
+        "start_time_ticks",
+        "worker_marker",
+    }:
+        raise KeepaliveProtocolError("keepalive attestation worker fields are invalid")
+    gpu_uuid = validate_gpu_uuid(value["gpu_uuid"])
+    pid = value["pid"]
+    driver_pid = value["driver_pid"]
+    boot_id = value["boot_id"]
+    start_time_ticks = value["start_time_ticks"]
+    worker_marker = value["worker_marker"]
+    if type(pid) is not int or pid <= 0:
+        raise KeepaliveProtocolError("keepalive attestation worker PID is invalid")
+    if type(driver_pid) is not int or driver_pid <= 0:
+        raise KeepaliveProtocolError("keepalive attestation worker driver PID is invalid")
+    if not isinstance(boot_id, str) or not boot_id or len(boot_id) > 128:
+        raise KeepaliveProtocolError("keepalive attestation worker boot identity is invalid")
+    if type(start_time_ticks) is not int or start_time_ticks <= 0:
+        raise KeepaliveProtocolError("keepalive attestation worker start identity is invalid")
+    if worker_marker != KEEPALIVE_WORKER_MARKER:
+        raise KeepaliveProtocolError("keepalive attestation worker marker is invalid")
+    return KeepaliveWorkerAttestation(
+        gpu_uuid=gpu_uuid,
+        pid=pid,
+        driver_pid=driver_pid,
+        boot_id=boot_id,
+        start_time_ticks=start_time_ticks,
+        worker_marker=worker_marker,
     )
 
 

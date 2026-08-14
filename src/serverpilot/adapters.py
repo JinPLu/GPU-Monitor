@@ -20,10 +20,13 @@ from typing import Any, Callable, Literal, Mapping
 from serverpilot.config import EndpointConfig
 from serverpilot.collector_protocol import SERVER_SCRIPT_REMOTE_COMMAND
 from serverpilot.keepalive_protocol import (
+    KEEPALIVE_INSPECT_COMMAND,
     KEEPALIVE_PROTOCOL_INFO_CAPABILITIES,
     KEEPALIVE_PROTOCOL_INFO_COMMAND,
     KEEPALIVE_REMOTE_COMMAND,
     KEEPALIVE_SCHEMA_VERSION,
+    KeepaliveAttestationRequest,
+    KeepaliveAttestationResponse,
     KeepaliveGPUResult,
     KeepaliveRequest,
     KeepaliveResponse,
@@ -499,6 +502,72 @@ class ServerScriptKeepaliveAdapter:
         self._validate_exact_result_mapping(response.results, requested, enabled)
         return response
 
+    async def attest_workers(
+        self,
+        endpoint: EndpointConfig,
+        gpu_uuids: list[str],
+    ) -> KeepaliveAttestationResponse:
+        """Return sealed helper evidence for exactly ``gpu_uuids``.
+
+        This is read-only: it never starts, stops, or discovers processes.  It
+        can only ask the endpoint helper to validate UUIDs supplied by the
+        Broker against that helper's own v3 state and fixed worker marker.
+        """
+
+        if not isinstance(gpu_uuids, list):
+            raise ValueError("gpu_uuids must be a list")
+        try:
+            requested = tuple(validate_gpu_uuid(gpu_uuid) for gpu_uuid in gpu_uuids)
+        except ValueError as exc:
+            raise ValueError("gpu_uuids contains malformed UUIDs") from exc
+        if not requested:
+            raise ValueError("gpu_uuids cannot be empty")
+        if len(set(requested)) != len(requested):
+            raise ValueError("gpu_uuids contains duplicates")
+        if endpoint.workspace_path is None:
+            raise AdapterCommandError("endpoint workspace_path is required for keepalive")
+        await self._probe_helper(endpoint)
+        payload = KeepaliveAttestationRequest(gpu_uuids=requested).encode()
+        remote_command = (
+            f"cd -- {shlex.quote(endpoint.workspace_path)} && {KEEPALIVE_INSPECT_COMMAND}"
+        )
+        process = await asyncio.create_subprocess_exec(
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"ConnectTimeout={self.connect_timeout_seconds}",
+            "-p",
+            str(endpoint.port),
+            f"{endpoint.ssh_user}@{endpoint.host}",
+            remote_command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(payload), timeout=self.timeout_seconds
+            )
+        except TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise AdapterCommandError("endpoint keepalive attestation timed out") from exc
+        cleaned_stderr = _clean_output(_decode_remote_output(stderr[:16_384], stream_name="stderr"))
+        if process.returncode != 0:
+            message = cleaned_stderr or f"helper exited with code {process.returncode}"
+            raise AdapterCommandError(f"endpoint keepalive attestation failed: {message[-1500:]}")
+        try:
+            response = KeepaliveAttestationResponse.decode(stdout)
+        except ValueError as exc:
+            raise AdapterCommandError(
+                f"endpoint keepalive attestation returned an invalid response: {exc}"
+            ) from exc
+        self._validate_exact_attestation_mapping(response, requested)
+        return response
+
     @staticmethod
     def _validate_exact_result_mapping(
         results: tuple[KeepaliveGPUResult, ...],
@@ -518,6 +587,17 @@ class ServerScriptKeepaliveAdapter:
             raise AdapterCommandError(
                 "endpoint keepalive response contains inconsistent GPU state",
                 uncertain=True,
+            )
+
+    @staticmethod
+    def _validate_exact_attestation_mapping(
+        response: KeepaliveAttestationResponse,
+        requested: tuple[str, ...],
+    ) -> None:
+        observed = tuple(worker.gpu_uuid for worker in response.workers)
+        if len(observed) != len(set(observed)) or set(observed) != set(requested):
+            raise AdapterCommandError(
+                "endpoint keepalive attestation does not map exactly to requested GPUs"
             )
 
 

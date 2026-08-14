@@ -5246,7 +5246,7 @@ private struct AddServerSheet: View {
     @ObservedObject var store: BrokerStore
     @Environment(\.dismiss) private var dismiss
     @State private var sshCommand = ""
-    @State private var workspacePath = "/media/datasets/OminiEWM_Data/tmp/ljp"
+    @State private var workspacePath = ""
     @State private var validationMessage: String?
     @State private var isSubmitting = false
 
@@ -5256,14 +5256,14 @@ private struct AddServerSheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("SSH 指令")
                     .fieldLabel()
-                TextField("ssh -p 2097 root@10.40.1.181", text: $sshCommand)
+                TextField("ssh -p 22 gpu@node-a.example", text: $sshCommand)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 13, weight: .medium, design: .monospaced))
                     .accessibilityLabel("SSH 指令")
             }
             LabeledField(
                 label: "远端工作区路径",
-                placeholder: "/media/datasets/OminiEWM_Data/tmp/ljp",
+                placeholder: "/srv/serverpilot-workspace",
                 text: $workspacePath
             )
             if let validationMessage {
@@ -5379,7 +5379,7 @@ private struct EditServerSheet: View {
             LabeledField(label: "SSH 用户", placeholder: "collector", text: $sshUser)
             LabeledField(
                 label: "远端工作区路径",
-                placeholder: "/media/datasets/OminiEWM_Data/tmp/ljp",
+                placeholder: "/srv/serverpilot-workspace",
                 text: $workspacePath
             )
             EndpointObservationProfileField(selection: $observationProfile)

@@ -28,6 +28,16 @@ banner 或日志写到 stdout。
 短脚本/包装器。它仍只能接受上面的固定参数并输出完全相同的 JSON。此类本地实现是服务器
 管理员的部署责任；不要把 Docker 命令、路径或额外参数填入 ServerPilot Endpoint。
 
+### 从源码构建受控 wheel
+
+在受控构建机的同一版本源码根目录执行：
+
+```bash
+uv build
+```
+
+将 `dist/serverpilot-<version>-py3-none-any.whl` 交给目标服务器管理员，按其受控的软件分发方式安装，并确保 `serverpilot-collect` 位于该 SSH 用户的非交互 `PATH`。安装后先在目标服务器本地运行固定入口，再在 App 中登记 endpoint；不要把 wheel 路径、pip 命令或运行时环境填入 endpoint 配置。
+
 ## JSON 合同
 
 版本 2 的顶层对象必须且只能包含：

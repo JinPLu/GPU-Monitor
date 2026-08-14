@@ -36,7 +36,7 @@ serverpilot daemon status
 
 已确认的空闲占卡 GPU 仍出现在可用容量中。`gpu_apply` 真正分配这张卡前会自动停止该卡 helper、定向刷新并确认空闲，再返回普通工作租约；Agent 不需要也不能手工执行占卡停止流程。
 
-新增服务器必须同时登记一个绝对 `workspace_path`；当前用户确认的共用值是 `/media/datasets/OminiEWM_Data/tmp/ljp`。历史 endpoint 没有该元数据时状态明确返回空值，需通过现有 endpoint 更新面补齐，不会猜测子项目路径。该字段是远端操作的工作目录元数据，不是代码仓库路径：ServerPilot 不会自动创建/删除远端目录，也不会因此获得启动项目 workload 的权限。密封占卡 helper 只采用固定布局 `${workspace_path}/serverpilot-keepalive`；adapter 先以该 workspace 执行只读 `./serverpilot-keepalive --protocol-info`，确认 v3 能力后再执行 `./serverpilot-keepalive --schema-version 3`，不从远端 `PATH` 查找，也不接受 caller 提供的 helper 路径、命令或参数。旧 v2 wire/state 版本直接 fail closed，不会收养、删除或停止旧状态。
+新增服务器必须同时登记一个绝对 `workspace_path`（例如 `/srv/serverpilot-workspace`）。历史 endpoint 没有该元数据时状态明确返回空值，需通过现有 endpoint 更新面补齐，不会猜测子项目路径。该字段是远端操作的工作目录元数据，不是代码仓库路径：ServerPilot 不会自动创建/删除远端目录，也不会因此获得启动项目 workload 的权限。密封占卡 helper 只采用固定布局 `${workspace_path}/serverpilot-keepalive`；adapter 先以该 workspace 执行只读 `./serverpilot-keepalive --protocol-info`，确认 v3 与所需能力后才执行固定逐卡启停命令；身份恢复只读执行 `./serverpilot-keepalive --inspect --schema-version 3`，并与新鲜 collector 观测交叉确认。不从远端 `PATH` 查找，也不接受 caller 提供的 PID、helper 路径、命令或参数。旧 v2 wire/state 版本直接 fail closed，不会收养、删除或停止旧状态。
 
 `no_capacity` 不创建队列，也不代表传输失败。同一 turn 最多再刷新一次状态，然后把再次尝试留给下一 turn 或后续工作周期，不在当前 turn 反复申请。`Transport closed` 与 `no_capacity` 分开处理：前者最多重试一次，仍失败就报告传输错误。
 
@@ -54,6 +54,6 @@ ServerPilot 只协调 GPU。申请成功后的直接 SSH 是执行 workload 的�
 
 ```bash
 serverpilot daemon status --json
-serverpilot-mcp --help
+serverpilot --help
 python3 scripts/install_agent_policy.py all --print
 ```

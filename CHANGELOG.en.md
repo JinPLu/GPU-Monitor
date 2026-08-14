@@ -4,6 +4,15 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## 1.5.6 - 2026-08-15
+
+**ServerPilot 1.5.6 fixes idle keepalive workers being misreported as running workloads after a task releases its GPU lease.**
+
+- The routine Agent contract is unchanged: a finished task calls `gpu_release`; ServerPilot restores idle keepalive itself and the Agent never turns the policy off.
+- The helper now provides read-only proof for its own recorded v3 workers, including the sole driver-visible PID on the target GPU. The Broker rebinds a worker only when that sealed proof matches a fresh collector PID/boot observation, covering worker and daemon restarts without adopting arbitrary processes.
+- Mismatched proof, damaged state, or an additional workload process remain fail-closed. Agents see a precise occupancy-verification failure rather than the misleading “task in use” label.
+- A verified keeper stop clears its previous process identity so the next worker cannot be compared to a stale PID.
+
 ## 1.5.5 - 2026-08-14
 
 **ServerPilot 1.5.5 upgrades the keepalive protocol to v3 and tightens GPU/control-plane reliability.**

@@ -9,7 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, Iterable, Mapping, TypeVar
 
 from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.orm import Session
@@ -1598,6 +1598,65 @@ class BrokerService:
             processes.extend(self._current_processes(session, gpu_id, utcnow()))
         return processes
 
+    @staticmethod
+    def _validate_keepalive_worker_confirmation(
+        *,
+        gpu_ids: Iterable[str],
+        processes_by_gpu: Mapping[str, list[ProcessObservation]],
+        confirmed_worker_identities: Mapping[str, tuple[int, str]],
+    ) -> None:
+        """Match sealed-helper worker evidence to one fresh observed process per GPU.
+
+        The service deliberately accepts only the narrow, internal result of
+        adapter attestation: ``gpu_id -> (pid, boot_id)``.  It never treats
+        this as enough by itself.  The caller must have collected after the
+        helper operation, and this method requires that collection to show
+        exactly one current process on every target and that it matches the
+        attested identity.  The authoritative process start time remains in
+        the Broker's own observation before it is persisted as expected
+        keepalive identity.
+        """
+
+        target_ids = list(gpu_ids)
+        if set(confirmed_worker_identities) != set(target_ids):
+            raise BrokerError(
+                "keepalive_confirmation_scope_mismatch",
+                "sealed keepalive confirmation must cover exactly the target GPUs",
+                status_code=409,
+            )
+        for gpu_id in target_ids:
+            identity = confirmed_worker_identities[gpu_id]
+            if (
+                not isinstance(identity, tuple)
+                or len(identity) != 2
+                or type(identity[0]) is not int
+                or identity[0] <= 0
+                or not isinstance(identity[1], str)
+                or not identity[1]
+            ):
+                raise BrokerError(
+                    "keepalive_confirmation_invalid",
+                    "sealed keepalive confirmation identity is invalid",
+                    status_code=409,
+                    details={"gpu_id": gpu_id},
+                )
+            processes = processes_by_gpu[gpu_id]
+            if len(processes) != 1:
+                raise BrokerError(
+                    "keepalive_confirmation_conflict",
+                    "fresh collection must show exactly one process per confirmed GPU",
+                    status_code=409,
+                    details={"gpu_id": gpu_id},
+                )
+            process = processes[0]
+            if (process.pid, process.boot_id) != identity:
+                raise BrokerError(
+                    "keepalive_confirmation_mismatch",
+                    "sealed keepalive worker identity does not match fresh collection",
+                    status_code=409,
+                    details={"gpu_id": gpu_id},
+                )
+
     def _record_observed_keepalive(
         self,
         session: Session,
@@ -1788,6 +1847,7 @@ class BrokerService:
         *,
         error_reason: str | None = None,
         expected_process: ProcessObservation | None = None,
+        clear_expected_process: bool = False,
         now: datetime,
     ) -> None:
         if actual not in {"ON", "OFF", "ERROR"}:
@@ -1814,7 +1874,11 @@ class BrokerService:
             return
         current.actual = actual
         current.error_reason = error_reason
-        if expected_process is not None:
+        if clear_expected_process:
+            current.expected_pid = None
+            current.expected_boot_id = None
+            current.expected_process_started_at = None
+        elif expected_process is not None:
             current.expected_pid = expected_process.pid
             current.expected_boot_id = expected_process.boot_id
             current.expected_process_started_at = expected_process.process_started_at
@@ -1875,6 +1939,8 @@ class BrokerService:
             status = "可用 · 占卡未运行"
         elif available:
             status = "可用 · 未开启占卡"
+        elif keepalive.get("actual") == "ERROR":
+            status = "占卡校验失败，暂不可申请"
         elif gpu.get("lease") is not None or gpu.get("state") in {
             "BUSY_UNMANAGED",
             "HELD",
@@ -2133,10 +2199,45 @@ class BrokerService:
                     lease = self._active_lease_for_gpu(session, gpu.id)
                     if lease is not None:
                         current = session.get(KeepaliveCurrent, gpu.id)
-                        if lease.kind == "keepalive" and (
-                            lease.state != "ACTIVE"
-                            or not self._current_processes(session, gpu.id, now)
-                            or self._keepalive_expected_process_key(current) is None
+                        processes = self._current_processes(session, gpu.id, now)
+                        expected_key = self._keepalive_expected_process_key(current)
+                        observed_keys = {self._process_key(process) for process in processes}
+                        needs_confirmation = (
+                            lease.kind == "keepalive"
+                            and bool(processes)
+                            and (
+                                current is None
+                                or current.actual == "ERROR"
+                                or expected_key is None
+                                or observed_keys != {expected_key}
+                            )
+                        )
+                        if needs_confirmation and len(processes) == 1:
+                            # A live worker with an unknown/replaced identity
+                            # is never normal free capacity.  The API can only
+                            # execute this after sealed helper attestation and
+                            # a matching fresh collection.
+                            transitions.append(
+                                {
+                                    "action": "recover",
+                                    "endpoint_id": endpoint.id,
+                                    "gpu_id": gpu.id,
+                                    "gpu_uuid": gpu.gpu_uuid,
+                                    "reason": "requires sealed helper attestation",
+                                }
+                            )
+                        elif needs_confirmation:
+                            transitions.append(
+                                {
+                                    "action": "ineligible",
+                                    "endpoint_id": endpoint.id,
+                                    "gpu_id": gpu.id,
+                                    "gpu_uuid": gpu.gpu_uuid,
+                                    "reason": "occupancy has additional processes; automatic recovery is blocked",
+                                }
+                            )
+                        elif lease.kind == "keepalive" and (
+                            lease.state != "ACTIVE" or not processes
                         ):
                             transitions.append(
                                 {
@@ -2404,6 +2505,7 @@ class BrokerService:
         *,
         observation_not_before: datetime,
         idempotency_key: str,
+        confirmed_worker_identities: Mapping[str, tuple[int, str]] | None = None,
     ) -> dict[str, Any]:
         """Atomically record one freshly observed keepalive for every target GPU."""
 
@@ -2498,6 +2600,12 @@ class BrokerService:
                     "fresh collection found additional processes on an occupancy GPU",
                     status_code=409,
                     details={"gpu_ids": conflicted_gpu_ids},
+                )
+            if confirmed_worker_identities is not None:
+                self._validate_keepalive_worker_confirmation(
+                    gpu_ids=gpu_ids,
+                    processes_by_gpu=processes_by_gpu,
+                    confirmed_worker_identities=confirmed_worker_identities,
                 )
 
             now = utcnow()
@@ -2596,6 +2704,39 @@ class BrokerService:
             return result
 
         return self._write(operation)
+
+    def confirm_keepalive_workers(
+        self,
+        actor: ActorContext,
+        endpoint_id: str,
+        gpu_ids: list[str],
+        *,
+        confirmed_worker_identities: Mapping[str, tuple[int, str]],
+        observation_not_before: datetime,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Persist a sealed-helper confirmation after matching fresh collection.
+
+        This is the only path that may rebind a desired keepalive whose live
+        worker no longer matches the last stored PID/start identity.  The API
+        obtains the identities from the fixed helper protocol and must collect
+        after that proof.  This service method then verifies the observed
+        process itself before it can rebind the keepalive lease, so an ordinary
+        process observation alone can never make a foreign workload available.
+
+        It intentionally shares the activation transaction: a just-started
+        worker and a recovered worker both become ``actual=ON`` only after the
+        same exact observation checks.
+        """
+
+        return self.activate_keepalives(
+            actor,
+            endpoint_id,
+            gpu_ids,
+            observation_not_before=observation_not_before,
+            idempotency_key=idempotency_key,
+            confirmed_worker_identities=confirmed_worker_identities,
+        )
 
     @staticmethod
     def _keepalive_lease_summary(lease: Lease, endpoint_id: str, gpu_id: str) -> dict[str, Any]:
@@ -2723,7 +2864,16 @@ class BrokerService:
                 request.state = "RELEASED"
                 request.updated_at = now
             self._resolve_lease_alerts(session, lease.id, now)
-            self._set_keepalive_current(session, gpu_ids[0], "OFF", now=now)
+            # This is the one validated stop boundary: fresh collection proved
+            # the target empty, so retaining the old PID/start identity would
+            # make a later keeper restart look foreign.
+            self._set_keepalive_current(
+                session,
+                gpu_ids[0],
+                "OFF",
+                clear_expected_process=True,
+                now=now,
+            )
             event = self._audit(
                 session,
                 actor_id=actor.id,

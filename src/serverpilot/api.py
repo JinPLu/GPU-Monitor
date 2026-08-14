@@ -39,6 +39,7 @@ from serverpilot.collector import SSHCollector
 from serverpilot.config import Settings, load_inventory
 from serverpilot.database import Database
 from serverpilot.importer import ParsedSSHCommand, parse_ssh_command
+from serverpilot.keepalive_protocol import KEEPALIVE_WORKER_MARKER
 from serverpilot.schemas import (
     ActorCreate,
     AlertAcknowledge,
@@ -105,10 +106,7 @@ class RequestBodyLimitMiddleware:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        headers = {
-            key.lower(): value
-            for key, value in scope.get("headers", [])
-        }
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
         content_length = headers.get(b"content-length")
         if content_length is not None:
             try:
@@ -189,6 +187,7 @@ def _public_error_message(exc: BrokerError) -> str:
         "keepalive_helper_incompatible": (
             "远端占卡 helper 版本或能力不匹配；请先完成该服务器的 helper 升级。"
         ),
+        "keepalive_attestation_invalid": "远端占卡程序的身份校验未通过；该 GPU 暂不可申请。",
         "keepalive_outcome_uncertain": "占卡程序返回结果不确定，本次没有分配任务。",
         "keepalive_adapter_failed": "占卡程序启动或停止失败；下一采集周期会继续尝试。",
         "keepalive_cleanup_failed": "占卡异常且未能完成清理；请在 APP 中确认该 GPU 的实际状态。",
@@ -388,6 +387,66 @@ def create_app(
             )
         return by_uuid
 
+    def attested_worker_identities_by_gpu_uuid(
+        adapter_result: Any,
+        gpu_uuids: list[str],
+    ) -> dict[str, tuple[int, str]]:
+        """Validate exact sealed-helper worker evidence for a GPU set.
+
+        The adapter is the only caller of the remote helper.  This function
+        deliberately keeps the REST/MCP surface out of that trust boundary:
+        callers can neither provide a PID nor ask the helper to inspect an
+        arbitrary process.  The service subsequently matches these narrow
+        identities to its own fresh collector observation before it writes an
+        expected process identity.
+        """
+
+        workers = getattr(adapter_result, "workers", None)
+        if not isinstance(workers, tuple) or len(workers) != len(gpu_uuids):
+            raise BrokerError(
+                "keepalive_attestation_invalid",
+                "endpoint keepalive worker evidence could not be verified",
+                status_code=503,
+            )
+        by_uuid: dict[str, tuple[int, str]] = {}
+        for worker in workers:
+            gpu_uuid = getattr(worker, "gpu_uuid", None)
+            pid = getattr(worker, "pid", None)
+            driver_pid = getattr(worker, "driver_pid", None)
+            boot_id = getattr(worker, "boot_id", None)
+            start_time_ticks = getattr(worker, "start_time_ticks", None)
+            worker_marker = getattr(worker, "worker_marker", None)
+            if (
+                not isinstance(gpu_uuid, str)
+                or gpu_uuid in by_uuid
+                or type(pid) is not int
+                or pid <= 0
+                or type(driver_pid) is not int
+                or driver_pid <= 0
+                or not isinstance(boot_id, str)
+                or not boot_id
+                or type(start_time_ticks) is not int
+                or start_time_ticks <= 0
+                or worker_marker != KEEPALIVE_WORKER_MARKER
+            ):
+                raise BrokerError(
+                    "keepalive_attestation_invalid",
+                    "endpoint keepalive worker evidence could not be verified",
+                    status_code=503,
+                )
+            # ``pid`` is the helper's PID-namespace identity used for its
+            # safe local signalling.  NVIDIA may report the host/driver PID
+            # instead, so the collector match deliberately uses the helper's
+            # separately attested driver-visible PID.
+            by_uuid[gpu_uuid] = (driver_pid, boot_id)
+        if set(by_uuid) != set(gpu_uuids):
+            raise BrokerError(
+                "keepalive_attestation_invalid",
+                "endpoint keepalive worker evidence could not be verified",
+                status_code=503,
+            )
+        return by_uuid
+
     async def reconcile_endpoint_keepalive(
         actor: ActorContext,
         endpoint_id: str,
@@ -422,7 +481,10 @@ def create_app(
                 transition for transition in transitions if transition.get("action") == "start"
             ]
             stops = [transition for transition in transitions if transition.get("action") == "stop"]
-            if not starts and not stops:
+            recovers = [
+                transition for transition in transitions if transition.get("action") == "recover"
+            ]
+            if not starts and not stops and not recovers:
                 return service.get_endpoint_keepalive_summary(endpoint_id)
             adapter_id = endpoint.keepalive_adapter_id
             if adapter_id is None:
@@ -492,23 +554,81 @@ def create_app(
                 except Exception:
                     await cleanup_failed_start("keepalive_adapter_failed")
 
-                observation_not_before = utcnow()
                 try:
+                    # The helper attests its own sealed v3 state first; the
+                    # following normal collection must independently observe
+                    # the same PID/boot identity before the service persists
+                    # it.  A process-only collector observation can therefore
+                    # never re-adopt a foreign workload.
+                    observation_not_before = utcnow()
+                    attested = await adapter.attest_workers(endpoint, gpu_uuids)
+                    identities_by_uuid = attested_worker_identities_by_gpu_uuid(attested, gpu_uuids)
                     await collect_keepalive_endpoint(endpoint)
-                except BrokerError as exc:
-                    await cleanup_failed_start(exc.code)
-                try:
-                    service.activate_keepalives(
+                    confirmed_worker_identities = {
+                        gpu_id: identities_by_uuid[gpu_uuid] for gpu_id, gpu_uuid in start_targets
+                    }
+                    service.confirm_keepalive_workers(
                         actor,
                         endpoint_id,
                         [gpu_id for gpu_id, _gpu_uuid in start_targets],
+                        confirmed_worker_identities=confirmed_worker_identities,
                         observation_not_before=observation_not_before,
                         idempotency_key=f"{idempotency_key}:activate-batch",
                     )
+                except AdapterCommandError as exc:
+                    await cleanup_failed_start(_keepalive_adapter_failure_code(exc))
                 except BrokerError as exc:
                     await cleanup_failed_start(exc.code)
                 except Exception:
                     await cleanup_failed_start("keepalive_activation_failed")
+            if recovers:
+                recover_targets: list[tuple[str, str]] = []
+                for transition in recovers:
+                    gpu_id = transition.get("gpu_id")
+                    gpu_uuid = transition.get("gpu_uuid")
+                    if not isinstance(gpu_id, str) or not isinstance(gpu_uuid, str):
+                        raise BrokerError(
+                            "keepalive_transition_plan_invalid",
+                            "endpoint keepalive recovery target is invalid",
+                            status_code=503,
+                        )
+                    recover_targets.append((gpu_id, gpu_uuid))
+                recover_gpu_uuids = [gpu_uuid for _gpu_id, gpu_uuid in recover_targets]
+                try:
+                    # Recovery has no mutation: it accepts an existing worker
+                    # only when a sealed helper proof and a *new* normal
+                    # observation agree.  A mismatch stays fail-closed.
+                    observation_not_before = utcnow()
+                    attested = await adapter.attest_workers(endpoint, recover_gpu_uuids)
+                    identities_by_uuid = attested_worker_identities_by_gpu_uuid(
+                        attested, recover_gpu_uuids
+                    )
+                    await collect_keepalive_endpoint(endpoint)
+                    service.confirm_keepalive_workers(
+                        actor,
+                        endpoint_id,
+                        [gpu_id for gpu_id, _gpu_uuid in recover_targets],
+                        confirmed_worker_identities={
+                            gpu_id: identities_by_uuid[gpu_uuid]
+                            for gpu_id, gpu_uuid in recover_targets
+                        },
+                        observation_not_before=observation_not_before,
+                        idempotency_key=f"{idempotency_key}:recover-batch",
+                    )
+                except AdapterCommandError as exc:
+                    raise BrokerError(
+                        _keepalive_adapter_failure_code(exc),
+                        "空闲占卡身份校验失败，将在下一次采集后重试。",
+                        status_code=503,
+                    ) from None
+                except BrokerError:
+                    raise
+                except Exception:
+                    raise BrokerError(
+                        "keepalive_attestation_invalid",
+                        "空闲占卡身份校验失败，将在下一次采集后重试。",
+                        status_code=503,
+                    ) from None
             if stops:
                 prepared_stops: list[tuple[dict[str, Any], str]] = []
                 stop_failures: list[dict[str, str]] = []
@@ -590,12 +710,8 @@ def create_app(
                         for item in stop_failures
                         if item["code"] == "keepalive_helper_incompatible"
                     }
-                    if (
-                        len(deterministic_codes) == 1
-                        and all(
-                            item["code"] == "keepalive_helper_incompatible"
-                            for item in stop_failures
-                        )
+                    if len(deterministic_codes) == 1 and all(
+                        item["code"] == "keepalive_helper_incompatible" for item in stop_failures
                     ):
                         code = next(iter(deterministic_codes))
                         raise BrokerError(

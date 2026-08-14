@@ -7,8 +7,10 @@ from sqlalchemy import select
 
 from serverpilot.models import (
     Endpoint,
+    KeepaliveCurrent,
     Lease,
     LeaseResource,
+    ProcessObservation,
     TelemetryCurrent,
 )
 from serverpilot.schemas import EndpointUpdate, LeaseObservedBind, RequestCreate
@@ -229,7 +231,136 @@ def test_foreign_replacement_never_becomes_public_keepalive_capacity(service, ad
     assert gpu["keepalive"]["actual"] == "ERROR"
     assert gpu["keepalive"]["reason"] == "检测到不属于占卡程序的进程"
     assert gpu["publicly_available"] is False
-    assert gpu["public_status"] == "任务使用中"
+    assert gpu["public_status"] == "占卡校验失败，暂不可申请"
+
+
+def test_live_identity_mismatch_plans_attested_recovery_without_admission(service, admin) -> None:
+    _configure_idle_policy(service, admin)
+    _begin(service, admin, 0)
+    service.ingest_observation(
+        observation(
+            count=2,
+            processes=[process_for_gpu("GPU-endpoint-a-0", pid=8801)],
+        )
+    )
+
+    transitions = service.list_keepalive_transitions("endpoint-a")["transitions"]
+
+    assert transitions == [
+        {
+            "action": "recover",
+            "endpoint_id": "endpoint-a",
+            "gpu_id": "endpoint-a:GPU-endpoint-a-0",
+            "gpu_uuid": "GPU-endpoint-a-0",
+            "reason": "requires sealed helper attestation",
+        },
+        {
+            "action": "start",
+            "endpoint_id": "endpoint-a",
+            "gpu_id": "endpoint-a:GPU-endpoint-a-1",
+            "gpu_uuid": "GPU-endpoint-a-1",
+        },
+    ]
+    gpu = _gpus(service.snapshot(admin))["endpoint-a:GPU-endpoint-a-0"]
+    assert gpu["state"] == "CONFLICT"
+    assert gpu["publicly_available"] is False
+
+
+def test_attested_confirmation_rebinds_replaced_keepalive_worker(service, admin) -> None:
+    _configure_idle_policy(service, admin)
+    _begin(service, admin, 0)
+    barrier = utcnow()
+    service.ingest_observation(
+        observation(
+            count=2,
+            processes=[process_for_gpu("GPU-endpoint-a-0", pid=8801)],
+        )
+    )
+    gpu_id = "endpoint-a:GPU-endpoint-a-0"
+
+    confirmed = service.confirm_keepalive_workers(
+        admin,
+        "endpoint-a",
+        [gpu_id],
+        confirmed_worker_identities={gpu_id: (8801, "boot-endpoint-a")},
+        observation_not_before=barrier,
+        idempotency_key="confirm-replaced-keeper",
+    )
+
+    assert confirmed["keepalives"][0]["state"] == "ACTIVE"
+    with service.database.session() as session:
+        current = session.get(KeepaliveCurrent, gpu_id)
+        observed = session.scalar(
+            select(ProcessObservation).where(
+                ProcessObservation.gpu_id == gpu_id,
+                ProcessObservation.pid == 8801,
+                ProcessObservation.active.is_(True),
+            )
+        )
+        assert current is not None
+        assert observed is not None
+        assert current.actual == "ON"
+        assert current.error_reason is None
+        assert current.expected_pid == observed.pid
+        assert current.expected_boot_id == observed.boot_id
+        assert current.expected_process_started_at == observed.process_started_at
+    gpu = _gpus(service.snapshot(admin))[gpu_id]
+    assert gpu["state"] == "KEEPALIVE"
+    assert gpu["publicly_available"] is True
+
+
+def test_attested_confirmation_starts_and_binds_new_keepalive_worker(service, admin) -> None:
+    _configure_idle_policy(service, admin)
+    barrier = utcnow()
+    service.ingest_observation(
+        observation(
+            count=2,
+            processes=[process_for_gpu("GPU-endpoint-a-0", pid=7722)],
+        )
+    )
+    gpu_id = "endpoint-a:GPU-endpoint-a-0"
+
+    confirmed = service.confirm_keepalive_workers(
+        admin,
+        "endpoint-a",
+        [gpu_id],
+        confirmed_worker_identities={gpu_id: (7722, "boot-endpoint-a")},
+        observation_not_before=barrier,
+        idempotency_key="confirm-new-keeper",
+    )
+
+    assert confirmed["keepalives"][0]["state"] == "ACTIVE"
+    gpu = _gpus(service.snapshot(admin))[gpu_id]
+    assert gpu["state"] == "KEEPALIVE"
+    assert gpu["keepalive"]["actual"] == "ON"
+
+
+def test_attested_confirmation_rejects_unmatched_identity_and_keeps_conflict(service, admin) -> None:
+    _configure_idle_policy(service, admin)
+    _begin(service, admin, 0)
+    barrier = utcnow()
+    service.ingest_observation(
+        observation(
+            count=2,
+            processes=[process_for_gpu("GPU-endpoint-a-0", pid=8801)],
+        )
+    )
+    gpu_id = "endpoint-a:GPU-endpoint-a-0"
+
+    with pytest.raises(BrokerError) as rejected:
+        service.confirm_keepalive_workers(
+            admin,
+            "endpoint-a",
+            [gpu_id],
+            confirmed_worker_identities={gpu_id: (4321, "boot-endpoint-a")},
+            observation_not_before=barrier,
+            idempotency_key="reject-foreign-replacement",
+        )
+
+    assert rejected.value.code == "keepalive_confirmation_mismatch"
+    gpu = _gpus(service.snapshot(admin))[gpu_id]
+    assert gpu["state"] == "CONFLICT"
+    assert gpu["keepalive"]["actual"] == "ERROR"
 
 
 def test_reclaim_plan_selects_only_complete_verified_per_gpu_keepalive_set(service, admin) -> None:
@@ -310,6 +441,37 @@ def test_stop_is_per_gpu_and_requires_fresh_empty_target_observation(service, ad
     gpus = _gpus(service.snapshot(admin))
     assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "AVAILABLE"
     assert gpus["endpoint-a:GPU-endpoint-a-1"]["state"] == "AVAILABLE"
+
+
+def test_validated_keepalive_stop_clears_old_expected_process_identity(service, admin) -> None:
+    _configure_idle_policy(service, admin)
+    begun = _begin(service, admin)
+    keepalive = begun["keepalive"]
+    assert isinstance(keepalive, dict)
+    service.configure_keepalive_policy(
+        admin,
+        "endpoint-a",
+        "disabled",
+        idempotency_key="disable-before-identity-clear",
+    )
+    barrier = utcnow()
+    service.ingest_observation(observation(count=2))
+
+    service.finalize_keepalive_stop(
+        admin,
+        "endpoint-a",
+        str(keepalive["lease_id"]),
+        observation_not_before=barrier,
+        idempotency_key="validated-stop-clears-identity",
+    )
+
+    with service.database.session() as session:
+        current = session.get(KeepaliveCurrent, "endpoint-a:GPU-endpoint-a-0")
+        assert current is not None
+        assert current.actual == "OFF"
+        assert current.expected_pid is None
+        assert current.expected_boot_id is None
+        assert current.expected_process_started_at is None
 
 
 def test_endpoint_operator_can_clear_stale_per_gpu_keepalive_lease(service, admin) -> None:

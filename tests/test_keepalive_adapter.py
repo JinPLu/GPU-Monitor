@@ -20,13 +20,17 @@ from serverpilot.adapters import (
 )
 from serverpilot.config import EndpointConfig
 from serverpilot.keepalive_protocol import (
+    KEEPALIVE_INSPECT_COMMAND,
     KEEPALIVE_IMPLEMENTATION_VERSION,
     KEEPALIVE_PROTOCOL_INFO_CAPABILITIES,
     KEEPALIVE_SCHEMA_VERSION,
+    KeepaliveAttestationRequest,
+    KeepaliveAttestationResponse,
     KeepaliveGPUResult,
     KeepaliveProtocolError,
     KeepaliveRequest,
     KeepaliveResponse,
+    KeepaliveWorkerAttestation,
     keepalive_protocol_info,
 )
 from serverpilot.server_keepalive import (
@@ -38,6 +42,7 @@ from serverpilot.server_keepalive import (
     LocalKeepaliveController,
     TorchSubprocessProvider,
     default_state_directory,
+    handle_attestation,
     handle_request,
 )
 
@@ -116,6 +121,43 @@ def test_torch_provider_reports_unknown_uuid_in_pci_mapping() -> None:
         provider._cuda_visible_device(GPU_B)
 
 
+def test_driver_pid_attestation_uses_only_the_fixed_compute_process_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_query(query_argument: str) -> str:
+        calls.append(query_argument)
+        return f"{GPU_A}, 50101\n{GPU_B}, 50102\n"
+
+    monkeypatch.setattr(keepalive_module, "_run_nvidia_smi_query", fake_query)
+
+    assert keepalive_module._resolve_keepalive_driver_pid(GPU_A) == 50101
+    assert calls == ["--query-compute-apps=gpu_uuid,pid"]
+
+
+@pytest.mark.parametrize(
+    ("output", "message"),
+    [
+        ("No running compute processes found\n", "exactly one process"),
+        (f"{GPU_B}, 50102\n", "exactly one process"),
+        (f"{GPU_A}, 50101\n{GPU_A}, 50103\n", "exactly one process"),
+        (f"{GPU_A}, invalid\n", "query is invalid"),
+    ],
+)
+def test_driver_pid_attestation_fails_closed_for_nonunique_or_malformed_compute_query(
+    monkeypatch: pytest.MonkeyPatch,
+    output: str,
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        keepalive_module, "_run_nvidia_smi_query", lambda _query_argument: output
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        keepalive_module._resolve_keepalive_driver_pid(GPU_A)
+
+
 def _result(
     gpu_uuid: str,
     *,
@@ -148,13 +190,65 @@ def test_protocol_info_publishes_v3_helper_capabilities() -> None:
     assert keepalive_protocol_info() == {
         "kind": "serverpilot-keepalive",
         "schema_version": 3,
-        "implementation_version": "1.5.5",
+        "implementation_version": "1.5.6",
         "capabilities": [
             "per_gpu_keepalive",
             "pidfd_identity",
             "pci_bus_id",
+            "worker_attestation",
         ],
     }
+
+
+def test_attestation_protocol_is_typed_and_rejects_ambiguous_identity_evidence() -> None:
+    request = KeepaliveAttestationRequest(gpu_uuids=(GPU_A,))
+    assert KeepaliveAttestationRequest.decode(request.encode()) == request
+    with pytest.raises(KeepaliveProtocolError, match="request fields are invalid"):
+        KeepaliveAttestationRequest.decode(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "gpu_uuids": [GPU_A],
+                    "command": "arbitrary",
+                }
+            )
+        )
+    with pytest.raises(KeepaliveProtocolError, match="worker marker is invalid"):
+        KeepaliveAttestationResponse.decode(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "workers": [
+                        {
+                            "gpu_uuid": GPU_A,
+                            "pid": 101,
+                            "driver_pid": 50_101,
+                            "boot_id": "fake-boot-id",
+                            "start_time_ticks": 1010,
+                            "worker_marker": "foreign-worker",
+                        }
+                    ],
+                }
+            )
+        )
+    with pytest.raises(KeepaliveProtocolError, match="driver PID is invalid"):
+        KeepaliveAttestationResponse.decode(
+            json.dumps(
+                {
+                    "schema_version": 3,
+                    "workers": [
+                        {
+                            "gpu_uuid": GPU_A,
+                            "pid": 101,
+                            "driver_pid": 0,
+                            "boot_id": "fake-boot-id",
+                            "start_time_ticks": 1010,
+                            "worker_marker": WORKER_PROCESS_MARKER,
+                        }
+                    ],
+                }
+            )
+        )
 
 
 def test_response_decodes_each_gpu_result() -> None:
@@ -358,6 +452,156 @@ def test_adapter_rejects_unknown_or_mismapped_gpu_results(
         asyncio.run(ServerScriptKeepaliveAdapter().set_enabled(endpoint, True, ["GPU-A;$(id)"]))
 
 
+def test_adapter_attests_workers_through_the_fixed_inspection_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[Any, ...], bytes]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, command: tuple[Any, ...]) -> None:
+            self.command = command
+
+        async def communicate(self, payload: bytes = b"") -> tuple[bytes, bytes]:
+            calls.append((self.command, payload))
+            if self.command[-1].endswith("--protocol-info"):
+                return (
+                    json.dumps(
+                        {
+                            "kind": "serverpilot-keepalive",
+                            "schema_version": KEEPALIVE_SCHEMA_VERSION,
+                            "implementation_version": KEEPALIVE_IMPLEMENTATION_VERSION,
+                            "capabilities": list(KEEPALIVE_PROTOCOL_INFO_CAPABILITIES),
+                        }
+                    ).encode(),
+                    b"",
+                )
+            return (
+                KeepaliveAttestationResponse(
+                    workers=(
+                        KeepaliveWorkerAttestation(
+                            gpu_uuid=GPU_A,
+                            pid=101,
+                            driver_pid=50_101,
+                            boot_id="fake-boot-id",
+                            start_time_ticks=1010,
+                            worker_marker=WORKER_PROCESS_MARKER,
+                        ),
+                    )
+                ).encode(),
+                b"",
+            )
+
+    async def fake_create_subprocess_exec(*args: Any, **_options: Any) -> FakeProcess:
+        return FakeProcess(args)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    endpoint = EndpointConfig(
+        id="endpoint-a",
+        host="gpu.example.test",
+        port=2202,
+        ssh_user="gpu",
+        workspace_path="/srv/project-a",
+    )
+
+    response = asyncio.run(ServerScriptKeepaliveAdapter().attest_workers(endpoint, [GPU_A]))
+
+    assert response.workers[0].pid == 101
+    assert response.workers[0].driver_pid == 50_101
+    assert calls[1][0][-1] == f"cd -- /srv/project-a && {KEEPALIVE_INSPECT_COMMAND}"
+    assert json.loads(calls[1][1]) == {"schema_version": 3, "gpu_uuids": [GPU_A]}
+    assert {"shell", "env", "command", "path", "argv", "pid"}.isdisjoint(
+        json.loads(calls[1][1])
+    )
+
+
+def test_adapter_rejects_attestation_that_widens_the_requested_gpu_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, command: tuple[Any, ...]) -> None:
+            self.command = command
+
+        async def communicate(self, _payload: bytes = b"") -> tuple[bytes, bytes]:
+            if self.command[-1].endswith("--protocol-info"):
+                return json.dumps(keepalive_protocol_info()).encode(), b""
+            workers = tuple(
+                KeepaliveWorkerAttestation(
+                    gpu_uuid=gpu_uuid,
+                    pid=101 + position,
+                    driver_pid=50_101 + position,
+                    boot_id="fake-boot-id",
+                    start_time_ticks=1010 + position,
+                    worker_marker=WORKER_PROCESS_MARKER,
+                )
+                for position, gpu_uuid in enumerate((GPU_A, GPU_B))
+            )
+            return KeepaliveAttestationResponse(workers=workers).encode(), b""
+
+    async def fake_create_subprocess_exec(*args: Any, **_options: Any) -> FakeProcess:
+        return FakeProcess(args)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    endpoint = EndpointConfig(
+        id="endpoint-a",
+        host="gpu.example.test",
+        port=22,
+        ssh_user="gpu",
+        workspace_path="/srv/project-a",
+    )
+
+    with pytest.raises(AdapterCommandError, match="does not map exactly"):
+        asyncio.run(ServerScriptKeepaliveAdapter().attest_workers(endpoint, [GPU_A]))
+
+
+def test_adapter_attestation_timeout_is_read_only_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HungProcess:
+        returncode: int | None = None
+        killed = False
+
+        async def communicate(self, _payload: bytes = b"") -> tuple[bytes, bytes]:
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode or 0
+
+    process = HungProcess()
+
+    async def fake_create_subprocess_exec(*_args: Any, **_options: Any) -> HungProcess:
+        return process
+
+    async def probe_without_ssh(_endpoint: EndpointConfig) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    adapter = ServerScriptKeepaliveAdapter()
+    adapter.timeout_seconds = 0.01
+    monkeypatch.setattr(adapter, "_probe_helper", probe_without_ssh)
+    endpoint = EndpointConfig(
+        id="endpoint-a",
+        host="gpu.example.test",
+        port=22,
+        ssh_user="gpu",
+        workspace_path="/srv/project-a",
+    )
+
+    with pytest.raises(AdapterCommandError, match="attestation timed out") as failure:
+        asyncio.run(adapter.attest_workers(endpoint, [GPU_A]))
+
+    assert failure.value.uncertain is False
+    assert process.killed is True
+
+
 class FakeProvider:
     def __init__(self) -> None:
         self.running: set[int] = set()
@@ -402,6 +646,7 @@ def test_local_controller_manages_each_gpu_independently_and_only_stops_own_stat
         provider=provider,
         state_directory=tmp_path / "keepalive",
         known_gpu_uuids_resolver=lambda: KNOWN_GPUS,
+        driver_pid_resolver=lambda gpu_uuid: {GPU_A: 50_101, GPU_B: 50_102}[gpu_uuid],
     )
 
     started = controller.set_enabled(True, [GPU_A, GPU_B])
@@ -428,6 +673,67 @@ def test_local_controller_manages_each_gpu_independently_and_only_stops_own_stat
             "worker_marker": WORKER_PROCESS_MARKER,
         }
     ]
+
+
+def test_local_controller_attests_only_its_live_v3_workers(tmp_path: Path) -> None:
+    provider = FakeProvider()
+    controller = LocalKeepaliveController(
+        provider=provider,
+        state_directory=tmp_path / "keepalive",
+        known_gpu_uuids_resolver=lambda: KNOWN_GPUS,
+        driver_pid_resolver=lambda gpu_uuid: {GPU_A: 50_101, GPU_B: 50_102}[gpu_uuid],
+    )
+    controller.set_enabled(True, [GPU_A, GPU_B])
+
+    response = handle_attestation(
+        KeepaliveAttestationRequest(gpu_uuids=(GPU_B, GPU_A)).encode(), controller=controller
+    )
+
+    assert [
+        (worker.gpu_uuid, worker.pid, worker.driver_pid, worker.start_time_ticks)
+        for worker in response.workers
+    ] == [
+        (GPU_B, 102, 50_102, 1020),
+        (GPU_A, 101, 50_101, 1010),
+    ]
+    assert all(worker.worker_marker == WORKER_PROCESS_MARKER for worker in response.workers)
+    provider.running.remove(102)
+    with pytest.raises(RuntimeError, match="recorded worker identity is not running"):
+        controller.attest_workers([GPU_B])
+    with pytest.raises(RuntimeError, match="does not contain requested GPU UUID"):
+        controller.attest_workers([GPU_C])
+
+
+def test_attestation_rejects_a_state_worker_with_a_foreign_marker(tmp_path: Path) -> None:
+    state_directory = tmp_path / "keepalive"
+    state_directory.mkdir(mode=0o700)
+    (state_directory / "workers.v3.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "workers": [
+                    {
+                        "gpu_uuid": GPU_A,
+                        "pid": 101,
+                        "boot_id": "fake-boot-id",
+                        "start_time_ticks": 1010,
+                        "worker_marker": "foreign-worker",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = LocalKeepaliveController(
+        provider=FakeProvider(),
+        state_directory=state_directory,
+        known_gpu_uuids_resolver=lambda: KNOWN_GPUS,
+    )
+
+    with pytest.raises(RuntimeError, match="invalid worker identity"):
+        handle_attestation(
+            KeepaliveAttestationRequest(gpu_uuids=(GPU_A,)).encode(), controller=controller
+        )
 
 
 def test_local_controller_starts_each_gpu_directly_without_batch_rollback(tmp_path: Path) -> None:

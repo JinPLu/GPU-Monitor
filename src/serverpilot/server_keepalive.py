@@ -32,10 +32,14 @@ from typing import Any, Callable, Iterator, Protocol
 
 from serverpilot.keepalive_protocol import (
     KEEPALIVE_SCHEMA_VERSION,
+    KEEPALIVE_WORKER_MARKER,
+    KeepaliveAttestationRequest,
+    KeepaliveAttestationResponse,
     KeepaliveGPUResult,
     KeepaliveProtocolError,
     KeepaliveRequest,
     KeepaliveResponse,
+    KeepaliveWorkerAttestation,
     keepalive_protocol_info,
     validate_gpu_uuid,
 )
@@ -52,7 +56,7 @@ COMPUTE_MATRIX_SIZE = 2048
 WORKER_READY_TIMEOUT_SECONDS = 35
 WORKER_STOP_TIMEOUT_SECONDS = 10
 NVIDIA_SMI_TIMEOUT_SECONDS = 10
-WORKER_PROCESS_MARKER = "serverpilot-keepalive-worker-v3"
+WORKER_PROCESS_MARKER = KEEPALIVE_WORKER_MARKER
 LINUX_PIDFD_SEND_SIGNAL_SYSCALL = 424
 LINUX_PIDFD_OPEN_SYSCALL = 434
 LINUX_PIDFD_SYSCALL_MACHINES = frozenset({"aarch64", "arm64", "amd64", "x86_64"})
@@ -277,10 +281,12 @@ class LocalKeepaliveController:
         provider: KeepaliveProcessProvider | None = None,
         state_directory: Path | None = None,
         known_gpu_uuids_resolver: Callable[[], set[str]] | None = None,
+        driver_pid_resolver: Callable[[str], int] | None = None,
     ) -> None:
         self.provider = provider or TorchSubprocessProvider()
         self.state_directory = state_directory or default_state_directory()
         self.known_gpu_uuids_resolver = known_gpu_uuids_resolver or _resolve_known_gpu_uuids
+        self.driver_pid_resolver = driver_pid_resolver or _resolve_keepalive_driver_pid
 
     def set_enabled(self, enabled: bool, gpu_uuids: list[str] | tuple[str, ...]) -> KeepaliveResponse:
         """Start or stop one occupancy worker for each supplied GPU UUID."""
@@ -302,6 +308,52 @@ class LocalKeepaliveController:
             if enabled:
                 return self._enable(requested, identities)
             return self._disable(requested, identities)
+
+    def attest_workers(
+        self, gpu_uuids: list[str] | tuple[str, ...]
+    ) -> KeepaliveAttestationResponse:
+        """Prove each requested worker from sealed v3 state and live identity.
+
+        This deliberately has no best-effort or discovery mode.  A caller
+        receives evidence for every requested UUID only if that UUID is in the
+        helper's own v3 state and its exact PID, boot, start-tick, and marker
+        identity still matches a live process.  Any malformed, missing, or
+        stale state fails closed rather than adopting an arbitrary CUDA PID.
+        """
+
+        try:
+            requested = tuple(validate_gpu_uuid(gpu_uuid) for gpu_uuid in gpu_uuids)
+        except TypeError as exc:
+            raise ValueError("gpu_uuids must be an iterable of GPU UUID strings") from exc
+        if not requested:
+            raise ValueError("gpu_uuids cannot be empty")
+        if len(set(requested)) != len(requested):
+            raise ValueError("gpu_uuids contains duplicate GPU UUIDs")
+        self._ensure_state_directory()
+        with self._lock():
+            identities = self._read_identities()
+            workers: list[KeepaliveWorkerAttestation] = []
+            for gpu_uuid in requested:
+                try:
+                    identity = identities[gpu_uuid]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        "keepalive worker state does not contain requested GPU UUID"
+                    ) from exc
+                if not self.provider.is_running(identity):
+                    raise RuntimeError("keepalive recorded worker identity is not running")
+                driver_pid = self.driver_pid_resolver(gpu_uuid)
+                workers.append(
+                    KeepaliveWorkerAttestation(
+                        gpu_uuid=gpu_uuid,
+                        pid=identity.pid,
+                        driver_pid=driver_pid,
+                        boot_id=identity.boot_id,
+                        start_time_ticks=identity.start_time_ticks,
+                        worker_marker=identity.worker_marker,
+                    )
+                )
+        return KeepaliveAttestationResponse(workers=tuple(workers))
 
     def _enable(
         self,
@@ -529,6 +581,17 @@ def handle_request(
     return (controller or LocalKeepaliveController()).set_enabled(request.enabled, request.gpu_uuids)
 
 
+def handle_attestation(
+    payload: bytes,
+    *,
+    controller: LocalKeepaliveController | None = None,
+) -> KeepaliveAttestationResponse:
+    """Handle the fixed helper inspection protocol without a mutation path."""
+
+    request = KeepaliveAttestationRequest.decode(payload)
+    return (controller or LocalKeepaliveController()).attest_workers(request.gpu_uuids)
+
+
 def _terminate_started_process(process: subprocess.Popen[bytes]) -> None:
     """Stop only the direct child represented by this fresh Popen handle."""
 
@@ -652,6 +715,43 @@ def _run_nvidia_smi_query(query_argument: str) -> str:
     if result.returncode != 0:
         raise RuntimeError("nvidia-smi host PID verification failed")
     return result.stdout
+
+
+def _resolve_keepalive_driver_pid(gpu_uuid: str) -> int:
+    """Return the sole driver-visible compute PID for one live helper GPU.
+
+    ``pid`` in v3 state belongs to the helper's local PID namespace and is
+    deliberately retained for safe pidfd signaling.  Collector observations,
+    however, use the NVIDIA driver's host-visible PID.  The helper may attest
+    that PID only after its own exact worker identity is live, and only when
+    NVIDIA reports exactly one compute process on the target physical UUID.
+    """
+
+    gpu_uuid = validate_gpu_uuid(gpu_uuid)
+    output = _run_nvidia_smi_query("--query-compute-apps=gpu_uuid,pid")
+    if output.strip().lower().startswith("no running compute processes"):
+        entries: list[tuple[str, int]] = []
+    else:
+        entries = []
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) != 2:
+                raise RuntimeError("keepalive driver process query is invalid")
+            observed_uuid = validate_gpu_uuid(parts[0])
+            if not parts[1].isdigit():
+                raise RuntimeError("keepalive driver process query is invalid")
+            driver_pid = int(parts[1])
+            if driver_pid <= 0 or driver_pid > 2**31 - 1:
+                raise RuntimeError("keepalive driver process query is invalid")
+            entries.append((observed_uuid, driver_pid))
+    matches = [driver_pid for observed_uuid, driver_pid in entries if observed_uuid == gpu_uuid]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "keepalive driver process query must contain exactly one process for requested GPU"
+        )
+    return matches[0]
 
 
 def _resolve_known_gpu_uuids() -> set[str]:
@@ -785,6 +885,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="reconcile sealed ServerPilot per-GPU keepalive workers")
     parser.add_argument("--schema-version", type=int)
     parser.add_argument("--protocol-info", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--inspect", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--internal-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--ready-fd", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--worker-marker", help=argparse.SUPPRESS)
@@ -792,6 +893,7 @@ def main() -> None:
     if arguments.protocol_info:
         if (
             arguments.schema_version is not None
+            or arguments.inspect
             or arguments.internal_worker
             or arguments.ready_fd is not None
             or arguments.worker_marker is not None
@@ -802,9 +904,26 @@ def main() -> None:
             + b"\n"
         )
         return
+    if arguments.inspect:
+        if (
+            arguments.schema_version != KEEPALIVE_SCHEMA_VERSION
+            or arguments.internal_worker
+            or arguments.ready_fd is not None
+            or arguments.worker_marker is not None
+        ):
+            parser.error("invalid keepalive inspection invocation")
+        try:
+            payload = sys.stdin.buffer.read()
+            response = handle_attestation(payload)
+            sys.stdout.buffer.write(response.encode())
+        except Exception as exc:
+            print(f"serverpilot-keepalive failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+        return
     if arguments.internal_worker:
         if (
             arguments.schema_version is not None
+            or arguments.inspect
             or arguments.ready_fd is None
             or arguments.worker_marker != WORKER_PROCESS_MARKER
         ):
@@ -813,6 +932,7 @@ def main() -> None:
         return
     if (
         arguments.schema_version != KEEPALIVE_SCHEMA_VERSION
+        or arguments.inspect
         or arguments.ready_fd is not None
         or arguments.worker_marker is not None
     ):

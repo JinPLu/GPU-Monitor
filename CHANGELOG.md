@@ -4,6 +4,15 @@
 
 这里只记录用户能感受到的变化；实现细节见 Git 提交。
 
+## 1.5.6 - 2026-08-15
+
+**ServerPilot 1.5.6 修复了任务归还后自身占卡 worker 被误报为“任务使用中”的问题。**
+
+- Agent 的日常合约不变：任务结束仍只需调用 `gpu_release`；ServerPilot 自行恢复空闲占卡，Agent 不需要关闭占卡开关。
+- helper 会对它自己登记的 v3 worker 作只读身份证明，并证明目标卡唯一的 driver-visible PID；Broker 仅在该证明与新鲜采集的 PID/boot identity 一致时重新登记 worker。占卡进程重启、daemon 重启或短暂控制面丢失后，不会再把 ServerPilot 自己的 worker 当作外部任务。
+- 证明不一致、状态损坏或额外业务进程仍保持 fail closed，绝不自动收养；Agent 会得到“占卡校验失败，暂不可申请”，而不是误导性的“任务使用中”。
+- 已确认停止的 keeper 会清除旧进程身份，避免下一次启动拿旧 PID 误比对新 worker。
+
 ## 1.5.5 - 2026-08-14
 
 **ServerPilot 1.5.5 将占卡协议升级到 v3，并收紧不同 GPU/驱动环境中的设备选择与控制面可靠性。**

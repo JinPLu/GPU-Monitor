@@ -23,8 +23,11 @@ from serverpilot.api import (
 )
 from serverpilot.config import InventoryConfig, Settings
 from serverpilot.keepalive_protocol import (
+    KEEPALIVE_WORKER_MARKER,
+    KeepaliveAttestationResponse,
     KeepaliveGPUResult,
     KeepaliveResponse,
+    KeepaliveWorkerAttestation,
 )
 from serverpilot.mcp_server import mcp
 from serverpilot.models import Lease
@@ -44,7 +47,11 @@ class FakeKeepaliveAdapter:
     def __init__(self, *, failure: Exception | None = None) -> None:
         self.failure = failure
         self.calls: list[tuple[str, bool, tuple[str, ...]]] = []
+        self.attest_calls: list[tuple[str, tuple[str, ...]]] = []
         self.active_pids: dict[str, int] = {}
+        self.attested_pids: dict[str, int] = {}
+        self.driver_pids: dict[str, int] = {}
+        self._next_driver_pid = 4_000
 
     async def set_enabled(self, endpoint, enabled: bool, gpu_uuids: list[str]) -> KeepaliveResponse:  # type: ignore[no-untyped-def]
         requested = tuple(gpu_uuids)
@@ -52,9 +59,20 @@ class FakeKeepaliveAdapter:
         if self.failure is not None:
             raise self.failure
         results: list[KeepaliveGPUResult] = []
-        for index, gpu_uuid in enumerate(requested, start=1):
+        for gpu_uuid in requested:
             if enabled:
-                self.active_pids.setdefault(gpu_uuid, 4_000 + index)
+                if gpu_uuid not in self.active_pids:
+                    # One helper worker has two relevant identities: a PID in
+                    # the helper namespace and the NVIDIA-driver PID which
+                    # the collector sees.  A new worker gets fresh values for
+                    # both; retaining an old driver PID after a stop would
+                    # incorrectly model a valid post-release restore as an
+                    # attestation mismatch.
+                    self._next_driver_pid += 1
+                    driver_pid = self._next_driver_pid
+                    self.active_pids[gpu_uuid] = driver_pid
+                    self.driver_pids[gpu_uuid] = driver_pid
+                    self.attested_pids[gpu_uuid] = 100_000 + driver_pid
                 results.append(
                     KeepaliveGPUResult(
                         gpu_uuid=gpu_uuid,
@@ -65,6 +83,8 @@ class FakeKeepaliveAdapter:
             else:
                 existed = gpu_uuid in self.active_pids
                 self.active_pids.pop(gpu_uuid, None)
+                self.attested_pids.pop(gpu_uuid, None)
+                self.driver_pids.pop(gpu_uuid, None)
                 results.append(
                     KeepaliveGPUResult(
                         gpu_uuid=gpu_uuid,
@@ -73,6 +93,29 @@ class FakeKeepaliveAdapter:
                     )
                 )
         return KeepaliveResponse(enabled=enabled, results=tuple(results))
+
+    async def attest_workers(self, endpoint, gpu_uuids: list[str]) -> KeepaliveAttestationResponse:  # type: ignore[no-untyped-def]
+        requested = tuple(gpu_uuids)
+        self.attest_calls.append((endpoint.id, requested))
+        workers: list[KeepaliveWorkerAttestation] = []
+        for gpu_uuid in requested:
+            pid = self.attested_pids.get(gpu_uuid, self.active_pids.get(gpu_uuid))
+            if pid is None:
+                raise AdapterCommandError("missing fake keepalive worker")
+            driver_pid = self.driver_pids.get(gpu_uuid, self.active_pids.get(gpu_uuid))
+            if driver_pid is None:
+                raise AdapterCommandError("missing fake keepalive driver worker")
+            workers.append(
+                KeepaliveWorkerAttestation(
+                    gpu_uuid=gpu_uuid,
+                    pid=pid,
+                    driver_pid=driver_pid,
+                    boot_id=f"boot-{endpoint.id}",
+                    start_time_ticks=100_000 + pid,
+                    worker_marker=KEEPALIVE_WORKER_MARKER,
+                )
+            )
+        return KeepaliveAttestationResponse(workers=tuple(workers))
 
 
 class PartiallyFailingStopAdapter(FakeKeepaliveAdapter):
@@ -1526,6 +1569,47 @@ def test_routine_agent_path_handles_keepalive_on_and_off(
     assert {gpu["status"] for gpu in status_on["gpus"]} == {"可用 · 空闲占卡"}
     assert {tuple(gpu["keepalive"].values()) for gpu in status_on["gpus"]} == {("ON", "ON")}
 
+    # Simulate the exact production failure: the workload has already been
+    # released and the helper restarted its own workers, so their PIDs no
+    # longer match the persisted keeper identities.  The collector must keep
+    # these GPUs fail-closed until the helper attests them; an Agent must not
+    # see a foreign workload or reclaim them by bypassing the normal path.
+    calls_before_recovery = list(adapter.calls)
+    adapter.active_pids = {gpu_uuid: pid + 10_000 for gpu_uuid, pid in adapter.active_pids.items()}
+    # The helper may run in a PID namespace: its own sealed PID differs from
+    # the NVIDIA driver PID that the normal collector observes.  Recovery is
+    # allowed only because the independently attested driver PID still agrees
+    # with that collector observation.
+    adapter.attested_pids = {gpu_uuid: pid + 20_000 for gpu_uuid, pid in adapter.active_pids.items()}
+    adapter.driver_pids = dict(adapter.active_pids)
+
+    async def collect_restarted_workers() -> None:
+        endpoint = app.state.service.collector_endpoint("endpoint-a")
+        await collector.collect_once(app.state.service, endpoints=[endpoint])
+
+    asyncio.run(collect_restarted_workers())
+    unavailable = mcp_server.gpu_status()
+    assert unavailable["gpus"] == []
+    assert unavailable["no_capacity"]["reason"] == "all_gpus_busy_or_unavailable"
+    error_status = mcp_server.gpu_status(include_busy=True)
+    assert {gpu["available"] for gpu in error_status["gpus"]} == {False}
+    assert {tuple(gpu["keepalive"].values()) for gpu in error_status["gpus"]} == {("ON", "ERROR")}
+    assert {gpu["status"] for gpu in error_status["gpus"]} == {"占卡校验失败，暂不可申请"}
+
+    async def recover_restarted_workers() -> None:
+        await app.state.reconcile_endpoint_keepalive(
+            app.state.service.local_actor("agent-a"),
+            "endpoint-a",
+            idempotency_key="agent-path-worker-recovery",
+        )
+
+    asyncio.run(recover_restarted_workers())
+    assert adapter.calls == calls_before_recovery
+    assert adapter.attest_calls[-1] == ("endpoint-a", GPU_UUIDS)
+    recovered_status = mcp_server.gpu_status()
+    assert len(recovered_status["gpus"]) == len(GPU_UUIDS)
+    assert {gpu["status"] for gpu in recovered_status["gpus"]} == {"可用 · 空闲占卡"}
+
     allocation_on = mcp_server.gpu_apply(
         server_id="endpoint-a", gpu_count=1, task="Agent 占卡开启申请验收"
     )
@@ -1548,6 +1632,11 @@ def test_routine_agent_path_handles_keepalive_on_and_off(
 
     asyncio.run(restore_then_disable())
     assert set(adapter.active_pids) == set(GPU_UUIDS)
+    # Restoring the selected GPU starts a *new* helper worker.  Its namespace
+    # PID is intentionally different, while the attested driver-visible PID
+    # tracks the collector's new process identity.
+    assert adapter.attested_pids[selected_uuid] != adapter.active_pids[selected_uuid]
+    assert adapter.driver_pids[selected_uuid] == adapter.active_pids[selected_uuid]
     disabled = rest.post(
         "/api/v1/endpoints/endpoint-a/keepalive",
         json={"enabled": False},
@@ -1565,6 +1654,88 @@ def test_routine_agent_path_handles_keepalive_on_and_off(
     assert len(allocation_off["gpus"]) == 1
     assert adapter.active_pids == {}
     mcp_server.gpu_release(allocation_off["lease_id"])
+
+
+def test_keepalive_recovery_rejects_mismatched_helper_attestation(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    """A collector process is not enough to re-adopt a keeper after restart."""
+
+    adapter = FakeKeepaliveAdapter()
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+    client = TestClient(app)
+    enabled = client.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("attestation-mismatch-on"),
+    )
+    assert enabled.status_code == 200, enabled.text
+    calls_before_recovery = list(adapter.calls)
+    adapter.active_pids = {gpu_uuid: pid + 10_000 for gpu_uuid, pid in adapter.active_pids.items()}
+    adapter.driver_pids = {gpu_uuid: pid + 1 for gpu_uuid, pid in adapter.active_pids.items()}
+
+    async def collect_then_recover() -> None:
+        endpoint = app.state.service.collector_endpoint("endpoint-a")
+        await collector.collect_once(app.state.service, endpoints=[endpoint])
+        await app.state.reconcile_endpoint_keepalive(
+            app.state.service.local_actor("agent-a"),
+            "endpoint-a",
+            idempotency_key="attestation-mismatch-recover",
+        )
+
+    with pytest.raises(BrokerError, match="sealed keepalive worker identity") as failure:
+        asyncio.run(collect_then_recover())
+    assert failure.value.code == "keepalive_confirmation_mismatch"
+    # Recovery is read-only.  A mismatched helper proof never stops an
+    # existing worker or turns the GPU into immediately claimable capacity.
+    assert adapter.calls == calls_before_recovery
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
+    assert {gpu["state"] for gpu in snapshot["gpus"]} == {"CONFLICT"}
+    assert {gpu["keepalive"]["actual"] for gpu in snapshot["gpus"]} == {"ERROR"}
+
+
+def test_keepalive_recovery_never_adopts_additional_foreign_processes(
+    tmp_path: Path, inventory: InventoryConfig
+) -> None:
+    """A verified keeper plus any extra process remains fail-closed."""
+
+    adapter = FakeKeepaliveAdapter()
+    collector = FakeTargetedCollector(adapter)
+    app, _ = _keepalive_app(tmp_path, inventory, adapter=adapter, collector=collector)
+    client = TestClient(app)
+    enabled = client.post(
+        "/api/v1/endpoints/endpoint-a/keepalive",
+        json={"enabled": True},
+        headers=_headers("foreign-process-on"),
+    )
+    assert enabled.status_code == 200, enabled.text
+    calls_before_recovery = list(adapter.calls)
+    attestations_before_recovery = list(adapter.attest_calls)
+    collector.unmanaged_gpu_uuids = GPU_UUIDS
+
+    async def collect_then_reconcile() -> dict:
+        endpoint = app.state.service.collector_endpoint("endpoint-a")
+        await collector.collect_once(app.state.service, endpoints=[endpoint])
+        return await app.state.reconcile_endpoint_keepalive(
+            app.state.service.local_actor("agent-a"),
+            "endpoint-a",
+            idempotency_key="foreign-process-reconcile",
+        )
+
+    reconciled = asyncio.run(collect_then_reconcile())
+    assert reconciled["keepalive"]["actual"] == "ERROR"
+    # The planner emits only an ineligible outcome: no helper attestation,
+    # stop, or restart is attempted around a potentially real workload.
+    assert adapter.calls == calls_before_recovery
+    assert adapter.attest_calls == attestations_before_recovery
+    snapshot = client.get("/api/v1/snapshot", headers={"X-ServerPilot-Actor": "agent-a"}).json()[
+        "data"
+    ]
+    assert {gpu["state"] for gpu in snapshot["gpus"]} == {"CONFLICT"}
+    assert {gpu["public_status"] for gpu in snapshot["gpus"]} == {"占卡校验失败，暂不可申请"}
 
 
 def test_restart_preserves_keepalive_ownership_without_remote_churn(
