@@ -7,17 +7,11 @@ app_bundle="${1:-${project_root}/ServerPilot.app}"
 result_dir="${2:-${project_root}/build/native-ui-acceptance}"
 executable="${app_bundle}/Contents/MacOS/ServerPilot"
 fixture_dir="${script_dir}/Fixtures"
-validator="/Users/jinplu/.codex/skills/build-gpu-broker-native-ui/scripts/validate_snapshot_contract.py"
 
 if [[ ! -x "${executable}" ]]; then
   print -u2 "Missing executable app: ${executable}"
   exit 2
 fi
-if [[ ! -x "${validator}" ]]; then
-  print -u2 "Missing fixture contract validator: ${validator}"
-  exit 2
-fi
-
 mkdir -p "${result_dir}/screenshots" "${result_dir}/logs" "${result_dir}/ax"
 : > "${result_dir}/commands.log"
 
@@ -55,8 +49,66 @@ run_capture reduce-motion-1280x800 resource-ownership server-pool 1280x800 -Appl
 run_capture system-dark-high-contrast-request-1280x800 resource-ownership server-pool 1280x800 \
   -AppleInterfaceStyle Dark -AppleIncreaseContrast YES
 
-"${validator}" --golden "${fixture_dir}/contract-healthy-snapshot.json" \
-  > "${result_dir}/fixture-contract-validation.json"
+# This baseline check intentionally uses only the Python standard library, so the
+# acceptance script can run from a clean clone. It validates the repository-owned
+# healthy fixture's public snapshot shape; it is not a replacement for API schema
+# tests, which remain in the Python test suite.
+python3 - "${fixture_dir}/contract-healthy-snapshot.json" > "${result_dir}/fixture-contract-validation.json" <<'PY'
+import json
+import pathlib
+import sys
+
+fixture_path = pathlib.Path(sys.argv[1])
+fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+errors = []
+
+if fixture.get("schema_version") != "v1":
+    errors.append("schema_version must be v1")
+if not isinstance(fixture.get("snapshot_revision"), int):
+    errors.append("snapshot_revision must be an integer")
+
+data = fixture.get("data")
+if not isinstance(data, dict):
+    errors.append("data must be an object")
+    data = {}
+
+summary = data.get("summary")
+if not isinstance(summary, dict):
+    errors.append("data.summary must be an object")
+
+endpoints = data.get("endpoints")
+if not isinstance(endpoints, list):
+    errors.append("data.endpoints must be a list")
+    endpoints = []
+endpoint_ids = set()
+for index, endpoint in enumerate(endpoints):
+    if not isinstance(endpoint, dict) or not isinstance(endpoint.get("id"), str):
+        errors.append(f"data.endpoints[{index}] must have a string id")
+        continue
+    endpoint_ids.add(endpoint["id"])
+
+gpus = data.get("gpus")
+if not isinstance(gpus, list):
+    errors.append("data.gpus must be a list")
+    gpus = []
+for index, gpu in enumerate(gpus):
+    if not isinstance(gpu, dict):
+        errors.append(f"data.gpus[{index}] must be an object")
+        continue
+    if not isinstance(gpu.get("id"), str):
+        errors.append(f"data.gpus[{index}] must have a string id")
+    if gpu.get("endpoint_id") not in endpoint_ids:
+        errors.append(f"data.gpus[{index}].endpoint_id must reference an endpoint")
+
+result = {
+    "fixture": str(fixture_path),
+    "validator": "built-in standard-library baseline",
+    "valid": not errors,
+    "errors": errors,
+}
+print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+raise SystemExit(0 if result["valid"] else 4)
+PY
 
 {
   xcode-select -p

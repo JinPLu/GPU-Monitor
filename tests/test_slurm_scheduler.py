@@ -256,7 +256,7 @@ def _upload_target() -> dict[str, Any]:
         "data-transfer",
     ]
     target["upload"] = {
-        "ssh_host": "211.86.151.113",
+        "ssh_host": "192.0.2.113",
         "ssh_user": "test",
         "ssh_port": 22,
         "control_path": "/Users/test/.ssh/cm/%C",

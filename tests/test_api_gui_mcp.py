@@ -1648,7 +1648,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                     "endpoints": [
                         {
                             "id": "server-a",
-                            "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                            "workspace_path": "/srv/serverpilot-workspace",
                             "monitor": {"status": "ONLINE", "last_error": None},
                             "private_detail": "must not cross MCP boundary",
                         }
@@ -1716,7 +1716,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
         lambda: FakeClient(),
     )
     workspace = {
-        "path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+        "path": "/srv/serverpilot-workspace",
         "kind": "working_directory",
         "use_as_cwd": True,
         "code_location": "not_provided",
@@ -1732,7 +1732,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "name": "A",
                 "vram_mib": 80000,
                 "status": "可用 · 未开启占卡",
-                "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                "workspace_path": "/srv/serverpilot-workspace",
                 "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
             }
@@ -1748,7 +1748,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "name": "A",
                 "vram_mib": 80000,
                 "status": "可用 · 未开启占卡",
-                "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                "workspace_path": "/srv/serverpilot-workspace",
                 "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
                 "available": True,
@@ -1760,7 +1760,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "name": "A",
                 "vram_mib": 80000,
                 "status": "任务使用中",
-                "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                "workspace_path": "/srv/serverpilot-workspace",
                 "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
                 "available": False,
