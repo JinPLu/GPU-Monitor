@@ -104,6 +104,7 @@ TERMINAL_SCHEDULER_JOB_STATES = {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}
 TERMINAL_SCHEDULER_TRANSFER_STATES = {"COMPLETED", "FAILED", "DEFERRED"}
 TELEMETRY_HISTORY_INTERVAL_SECONDS = 60
 TELEMETRY_HISTORY_RETENTION_SECONDS = 24 * 60 * 60
+TELEMETRY_RECENT_AVERAGE_WINDOW_SECONDS = 10 * 60
 # The collector derives a process start time from `ps etimes`, which has
 # one-second precision and is sampled after the endpoint observation begins.
 # Preserve the already-observed identity across this bounded measurement
@@ -368,6 +369,7 @@ class BrokerService:
                     storage_group=configured_endpoint.storage_group,
                     expected_gpu_count=configured_endpoint.expected_gpu_count,
                     expected_gpu_total_vram_mib=configured_endpoint.expected_gpu_total_vram_mib,
+                    resource_kind="unknown",
                     owner_project_id=(
                         configured_endpoint.project_ids[0]
                         if configured_endpoint.project_ids
@@ -925,6 +927,7 @@ class BrokerService:
             "storage_group": endpoint.storage_group,
             "expected_gpu_count": endpoint.expected_gpu_count,
             "expected_gpu_total_vram_mib": endpoint.expected_gpu_total_vram_mib,
+            "resource_kind": endpoint.resource_kind,
             "owner_project_id": endpoint.owner_project_id,
             "lifecycle_state": endpoint.lifecycle_state,
             "enabled": endpoint.lifecycle_state == "active",
@@ -1315,6 +1318,44 @@ class BrokerService:
             "pstate": telemetry.pstate,
             "health": telemetry.health,
             "provider": telemetry.provider,
+        }
+
+    @staticmethod
+    def _recent_telemetry_average(
+        gpu: GPUDevice,
+        samples: list[TelemetryCurrent | TelemetrySnapshot],
+    ) -> dict[str, Any] | None:
+        """Summarize the recent observed history for one GPU.
+
+        The current sample is included only when it is newer than the last
+        persisted history point, matching :meth:`gpu_history` and avoiding a
+        duplicate observation in the rolling average.
+        """
+
+        if not samples:
+            return None
+
+        def average(name: str) -> float | None:
+            values = [getattr(sample, name) for sample in samples]
+            present = [float(value) for value in values if value is not None]
+            return round(sum(present) / len(present), 2) if present else None
+
+        memory_used_mib = average("memory_used_mib")
+        return {
+            "window_seconds": TELEMETRY_RECENT_AVERAGE_WINDOW_SECONDS,
+            "sample_count": len(samples),
+            "first_observed_at": _iso(samples[0].observed_at),
+            "last_observed_at": _iso(samples[-1].observed_at),
+            "memory_used_mib": memory_used_mib,
+            "memory_free_mib": average("memory_free_mib"),
+            "memory_used_pct": (
+                round(memory_used_mib * 100 / gpu.total_vram_mib, 2)
+                if memory_used_mib is not None and gpu.total_vram_mib > 0
+                else None
+            ),
+            "gpu_utilization_pct": average("gpu_utilization_pct"),
+            "memory_utilization_pct": average("memory_utilization_pct"),
+            "temperature_c": average("temperature_c"),
         }
 
     @staticmethod
@@ -3135,15 +3176,15 @@ class BrokerService:
                 gpu_counts[gpu.endpoint_id] += 1
 
             telemetry_by_gpu: dict[str, TelemetryCurrent | TelemetrySnapshot] = {}
+            current_telemetry_by_gpu: dict[str, TelemetryCurrent] = {}
             if gpu_ids:
-                telemetry_by_gpu.update(
-                    {
-                        item.gpu_id: item
-                        for item in session.scalars(
-                            select(TelemetryCurrent).where(TelemetryCurrent.gpu_id.in_(gpu_ids))
-                        ).all()
-                    }
-                )
+                current_telemetry_by_gpu = {
+                    item.gpu_id: item
+                    for item in session.scalars(
+                        select(TelemetryCurrent).where(TelemetryCurrent.gpu_id.in_(gpu_ids))
+                    ).all()
+                }
+                telemetry_by_gpu.update(current_telemetry_by_gpu)
                 missing = gpu_ids.difference(telemetry_by_gpu)
                 if missing:
                     latest_ids = (
@@ -3161,6 +3202,35 @@ class BrokerService:
                             ).all()
                         }
                     )
+
+            recent_telemetry_samples_by_gpu: dict[
+                str, list[TelemetryCurrent | TelemetrySnapshot]
+            ] = defaultdict(list)
+            if gpu_ids:
+                recent_cutoff = now - timedelta(seconds=TELEMETRY_RECENT_AVERAGE_WINDOW_SECONDS)
+                for sample in session.scalars(
+                    select(TelemetrySnapshot)
+                    .where(
+                        TelemetrySnapshot.gpu_id.in_(gpu_ids),
+                        TelemetrySnapshot.observed_at >= recent_cutoff,
+                    )
+                    .order_by(
+                        TelemetrySnapshot.gpu_id,
+                        TelemetrySnapshot.observed_at,
+                        TelemetrySnapshot.id,
+                    )
+                ).all():
+                    recent_telemetry_samples_by_gpu[sample.gpu_id].append(sample)
+                for gpu_id, current in current_telemetry_by_gpu.items():
+                    observed_at = _as_utc(current.observed_at)
+                    samples = recent_telemetry_samples_by_gpu[gpu_id]
+                    last_observed_at = _as_utc(samples[-1].observed_at) if samples else None
+                    if (
+                        observed_at is not None
+                        and observed_at >= recent_cutoff
+                        and (last_observed_at is None or observed_at > last_observed_at)
+                    ):
+                        samples.append(current)
 
             process_cutoff = now - timedelta(seconds=self.inventory.collector.stale_after_seconds)
             processes_by_gpu: dict[str, list[ProcessObservation]] = defaultdict(list)
@@ -3384,6 +3454,12 @@ class BrokerService:
             gpu_payloads: list[dict[str, Any]] = []
             for gpu in gpus:
                 telemetry = telemetry_by_gpu.get(gpu.id)
+                telemetry_payload = self._telemetry_dict(telemetry)
+                if telemetry_payload is not None:
+                    telemetry_payload["recent_average"] = self._recent_telemetry_average(
+                        gpu,
+                        recent_telemetry_samples_by_gpu[gpu.id],
+                    )
                 processes = processes_by_gpu[gpu.id]
                 lease = lease_by_gpu.get(gpu.id)
                 gpu_state, reason = derive_state(gpu)
@@ -3412,7 +3488,7 @@ class BrokerService:
                     "first_seen_at": _iso(gpu.first_seen_at),
                     "last_seen_at": _iso(gpu.last_seen_at),
                     "absent_at": _iso(gpu.absent_at),
-                    "telemetry": self._telemetry_dict(telemetry),
+                    "telemetry": telemetry_payload,
                     "processes": [self._process_dict(process) for process in processes],
                     "lease": (
                         lease_payloads.get(lease.id)
@@ -5553,6 +5629,12 @@ class BrokerService:
                     "current_observed_at": _iso(current_observed_at),
                 }
             revision = self._bump_revision(session, now)
+            if observation.gpu_probe_status == "cpu_only":
+                endpoint.resource_kind = "cpu_only"
+                endpoint.updated_at = now
+            elif observation.gpus:
+                endpoint.resource_kind = "gpu"
+                endpoint.updated_at = now
             host_cpu_total_ticks = observation.host.cpu_total_ticks
             host_cpu_idle_ticks = observation.host.cpu_idle_ticks
             host_cpu_utilization_pct = self._host_cpu_utilization_pct(
@@ -10178,6 +10260,7 @@ class BrokerService:
                 storage_group=endpoint_data.storage_group,
                 expected_gpu_count=endpoint_data.expected_gpu_count,
                 expected_gpu_total_vram_mib=endpoint_data.expected_gpu_total_vram_mib,
+                resource_kind="unknown",
                 owner_project_id=endpoint_data.owner_project_id,
                 lifecycle_state="active",
                 enabled=True,

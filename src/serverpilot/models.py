@@ -59,6 +59,10 @@ class Endpoint(Base):
             "keepalive_policy IN ('disabled', 'idle_keepalive')",
             name="ck_endpoint_keepalive_policy",
         ),
+        CheckConstraint(
+            "resource_kind IN ('unknown', 'cpu_only', 'gpu')",
+            name="ck_endpoint_resource_kind",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -82,6 +86,11 @@ class Endpoint(Base):
     storage_group: Mapped[str | None] = mapped_column(String(120))
     expected_gpu_count: Mapped[int | None] = mapped_column(Integer)
     expected_gpu_total_vram_mib: Mapped[int | None] = mapped_column(Integer)
+    # Collector-owned hardware classification. It is never supplied by a
+    # caller, so a CPU-only host cannot be advertised as a GPU node by mistake.
+    resource_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
     # Optional project attribution for reporting. Endpoint lifecycle operations
     # are shared loopback inventory actions and are not permission-gated by it.
     owner_project_id: Mapped[str | None] = mapped_column(

@@ -98,7 +98,7 @@
       <div class="preview-heading"><div><p class="eyebrow">注册预览</p><h3 id="ssh-preview-title">确认服务器信息</h3></div><span class="badge">未连接验证</span></div>
       <div id="ssh-preview-fields" class="ssh-preview-fields"></div>
       <label id="ssh-endpoint-id-field">服务器名称（可选）<input id="ssh-endpoint-id" name="endpoint_id" placeholder="例如 training-a"></label>
-      <p class="field-help">继续只会登记配置。首次只读采集成功前，该服务器及 GPU 不会被视为可用。</p>
+      <p class="field-help">继续只会登记配置。首次只读采集会自动识别已发现 GPU 或纯 CPU 服务器；未能确认 GPU 时不会参与 GPU 分配。</p>
       <div class="dialog-actions"><button class="quiet-action" type="button" data-edit-ssh-command>返回修改</button><button id="ssh-commit-button" type="button">确认注册</button></div>
     </section>
   </section>
@@ -173,6 +173,7 @@
   <section class="detail-metrics" aria-label="当前 GPU 指标">
     <div><span>显存</span><strong id="detail-memory">—</strong></div><div><span>利用率</span><strong id="detail-util">—</strong></div><div><span>温度</span><strong id="detail-temp">—</strong></div><div><span>功耗</span><strong id="detail-power">—</strong></div>
   </section>
+  <p id="detail-recent-average" class="detail-recent-average muted">近 10 分钟均值：暂无采样</p>
   <div class="chart-heading"><h3>使用趋势</h3><div class="range-switch" aria-label="历史时间范围"><button type="button" data-history-window="3600" aria-pressed="true">1h</button><button type="button" data-history-window="21600" aria-pressed="false">6h</button><button type="button" data-history-window="86400" aria-pressed="false">24h</button></div></div>
   <div id="gpu-chart" class="gpu-chart"><p class="muted">打开详情后才加载历史曲线。</p></div>
   <section class="detail-ownership"><h3>归属与进程</h3><div id="detail-ownership" class="muted">—</div></section>

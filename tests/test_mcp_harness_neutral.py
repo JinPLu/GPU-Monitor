@@ -415,6 +415,7 @@ def test_busy_status_returns_task_without_a_contact_field() -> None:
         "name",
         "vram_mib",
         "status",
+        "telemetry",
         "workspace_path",
         "workspace",
         "available",

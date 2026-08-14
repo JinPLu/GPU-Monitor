@@ -164,6 +164,7 @@ def test_web_dashboard_uses_the_canonical_public_capacity_projection() -> None:
     assert "gpu.publicly_available === true" in source
     assert "const publicStatus = gpu.public_status" in source
     assert "gpu.publicly_available !== true && claimedStates.has(gpu.state)" in source
+    assert '纯 CPU 服务器（不参与 GPU 分配）' in source
     claimed_definition = next(line for line in source.splitlines() if "const claimedStates" in line)
     assert "KEEPALIVE" not in claimed_definition
 
@@ -187,6 +188,7 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert "添加服务器" in home.text
     assert 'id="server-groups"' in home.text
     assert 'id="gpu-detail"' in home.text
+    assert 'id="detail-recent-average"' in home.text
     assert 'id="resource-search"' in home.text
     assert 'class="resource-list-head"' in home.text
     assert 'id="toggle-coordination"' in home.text
@@ -1245,7 +1247,7 @@ def test_mcp_exposes_required_tools() -> None:
     assert set(status_schema["properties"]) == {"include_busy"}
     assert status_schema["properties"]["include_busy"]["default"] is False
     assert by_name["gpu_status"].description == (
-        "列出可用 GPU、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"
+        "列出可用 GPU、最新及近 10 分钟平均显存/利用率遥测、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"
     )
     for name in (
         "gpu_add_server",
@@ -1268,7 +1270,7 @@ def test_default_stdio_mcp_uses_intent_first_routine_surface() -> None:
     assert not any(name.startswith("gpu_scheduler_") for name in names)
     assert names == {"gpu_status", "gpu_apply", "gpu_release"}
     assert by_name["gpu_status"].description == (
-        "列出可用 GPU、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"
+        "列出可用 GPU、最新及近 10 分钟平均显存/利用率遥测、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"
     )
 
 
@@ -1685,7 +1687,15 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                                 "reason": None,
                                 "lease_id": None,
                             },
-                            "telemetry": {"memory_used_mib": 0, "private": "drop"},
+                            "telemetry": {
+                                "observed_at": "2026-08-12T00:00:00Z",
+                                "memory_used_mib": 0,
+                                "memory_free_mib": 80_000,
+                                "gpu_utilization_pct": 3,
+                                "memory_utilization_pct": 1,
+                                "temperature_c": 42,
+                                "private": "drop",
+                            },
                             "processes": ["drop"],
                         },
                         {
@@ -1701,7 +1711,15 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                             "publicly_available": False,
                             "public_status": "任务使用中",
                             "keepalive": {"state": "OFF", "reason": None, "lease_id": None},
-                            "telemetry": {"memory_used_mib": 25000},
+                            "telemetry": {
+                                "observed_at": "2026-08-12T00:00:00Z",
+                                "memory_used_mib": 25_000,
+                                "memory_free_mib": 55_000,
+                                "gpu_utilization_pct": 93,
+                                "memory_utilization_pct": 27,
+                                "temperature_c": 75,
+                                "private": "drop",
+                            },
                             "processes": ["drop"],
                         },
                     ],
@@ -1732,11 +1750,36 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "name": "A",
                 "vram_mib": 80000,
                 "status": "可用 · 未开启占卡",
+                "telemetry": {
+                    "observed_at": "2026-08-12T00:00:00Z",
+                    "memory_used_mib": 0,
+                    "memory_free_mib": 80000,
+                    "memory_used_pct": 0.0,
+                    "gpu_utilization_pct": 3,
+                    "memory_utilization_pct": 1,
+                    "temperature_c": 42,
+                    "recent_average": None,
+                },
                 "workspace_path": "/srv/serverpilot-workspace",
                 "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
             }
-        ]
+        ],
+        "telemetry_summary": {
+            "visible_gpu_count": 1,
+            "vram_total_mib": 80000,
+            "average_vram_mib": 80000.0,
+            "telemetry_gpu_count": 1,
+            "memory_used_mib": 0,
+            "memory_used_gpu_count": 1,
+            "memory_free_mib": 80000,
+            "memory_free_gpu_count": 1,
+            "memory_used_pct": 0.0,
+            "current_average_gpu_utilization_pct": 3.0,
+            "gpu_utilization_gpu_count": 1,
+            "current_average_memory_utilization_pct": 1.0,
+            "memory_utilization_gpu_count": 1,
+        },
     }
 
     assert mcp_server.gpu_status(include_busy=True) == {
@@ -1748,6 +1791,16 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "name": "A",
                 "vram_mib": 80000,
                 "status": "可用 · 未开启占卡",
+                "telemetry": {
+                    "observed_at": "2026-08-12T00:00:00Z",
+                    "memory_used_mib": 0,
+                    "memory_free_mib": 80000,
+                    "memory_used_pct": 0.0,
+                    "gpu_utilization_pct": 3,
+                    "memory_utilization_pct": 1,
+                    "temperature_c": 42,
+                    "recent_average": None,
+                },
                 "workspace_path": "/srv/serverpilot-workspace",
                 "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
@@ -1760,13 +1813,89 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "name": "A",
                 "vram_mib": 80000,
                 "status": "任务使用中",
+                "telemetry": {
+                    "observed_at": "2026-08-12T00:00:00Z",
+                    "memory_used_mib": 25000,
+                    "memory_free_mib": 55000,
+                    "memory_used_pct": 31.25,
+                    "gpu_utilization_pct": 93,
+                    "memory_utilization_pct": 27,
+                    "temperature_c": 75,
+                    "recent_average": None,
+                },
                 "workspace_path": "/srv/serverpilot-workspace",
                 "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
                 "available": False,
                 "task": "训练",
             },
-        ]
+        ],
+        "telemetry_summary": {
+            "visible_gpu_count": 2,
+            "vram_total_mib": 160000,
+            "average_vram_mib": 80000.0,
+            "telemetry_gpu_count": 2,
+            "memory_used_mib": 25000,
+            "memory_used_gpu_count": 2,
+            "memory_free_mib": 135000,
+            "memory_free_gpu_count": 2,
+            "memory_used_pct": 15.62,
+            "current_average_gpu_utilization_pct": 48.0,
+            "gpu_utilization_gpu_count": 2,
+            "current_average_memory_utilization_pct": 14.0,
+            "memory_utilization_gpu_count": 2,
+        },
+    }
+
+
+def test_routine_status_projects_per_gpu_recent_telemetry_average() -> None:
+    status = mcp_server._routine_gpu_status(
+        {
+            "data": {
+                "endpoints": [{"id": "server-a", "workspace_path": "/srv/server-a"}],
+                "gpus": [
+                    {
+                        "endpoint_id": "server-a",
+                        "gpu_uuid": "GPU-a",
+                        "gpu_index": 0,
+                        "name": "A800",
+                        "total_vram_mib": 80_000,
+                        "publicly_available": True,
+                        "public_status": "可用 · 未开启占卡",
+                        "telemetry": {
+                            "memory_used_mib": 4_000,
+                            "recent_average": {
+                                "window_seconds": 3_600,
+                                "sample_count": 3,
+                                "first_observed_at": "2026-08-15T00:00:00Z",
+                                "last_observed_at": "2026-08-15T00:02:00Z",
+                                "memory_used_mib": 12_000.5,
+                                "memory_free_mib": 67_999.5,
+                                "memory_used_pct": 15.0,
+                                "gpu_utilization_pct": 47.33,
+                                "memory_utilization_pct": 21.0,
+                                "temperature_c": 54.67,
+                                "private": "drop",
+                            },
+                        },
+                    }
+                ],
+            }
+        },
+        include_busy=False,
+    )
+
+    assert status["gpus"][0]["telemetry"]["recent_average"] == {
+        "window_seconds": 3_600,
+        "sample_count": 3,
+        "first_observed_at": "2026-08-15T00:00:00Z",
+        "last_observed_at": "2026-08-15T00:02:00Z",
+        "memory_used_mib": 12_000.5,
+        "memory_free_mib": 67_999.5,
+        "memory_used_pct": 15.0,
+        "gpu_utilization_pct": 47.33,
+        "memory_utilization_pct": 21.0,
+        "temperature_c": 54.67,
     }
 
 

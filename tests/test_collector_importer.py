@@ -14,6 +14,7 @@ from serverpilot.adapters import RAW_SSH_OBSERVATION_ADAPTER, RawSSHResult
 from serverpilot.collector import (
     COMBINED_QUERY,
     CollectionError,
+    GPU_CPU_ONLY,
     GPU_UNAVAILABLE,
     MAX_SERVER_SCRIPT_SNAPSHOT_BYTES,
     SSHCollector,
@@ -76,9 +77,9 @@ def test_server_collector_assigns_cuda_ordinals_by_pci_bus(
 
     monkeypatch.setattr(server_collector, "_run_nvidia_smi", fake_query)
 
-    available, gpus, processes = server_collector._gpu_snapshot()
+    gpu_probe_status, gpus, processes = server_collector._gpu_snapshot()
 
-    assert available is True
+    assert gpu_probe_status == "gpu"
     assert [
         (gpu["gpu_uuid"], gpu["gpu_index"], gpu["cuda_ordinal"]) for gpu in gpus
     ] == [
@@ -200,7 +201,7 @@ def test_hung_probe_timeout_is_recorded_as_endpoint_failure(
     )
 
 
-def test_collector_keeps_cpu_only_endpoint_online_without_nvidia_runtime(
+def test_collector_keeps_unconfirmed_gpu_probe_online_for_host_telemetry(
     service, inventory
 ) -> None:
     async def fake_runner(endpoint, command):  # type: ignore[no-untyped-def]
@@ -223,6 +224,7 @@ def test_collector_keeps_cpu_only_endpoint_online_without_nvidia_runtime(
     assert observation.gpus == []
     assert observation.processes == []
     assert observation.observation_complete is False
+    assert observation.gpu_probe_status == "unknown"
     assert observation.host.cpu_count == 32
     assert observation.host.memory_available_mib == 98304
 
@@ -231,6 +233,7 @@ def test_collector_keeps_cpu_only_endpoint_online_without_nvidia_runtime(
     snapshot = service.snapshot(service.local_actor("human"))["data"]
     endpoint = next(value for value in snapshot["endpoints"] if value["id"] == "endpoint-a")
     assert endpoint["monitor"]["status"] == "ONLINE"
+    assert endpoint["resource_kind"] == "unknown"
     assert endpoint["host_telemetry"]["cpu_count"] == 32
     assert endpoint["host_telemetry"]["memory_available_mib"] == 98304
 
@@ -243,6 +246,7 @@ def test_collector_keeps_cpu_only_endpoint_online_when_nvidia_smi_returns_no_row
         assert command == COMBINED_QUERY
         return (
             "__SERVERPILOT_GPU__\n"
+            f"{GPU_CPU_ONLY}\n"
             "__SERVERPILOT_PROCESSES__\n"
             "__SERVERPILOT_PROCESS_DETAILS__\n"
             "__SERVERPILOT_IDENTITY__\n"
@@ -256,7 +260,8 @@ def test_collector_keeps_cpu_only_endpoint_online_when_nvidia_smi_returns_no_row
 
     assert observation.gpus == []
     assert observation.processes == []
-    assert observation.observation_complete is False
+    assert observation.observation_complete is True
+    assert observation.gpu_probe_status == "cpu_only"
     assert observation.host.cpu_count == 16
     assert observation.host.memory_available_mib == 49152
 
@@ -264,6 +269,8 @@ def test_collector_keeps_cpu_only_endpoint_online_when_nvidia_smi_returns_no_row
     snapshot = service.snapshot(service.local_actor("human"))["data"]
     endpoint = next(value for value in snapshot["endpoints"] if value["id"] == "endpoint-a")
     assert endpoint["monitor"]["status"] == "ONLINE"
+    assert endpoint["resource_kind"] == "cpu_only"
+    assert endpoint["monitor"]["last_error"] is None
     assert endpoint["host_telemetry"]["memory_available_mib"] == 49152
 
 

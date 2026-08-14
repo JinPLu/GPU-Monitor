@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
 from serverpilot.adapters import (
+    GPU_CPU_ONLY,
     GPU_SECTION,
     GPU_UNAVAILABLE,
     HOST_RESOURCES_SECTION,
@@ -84,13 +85,20 @@ def _reject_json_constant(value: str) -> None:
     raise CollectionError(f"server collector JSON contains invalid numeric constant: {value}")
 
 
-def _mapping(value: Any, *, label: str, keys: set[str]) -> dict[str, Any]:
+def _mapping(
+    value: Any,
+    *,
+    label: str,
+    keys: set[str],
+    optional_keys: set[str] | None = None,
+) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CollectionError(f"server collector {label} must be an object")
     actual = set(value)
-    if actual != keys:
+    optional_keys = optional_keys or set()
+    if not keys.issubset(actual) or not actual.issubset(keys | optional_keys):
         missing = sorted(keys - actual)
-        unexpected = sorted(actual - keys)
+        unexpected = sorted(actual - keys - optional_keys)
         raise CollectionError(
             f"server collector {label} has invalid fields "
             f"(missing={missing}, unexpected={unexpected})"
@@ -191,6 +199,7 @@ def parse_server_script_snapshot(
         decoded,
         label="snapshot",
         keys={"schema_version", "identity", "host", "gpu_probe_available", "gpus", "processes"},
+        optional_keys={"gpu_probe_status"},
     )
     if (
         type(snapshot["schema_version"]) is not int
@@ -201,6 +210,11 @@ def parse_server_script_snapshot(
         )
     if type(snapshot["gpu_probe_available"]) is not bool:
         raise CollectionError("server collector gpu_probe_available must be a boolean")
+    gpu_probe_status = snapshot.get("gpu_probe_status")
+    if gpu_probe_status is None:
+        gpu_probe_status = "gpu" if snapshot["gpu_probe_available"] else "unknown"
+    if gpu_probe_status not in {"gpu", "cpu_only", "unknown"}:
+        raise CollectionError("server collector gpu_probe_status is invalid")
 
     identity = _mapping(snapshot["identity"], label="identity", keys={"hostname", "boot_id"})
     _text(identity["hostname"], label="identity.hostname", maximum=253)
@@ -400,6 +414,10 @@ def parse_server_script_snapshot(
         raise CollectionError("server collector marked GPU probe unavailable but returned GPU data")
     if gpu_probe_available and not gpus:
         raise CollectionError("server collector marked GPU probe available but returned no GPUs")
+    if gpu_probe_status == "gpu" and not gpu_probe_available:
+        raise CollectionError("server collector marked GPU status without GPU telemetry")
+    if gpu_probe_status != "gpu" and gpu_probe_available:
+        raise CollectionError("server collector GPU probe status conflicts with telemetry")
     return EndpointObservation(
         endpoint_id=endpoint_id,
         observed_at=observed_at,
@@ -414,7 +432,8 @@ def parse_server_script_snapshot(
         },
         gpus=gpus,
         processes=processes,
-        observation_complete=gpu_probe_available,
+        observation_complete=gpu_probe_status != "unknown",
+        gpu_probe_status=gpu_probe_status,
     )
 
 
@@ -687,11 +706,17 @@ class SSHCollector:
         gpu_raw, process_raw, process_details_raw, identity_raw, host_raw = parse_combined_probe(
             await self._run(endpoint, COMBINED_QUERY, probe="endpoint-telemetry")
         )
-        # Some CPU-only hosts expose an `nvidia-smi` wrapper that succeeds but
-        # emits no rows. Treat that shape exactly like an unavailable NVIDIA
-        # runtime so the already-valid host CPU/memory observation remains
-        # useful, while any previously known GPU inventory stays fail-closed.
-        gpu_probe_available = bool(gpu_raw.strip()) and GPU_UNAVAILABLE not in gpu_raw.splitlines()
+        # CPU-only is a positive discovery result: the NVIDIA runtime is
+        # absent, or it successfully reports no rows. A failed query remains
+        # unknown and cannot overwrite earlier GPU facts.
+        gpu_probe_status = (
+            "cpu_only"
+            if GPU_CPU_ONLY in gpu_raw.splitlines()
+            else "unknown"
+            if GPU_UNAVAILABLE in gpu_raw.splitlines()
+            else "gpu"
+        )
+        gpu_probe_available = gpu_probe_status == "gpu"
         gpus = parse_gpu_csv(gpu_raw) if gpu_probe_available else []
         apps = parse_process_csv(process_raw) if gpu_probe_available else []
         _hostname, boot_id = parse_identity(identity_raw)
@@ -733,9 +758,10 @@ class SSHCollector:
             },
             gpus=gpus,
             processes=processes,
-            # A missing host-side NVIDIA runtime must not prevent CPU and memory
-            # monitoring, but it also must not mark previously known GPUs absent.
-            observation_complete=gpu_probe_available,
+            # An unknown NVIDIA probe does not mark previously known GPUs
+            # absent. A confirmed CPU-only endpoint is a complete host result.
+            observation_complete=gpu_probe_status != "unknown",
+            gpu_probe_status=gpu_probe_status,
         )
 
     async def collect_once(

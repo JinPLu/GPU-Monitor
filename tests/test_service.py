@@ -1506,6 +1506,93 @@ def test_current_telemetry_is_bounded_and_routine_samples_do_not_audit(service, 
     assert audit_count == 0
 
 
+def test_snapshot_includes_per_gpu_recent_telemetry_average(service, admin) -> None:
+    start = utcnow() - timedelta(minutes=9)
+
+    def sample(
+        observed_at,
+        *,
+        memory_used_mib: int,
+        gpu_utilization_pct: int,
+        memory_utilization_pct: int,
+        temperature_c: int,
+    ) -> EndpointObservation:
+        value = observation(count=1, observed_at=observed_at)
+        value.gpus[0] = value.gpus[0].model_copy(
+            update={
+                "memory_used_mib": memory_used_mib,
+                "memory_free_mib": 100_000 - memory_used_mib,
+                "gpu_utilization_pct": gpu_utilization_pct,
+                "memory_utilization_pct": memory_utilization_pct,
+                "temperature_c": temperature_c,
+            }
+        )
+        return value
+
+    service.ingest_observation(
+        sample(
+            start,
+            memory_used_mib=10_000,
+            gpu_utilization_pct=10,
+            memory_utilization_pct=20,
+            temperature_c=40,
+        )
+    )
+    service.ingest_observation(
+        sample(
+            start + timedelta(seconds=61),
+            memory_used_mib=20_000,
+            gpu_utilization_pct=40,
+            memory_utilization_pct=50,
+            temperature_c=50,
+        )
+    )
+    # This newest current sample is not yet another persisted history point,
+    # but must still contribute to the average exactly once.
+    service.ingest_observation(
+        sample(
+            start + timedelta(seconds=90),
+            memory_used_mib=30_000,
+            gpu_utilization_pct=80,
+            memory_utilization_pct=90,
+            temperature_c=60,
+        )
+    )
+
+    recent_average = service.snapshot(admin)["data"]["gpus"][0]["telemetry"]["recent_average"]
+    assert recent_average == {
+        "window_seconds": 600,
+        "sample_count": 3,
+        "first_observed_at": start.isoformat(),
+        "last_observed_at": (start + timedelta(seconds=90)).isoformat(),
+        "memory_used_mib": 20_000.0,
+        "memory_free_mib": 80_000.0,
+        "memory_used_pct": 20.0,
+        "gpu_utilization_pct": 43.33,
+        "memory_utilization_pct": 53.33,
+        "temperature_c": 50.0,
+    }
+
+
+def test_cpu_only_observation_is_persisted_as_endpoint_resource_kind(service, admin) -> None:
+    service.ingest_observation(
+        observation(
+            count=0,
+            observation_complete=True,
+        ).model_copy(update={"gpu_probe_status": "cpu_only"})
+    )
+
+    endpoint = service.snapshot(admin)["data"]["endpoints"][0]
+
+    assert endpoint["resource_kind"] == "cpu_only"
+    assert endpoint["monitor"] == {
+        **endpoint["monitor"],
+        "status": "ONLINE",
+        "gpu_count": 0,
+        "last_error": None,
+    }
+
+
 def test_endpoint_cpu_and_memory_telemetry_is_exposed_in_snapshot(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     endpoint = service.snapshot(admin)["data"]["endpoints"][0]

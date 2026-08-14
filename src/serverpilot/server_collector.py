@@ -127,10 +127,12 @@ def _host_snapshot() -> dict[str, int | float]:
     }
 
 
-def _gpu_snapshot() -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
+def _gpu_snapshot() -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     raw_gpus = _run_nvidia_smi(GPU_QUERY)
-    if raw_gpus is None or not raw_gpus.strip():
-        return False, [], []
+    if raw_gpus is None:
+        return ("cpu_only" if shutil.which("nvidia-smi") is None else "unknown"), [], []
+    if not raw_gpus.strip():
+        return "cpu_only", [], []
 
     observed_gpus: list[tuple[tuple[int, int, int, int], dict[str, Any]]] = []
     seen_indices: set[int] = set()
@@ -189,7 +191,7 @@ def _gpu_snapshot() -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
     if raw_processes is None:
         raise RuntimeError("nvidia-smi process query failed")
     if raw_processes.strip().lower().startswith("no running processes"):
-        return True, gpus, []
+        return "gpu", gpus, []
     processes: list[dict[str, Any]] = []
     for row in csv.reader(raw_processes.splitlines()):
         if not row or not any(value.strip() for value in row):
@@ -209,7 +211,7 @@ def _gpu_snapshot() -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
                 "executable": values[3] or "unknown",
             }
         )
-    return True, gpus, _with_process_details(processes)
+    return "gpu", gpus, _with_process_details(processes)
 
 
 def _with_process_details(processes: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -250,7 +252,7 @@ def _with_process_details(processes: list[dict[str, Any]]) -> list[dict[str, Any
 def collect_snapshot() -> dict[str, Any]:
     """Collect one current-schema snapshot without caller-controlled I/O."""
 
-    gpu_probe_available, gpus, processes = _gpu_snapshot()
+    gpu_probe_status, gpus, processes = _gpu_snapshot()
     return {
         "schema_version": SERVER_SCRIPT_SCHEMA_VERSION,
         "identity": {
@@ -258,7 +260,8 @@ def collect_snapshot() -> dict[str, Any]:
             "boot_id": _read_required("/proc/sys/kernel/random/boot_id").strip(),
         },
         "host": _host_snapshot(),
-        "gpu_probe_available": gpu_probe_available,
+        "gpu_probe_available": gpu_probe_status == "gpu",
+        "gpu_probe_status": gpu_probe_status,
         "gpus": gpus,
         "processes": processes,
     }

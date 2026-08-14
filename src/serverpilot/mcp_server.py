@@ -23,12 +23,11 @@ RESOURCE_MARGINAL_MIN_SAVED_RATIO = 0.10
 RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
 _ROUTINE_MCP_INSTANCE_ID = secrets.token_hex(16)
 
-MCP_INSTRUCTIONS = """常规 GPU 任务只用三个工具：gpu_status；gpu_apply 自动选卡，task=任务名，不读取客户端 UI 标题；gpu_release。
-ssh=连接；workspace.path（workspace_path）=cwd，以它为工作目录；kind=working_directory；
-use_as_cwd=true、code_location=not_provided，不得把 workspace_path 当代码仓库路径。
-cuda_device_order=PCI_BUS_ID；cuda_visible_devices=租约 ordinal；gpus[].gpu_cuda_visible_devices=单卡 ordinal。
-CUDA gate/启动失败即 gpu_release。gpu_status(include_busy=true) 看 task、空闲占卡。无容量直接失败，不排队；
-Transport closed 重试一次。只协调 GPU；不得用 SSH、SQLite、inventory、nvidia-smi 绕过协调。
+MCP_INSTRUCTIONS = """常规 GPU 任务三个工具：gpu_status；gpu_apply 自动选卡(task=任务名)，不读取客户端 UI 标题；gpu_release。
+ssh=连接；workspace.path（workspace_path）=cwd，以它为工作目录；kind=working_directory、use_as_cwd=true、code_location=not_provided；不得把 workspace_path 当代码仓库路径。
+cuda_device_order=PCI_BUS_ID；cuda_visible_devices=租约ordinal；gpus[].gpu_cuda_visible_devices=单卡ordinal。
+telemetry 含最近观测/近10分钟均值，status/gpu_apply 决定申请。include_busy=true 看 task/空闲占卡；无容量直接失败，不排队。
+失败即 gpu_release。只协调 GPU；勿用 SSH、SQLite、inventory、nvidia-smi 绕过协调。
 非 GPU 远端操作（Git 同步）无需 GPU 租约。"""
 
 
@@ -98,6 +97,132 @@ def _routine_workspace(path: Any) -> dict[str, Any]:
         "kind": "working_directory",
         "use_as_cwd": True,
         "code_location": "not_provided",
+    }
+
+
+def _routine_integer(value: Any) -> int | None:
+    """Keep an optional non-negative integer from a broker telemetry payload."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _routine_number(value: Any) -> int | float | None:
+    """Keep an optional finite non-negative telemetry measurement."""
+
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return None
+    return value if value >= 0 else None
+
+
+def _routine_recent_telemetry_average(value: Any) -> dict[str, Any] | None:
+    """Project a per-GPU rolling average without exposing other snapshot state."""
+
+    if not isinstance(value, dict):
+        return None
+    window_seconds = _routine_integer(value.get("window_seconds"))
+    sample_count = _routine_integer(value.get("sample_count"))
+    first_observed_at = value.get("first_observed_at")
+    last_observed_at = value.get("last_observed_at")
+    return {
+        "window_seconds": window_seconds if window_seconds and window_seconds > 0 else None,
+        "sample_count": sample_count if sample_count and sample_count > 0 else None,
+        "first_observed_at": (
+            first_observed_at
+            if isinstance(first_observed_at, str) and first_observed_at
+            else None
+        ),
+        "last_observed_at": (
+            last_observed_at if isinstance(last_observed_at, str) and last_observed_at else None
+        ),
+        "memory_used_mib": _routine_number(value.get("memory_used_mib")),
+        "memory_free_mib": _routine_number(value.get("memory_free_mib")),
+        "memory_used_pct": _routine_number(value.get("memory_used_pct")),
+        "gpu_utilization_pct": _routine_number(value.get("gpu_utilization_pct")),
+        "memory_utilization_pct": _routine_number(value.get("memory_utilization_pct")),
+        "temperature_c": _routine_number(value.get("temperature_c")),
+    }
+
+
+def _routine_gpu_telemetry(gpu: dict[str, Any], *, vram_mib: Any) -> dict[str, Any] | None:
+    """Project current GPU telemetry without exposing the full snapshot payload.
+
+    Telemetry is descriptive rather than a scheduling input.  Preserve the
+    observation timestamp so callers can distinguish a missing or old sample
+    from a lightly loaded device.
+    """
+
+    source = gpu.get("telemetry")
+    if not isinstance(source, dict):
+        return None
+    total_vram_mib = _routine_integer(vram_mib)
+    memory_used_mib = _routine_integer(source.get("memory_used_mib"))
+    memory_used_pct = (
+        round(memory_used_mib * 100 / total_vram_mib, 2)
+        if memory_used_mib is not None and total_vram_mib and total_vram_mib > 0
+        else None
+    )
+    observed_at = source.get("observed_at")
+    return {
+        "observed_at": observed_at if isinstance(observed_at, str) and observed_at else None,
+        "memory_used_mib": memory_used_mib,
+        "memory_free_mib": _routine_integer(source.get("memory_free_mib")),
+        "memory_used_pct": memory_used_pct,
+        "gpu_utilization_pct": _routine_integer(source.get("gpu_utilization_pct")),
+        "memory_utilization_pct": _routine_integer(source.get("memory_utilization_pct")),
+        "temperature_c": _routine_integer(source.get("temperature_c")),
+        "recent_average": _routine_recent_telemetry_average(source.get("recent_average")),
+    }
+
+
+def _routine_gpu_telemetry_summary(gpus: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize exactly the GPUs visible in one routine status response."""
+
+    vram_values = [
+        vram_mib for gpu in gpus if (vram_mib := _routine_integer(gpu.get("vram_mib"))) is not None
+    ]
+    telemetry = [item for gpu in gpus if isinstance(item := gpu.get("telemetry"), dict)]
+
+    def values_for(field: str) -> list[int]:
+        return [
+            value for item in telemetry if (value := _routine_integer(item.get(field))) is not None
+        ]
+
+    memory_used_values = values_for("memory_used_mib")
+    memory_free_values = values_for("memory_free_mib")
+    gpu_utilization_values = values_for("gpu_utilization_pct")
+    memory_utilization_values = values_for("memory_utilization_pct")
+    observed_memory_vram = [
+        vram_mib
+        for gpu in gpus
+        if isinstance(gpu.get("telemetry"), dict)
+        and _routine_integer(gpu["telemetry"].get("memory_used_mib")) is not None
+        and (vram_mib := _routine_integer(gpu.get("vram_mib"))) is not None
+    ]
+    memory_used_pct = (
+        round(sum(memory_used_values) * 100 / sum(observed_memory_vram), 2)
+        if memory_used_values and observed_memory_vram and sum(observed_memory_vram) > 0
+        else None
+    )
+
+    def average(values: list[int]) -> float | None:
+        return round(sum(values) / len(values), 2) if values else None
+
+    return {
+        "visible_gpu_count": len(gpus),
+        "vram_total_mib": sum(vram_values),
+        "average_vram_mib": average(vram_values),
+        "telemetry_gpu_count": len(telemetry),
+        "memory_used_mib": sum(memory_used_values) if memory_used_values else None,
+        "memory_used_gpu_count": len(memory_used_values),
+        "memory_free_mib": sum(memory_free_values) if memory_free_values else None,
+        "memory_free_gpu_count": len(memory_free_values),
+        "memory_used_pct": memory_used_pct,
+        "current_average_gpu_utilization_pct": average(gpu_utilization_values),
+        "gpu_utilization_gpu_count": len(gpu_utilization_values),
+        "current_average_memory_utilization_pct": average(memory_utilization_values),
+        "memory_utilization_gpu_count": len(memory_utilization_values),
     }
 
 
@@ -401,6 +526,7 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
             "vram_mib": gpu.get("total_vram_mib"),
             "status": status,
         }
+        row["telemetry"] = _routine_gpu_telemetry(gpu, vram_mib=row["vram_mib"])
         row["workspace"] = _routine_workspace(row["workspace_path"])
         ssh = _routine_ssh(endpoint)
         if ssh is not None:
@@ -417,6 +543,8 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
                 row["task"] = lease.get("task_ref") or "未命名任务"
         gpus.append(row)
     result: dict[str, Any] = {"gpus": gpus}
+    if gpus:
+        result["telemetry_summary"] = _routine_gpu_telemetry_summary(gpus)
     summary = data.get("summary") if isinstance(data, dict) else None
     if isinstance(summary, dict) and summary.get("total_gpus") == 0:
         result["message"] = "无 GPU"
@@ -651,7 +779,7 @@ def control_plane_state(
 
 @mcp.tool()
 def gpu_status(include_busy: bool = False) -> dict[str, Any]:
-    """列出可用 GPU、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"""
+    """列出可用 GPU、最新及近 10 分钟平均显存/利用率遥测、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"""
 
     payload = _routine_client().snapshot(
         compact=False,

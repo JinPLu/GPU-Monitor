@@ -228,6 +228,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .42); backdrop-filter: blur(2px); }
 .detail-metrics div { padding: .62rem; border: 1px solid var(--line); border-radius: .48rem; background: var(--surface-subtle); }
 .detail-metrics span { display: block; margin-bottom: .25rem; color: var(--text-tertiary); font-size: .66rem; }
 .detail-metrics strong { font-size: .9rem; font-variant-numeric: tabular-nums; }
+.detail-recent-average { margin: -0.45rem 0 1.2rem; font-variant-numeric: tabular-nums; }
 .chart-heading { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
 .chart-heading h3 { margin-bottom: 0; }
 .range-switch { display: flex; padding: .14rem; border: 1px solid var(--line); border-radius: .42rem; background: var(--surface-subtle); }

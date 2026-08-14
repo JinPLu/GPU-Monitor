@@ -450,10 +450,15 @@
     const sshCommand = `ssh -p ${endpoint.port} ${endpoint.ssh_user}@${endpoint.host}`;
     const expanded = allExpanded || expandedServers.has(endpoint.id);
     const status = endpoint.monitor?.status || "PENDING";
+    const gpuObservationNote = endpoint.resource_kind === "cpu_only"
+      ? " · 纯 CPU 服务器（不参与 GPU 分配）"
+      : endpoint.monitor?.last_error === "incomplete endpoint observation"
+        ? " · GPU 遥测不可用（不参与分配）"
+        : "";
     return `
       <section class="server-block" data-server-id="${escapeHTML(endpoint.id)}" data-expanded="${expanded}">
         <div class="server-summary">
-          <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong><code>${escapeHTML(sshCommand)}</code></strong><small>${escapeHTML(endpoint.workspace_path || "工作区未设置")} · ${escapeHTML(monitorLabels[status] || status)}</small></span></span>
+          <span class="server-name"><i class="status-dot ${status.toLowerCase()}"></i><span><strong><code>${escapeHTML(sshCommand)}</code></strong><small>${escapeHTML(endpoint.workspace_path || "工作区未设置")} · ${escapeHTML(monitorLabels[status] || status)}${gpuObservationNote}</small></span></span>
           <span class="server-counts" aria-label="GPU 状态：共 ${gpus.length}，可分配 ${available}，占用 ${busy}，任务分配 ${claimed}，异常 ${abnormal}"><span title="总数"><strong>${gpus.length}</strong></span><span class="count-available" title="可分配"><strong>${available}</strong></span><span title="占用"><strong>${busy}</strong></span><span title="任务分配"><strong>${claimed}</strong></span><span class="${abnormal ? "count-alert" : ""}" title="异常"><strong>${abnormal}</strong></span></span>
           <span class="server-aggregate">${clusterMeter("CPU", cpuLoadPct, "cpu", cpuDetail)}${clusterMeter("内存", memoryUsedPct, "memory", memoryDetail)}${clusterMeter("显存", memoryPct, "memory", vramDetail)}${clusterMeter("GPU", util, "utilization", `${Math.round(util)}% 利用率`)}</span>
           <span class="server-actions">
@@ -657,6 +662,7 @@
 
   const updateDetailText = (gpu) => {
     const telemetry = gpu.telemetry || {};
+    const recentAverage = telemetry.recent_average;
     document.getElementById("detail-server").textContent = gpu.endpoint_id;
     document.getElementById("detail-title").textContent = `GPU ${gpu.gpu_index} · ${gpu.name}`;
     document.getElementById("detail-state").textContent = stateLabels[gpu.state] || gpu.state;
@@ -665,6 +671,22 @@
     document.getElementById("detail-util").textContent = `${telemetry.gpu_utilization_pct ?? "—"}%`;
     document.getElementById("detail-temp").textContent = telemetry.temperature_c === null || telemetry.temperature_c === undefined ? "—" : `${telemetry.temperature_c} °C`;
     document.getElementById("detail-power").textContent = telemetry.power_watts === null || telemetry.power_watts === undefined ? "—" : `${Number(telemetry.power_watts).toFixed(0)} W`;
+    const recentAverageNode = document.getElementById("detail-recent-average");
+    if (recentAverage?.sample_count) {
+      const memoryPct = recentAverage.memory_used_pct === null || recentAverage.memory_used_pct === undefined
+        ? "—"
+        : `${recentAverage.memory_used_pct}%`;
+      const gpuUtilization = recentAverage.gpu_utilization_pct === null || recentAverage.gpu_utilization_pct === undefined
+        ? "—"
+        : `${recentAverage.gpu_utilization_pct}%`;
+      recentAverageNode.textContent = `近 10 分钟均值（${recentAverage.sample_count} 个样本）：显存 ${formatMemory(recentAverage.memory_used_mib)}（${memoryPct}）· GPU 利用率 ${gpuUtilization}`;
+      recentAverageNode.title = recentAverage.first_observed_at && recentAverage.last_observed_at
+        ? `样本范围：${formatDate(recentAverage.first_observed_at, true)} 至 ${formatDate(recentAverage.last_observed_at, true)}`
+        : "";
+    } else {
+      recentAverageNode.textContent = "近 10 分钟均值：暂无采样";
+      recentAverageNode.title = "";
+    }
     const lease = gpu.lease;
     const processes = gpu.processes || [];
     document.getElementById("detail-ownership").innerHTML = lease

@@ -791,6 +791,9 @@ class EndpointObservation(StrictModel):
     gpus: list[TelemetryInput]
     processes: list[ProcessInput] = Field(default_factory=list)
     observation_complete: bool = True
+    # ``cpu_only`` is a positive hardware discovery result. ``unknown`` keeps
+    # a failed NVIDIA probe fail-closed without overwriting earlier GPU facts.
+    gpu_probe_status: Literal["gpu", "cpu_only", "unknown"] = "unknown"
 
     @field_validator("observed_at")
     @classmethod

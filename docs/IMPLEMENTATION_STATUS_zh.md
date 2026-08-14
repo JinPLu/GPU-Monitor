@@ -33,7 +33,7 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 | Ruff | `uv run ruff check .` 通过 |
 | 数据迁移 | 当前源码迁移头 `20260814_0025`；`gpu_devices.cuda_ordinal` 初始为 NULL，只有当前 collector 观测才写入并恢复分配；`keepalive_current` 保存 `actual/error_reason` 与逐卡唯一进程身份，只把仍有 active resource 的活动 keepalive lease 转为无 TTL，保留 terminal keeper 与 workload 历史 expiry |
 | MCP 上下文 | 默认发现结果严格为 3 个工具；`gpu_apply` schema 仍只有 `server_id / gpu_count / task`。adapter 使用进程随机命名空间与 MCP request ID 生成不公开的重放键；同一次本地 HTTP 传输失败只重试一次，不同调用不按任务名折叠 |
-| Agent 任务说明 | 默认 MCP 不依赖客户端身份、UI 标题或专用环境变量。`gpu_apply(task?)` 接收用户任务名或当前目标的简短人类可读概括；未提供时使用“未命名任务”。`gpu_status(include_busy=true)` 为忙卡返回人类可读 `task` |
+| Agent 任务说明 | 默认 MCP 不依赖客户端身份、UI 标题或专用环境变量。`gpu_apply(task?)` 接收用户任务名或当前目标的简短人类可读概括；未提供时使用“未命名任务”。`gpu_status` 逐卡返回最近显存/利用率 `telemetry` 与 `telemetry.recent_average`（近 10 分钟平均资源使用及样本时间范围），并给出本次可见卡的 `telemetry_summary`；这些仅为观测，调度仍以 `status` 与 `gpu_apply` 为准。首次只读采集会将端点记录为 GPU、纯 CPU 或尚未确认；纯 CPU 端点保留主机容量但不会参与 GPU 分配。`gpu_status(include_busy=true)` 为忙卡返回人类可读 `task` |
 | macOS App 构建 | `zsh desktop/build-macos-app.sh` 通过，包含 Swift 桌面端编译；根目录 App 为 `1.5.6 / build 11` |
 | standalone 验证 | `zsh desktop/verify-macos-app.sh` 通过 |
 | 冗余机制扫描 | 运行源码和桌面端没有摘要计算、登录 token、永久删除入口、占卡 `STARTING/HELD`、额外定时器或自动抢占 |
