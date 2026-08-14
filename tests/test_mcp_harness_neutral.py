@@ -433,6 +433,48 @@ def test_routine_status_reports_no_gpu_from_the_canonical_summary() -> None:
     assert status == {"gpus": [], "message": "无 GPU"}
 
 
+def test_routine_status_reports_recognized_cpu_only_servers() -> None:
+    status = mcp_server._routine_gpu_status(
+        {
+            "data": {
+                "summary": {"total_gpus": 0},
+                "endpoints": [
+                    {
+                        "id": "server-cpu",
+                        "resource_kind": "cpu_only",
+                        "monitor": {"status": "ONLINE"},
+                        "host_telemetry": {
+                            "cpu_count": 104,
+                            "memory_available_mib": 985_798,
+                        },
+                    },
+                    {
+                        "id": "server-unknown",
+                        "resource_kind": "unknown",
+                        "monitor": {"status": "ONLINE"},
+                    },
+                ],
+                "gpus": [],
+            }
+        },
+        include_busy=False,
+    )
+
+    assert status == {
+        "gpus": [],
+        "cpu_only_servers": [
+            {
+                "server_id": "server-cpu",
+                "resource_kind": "cpu_only",
+                "monitor_status": "ONLINE",
+                "cpu_count": 104,
+                "memory_available_mib": 985_798,
+            }
+        ],
+        "message": "无 GPU",
+    }
+
+
 def test_routine_status_explains_when_all_gpus_are_unavailable() -> None:
     status = mcp_server._routine_gpu_status(
         {"data": {"summary": {"total_gpus": 4, "available_gpus": 0}, "gpus": []}},

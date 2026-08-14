@@ -543,6 +543,27 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
                 row["task"] = lease.get("task_ref") or "未命名任务"
         gpus.append(row)
     result: dict[str, Any] = {"gpus": gpus}
+    cpu_only_servers: list[dict[str, Any]] = []
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict) or endpoint.get("resource_kind") != "cpu_only":
+            continue
+        monitor = endpoint.get("monitor")
+        monitor = monitor if isinstance(monitor, dict) else {}
+        host_telemetry = endpoint.get("host_telemetry")
+        host_telemetry = host_telemetry if isinstance(host_telemetry, dict) else {}
+        cpu_only_servers.append(
+            {
+                "server_id": endpoint.get("id"),
+                "resource_kind": "cpu_only",
+                "monitor_status": monitor.get("status"),
+                "cpu_count": _routine_integer(host_telemetry.get("cpu_count")),
+                "memory_available_mib": _routine_integer(
+                    host_telemetry.get("memory_available_mib")
+                ),
+            }
+        )
+    if cpu_only_servers:
+        result["cpu_only_servers"] = cpu_only_servers
     if gpus:
         result["telemetry_summary"] = _routine_gpu_telemetry_summary(gpus)
     summary = data.get("summary") if isinstance(data, dict) else None
@@ -779,7 +800,7 @@ def control_plane_state(
 
 @mcp.tool()
 def gpu_status(include_busy: bool = False) -> dict[str, Any]:
-    """列出可用 GPU、最新及近 10 分钟平均显存/利用率遥测、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"""
+    """列出 GPU、已识别纯 CPU 服务器和近 10 分钟显存/利用率遥测；include_busy=true 时列出占用任务。"""
 
     payload = _routine_client().snapshot(
         compact=False,

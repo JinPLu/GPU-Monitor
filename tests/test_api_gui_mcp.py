@@ -1247,7 +1247,7 @@ def test_mcp_exposes_required_tools() -> None:
     assert set(status_schema["properties"]) == {"include_busy"}
     assert status_schema["properties"]["include_busy"]["default"] is False
     assert by_name["gpu_status"].description == (
-        "列出可用 GPU、最新及近 10 分钟平均显存/利用率遥测、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"
+        "列出 GPU、已识别纯 CPU 服务器和近 10 分钟显存/利用率遥测；include_busy=true 时列出占用任务。"
     )
     for name in (
         "gpu_add_server",
@@ -1270,7 +1270,7 @@ def test_default_stdio_mcp_uses_intent_first_routine_surface() -> None:
     assert not any(name.startswith("gpu_scheduler_") for name in names)
     assert names == {"gpu_status", "gpu_apply", "gpu_release"}
     assert by_name["gpu_status"].description == (
-        "列出可用 GPU、最新及近 10 分钟平均显存/利用率遥测、SSH 和结构化远端工作目录；include_busy=true 时列出占用任务。"
+        "列出 GPU、已识别纯 CPU 服务器和近 10 分钟显存/利用率遥测；include_busy=true 时列出占用任务。"
     )
 
 
