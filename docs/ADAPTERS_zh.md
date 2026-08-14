@@ -24,7 +24,7 @@ ServerPilot 传入精确物理 UUID，helper 只能管理自己的 worker。
 
 Adapter 在任何启停 mutation 前先执行只读 `--protocol-info`，要求 helper 返回
 `kind=serverpilot-keepalive`、`schema_version=3` 及所需能力（helper 同时报告
-`implementation_version=1.5.6`），以及
+`implementation_version=1.5.7`），以及
 `per_gpu_keepalive`、`pidfd_identity`、`pci_bus_id`、`worker_attestation` 能力；预检失败时返回
 `keepalive_helper_incompatible`，不会发送 mutation payload。旧 v2 wire/state 版本直接拒绝。
 恢复只接受 helper 自己 v3 状态中仍存活且带固定 marker 的 worker：helper 对指定物理 UUID 的固定

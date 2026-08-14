@@ -4,9 +4,9 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
-## Unreleased
+## 1.5.7 - 2026-08-15
 
-**GPU and CPU-only server resource states now appear consistently from one live snapshot.**
+**ServerPilot 1.5.7 makes GPU and CPU-only server resource states appear consistently from one live snapshot.**
 
 - `gpu_status` returns each GPU's latest observation and a rolling ten-minute average of memory, GPU/memory-controller utilization, and temperature, alongside a summary of the visible cards to distinguish sustained load from a momentary spike.
 - The GUI and MCP share the daemon REST snapshot rather than collecting over SSH separately; the GPU detail view displays that same per-GPU average.

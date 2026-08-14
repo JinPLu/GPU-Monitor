@@ -190,7 +190,7 @@ def test_protocol_info_publishes_v3_helper_capabilities() -> None:
     assert keepalive_protocol_info() == {
         "kind": "serverpilot-keepalive",
         "schema_version": 3,
-        "implementation_version": "1.5.6",
+        "implementation_version": "1.5.7",
         "capabilities": [
             "per_gpu_keepalive",
             "pidfd_identity",
