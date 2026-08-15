@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 
 KEEPALIVE_SCHEMA_VERSION = 3
-KEEPALIVE_IMPLEMENTATION_VERSION = "1.5.7"
+KEEPALIVE_IMPLEMENTATION_VERSION = "1.5.8"
 KEEPALIVE_PROTOCOL_INFO_CAPABILITIES = (
     "per_gpu_keepalive",
     "pidfd_identity",

@@ -40,6 +40,12 @@ final class FixtureModeUITests: XCTestCase {
     }
 
     func testResourceTableExposesGPUModelForScheduling() {
+        let overviewMetricWindow = app.staticTexts["资源指标：近 10 分钟均值"]
+        XCTAssertTrue(
+            overviewMetricWindow.waitForExistence(timeout: 5),
+            "The resource overview must identify its shared 10-minute metric window"
+        )
+
         let serverRow = app.descendants(matching: .any).matching(
             NSPredicate(format: "label == %@", "服务器 ssh -p 2221 gpu@127.0.0.1")
         ).firstMatch
@@ -56,10 +62,11 @@ final class FixtureModeUITests: XCTestCase {
         serverRow.click()
         let serverDetail = app.descendants(matching: .any)["服务器详情"]
         XCTAssertTrue(serverDetail.waitForExistence(timeout: 2), "Selecting a server must open a separate detail sheet")
-        let gpuModel = app.buttons.matching(
-            NSPredicate(format: "label CONTAINS %@", "GPU 0 · Fixture GPU")
+        let gpuMemoryGrid = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "GPU 显存状态")
         ).firstMatch
-        XCTAssertTrue(gpuModel.waitForExistence(timeout: 2), "Server detail must keep the GPU model visible")
+        XCTAssertTrue(gpuMemoryGrid.waitForExistence(timeout: 2), "Server detail must group per-GPU memory rings by state")
+        XCTAssertFalse(app.staticTexts["当前观测"].exists, "The detail sheet must not repeat a bulky current-observation summary")
 
         let closeButton = app.buttons["关闭"].firstMatch
         XCTAssertTrue(closeButton.waitForExistence(timeout: 2), "Server detail must expose an obvious close action")
@@ -85,14 +92,15 @@ final class FixtureModeUITests: XCTestCase {
         serverRow.click()
         assertAgentIdentityIsNotExposed()
 
-        let gpu = app.buttons.matching(NSPredicate(format: "label == %@", "GPU 0")).firstMatch
-        XCTAssertTrue(gpu.waitForExistence(timeout: 2), "Server detail must expose the assigned GPU")
-        XCTAssertTrue(String(describing: gpu.value).contains("train-resnet"), "GPU accessibility must expose the current task")
-        gpu.click()
-        let close = app.buttons["关闭"]
-        XCTAssertTrue(close.waitForExistence(timeout: 2), "GPU detail must open before checking its exposed content")
-        XCTAssertTrue(app.staticTexts["train-resnet"].exists, "GPU detail must expose the current task")
-        assertAgentIdentityIsNotExposed()
+        let gpuMemoryGrid = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "GPU 显存状态")
+        ).firstMatch
+        XCTAssertTrue(gpuMemoryGrid.waitForExistence(timeout: 2), "Server detail must group each GPU memory ring by state")
+        XCTAssertTrue(
+            String(describing: gpuMemoryGrid.value).contains("GPU 0 繁忙"),
+            "The state grid must expose each GPU's state without a verbose card list"
+        )
+        XCTAssertFalse(app.buttons["GPU 0"].exists, "Server detail memory rings must not recreate per-GPU detail cards")
     }
 
     func testOccupancyActionsAndServerOperationsRemainReachable() {
@@ -110,8 +118,14 @@ final class FixtureModeUITests: XCTestCase {
         XCTAssertFalse(rowValue.contains("__serverpilot_system__"), "Internal system identity must not appear in the resource table")
 
         serverRow.click()
-        let status = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "占卡")).firstMatch
-        XCTAssertTrue(status.waitForExistence(timeout: 2), "Server detail must expose the user-facing occupancy state")
+        let gpuMemoryGrid = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "GPU 显存状态")
+        ).firstMatch
+        XCTAssertTrue(gpuMemoryGrid.waitForExistence(timeout: 2), "Server detail must expose occupancy through the GPU state group")
+        XCTAssertTrue(
+            String(describing: gpuMemoryGrid.value).contains("占卡 2 张"),
+            "Active occupancy must be conveyed by the corresponding GPU state group, not a duplicate summary row"
+        )
         let action = app.buttons["endpoint-keepalive-action"]
         XCTAssertTrue(action.exists, "Configured keepalive must expose exactly one endpoint action")
         XCTAssertEqual(action.label, "结束占卡", "Active occupancy must offer the plainly named end action")
@@ -164,33 +178,31 @@ final class FixtureModeUITests: XCTestCase {
         XCTAssertTrue(serverRow.waitForExistence(timeout: 5))
         serverRow.click()
 
-        let conflictedKeeper = app.buttons.matching(
-            NSPredicate(format: "label == %@", "GPU 0")
+        let gpuMemoryGrid = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "GPU 显存状态")
         ).firstMatch
-        XCTAssertTrue(conflictedKeeper.waitForExistence(timeout: 2))
-        let conflictedValue = String(describing: conflictedKeeper.value)
+        XCTAssertTrue(gpuMemoryGrid.waitForExistence(timeout: 2))
+        let gridValue = String(describing: gpuMemoryGrid.value)
         XCTAssertTrue(
-            conflictedValue.contains("任务使用中"),
-            "A fail-closed keeper must prefer the broker's canonical public status"
+            gridValue.contains("GPU 0 错误"),
+            "A fail-closed keeper must be placed in the explicit error state group"
         )
         XCTAssertFalse(
-            conflictedValue.contains("可用"),
+            gridValue.contains("GPU 0 空闲"),
             "A CONFLICT GPU must never be presented as available"
         )
-
-        let stoppedKeeper = app.buttons.matching(
-            NSPredicate(format: "label == %@", "GPU 1")
-        ).firstMatch
-        XCTAssertTrue(stoppedKeeper.waitForExistence(timeout: 2))
         XCTAssertTrue(
-            String(describing: stoppedKeeper.value).contains("可用 · 占卡未运行"),
-            "desired=ON and actual=OFF must remain distinct from an unopened occupancy policy"
+            gridValue.contains("GPU 1 空闲"),
+            "A stopped occupancy helper must remain visibly available in the free state group"
         )
     }
 
     func testResourceTableHeadersToggleSortDirection() {
-        let gpuSort = app.buttons["按GPU 利用排序"]
+        let gpuSort = app.buttons["按GPU 利用率排序"]
         XCTAssertTrue(gpuSort.waitForExistence(timeout: 5), "GPU utilization header must be directly sortable")
+        for header in ["按显存占用率排序", "按CPU 负载排序", "按内存占用率排序"] {
+            XCTAssertTrue(app.buttons[header].exists, "Resource table must expose the full metric header: \(header)")
+        }
         XCTAssertEqual(String(describing: gpuSort.value), "未选中")
 
         gpuSort.click()

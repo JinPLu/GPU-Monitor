@@ -115,7 +115,7 @@ gpu_status → gpu_apply(task="任务名") → 使用返回的分配 → gpu_rel
 ```
 
 - Agent 不传 GPU ID，`gpu_apply` 负责选卡。
-- `gpu_status` 的逐卡 `telemetry` 同时包含最近观测与近 10 分钟平均资源使用；GUI 与 MCP 都读取 daemon 的同一份 REST 快照，不会重复 SSH 采集。首次只读采集会把端点记录为 GPU、纯 CPU 或尚未确认；纯 CPU 服务器保留 CPU/内存监控，并以说明性的 `cpu_only_servers` 返回给 Agent，但不会参与 GPU 分配。汇总 `telemetry_summary` 的 `current_average_*` 只表示当前瞬时样本的跨卡平均；它们不决定可申请性，仍以 `status` 和 `gpu_apply` 为准。
+- `gpu_status` 的逐卡 `telemetry` 同时包含最近观测与近 10 分钟平均资源使用；端点 `host_telemetry.recent_average` 同样提供 CPU 负载和内存占用的近 10 分钟均值。GUI 与 MCP 都读取 daemon 的同一份 REST 快照，不会重复 SSH 采集。首次只读采集会把端点记录为 GPU、纯 CPU 或尚未确认；纯 CPU 服务器保留 CPU/内存监控，并以说明性的 `cpu_only_servers` 返回给 Agent，但不会参与 GPU 分配。汇总 `telemetry_summary` 的 `current_average_*` 只表示当前瞬时样本的跨卡平均；它们不决定可申请性，仍以 `status` 和 `gpu_apply` 为准。
 - SSH 后先进入返回的 `workspace.path`，再使用 CUDA selector。`workspace.path` 是远端工作目录，不是代码仓库。
 - CUDA 初始化或 workload 启动失败时，立即 `gpu_release`。
 - `no_capacity` 表示不分配、不排队；不要在同一轮反复申请。

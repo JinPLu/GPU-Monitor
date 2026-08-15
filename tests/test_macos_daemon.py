@@ -157,6 +157,26 @@ def test_live_probe_rejects_daemon_missing_current_runtime_capability(
         probe_live(config)
 
 
+def test_live_probe_requires_recent_telemetry_average_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    capabilities = sorted(daemon.EXPECTED_CAPABILITIES - {"telemetry_recent_averages"})
+    monkeypatch.setattr(
+        daemon,
+        "_probe_json",
+        lambda *_args, **_kwargs: {
+            "status": "live",
+            "schema_version": "v1",
+            "capabilities": capabilities,
+        },
+    )
+
+    with pytest.raises(DaemonError, match="incompatible ServerPilot service"):
+        probe_live(config)
+
+
 def test_install_migrates_inventory_and_database_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

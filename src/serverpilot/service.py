@@ -1359,6 +1359,42 @@ class BrokerService:
         }
 
     @staticmethod
+    def _recent_host_telemetry_average(
+        samples: list[EndpointTelemetryCurrent | EndpointTelemetrySnapshot],
+    ) -> dict[str, Any] | None:
+        """Summarize one endpoint's host pressure over the standard 10-minute window."""
+
+        if not samples:
+            return None
+
+        def average(values: list[float | None]) -> float | None:
+            present = [value for value in values if value is not None]
+            return round(sum(present) / len(present), 2) if present else None
+
+        cpu_load_fraction = average(
+            [
+                sample.load_1m / sample.cpu_count if sample.cpu_count > 0 else None
+                for sample in samples
+            ]
+        )
+        memory_used_pct = average(
+            [
+                (1 - sample.memory_available_mib / sample.memory_total_mib) * 100
+                if sample.memory_total_mib > 0
+                else None
+                for sample in samples
+            ]
+        )
+        return {
+            "window_seconds": TELEMETRY_RECENT_AVERAGE_WINDOW_SECONDS,
+            "sample_count": len(samples),
+            "first_observed_at": _iso(samples[0].observed_at),
+            "last_observed_at": _iso(samples[-1].observed_at),
+            "cpu_load_fraction": cpu_load_fraction,
+            "memory_used_pct": memory_used_pct,
+        }
+
+    @staticmethod
     def _host_telemetry_dict(
         telemetry: EndpointTelemetryCurrent | EndpointTelemetrySnapshot | None,
     ) -> dict[str, Any] | None:
@@ -3159,6 +3195,34 @@ class BrokerService:
                 if visible_ids
                 else {}
             )
+            recent_host_telemetry_samples_by_endpoint: dict[
+                str, list[EndpointTelemetryCurrent | EndpointTelemetrySnapshot]
+            ] = defaultdict(list)
+            if visible_ids:
+                recent_cutoff = now - timedelta(seconds=TELEMETRY_RECENT_AVERAGE_WINDOW_SECONDS)
+                for sample in session.scalars(
+                    select(EndpointTelemetrySnapshot)
+                    .where(
+                        EndpointTelemetrySnapshot.endpoint_id.in_(visible_ids),
+                        EndpointTelemetrySnapshot.observed_at >= recent_cutoff,
+                    )
+                    .order_by(
+                        EndpointTelemetrySnapshot.endpoint_id,
+                        EndpointTelemetrySnapshot.observed_at,
+                        EndpointTelemetrySnapshot.id,
+                    )
+                ).all():
+                    recent_host_telemetry_samples_by_endpoint[sample.endpoint_id].append(sample)
+                for host_endpoint_id, current in host_telemetry_by_endpoint.items():
+                    observed_at = _as_utc(current.observed_at)
+                    samples = recent_host_telemetry_samples_by_endpoint[host_endpoint_id]
+                    last_observed_at = _as_utc(samples[-1].observed_at) if samples else None
+                    if (
+                        observed_at is not None
+                        and observed_at >= recent_cutoff
+                        and (last_observed_at is None or observed_at > last_observed_at)
+                    ):
+                        samples.append(current)
             endpoint_gpus = (
                 session.scalars(
                     select(GPUDevice)
@@ -3335,15 +3399,19 @@ class BrokerService:
                     monitor_status = "STALE"
                 else:
                     monitor_status = "ONLINE"
+                host_telemetry = host_telemetry_by_endpoint.get(endpoint.id)
+                host_telemetry_payload = self._host_telemetry_dict(host_telemetry)
+                if host_telemetry_payload is not None:
+                    host_telemetry_payload["recent_average"] = self._recent_host_telemetry_average(
+                        recent_host_telemetry_samples_by_endpoint[endpoint.id]
+                    )
                 return {
                     **self._endpoint_dict(endpoint),
                     # Filled from the final per-GPU projection below, so a
                     # busy sibling GPU never invalidates an independent
                     # keepalive worker.
                     "keepalive": self._keepalive_aggregate(endpoint, (), eligible_idle_gpu_count=0),
-                    "host_telemetry": self._host_telemetry_dict(
-                        host_telemetry_by_endpoint.get(endpoint.id)
-                    ),
+                    "host_telemetry": host_telemetry_payload,
                     "monitor": {
                         "status": monitor_status,
                         "gpu_count": gpu_counts[endpoint.id],

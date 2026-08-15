@@ -201,6 +201,24 @@ final class BrokerStoreTests: XCTestCase {
         )
     }
 
+    func testSnapshotParsesTenMinuteOverviewMetricsSeparatelyFromCurrentTelemetry() throws {
+        let snapshot = try Self.snapshot(named: "resource-ownership")
+        let endpoint = try XCTUnwrap(snapshot.endpoint(id: "gpu-node-01"))
+        let gpu = try XCTUnwrap(snapshot.gpu(id: "gpu-node-01:GPU-FIXTURE-0"))
+
+        XCTAssertEqual(endpoint.cpuLoadFraction, 18.0 / 64.0)
+        XCTAssertEqual(endpoint.recentTelemetryAverage?.windowSeconds, 600)
+        XCTAssertEqual(endpoint.recentTelemetryAverage?.sampleCount, 10)
+        XCTAssertEqual(endpoint.recentTelemetryAverage?.cpuLoadFraction, 0.21)
+        XCTAssertEqual(endpoint.recentTelemetryAverage?.memoryFraction, 0.34)
+
+        XCTAssertEqual(gpu.utilization, 67)
+        XCTAssertEqual(gpu.recentTelemetryAverage?.windowSeconds, 600)
+        XCTAssertEqual(gpu.recentTelemetryAverage?.sampleCount, 10)
+        XCTAssertEqual(gpu.recentTelemetryAverage?.utilizationFraction, 0.52)
+        XCTAssertEqual(gpu.recentTelemetryAverage?.memoryFraction, 0.35)
+    }
+
     func testEndpointDraftUsesStructuredSealedObservationProfile() throws {
         let draft = try EndpointDraft(
             host: "gpu.example.test",

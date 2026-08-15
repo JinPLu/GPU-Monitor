@@ -311,7 +311,10 @@ ax_text = {
 semantic_checks = {
     "servers_navigation_and_sort_ax": all(
         token in ax_text["servers"]
-        for token in ("服务器", "使用情况", "设置", "测试数据不能刷新", "按GPU 利用排序")
+        for token in (
+            "服务器", "使用情况", "设置", "测试数据不能刷新",
+            "按GPU 利用率排序", "按显存占用率排序", "按CPU 负载排序", "按内存占用率排序"
+        )
     ),
     "usage_project_task_ax": all(
         token in ax_text["usage"]

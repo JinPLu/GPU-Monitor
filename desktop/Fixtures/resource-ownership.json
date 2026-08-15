@@ -35,7 +35,15 @@
             "cpu_count": 32,
             "load_1m": 7.5,
             "memory_total_mib": 131072,
-            "memory_available_mib": 98304
+            "memory_available_mib": 98304,
+            "recent_average": {
+              "window_seconds": 600,
+              "sample_count": 10,
+              "first_observed_at": "2026-08-06T08:49:58Z",
+              "last_observed_at": "2026-08-06T08:59:58Z",
+              "cpu_load_fraction": 0.18,
+              "memory_used_pct": 29.0
+            }
           }
         },
         {
@@ -59,7 +67,15 @@
             "cpu_count": 64,
             "load_1m": 18.0,
             "memory_total_mib": 262144,
-            "memory_available_mib": 163840
+            "memory_available_mib": 163840,
+            "recent_average": {
+              "window_seconds": 600,
+              "sample_count": 10,
+              "first_observed_at": "2026-08-06T08:49:57Z",
+              "last_observed_at": "2026-08-06T08:59:57Z",
+              "cpu_load_fraction": 0.21,
+              "memory_used_pct": 34.0
+            }
           }
         }
       ],
@@ -87,7 +103,15 @@
           "telemetry": {
             "memory_used_mib": 32768,
             "gpu_utilization_pct": 67,
-            "temperature_c": 61
+            "temperature_c": 61,
+            "recent_average": {
+              "window_seconds": 600,
+              "sample_count": 10,
+              "first_observed_at": "2026-08-06T08:49:57Z",
+              "last_observed_at": "2026-08-06T08:59:57Z",
+              "memory_used_pct": 35.0,
+              "gpu_utilization_pct": 52.0
+            }
           }
         },
         {
@@ -107,7 +131,15 @@
           "telemetry": {
             "memory_used_mib": 4096,
             "gpu_utilization_pct": 4,
-            "temperature_c": 34
+            "temperature_c": 34,
+            "recent_average": {
+              "window_seconds": 600,
+              "sample_count": 10,
+              "first_observed_at": "2026-08-06T08:49:57Z",
+              "last_observed_at": "2026-08-06T08:59:57Z",
+              "memory_used_pct": 6.0,
+              "gpu_utilization_pct": 9.0
+            }
           }
         }
       ],

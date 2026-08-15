@@ -2,11 +2,11 @@
 
 更新时间：2026-08-15（Asia/Shanghai）
 
-本文只记录当前事实、直接证据和仍未验证的边界。当前源码候选为 `1.5.7`；本轮自动化与定向现场验收均以该版本完成，并与 `1.5.6` 及更早版本的历史现场验收明确分开。历史过程见 `docs/archive/`。
+本文只记录当前事实、直接证据和仍未验证的边界。当前源码候选为 `1.5.8`；本轮自动化与固定夹具桌面验收均以该版本完成，并与 `1.5.7` 及更早版本的历史现场验收明确分开。历史过程见 `docs/archive/`。
 
 ## 当前四项功能
 
-1. **信息采集**：固定只读探针采集服务器 CPU、内存、GPU、进程和历史趋势；APP 刷新只读取这份状态。
+1. **信息采集**：固定只读探针采集服务器 CPU、内存、GPU、进程和历史趋势；APP 刷新只读取这份状态。GPU 与主机资源都投影最近 10 分钟均值，端点快照在 `host_telemetry.recent_average` 提供标准化 CPU 负载和内存占用率，详情页的逐卡显存环图仍以当前观测绘制。
 2. **人类监控与纠错**：APP 展示服务器、任务与 GPU。任务详情允许人保持卡数不变，直接选择新的 GPU；目标 GPU 正在占卡时先按卡停止并刷新确认，再更新分配，随后提示对应 Agent 按返回的 `CUDA_VISIBLE_DEVICES` 重启任务。
 3. **Agent 操作**：默认 MCP 只有 `gpu_status`、`gpu_apply`、`gpu_release`。连接、工作目录、代码位置和设备选择分开投影：`ssh` 只负责连接；`workspace {path, kind=working_directory, use_as_cwd=true, code_location=not_provided}` 明确远端 cwd 且不暗示代码路径；`workspace_path` 继续保留。GPU UUID 只作物理身份，`gpu_index` 保留采集时的 `nvidia-smi index`；collector schema v2 另按 PCI bus 顺序生成 `cuda_ordinal`，lease 返回 `cuda_device_order=PCI_BUS_ID`、顶层完整 `cuda_visible_devices` ordinal 集合和逐卡 `gpu_cuda_visible_devices` ordinal。数据库中没有当前 `cuda_ordinal` 的 GPU 不参与分配。启动前做最小 CUDA gate，失败立即释放并在当前任务内避开同一环境。租约持续到显式释放或 App 人工处理，容量不足直接返回 `no_capacity`，不排队且同一 turn 不反复轮询。一次 MCP 调用具有内部重放键并在本地传输失败时只重试一次；新的同参数调用仍能取得第二个 lease，多个 lease 由申请者逐个确认释放。
 4. **空闲 GPU 占卡**：明确分开持久意图与当前进程状态。endpoint 的 `desired` 只有 `ON / OFF`，只随用户开关改变；逐卡 `actual` 只有 `ON / OFF / ERROR`，由 helper 操作与新鲜采集更新。内部逐卡归属不再使用 TTL，并持久保存唯一的 collector PID、boot ID 和进程启动时间；远端 helper 本地状态保存其 PID namespace 内的 PID、Linux boot ID、`/proc` 启动时钟和固定 worker marker，停止前使用 pidfd 重新校验并发信号，PID 重用或 marker 不匹配时绝不 kill。恢复时 helper 先确认该 namespace worker 仍是自己，再以固定 NVIDIA 查询证明目标 UUID 恰有一个 driver-visible PID；Broker 只在该 driver PID 与 boot ID 同新鲜 collector 的唯一进程一致时重新登记 worker，且以 collector 的启动时间写入持久状态。helper namespace 的 ticks 不被伪装为 host PID 的启动身份；当前 collector schema v2 尚未提供可端到端比较的 host ticks。PID-only 或旧 marker 状态直接 fail closed，不提供旧版收养路径。额外或替代业务进程为 `ERROR/CONFLICT` 并 fail closed。helper 状态文件和数据库备份都通过同目录临时文件、fsync 与原子替换发布。
@@ -25,16 +25,16 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 
 ## 已完成验证
 
-以下自动化结果来自 `1.5.7` 当前工作树；测试使用临时数据库和 fake provider。
+以下自动化结果来自 `1.5.8` 当前工作树；测试使用临时数据库和 fake provider。
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `449` 项 collected，`uv run --reinstall-package serverpilot pytest -q` 通过；覆盖实际 ASGI body 限流与断连转发、并发限流、CSV 字段投影、Web actor CSRF、SQLite 原子备份、owner/operator 改派授权、direct 与 generic CPU/RAM 双向 admission、CUDA ordinal、MCP request-id 命名空间/传输重试/同参数多 lease，以及 keepalive v3 预检、固定 inspect、worker 身份校验、旧 wire/state 拒绝、PID 重用、marker、目标 GPU 映射和原子状态写入 |
+| Python 全量测试 | `450` 项 collected，`uv run --reinstall-package serverpilot pytest -q` 通过；覆盖实际 ASGI body 限流与断连转发、并发限流、CSV 字段投影、Web actor CSRF、SQLite 原子备份、owner/operator 改派授权、direct 与 generic CPU/RAM 双向 admission、GPU 与主机近 10 分钟遥测均值、CUDA ordinal、MCP request-id 命名空间/传输重试/同参数多 lease，以及 keepalive v3 预检、固定 inspect、worker 身份校验、旧 wire/state 拒绝、PID 重用、marker、目标 GPU 映射和原子状态写入 |
 | Ruff | `uv run ruff check .` 通过 |
 | 数据迁移 | 当前源码迁移头 `20260815_0026`；endpoint 的 `resource_kind` 默认 `unknown`，只由 collector 将端点更新为 `gpu` 或 `cpu_only`；`gpu_devices.cuda_ordinal` 初始为 NULL，只有当前 collector 观测才写入并恢复分配；`keepalive_current` 保存 `actual/error_reason` 与逐卡唯一进程身份，只把仍有 active resource 的活动 keepalive lease 转为无 TTL，保留 terminal keeper 与 workload 历史 expiry |
 | MCP 上下文 | 默认发现结果严格为 3 个工具；`gpu_apply` schema 仍只有 `server_id / gpu_count / task`。adapter 使用进程随机命名空间与 MCP request ID 生成不公开的重放键；同一次本地 HTTP 传输失败只重试一次，不同调用不按任务名折叠 |
-| Agent 任务说明 | 默认 MCP 不依赖客户端身份、UI 标题或专用环境变量。`gpu_apply(task?)` 接收用户任务名或当前目标的简短人类可读概括；未提供时使用“未命名任务”。`gpu_status` 逐卡返回最近显存/利用率 `telemetry` 与 `telemetry.recent_average`（近 10 分钟平均资源使用及样本时间范围），并给出本次可见卡的 `telemetry_summary`；这些仅为观测，调度仍以 `status` 与 `gpu_apply` 为准。首次只读采集会将端点记录为 GPU、纯 CPU 或尚未确认；已识别纯 CPU 端点保留主机容量，并以说明性的 `cpu_only_servers` 返回，但不会参与 GPU 分配。`gpu_status(include_busy=true)` 为忙卡返回人类可读 `task` |
-| macOS App 构建 | `zsh desktop/build-macos-app.sh` 通过，包含 Swift 桌面端编译；根目录 App 为 `1.5.7 / build 12` |
+| Agent 任务说明 | 默认 MCP 不依赖客户端身份、UI 标题或专用环境变量。`gpu_apply(task?)` 接收用户任务名或当前目标的简短人类可读概括；未提供时使用“未命名任务”。`gpu_status` 逐卡返回最近显存/利用率 `telemetry` 与 `telemetry.recent_average`（近 10 分钟平均资源使用及样本时间范围），端点 `host_telemetry.recent_average` 同样提供 CPU 负载和内存占用均值，并给出本次可见卡的 `telemetry_summary`；这些仅为观测，调度仍以 `status` 与 `gpu_apply` 为准。首次只读采集会将端点记录为 GPU、纯 CPU 或尚未确认；已识别纯 CPU 端点保留主机容量，并以说明性的 `cpu_only_servers` 返回，但不会参与 GPU 分配。`gpu_status(include_busy=true)` 为忙卡返回人类可读 `task` |
+| macOS App 构建 | `zsh desktop/build-macos-app.sh` 通过，包含 Swift 桌面端编译；根目录 App 为 `1.5.8 / build 13` |
 | standalone 验证 | `zsh desktop/verify-macos-app.sh` 通过 |
 | 冗余机制扫描 | 运行源码和桌面端没有摘要计算、登录 token、永久删除入口、占卡 `STARTING/HELD`、额外定时器或自动抢占 |
 | 文本与补丁完整性 | `git diff --check` 通过 |

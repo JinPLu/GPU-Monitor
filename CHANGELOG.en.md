@@ -4,6 +4,14 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## 1.5.8 - 2026-08-15
+
+**ServerPilot 1.5.8 makes server resource summaries and desktop GPU details more consistent and readable.**
+
+- GPU utilization, memory utilization, normalized CPU load, and system-memory utilization in the server overview now use the same rolling ten-minute observation window. Endpoint snapshots add `host_telemetry.recent_average`, and an older local service is no longer treated as compatible.
+- The resource table fills its available width: Project / Current Task absorbs the spare space, GPU Configuration stays toward the left, and the four resource columns use full professional labels and one shared ten-minute sort basis.
+- Server details return to compact horizontal per-GPU cards. Each ring shows current memory use, while a small state label distinguishes free, occupancy, busy, and error; resource history remains a fixed 2×2 chart layout.
+
 ## 1.5.7 - 2026-08-15
 
 **ServerPilot 1.5.7 makes GPU and CPU-only server resource states appear consistently from one live snapshot.**

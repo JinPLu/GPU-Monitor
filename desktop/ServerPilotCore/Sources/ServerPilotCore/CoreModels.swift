@@ -23,7 +23,7 @@ public struct ServiceInfo: Equatable, Sendable {
     public static let fixture = ServiceInfo(
         schemaVersion: "v1",
         version: "fixture",
-        capabilities: ["instant_claims", "endpoint_update", "endpoint_keepalive", "endpoint_conflict_cleanup", "operator_lease_release", "operator_lease_reassignment", "collector_settings"]
+        capabilities: ["instant_claims", "endpoint_update", "endpoint_keepalive", "endpoint_conflict_cleanup", "operator_lease_release", "operator_lease_reassignment", "collector_settings", "telemetry_recent_averages"]
     )
 
     public var supportsEndpointUpdate: Bool {
@@ -507,6 +507,27 @@ public struct GPUKeepaliveStatus: Equatable, Sendable {
 
 }
 
+public struct HostTelemetryRecentAverage: Equatable, Sendable {
+    public let windowSeconds: Int
+    public let sampleCount: Int
+    public let firstObservedAt: String?
+    public let lastObservedAt: String?
+    public let cpuLoadFraction: Double?
+    public let memoryFraction: Double?
+
+    public init?(raw: [String: Any]) {
+        let windowSeconds = raw.int("window_seconds")
+        let sampleCount = raw.int("sample_count")
+        guard windowSeconds > 0, sampleCount > 0 else { return nil }
+        self.windowSeconds = windowSeconds
+        self.sampleCount = sampleCount
+        self.firstObservedAt = raw.string("first_observed_at")
+        self.lastObservedAt = raw.string("last_observed_at")
+        self.cpuLoadFraction = raw.optionalFraction("cpu_load_fraction")
+        self.memoryFraction = raw.optionalPercent("memory_used_pct")
+    }
+}
+
 public struct EndpointRecord: Identifiable, Equatable, Sendable {
     public let id: String
     public let host: String
@@ -527,6 +548,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
     public let load1m: Double?
     public let memoryTotalMiB: Int?
     public let memoryAvailableMiB: Int?
+    public let recentTelemetryAverage: HostTelemetryRecentAverage?
 
     public init?(raw: [String: Any]) {
         guard let id = raw.string("id"), let host = raw.string("host"), let sshUser = raw.string("ssh_user") else {
@@ -557,6 +579,9 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         self.load1m = hostTelemetry.optionalDouble("load_1m")
         self.memoryTotalMiB = hostTelemetry.optionalInt("memory_total_mib")
         self.memoryAvailableMiB = hostTelemetry.optionalInt("memory_available_mib")
+        self.recentTelemetryAverage = HostTelemetryRecentAverage(
+            raw: hostTelemetry["recent_average"] as? [String: Any] ?? [:]
+        )
     }
 
     public var sshCommand: String {
@@ -639,6 +664,27 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
     }
 }
 
+public struct GPURecentTelemetryAverage: Equatable, Sendable {
+    public let windowSeconds: Int
+    public let sampleCount: Int
+    public let firstObservedAt: String?
+    public let lastObservedAt: String?
+    public let memoryFraction: Double?
+    public let utilizationFraction: Double?
+
+    public init?(raw: [String: Any]) {
+        let windowSeconds = raw.int("window_seconds")
+        let sampleCount = raw.int("sample_count")
+        guard windowSeconds > 0, sampleCount > 0 else { return nil }
+        self.windowSeconds = windowSeconds
+        self.sampleCount = sampleCount
+        self.firstObservedAt = raw.string("first_observed_at")
+        self.lastObservedAt = raw.string("last_observed_at")
+        self.memoryFraction = raw.optionalPercent("memory_used_pct")
+        self.utilizationFraction = raw.optionalPercent("gpu_utilization_pct")
+    }
+}
+
 public struct GPURecord: Identifiable, Equatable, Sendable {
     public let id: String
     public let endpointID: String
@@ -651,6 +697,7 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
     public let memoryUsedMiB: Int?
     public let utilization: Int?
     public let temperature: Int?
+    public let recentTelemetryAverage: GPURecentTelemetryAverage?
     public let owner: String?
     public let taskReference: String?
     public let leaseID: String?
@@ -686,6 +733,9 @@ public struct GPURecord: Identifiable, Equatable, Sendable {
         self.memoryUsedMiB = telemetry.optionalInt("memory_used_mib")
         self.utilization = telemetry.optionalInt("gpu_utilization_pct")
         self.temperature = telemetry.optionalInt("temperature_c")
+        self.recentTelemetryAverage = GPURecentTelemetryAverage(
+            raw: telemetry["recent_average"] as? [String: Any] ?? [:]
+        )
         let lease = raw["lease"] as? [String: Any] ?? [:]
         self.leaseID = lease.string("id")
         self.owner = lease.string("actor_id")

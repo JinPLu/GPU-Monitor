@@ -233,7 +233,7 @@ def test_api_gui_and_idempotency(tmp_path: Path, inventory) -> None:
     assert capabilities[: len(API_CAPABILITIES)] == list(API_CAPABILITIES)
     assert "endpoint_deletion" not in capabilities
     assert "server_deletion" not in capabilities
-    assert {"endpoint_update", "endpoint_keepalive"}.issubset(capabilities)
+    assert {"endpoint_update", "endpoint_keepalive", "telemetry_recent_averages"}.issubset(capabilities)
     compact = client.get(
         "/api/v1/gpus?compact=true",
         headers={"X-ServerPilot-Actor": "test-agent"},

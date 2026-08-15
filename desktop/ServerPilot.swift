@@ -224,7 +224,8 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
                 return
             }
             guard info.capabilities.contains("endpoint_conflict_cleanup"),
-                  info.capabilities.contains("operator_lease_release") else {
+                  info.capabilities.contains("operator_lease_release"),
+                  info.capabilities.contains("telemetry_recent_averages") else {
                 completion(.unavailable)
                 return
             }
@@ -350,7 +351,8 @@ final class DesktopAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegat
         guard let outputPath = environment["SERVERPILOT_DESKTOP_SCREENSHOT"], !outputPath.isEmpty else {
             return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        let captureDelay = TimeInterval(environment["SERVERPILOT_DESKTOP_SCREENSHOT_DELAY"] ?? "") ?? 0.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(captureDelay, 0)) {
             let bounds = view.bounds
             guard
                 let representation = NSBitmapImageRep(
@@ -525,6 +527,17 @@ private struct NativeBrokerRoot: View {
         )
     }
 
+    private func openFixtureDetailIfRequested(endpointIDs: [String]) {
+#if DEBUG || DESKTOP_FIXTURES
+        guard
+            selectedEndpointDetailID == nil,
+            let requestedID = ProcessInfo.processInfo.environment["SERVERPILOT_DESKTOP_SELECTED_ENDPOINT"],
+            endpointIDs.contains(requestedID)
+        else { return }
+        selectedEndpointDetailID = requestedID
+#endif
+    }
+
     var body: some View {
         GeometryReader { proxy in
             let compactNavigation = proxy.size.width < 1180
@@ -634,7 +647,11 @@ private struct NativeBrokerRoot: View {
                 GPUDetailSheet(gpu: gpu)
             }
         }
+        .onAppear {
+            openFixtureDetailIfRequested(endpointIDs: store.snapshot.endpoints.map(\.id))
+        }
         .onChange(of: store.snapshot.endpoints.map(\.id)) { _, endpointIDs in
+            openFixtureDetailIfRequested(endpointIDs: endpointIDs)
             if let selectedEndpointDetailID, !endpointIDs.contains(selectedEndpointDetailID) {
                 self.selectedEndpointDetailID = nil
             }
@@ -1138,10 +1155,10 @@ private enum EndpointSort: String, CaseIterable, Identifiable {
         case .assignment: return "项目 / 任务"
         case .availableGPU: return "空闲 GPU"
         case .gpuModel: return "GPU 配置"
-        case .gpuUtilization: return "GPU 利用"
-        case .gpuMemory: return "显存占用"
+        case .gpuUtilization: return "GPU 利用率"
+        case .gpuMemory: return "显存占用率"
         case .cpuLoad: return "CPU 负载"
-        case .memory: return "内存占用"
+        case .memory: return "内存占用率"
         }
     }
 
@@ -1164,7 +1181,6 @@ private struct ResourcesDashboard: View {
     @State private var filter: EndpointFilter = .all
     @State private var sort: EndpointSort = .id
     @State private var sortDirection: EndpointSortDirection = .ascending
-    @State private var endpointTableWidth: CGFloat = 1_200
     let claimEndpoint: (String) -> Void
     let openEndpoint: (EndpointRecord) -> Void
     let editEndpoint: (EndpointRecord) -> Void
@@ -1236,15 +1252,11 @@ private struct ResourcesDashboard: View {
     }
 
     var body: some View {
-        GeometryReader { proxy in
-            VStack(spacing: 0) {
-                resourceSummary
-                Divider().opacity(0.45)
-                endpointTable
-                    .background(DesignTokens.surface)
-            }
-            .onAppear { endpointTableWidth = proxy.size.width }
-            .onChange(of: proxy.size.width) { _, width in endpointTableWidth = width }
+        VStack(spacing: 0) {
+            resourceSummary
+            Divider().opacity(0.45)
+            endpointTable
+                .background(DesignTokens.surface)
         }
         .onChange(of: sort) { _, newSort in
             sortDirection = newSort.defaultDirection
@@ -1322,6 +1334,12 @@ private struct ResourcesDashboard: View {
                 .frame(maxWidth: 430)
                 .accessibilityLabel("端点过滤")
 
+                Label("资源指标：近 10 分钟均值", systemImage: "clock")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
+                    .help("GPU、显存、CPU 负载和内存占用率按最近 10 分钟的观测均值展示。点开服务器可查看当前观测。")
+
                 Spacer(minLength: 0)
 
                 Menu {
@@ -1341,54 +1359,58 @@ private struct ResourcesDashboard: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 11)
 
-            VStack(spacing: 0) {
-                EndpointTableHeader(
-                    sort: sort,
-                    direction: sortDirection,
-                    compactLayout: endpointTableWidth < 1_040,
-                    selectSort: selectSort
-                )
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(DesignTokens.glassSmoke)
-                    .overlay(alignment: .bottom) {
-                        Rectangle()
-                            .fill(DesignTokens.surfaceStroke)
-                            .frame(height: 1.5)
-                    }
+            GeometryReader { proxy in
+                let compactLayout = EndpointTableLayout.usesCompactLayout(tableWidth: proxy.size.width)
+                VStack(spacing: 0) {
+                    EndpointTableHeader(
+                        sort: sort,
+                        direction: sortDirection,
+                        compactLayout: compactLayout,
+                        selectSort: selectSort
+                    )
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 5)
+                        .background(DesignTokens.glassSmoke)
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(DesignTokens.surfaceStroke)
+                                .frame(height: 1.5)
+                        }
 
-                if filteredEndpoints.isEmpty {
-                    VStack(spacing: 8) {
-                        Image(systemName: endpoints.isEmpty ? "server.rack" : "magnifyingglass")
-                            .font(.system(size: 24, weight: .medium))
-                            .foregroundStyle(DesignTokens.mutedInk)
-                        Text(endpoints.isEmpty ? "暂无端点" : "没有匹配端点")
-                            .font(.system(size: 14, weight: .semibold))
-                        Text(endpoints.isEmpty ? "添加服务器后会显示资源。" : "调整搜索或过滤条件。")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(DesignTokens.mutedInk)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .accessibilityElement(children: .combine)
-                } else {
-                    ScrollView {
-                        VStack(spacing: 0) {
-                            ForEach(filteredEndpoints) { endpoint in
-                                EndpointTableRow(
-                                    endpoint: endpoint,
-                                    gpus: store.snapshot.gpus(for: endpoint),
-                                    leases: leases(for: endpoint),
-                                    isSnapshotFresh: store.freshness == .fresh,
-                                    compactLayout: endpointTableWidth < 1_040,
-                                    selected: false
-                                ) {
-                                    openEndpoint(endpoint)
+                    if filteredEndpoints.isEmpty {
+                        VStack(spacing: 8) {
+                            Image(systemName: endpoints.isEmpty ? "server.rack" : "magnifyingglass")
+                                .font(.system(size: 24, weight: .medium))
+                                .foregroundStyle(DesignTokens.mutedInk)
+                            Text(endpoints.isEmpty ? "暂无端点" : "没有匹配端点")
+                                .font(.system(size: 14, weight: .semibold))
+                            Text(endpoints.isEmpty ? "添加服务器后会显示资源。" : "调整搜索或过滤条件。")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(DesignTokens.mutedInk)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityElement(children: .combine)
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 0) {
+                                ForEach(filteredEndpoints) { endpoint in
+                                    EndpointTableRow(
+                                        endpoint: endpoint,
+                                        gpus: store.snapshot.gpus(for: endpoint),
+                                        leases: leases(for: endpoint),
+                                        isSnapshotFresh: store.freshness == .fresh,
+                                        compactLayout: compactLayout,
+                                        selected: false
+                                    ) {
+                                        openEndpoint(endpoint)
+                                    }
+                                    Divider()
                                 }
-                                Divider()
                             }
                         }
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .background(DesignTokens.surface)
@@ -1449,17 +1471,17 @@ private struct ResourcesDashboard: View {
             let right = endpointGPUModelSummary(store.snapshot.gpus(for: rhs))
             comparison = left.localizedStandardCompare(right)
         case .gpuUtilization:
-            let left = endpointAverageUtilizationFraction(endpoint: lhs, gpus: store.snapshot.gpus(for: lhs)) ?? -1
-            let right = endpointAverageUtilizationFraction(endpoint: rhs, gpus: store.snapshot.gpus(for: rhs)) ?? -1
+            let left = endpointOverviewGPUUtilizationFraction(endpoint: lhs, gpus: store.snapshot.gpus(for: lhs)) ?? -1
+            let right = endpointOverviewGPUUtilizationFraction(endpoint: rhs, gpus: store.snapshot.gpus(for: rhs)) ?? -1
             comparison = compare(left, right)
         case .gpuMemory:
-            let left = endpointAverageMemoryFraction(endpoint: lhs, gpus: store.snapshot.gpus(for: lhs)) ?? -1
-            let right = endpointAverageMemoryFraction(endpoint: rhs, gpus: store.snapshot.gpus(for: rhs)) ?? -1
+            let left = endpointOverviewGPUMemoryFraction(endpoint: lhs, gpus: store.snapshot.gpus(for: lhs)) ?? -1
+            let right = endpointOverviewGPUMemoryFraction(endpoint: rhs, gpus: store.snapshot.gpus(for: rhs)) ?? -1
             comparison = compare(left, right)
         case .cpuLoad:
-            comparison = compare(lhs.cpuLoadFraction ?? -1, rhs.cpuLoadFraction ?? -1)
+            comparison = compare(endpointOverviewCPULoadFraction(endpoint: lhs) ?? -1, endpointOverviewCPULoadFraction(endpoint: rhs) ?? -1)
         case .memory:
-            comparison = compare(lhs.memoryFraction ?? -1, rhs.memoryFraction ?? -1)
+            comparison = compare(endpointOverviewMemoryFraction(endpoint: lhs) ?? -1, endpointOverviewMemoryFraction(endpoint: rhs) ?? -1)
         }
         if comparison == .orderedSame {
             return lhs.id.localizedStandardCompare(rhs.id) == .orderedAscending
@@ -1557,6 +1579,31 @@ private struct ResourceInlineStat: View {
     }
 }
 
+private enum EndpointTableLayout {
+    static let columnSpacing: CGFloat = 8
+    static let serverWidth: CGFloat = 190
+    static let assignmentMinimumWidth: CGFloat = 170
+    static let gpuModelWidth: CGFloat = 184
+    static let availabilityWidth: CGFloat = 80
+    static let pressureWidth: CGFloat = 88
+    static let disclosureWidth: CGFloat = 10
+    static let rowHorizontalInset: CGFloat = 32
+
+    static var standardContentMinimumWidth: CGFloat {
+        serverWidth
+            + assignmentMinimumWidth
+            + gpuModelWidth
+            + availabilityWidth
+            + pressureWidth * 4
+            + disclosureWidth
+            + columnSpacing * 8
+    }
+
+    static func usesCompactLayout(tableWidth: CGFloat) -> Bool {
+        tableWidth < standardContentMinimumWidth + rowHorizontalInset
+    }
+}
+
 private struct EndpointTableHeader: View {
     let sort: EndpointSort
     let direction: EndpointSortDirection
@@ -1575,26 +1622,26 @@ private struct EndpointTableHeader: View {
     }
 
     private var standardHeader: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: EndpointTableLayout.columnSpacing) {
                 header("服务器", icon: "terminal", column: .id, alignment: .leading)
-                    .frame(width: 190, alignment: .leading)
+                    .frame(width: EndpointTableLayout.serverWidth, alignment: .leading)
                 header("项目 · 任务", icon: "folder", column: .assignment, alignment: .leading)
-                    .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+                    .frame(minWidth: EndpointTableLayout.assignmentMinimumWidth, maxWidth: .infinity, alignment: .leading)
                 header("GPU 配置", icon: "square.stack.3d.up", column: .gpuModel, alignment: .leading)
-                    .frame(width: 140, alignment: .leading)
+                    .frame(width: EndpointTableLayout.gpuModelWidth, alignment: .leading)
                 header("空闲", accessibilityTitle: "空闲 GPU", icon: "checkmark.circle", column: .availableGPU, alignment: .trailing)
-                    .frame(width: 90)
-                header("GPU", accessibilityTitle: "GPU 利用", icon: "chart.bar.fill", column: .gpuUtilization, alignment: .trailing)
-                    .frame(width: 68)
-                header("显存", accessibilityTitle: "显存占用", icon: "memorychip", column: .gpuMemory, alignment: .trailing)
-                    .frame(width: 68)
-                header("CPU", accessibilityTitle: "CPU 负载", icon: "cpu", column: .cpuLoad, alignment: .trailing)
-                    .frame(width: 68)
-                header("内存", accessibilityTitle: "内存占用", icon: "memorychip.fill", column: .memory, alignment: .trailing)
-                    .frame(width: 68)
-                Color.clear.frame(width: 10, height: 10)
+                    .frame(width: EndpointTableLayout.availabilityWidth)
+                header("GPU 利用率", icon: nil, column: .gpuUtilization, alignment: .trailing)
+                    .frame(width: EndpointTableLayout.pressureWidth)
+                header("显存占用率", icon: nil, column: .gpuMemory, alignment: .trailing)
+                    .frame(width: EndpointTableLayout.pressureWidth)
+                header("CPU 负载", icon: nil, column: .cpuLoad, alignment: .trailing)
+                    .frame(width: EndpointTableLayout.pressureWidth)
+                header("内存占用率", icon: nil, column: .memory, alignment: .trailing)
+                    .frame(width: EndpointTableLayout.pressureWidth)
+                Color.clear.frame(width: EndpointTableLayout.disclosureWidth, height: 10)
         }
-        .frame(minWidth: 934, alignment: .leading)
+        .frame(minWidth: EndpointTableLayout.standardContentMinimumWidth, maxWidth: .infinity, alignment: .leading)
     }
 
     private var compactHeader: some View {
@@ -1610,13 +1657,13 @@ private struct EndpointTableHeader: View {
                     .frame(width: 76, alignment: .trailing)
             }
             HStack(spacing: 12) {
-                header("GPU 利用", icon: "chart.bar.fill", column: .gpuUtilization, alignment: .leading)
+                header("GPU 利用率", icon: "chart.bar.fill", column: .gpuUtilization, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                header("显存", accessibilityTitle: "显存占用", icon: "memorychip", column: .gpuMemory, alignment: .leading)
+                header("显存占用率", icon: "memorychip", column: .gpuMemory, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                header("CPU", accessibilityTitle: "CPU 负载", icon: "cpu", column: .cpuLoad, alignment: .leading)
+                header("CPU 负载", icon: "cpu", column: .cpuLoad, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                header("内存", accessibilityTitle: "内存占用", icon: "memorychip.fill", column: .memory, alignment: .leading)
+                header("内存占用率", icon: "memorychip.fill", column: .memory, alignment: .leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1707,7 +1754,7 @@ private struct EndpointTableRow: View {
                     compactRow
                 } else {
                     standardRow
-                        .frame(minWidth: 934, alignment: .leading)
+                        .frame(minWidth: EndpointTableLayout.standardContentMinimumWidth, maxWidth: .infinity, alignment: .leading)
                 }
             }
             .padding(.horizontal, 16)
@@ -1723,25 +1770,25 @@ private struct EndpointTableRow: View {
         .help("\(endpoint.sshCommand)\n\(endpoint.workspacePath ?? "工作区未设置")\n\(assignmentHelp)")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("服务器 \(endpoint.sshCommand)")
-        .accessibilityValue("\(assignmentHelp)，GPU 配置 \(gpuModelSummary)，\(gpuCaption)，\(attentionLabel)，CPU 负载 \(percentageLabel(endpoint.cpuLoadFraction))，内存占用率 \(percentageLabel(endpoint.memoryFraction))，GPU 利用率 \(percentageLabel(gpuPressure))")
+        .accessibilityValue("\(assignmentHelp)，GPU 配置 \(gpuModelSummary)，\(gpuCaption)，资源指标为近 10 分钟均值：CPU 负载 \(percentageLabel(cpuLoadPressure))，内存占用率 \(percentageLabel(memoryPressure))，GPU 利用率 \(percentageLabel(gpuPressure))")
     }
 
     private var standardRow: some View {
-        HStack(alignment: .center, spacing: 10) {
+        HStack(alignment: .center, spacing: EndpointTableLayout.columnSpacing) {
             endpointTitle
-                .frame(width: 190, alignment: .leading)
-            assignmentCell.frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
-            gpuModelCell.frame(width: 140, alignment: .leading)
+                .frame(width: EndpointTableLayout.serverWidth, alignment: .leading)
+            assignmentCell.frame(minWidth: EndpointTableLayout.assignmentMinimumWidth, maxWidth: .infinity, alignment: .leading)
+            gpuModelCell.frame(width: EndpointTableLayout.gpuModelWidth, alignment: .leading)
             availabilitySummary
-                .frame(width: 90, alignment: .trailing)
-            TablePressureCell(label: "GPU 利用率", fraction: gpuPressure).frame(width: 68)
-            TablePressureCell(label: "显存占用率", fraction: gpuMemoryPressure).frame(width: 68)
-            TablePressureCell(label: "CPU 负载", fraction: endpoint.cpuLoadFraction).frame(width: 68)
-            TablePressureCell(label: "内存占用率", fraction: endpoint.memoryFraction).frame(width: 68)
+                .frame(width: EndpointTableLayout.availabilityWidth, alignment: .trailing)
+            TablePressureCell(label: "GPU 利用率", fraction: gpuPressure).frame(width: EndpointTableLayout.pressureWidth)
+            TablePressureCell(label: "显存占用率", fraction: gpuMemoryPressure).frame(width: EndpointTableLayout.pressureWidth)
+            TablePressureCell(label: "CPU 负载", fraction: cpuLoadPressure).frame(width: EndpointTableLayout.pressureWidth)
+            TablePressureCell(label: "内存占用率", fraction: memoryPressure).frame(width: EndpointTableLayout.pressureWidth)
             Image(systemName: "chevron.right")
                 .font(.system(size: 9, weight: .bold))
                 .foregroundStyle(DesignTokens.mutedInk)
-                .frame(width: 10)
+                .frame(width: EndpointTableLayout.disclosureWidth)
                 .help("查看详情与历史")
         }
     }
@@ -1762,13 +1809,13 @@ private struct EndpointTableRow: View {
                     .frame(width: 90, alignment: .trailing)
             }
             HStack(spacing: 12) {
-                CompactPressureLabel(label: "GPU", fraction: gpuPressure)
+                CompactPressureLabel(label: "GPU 利用率", fraction: gpuPressure)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                CompactPressureLabel(label: "显存", fraction: gpuMemoryPressure)
+                CompactPressureLabel(label: "显存占用率", fraction: gpuMemoryPressure)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                CompactPressureLabel(label: "CPU", fraction: endpoint.cpuLoadFraction)
+                CompactPressureLabel(label: "CPU 负载", fraction: cpuLoadPressure)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                CompactPressureLabel(label: "内存", fraction: endpoint.memoryFraction)
+                CompactPressureLabel(label: "内存占用率", fraction: memoryPressure)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -1897,11 +1944,19 @@ private struct EndpointTableRow: View {
     }
 
     private var gpuPressure: Double? {
-        endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus)
+        endpointOverviewGPUUtilizationFraction(endpoint: endpoint, gpus: gpus)
     }
 
     private var gpuMemoryPressure: Double? {
-        endpointAverageMemoryFraction(endpoint: endpoint, gpus: gpus)
+        endpointOverviewGPUMemoryFraction(endpoint: endpoint, gpus: gpus)
+    }
+
+    private var cpuLoadPressure: Double? {
+        endpointOverviewCPULoadFraction(endpoint: endpoint)
+    }
+
+    private var memoryPressure: Double? {
+        endpointOverviewMemoryFraction(endpoint: endpoint)
     }
 
     private var gpuCaption: String {
@@ -2010,7 +2065,7 @@ private struct TablePressureCell: View {
                 .lineLimit(1)
                 .frame(width: 30, alignment: .trailing)
             PressureMeter(fraction: fraction, color: pressureColor(fraction))
-                .frame(width: 40)
+                .frame(width: 48)
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
         .accessibilityElement(children: .ignore)
@@ -2286,9 +2341,12 @@ private struct EndpointTelemetryHistoryChart: View, Equatable {
                 .frame(maxWidth: .infinity, minHeight: 112, alignment: .leading)
             } else {
                 LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 300), spacing: 8)],
+                    columns: [
+                        GridItem(.flexible(minimum: 300), spacing: 12),
+                        GridItem(.flexible(minimum: 300), spacing: 12),
+                    ],
                     alignment: .leading,
-                    spacing: 8
+                    spacing: 12
                 ) {
                     EndpointTelemetryMetricChart(
                         title: "CPU 使用率",
@@ -2377,7 +2435,7 @@ private struct EndpointTelemetryMetricChart: View, Equatable {
                 Label(emptyMessage, systemImage: "chart.line.flattrend.xyaxis")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
-                    .frame(maxWidth: .infinity, minHeight: 154, alignment: .leading)
+                    .frame(maxWidth: .infinity, minHeight: 178, alignment: .leading)
             } else {
 #if canImport(Charts)
                 chart
@@ -2385,7 +2443,7 @@ private struct EndpointTelemetryMetricChart: View, Equatable {
                 Text("当前系统没有 Swift Charts，使用文本降级。")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(DesignTokens.mutedInk)
-                    .frame(maxWidth: .infinity, minHeight: 154, alignment: .leading)
+                    .frame(maxWidth: .infinity, minHeight: 178, alignment: .leading)
 #endif
             }
 
@@ -2461,7 +2519,7 @@ private struct EndpointTelemetryMetricChart: View, Equatable {
         .chartOverlay { proxy in
             EndpointTelemetryChartHoverOverlay(proxy: proxy, items: hoverItems)
         }
-        .frame(height: 126)
+        .frame(height: 160)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)
         .accessibilityValue(accessibilitySummary)
@@ -3011,33 +3069,29 @@ private struct ServerAccessoryCard: View {
     }
 
     private var averageMemoryFraction: Double? {
-        endpointAverageMemoryFraction(endpoint: endpoint, gpus: gpus)
+        endpointOverviewGPUMemoryFraction(endpoint: endpoint, gpus: gpus)
     }
 
     private var averageUtilizationFraction: Double? {
-        endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus)
+        endpointOverviewGPUUtilizationFraction(endpoint: endpoint, gpus: gpus)
     }
 
     private var gpuMemoryDetail: String? {
-        guard !gpus.isEmpty, gpus.allSatisfy({ $0.memoryUsedMiB != nil }) else { return nil }
-        let used = gpus.compactMap(\.memoryUsedMiB).reduce(0, +) / 1024
-        let total = gpus.map(\.totalVRAMMiB).reduce(0, +) / 1024
-        return "\(used) / \(total) GB"
+        let sampleCount = gpus.compactMap { $0.recentTelemetryAverage?.sampleCount }.min()
+        return sampleCount.map { "近 10 分钟 · \($0) 个样本" }
     }
 
     private var gpuUtilizationDetail: String? {
-        let observed = gpus.compactMap(\.utilization).count
-        return observed > 0 ? "\(observed) 块 GPU 平均" : nil
+        let observed = gpus.compactMap { $0.recentTelemetryAverage }.count
+        return observed > 0 ? "\(observed) 块 GPU 均值" : nil
     }
 
     private var cpuLoadDetail: String? {
-        guard let cpuCount = endpoint.cpuCount, let load1m = endpoint.load1m else { return nil }
-        return "1 分钟负载 \(String(format: "%.1f", load1m)) / \(cpuCount) 核"
+        endpoint.recentTelemetryAverage.map { "近 10 分钟 · \($0.sampleCount) 个样本" }
     }
 
     private var memoryDetail: String? {
-        guard let total = endpoint.memoryTotalMiB, let available = endpoint.memoryAvailableMiB else { return nil }
-        return "可用 \(available / 1024) / \(total / 1024) GB"
+        endpoint.recentTelemetryAverage.map { "近 10 分钟 · \($0.sampleCount) 个样本" }
     }
 
     private var isUnavailable: Bool {
@@ -3090,10 +3144,10 @@ private struct ServerAccessoryCard: View {
             }
 
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 11) {
-                ServerMetric(label: "平均 GPU 显存", value: averageMemoryFraction, detail: gpuMemoryDetail, tint: DesignTokens.interaction)
-                ServerMetric(label: "平均 GPU 利用率", value: averageUtilizationFraction, detail: gpuUtilizationDetail, tint: DesignTokens.warning)
-                ServerMetric(label: "CPU 负载", value: endpoint.cpuLoadFraction, detail: cpuLoadDetail, tint: DesignTokens.ink, help: "1 分钟负载 ÷ CPU 核数，不等同于 CPU 利用率")
-                ServerMetric(label: "系统内存", value: endpoint.memoryFraction, detail: memoryDetail, tint: DesignTokens.success)
+                ServerMetric(label: "GPU 显存占用率", value: averageMemoryFraction, detail: gpuMemoryDetail, tint: DesignTokens.interaction)
+                ServerMetric(label: "GPU 利用率", value: averageUtilizationFraction, detail: gpuUtilizationDetail, tint: DesignTokens.warning)
+                ServerMetric(label: "CPU 负载", value: endpointOverviewCPULoadFraction(endpoint: endpoint), detail: cpuLoadDetail, tint: DesignTokens.ink, help: "最近 10 分钟的 CPU 负载均值；负载 ÷ CPU 核数，不等同于 CPU 利用率")
+                ServerMetric(label: "系统内存占用率", value: endpointOverviewMemoryFraction(endpoint: endpoint), detail: memoryDetail, tint: DesignTokens.success)
             }
 
             if !gpus.isEmpty {
@@ -3185,21 +3239,28 @@ private func endpointGPUModelSummary(_ gpus: [GPURecord]) -> String {
     return names.count == 1 ? first : "\(first) +\(names.count - 1) 类"
 }
 
-private func endpointAverageMemoryFraction(endpoint: EndpointRecord, gpus: [GPURecord]) -> Double? {
+private func endpointOverviewGPUMemoryFraction(endpoint: EndpointRecord, gpus: [GPURecord]) -> Double? {
     guard endpoint.monitorStatus == "ONLINE" else { return nil }
-    let values = gpus.compactMap { gpu -> Double? in
-        guard gpu.totalVRAMMiB > 0, gpu.memoryUsedMiB != nil else { return nil }
-        return gpu.memoryFraction
-    }
-    guard !values.isEmpty else { return nil }
-    return values.reduce(0, +) / Double(values.count)
-}
-
-private func endpointAverageUtilizationFraction(endpoint: EndpointRecord, gpus: [GPURecord]) -> Double? {
-    guard endpoint.monitorStatus == "ONLINE" else { return nil }
-    let values = gpus.compactMap { $0.utilization }.map { Double($0) / 100 }
+    let values = gpus.compactMap { $0.recentTelemetryAverage?.memoryFraction }
     guard !values.isEmpty else { return nil }
     return min(max(values.reduce(0, +) / Double(values.count), 0), 1)
+}
+
+private func endpointOverviewGPUUtilizationFraction(endpoint: EndpointRecord, gpus: [GPURecord]) -> Double? {
+    guard endpoint.monitorStatus == "ONLINE" else { return nil }
+    let values = gpus.compactMap { $0.recentTelemetryAverage?.utilizationFraction }
+    guard !values.isEmpty else { return nil }
+    return min(max(values.reduce(0, +) / Double(values.count), 0), 1)
+}
+
+private func endpointOverviewCPULoadFraction(endpoint: EndpointRecord) -> Double? {
+    guard endpoint.monitorStatus == "ONLINE" else { return nil }
+    return endpoint.recentTelemetryAverage?.cpuLoadFraction
+}
+
+private func endpointOverviewMemoryFraction(endpoint: EndpointRecord) -> Double? {
+    guard endpoint.monitorStatus == "ONLINE" else { return nil }
+    return endpoint.recentTelemetryAverage?.memoryFraction
 }
 
 private func percentageLabel(_ value: Double?) -> String {
@@ -3210,9 +3271,9 @@ private let endpointHighPressureThreshold = 0.85
 
 private func endpointPressureFraction(endpoint: EndpointRecord, gpus: [GPURecord]) -> Double? {
     [
-        endpoint.cpuLoadFraction,
-        endpoint.memoryFraction,
-        endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus)
+        endpointOverviewCPULoadFraction(endpoint: endpoint),
+        endpointOverviewMemoryFraction(endpoint: endpoint),
+        endpointOverviewGPUUtilizationFraction(endpoint: endpoint, gpus: gpus)
     ]
     .compactMap { $0 }
     .max()
@@ -4349,7 +4410,6 @@ private struct HomeClaimButtonStyle: ButtonStyle {
 private struct ServerDetailSheet: View {
     @ObservedObject var store: BrokerStore
     @Environment(\.dismiss) private var dismiss
-    @State private var selectedGPUID: String?
     let endpointID: String
     let claim: () -> Void
     let edit: () -> Void
@@ -4363,21 +4423,10 @@ private struct ServerDetailSheet: View {
         return store.snapshot.gpus(for: endpoint)
     }
 
-    private var selectedGPUSelection: Binding<StableRecordSelection?> {
-        Binding(
-            get: { selectedGPUID.map(StableRecordSelection.init(id:)) },
-            set: { selectedGPUID = $0?.id }
-        )
-    }
-
     private var availableGPUCount: Int {
         guard let endpoint else { return 0 }
         guard endpoint.monitorStatus == "ONLINE" else { return 0 }
         return gpus.filter(\.isPubliclyAvailable).count
-    }
-
-    private var claimedGPUCount: Int {
-        gpus.filter(isGPUClaimed).count
     }
 
     private var conflictedLeases: [LeaseRecord] {
@@ -4450,13 +4499,6 @@ private struct ServerDetailSheet: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         header(endpoint)
-
-                        DetailCallout(
-                            icon: "folder",
-                            color: endpoint.workspacePath == nil ? DesignTokens.warning : DesignTokens.interaction,
-                            message: endpoint.workspacePath.map { "远端工作区：\($0)" } ?? "远端工作区未设置；申请资源后仍需先补齐路径。"
-                        )
-
                         serverActions(endpoint)
 
                         if endpoint.monitorStatus != "ONLINE" {
@@ -4467,26 +4509,11 @@ private struct ServerDetailSheet: View {
                             )
                         }
 
-                        if endpoint.keepalive.configured {
-                            occupancySummary(endpoint)
-                        } else if store.supportsEndpointKeepalive {
-                            DetailCallout(
-                                icon: "shield",
-                                color: DesignTokens.mutedInk,
-                                message: "占卡程序由 ServerPilot 自动管理；点击“开始占卡”后会在符合条件的空闲 GPU 上运行。"
-                            )
-                        }
-
-                        HStack(spacing: 10) {
-                            detailStatistic(label: "可申请", value: capacityLabel, accent: DesignTokens.success)
-                            detailStatistic(label: "已分配", value: "\(claimedGPUCount) / \(gpus.count)", accent: DesignTokens.interaction)
-                            detailStatistic(label: "GPU 利用", value: percentageLabel(endpointAverageUtilizationFraction(endpoint: endpoint, gpus: gpus)), accent: DesignTokens.warning)
-                            detailStatistic(label: "显存", value: percentageLabel(endpointAverageMemoryFraction(endpoint: endpoint, gpus: gpus)), accent: DesignTokens.ink)
-                        }
-
-                        if !gpus.isEmpty {
-                            ServerLeaseSummary(gpus: gpus)
-                        }
+                        DetailCallout(
+                            icon: "folder",
+                            color: endpoint.workspacePath == nil ? DesignTokens.warning : DesignTokens.interaction,
+                            message: endpoint.workspacePath.map { "远端工作区：\($0)" } ?? "远端工作区未设置；申请资源后仍需先补齐路径。"
+                        )
 
                         if !reclaimableKeepaliveLeaseIDs.isEmpty {
                             ForEach(reclaimableKeepaliveLeaseIDs, id: \.self) { leaseID in
@@ -4545,32 +4572,8 @@ private struct ServerDetailSheet: View {
                             InlineValidation(message: error)
                         }
 
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Text("GPU 明细")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(DesignTokens.ink)
-                                Spacer()
-                                Text("\(gpus.count) 块")
-                                    .font(.system(size: 10, weight: .semibold, design: .rounded))
-                                    .foregroundStyle(DesignTokens.mutedInk)
-                            }
-
-                            if gpus.isEmpty {
-                                DetailCallout(
-                                    icon: "square.grid.3x3",
-                                    color: DesignTokens.mutedInk,
-                                    message: endpoint.monitorStatus == "ONLINE" ? "未检测到 GPU" : "没有可显示的 GPU"
-                                )
-                            } else {
-                                LazyVGrid(columns: [GridItem(.adaptive(minimum: gpus.count > 16 ? 142 : 220, maximum: 280), spacing: 10)], spacing: 10) {
-                                    ForEach(gpus.sorted { $0.index < $1.index }) { gpu in
-                                        ServerGPUDetailCard(gpu: gpu, compact: gpus.count > 16) {
-                                            selectedGPUID = gpu.id
-                                        }
-                                    }
-                                }
-                            }
+                        if !gpus.isEmpty {
+                            ServerGPUMemoryStatusGrid(gpus: gpus)
                         }
 
                         EndpointTelemetryHistoryPanel(store: store, endpoint: endpoint)
@@ -4596,31 +4599,15 @@ private struct ServerDetailSheet: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(minWidth: 560, idealWidth: 760, maxWidth: 920, minHeight: 420, idealHeight: 640, maxHeight: 780)
+        .frame(minWidth: 720, idealWidth: 1_040, maxWidth: 1_260, minHeight: 620, idealHeight: 800, maxHeight: 920)
         .background(VisualEffect(material: .hudWindow, blendingMode: .behindWindow))
         .accessibilityLabel("服务器详情")
         .accessibilityValue(accessibilityValue)
-        .sheet(item: selectedGPUSelection) { selection in
-            if let gpu = store.snapshot.gpu(id: selection.id) {
-                GPUDetailSheet(gpu: gpu)
-            }
-        }
         .onChange(of: store.snapshot.endpoints.map(\.id)) { _, endpointIDs in
             if !endpointIDs.contains(endpointID) {
                 dismiss()
             }
         }
-        .onChange(of: gpus.map(\.id)) { _, gpuIDs in
-            if let selectedGPUID, !gpuIDs.contains(selectedGPUID) {
-                self.selectedGPUID = nil
-            }
-        }
-    }
-
-    private var capacityLabel: String {
-        guard let endpoint else { return "已移除" }
-        guard endpoint.monitorStatus == "ONLINE" else { return "不可分配" }
-        return "\(availableGPUCount) / \(gpus.count)"
     }
 
     private var accessibilityValue: String {
@@ -4718,53 +4705,6 @@ private struct ServerDetailSheet: View {
         .help("编辑或暂停服务器")
     }
 
-    private func occupancySummary(_ endpoint: EndpointRecord) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: occupancyActionStarts ? "shield" : "shield.fill")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(occupancyActionStarts ? DesignTokens.mutedInk : DesignTokens.interaction)
-                .frame(width: 32, height: 32)
-                .background((occupancyActionStarts ? DesignTokens.mutedInk : DesignTokens.interaction).opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("占卡")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(DesignTokens.ink)
-                Text(endpoint.keepalive.coverageSummary(totalGPUCount: gpus.count, taskGPUCount: taskGPUCount))
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(DesignTokens.mutedInk)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(DesignTokens.glassSmoke, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("占卡")
-        .accessibilityValue(endpoint.keepalive.coverageSummary(totalGPUCount: gpus.count, taskGPUCount: taskGPUCount))
-    }
-
-    private func detailStatistic(label: String, value: String, accent: Color) -> some View {
-        HStack(spacing: 6) {
-            Circle().fill(accent).frame(width: 6, height: 6)
-            Text(label)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(DesignTokens.mutedInk)
-            Text(value)
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .foregroundStyle(DesignTokens.ink)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(label)
-        .accessibilityValue(value)
-    }
-
-    private var taskGPUCount: Int {
-        gpus.filter(\.isTaskOccupancy).count
-    }
-
     private var unavailableReason: String {
         if !store.allowsMutations { return store.mutationUnavailableReason }
         if isMutating { return "服务器操作正在处理中。" }
@@ -4782,52 +4722,244 @@ private struct ServerDetailSheet: View {
     }
 }
 
-private struct ServerGPUDetailCard: View {
-    let gpu: GPURecord
-    var compact = false
-    let select: () -> Void
+private enum GPUStatusSection: String, CaseIterable, Identifiable {
+    case available
+    case keepalive
+    case busy
+    case error
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .available: return "空闲"
+        case .keepalive: return "占卡"
+        case .busy: return "繁忙"
+        case .error: return "错误"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .available: return "checkmark.circle.fill"
+        case .keepalive: return "shield.fill"
+        case .busy: return "bolt.fill"
+        case .error: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .available: return DesignTokens.success
+        case .keepalive: return DesignTokens.interaction
+        case .busy: return DesignTokens.warning
+        case .error: return DesignTokens.danger
+        }
+    }
+}
+
+private struct ServerGPUMemoryStatusGrid: View {
+    let gpus: [GPURecord]
+
+    private func section(for gpu: GPURecord) -> GPUStatusSection {
+        if gpuNeedsAttention(gpu) { return .error }
+        if gpu.keepalive.isActive { return .keepalive }
+        if gpu.isPubliclyAvailable { return .available }
+        return .busy
+    }
+
+    private var orderedGPUs: [GPURecord] {
+        gpus.sorted { lhs, rhs in
+            let lhsRank = GPUStatusSection.allCases.firstIndex(of: section(for: lhs)) ?? 0
+            let rhsRank = GPUStatusSection.allCases.firstIndex(of: section(for: rhs)) ?? 0
+            if lhsRank == rhsRank { return lhs.index < rhs.index }
+            return lhsRank < rhsRank
+        }
+    }
+
+    private func count(in section: GPUStatusSection) -> Int {
+        gpus.filter { self.section(for: $0) == section }.count
+    }
+
+    private var accessibilityValue: String {
+        let gpuStates = gpus
+            .sorted { $0.index < $1.index }
+            .map { gpu in
+                "GPU \(gpu.index) \(section(for: gpu).label) 显存 \(gpuMemoryPercent(gpu))"
+            }
+            .joined(separator: "，")
+        let counts = GPUStatusSection.allCases
+            .map { "\($0.label) \(count(in: $0)) 张" }
+            .joined(separator: "，")
+        return "\(gpuStates)；\(counts)"
+    }
 
     var body: some View {
-        Button(action: select) {
-            HStack(spacing: 10) {
-                GPUUsageGlyph(gpu: gpu, diameter: compact ? 26 : 34)
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text("GPU \(gpu.index)")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(DesignTokens.ink)
-                        Text(gpuPresentationLabel(gpu))
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(gpuStateColor(gpu.state))
-                    }
-                    Text(gpu.name)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(DesignTokens.mutedInk)
-                        .lineLimit(1)
-                    if !compact {
-                        Text(detailLine)
-                            .font(.system(size: 10, weight: .medium, design: .rounded))
-                            .foregroundStyle(DesignTokens.ink.opacity(0.78))
-                            .lineLimit(1)
-                    }
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Label("GPU 状态", systemImage: "memorychip")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(DesignTokens.ink)
+                Spacer(minLength: 0)
+                Text("当前显存 · \(gpus.count) 张 GPU")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundStyle(DesignTokens.mutedInk)
+            }
+
+            HStack(spacing: 7) {
+                ForEach(GPUStatusSection.allCases) { section in
+                    GPUStatusCountChip(section: section, count: count(in: section))
                 }
                 Spacer(minLength: 0)
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, minHeight: compact ? 48 : 74, alignment: .leading)
-            .background(DesignTokens.surface.opacity(0.76), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(DesignTokens.surfaceStroke, lineWidth: 1))
+
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 235, maximum: 360), spacing: 10)],
+                alignment: .leading,
+                spacing: 10
+            ) {
+                ForEach(orderedGPUs) { gpu in
+                    GPUMemoryStatusRow(gpu: gpu, status: section(for: gpu))
+                }
+            }
         }
-        .buttonStyle(.plain)
-        .help("查看 GPU \(gpu.index) 详情")
+        .padding(14)
+        .background(DesignTokens.surface.opacity(0.70), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(DesignTokens.surfaceStroke.opacity(0.82), lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("GPU 显存状态")
+        .accessibilityValue(accessibilityValue)
+        .help("每行代表一张 GPU；环图表示当前显存占用，状态标签表示可用状态。")
+    }
+}
+
+private struct GPUStatusCountChip: View {
+    let section: GPUStatusSection
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(section.tint)
+                .frame(width: 6, height: 6)
+            Text(section.label)
+            Text("\(count)")
+                .fontWeight(.semibold)
+                .foregroundStyle(count == 0 ? DesignTokens.mutedInk : DesignTokens.ink)
+        }
+        .font(.system(size: 10, weight: .medium, design: .rounded))
+        .foregroundStyle(DesignTokens.mutedInk)
+        .padding(.horizontal, 8)
+        .frame(height: 24)
+        .background(DesignTokens.ink.opacity(count == 0 ? 0.025 : 0.045), in: Capsule())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(section.label)
+        .accessibilityValue("\(count) 张 GPU")
+    }
+}
+
+private struct GPUMemoryStatusRow: View {
+    let gpu: GPURecord
+    let status: GPUStatusSection
+
+    var body: some View {
+        HStack(spacing: 11) {
+            GPUMemoryGlyph(gpu: gpu, diameter: 40)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 7) {
+                    Text("GPU \(gpu.index)")
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(DesignTokens.ink)
+                    Label(status.label, systemImage: status.icon)
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(status.tint)
+                        .padding(.horizontal, 7)
+                        .frame(height: 20)
+                        .background(status.tint.opacity(0.10), in: Capsule())
+                }
+                Text(gpu.memoryLabel)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(DesignTokens.mutedInk)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(gpuMemoryPercent(gpu))
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .foregroundStyle(memoryPressureColor(gpu))
+                Text("显存")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(DesignTokens.mutedInk)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, minHeight: 66, alignment: .leading)
+        .background(DesignTokens.surface.opacity(0.92), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .stroke(DesignTokens.surfaceStroke, lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel("GPU \(gpu.index)")
-        .accessibilityValue("\(gpuPresentationLabel(gpu))，UUID \(gpu.uuidLabel)")
+        .accessibilityValue("\(status.label)，当前显存 \(gpu.memoryLabel)，占用 \(gpuMemoryPercent(gpu))")
+        .help("GPU \(gpu.index) · \(status.label) · 当前显存 \(gpu.memoryLabel)")
     }
 
-    private var detailLine: String {
-        let utilization = gpu.utilization.map { "\($0)%" } ?? "—"
-        return "\(gpu.memoryLabel) · \(utilization)"
+    private func memoryPressureColor(_ gpu: GPURecord) -> Color {
+        guard gpu.memoryUsedMiB != nil, gpu.totalVRAMMiB > 0 else { return DesignTokens.mutedInk }
+        return pressureColor(gpu.memoryFraction)
     }
+}
+
+private struct GPUMemoryGlyph: View {
+    let gpu: GPURecord
+    let diameter: CGFloat
+
+    private var memoryFraction: Double? {
+        guard gpu.memoryUsedMiB != nil, gpu.totalVRAMMiB > 0 else { return nil }
+        return min(max(gpu.memoryFraction, 0), 1)
+    }
+
+    private var memoryColor: Color {
+        pressureColor(memoryFraction)
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(DesignTokens.ink.opacity(0.09), lineWidth: 4)
+
+            if let memoryFraction {
+                Circle()
+                    .trim(from: 0, to: memoryFraction)
+                    .stroke(memoryColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                Circle()
+                    .fill(memoryColor.opacity(0.11))
+                    .frame(width: diameter * 0.56, height: diameter * 0.56)
+            } else {
+                Circle()
+                    .stroke(DesignTokens.mutedInk.opacity(0.32), style: StrokeStyle(lineWidth: 2, dash: [3, 3]))
+            }
+
+            Text("\(gpu.index)")
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(DesignTokens.ink)
+        }
+        .frame(width: diameter, height: diameter)
+        .accessibilityHidden(true)
+    }
+}
+
+private func gpuMemoryPercent(_ gpu: GPURecord) -> String {
+    guard gpu.memoryUsedMiB != nil, gpu.totalVRAMMiB > 0 else { return "—" }
+    return "\(Int((min(max(gpu.memoryFraction, 0), 1) * 100).rounded()))%"
 }
 
 private struct ServerPoolHeader: View {

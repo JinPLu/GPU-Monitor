@@ -43,6 +43,7 @@ EXPECTED_CAPABILITIES = frozenset(
         "cuda_ordinal_selectors",
         "keepalive_protocol_v3",
         "keepalive_worker_attestation",
+        "telemetry_recent_averages",
     }
 )
 DAEMON_PROTOCOL = "macos-launchagent-v1"

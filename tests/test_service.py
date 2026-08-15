@@ -1517,7 +1517,24 @@ def test_snapshot_includes_per_gpu_recent_telemetry_average(service, admin) -> N
         memory_utilization_pct: int,
         temperature_c: int,
     ) -> EndpointObservation:
-        value = observation(count=1, observed_at=observed_at)
+        value = observation(
+            count=1,
+            observed_at=observed_at,
+            host={
+                "cpu_count": 64,
+                "load_1m": {
+                    10_000: 6.4,
+                    20_000: 12.8,
+                    30_000: 32.0,
+                }[memory_used_mib],
+                "memory_total_mib": 100_000,
+                "memory_available_mib": {
+                    10_000: 90_000,
+                    20_000: 80_000,
+                    30_000: 60_000,
+                }[memory_used_mib],
+            },
+        )
         value.gpus[0] = value.gpus[0].model_copy(
             update={
                 "memory_used_mib": memory_used_mib,
@@ -1572,6 +1589,15 @@ def test_snapshot_includes_per_gpu_recent_telemetry_average(service, admin) -> N
         "memory_utilization_pct": 53.33,
         "temperature_c": 50.0,
     }
+    recent_host_average = service.snapshot(admin)["data"]["endpoints"][0]["host_telemetry"]["recent_average"]
+    assert recent_host_average == {
+        "window_seconds": 600,
+        "sample_count": 3,
+        "first_observed_at": start.isoformat(),
+        "last_observed_at": (start + timedelta(seconds=90)).isoformat(),
+        "cpu_load_fraction": 0.27,
+        "memory_used_pct": 23.33,
+    }
 
 
 def test_cpu_only_observation_is_persisted_as_endpoint_resource_kind(service, admin) -> None:
@@ -1607,6 +1633,14 @@ def test_endpoint_cpu_and_memory_telemetry_is_exposed_in_snapshot(service, admin
         "memory_total_mib": 262_144,
         "memory_available_mib": 196_608,
         "provider": "raw-ssh",
+        "recent_average": {
+            "window_seconds": 600,
+            "sample_count": 1,
+            "first_observed_at": endpoint["host_telemetry"]["observed_at"],
+            "last_observed_at": endpoint["host_telemetry"]["observed_at"],
+            "cpu_load_fraction": 0.06,
+            "memory_used_pct": 25.0,
+        },
     }
 
 
