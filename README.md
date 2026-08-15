@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Agent 自己拿卡，人类实时监控。</strong><br>
-  MCP for Agent · Native Mac App · Open Source
+  MCP for Agent · Native Desktop Apps · Open Source
 </p>
 
 <p align="center">
@@ -20,6 +20,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.12%2B-2563EB?logo=python&logoColor=white" alt="Python 3.12+">
   <img src="https://img.shields.io/badge/macOS-native%20App-111827?logo=apple&logoColor=white" alt="Native macOS App">
+  <img src="https://img.shields.io/badge/Windows-native%20App-147AF3?logo=windows&logoColor=white" alt="Native Windows App">
   <img src="https://img.shields.io/badge/MCP-3%20routine%20tools-7C3AED" alt="Three routine MCP tools">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-334155" alt="MIT License"></a>
 </p>
@@ -32,9 +33,9 @@
 
 > 🤖 Agent 会写代码、跑实验了，GPU 还需要一张张指定吗？
 
-对 Agent，ServerPilot 是一个 MCP：查卡、申请、归还。对人，它是一个 Mac App：看多台服务器的空闲、占用、任务和异常。
+对 Agent，ServerPilot 是一个 MCP：查卡、申请、归还。对人，它是一个 macOS 或 Windows App：看多台服务器的空闲、占用、任务和异常。
 
-一个 macOS 用户，管理多台服务器与协作 Agent；资源状态、申请和人工纠错始终围绕同一份本机控制面快照。
+一个本机用户，管理多台服务器与协作 Agent；资源状态、申请和人工纠错始终围绕同一份本机控制面快照。
 
 | 核心价值 | ServerPilot 提供什么 |
 | --- | --- |
@@ -71,7 +72,7 @@ Agent 正常干活时，人只看全局。发现归属不对、连接异常或�
 
 ## 🚀 快速开始
 
-需要 [Python 3.12+](https://www.python.org/)、[uv](https://docs.astral.sh/uv/) 和一台 macOS 主机。
+从源码启动需要 [Python 3.12+](https://www.python.org/)、[uv](https://docs.astral.sh/uv/) 和 macOS 或 Windows。Windows 用户也可以直接下载下方的桌面 App，无需预先安装 Python 或 uv。
 
 ### 1. 🧰 启动本机控制面
 
@@ -120,7 +121,21 @@ gpu_status → gpu_apply(task="任务名") → 使用返回的分配 → gpu_rel
 - CUDA 初始化或 workload 启动失败时，立即 `gpu_release`。
 - `no_capacity` 表示不分配、不排队；不要在同一轮反复申请。
 
-## 🖥️ 打开 Mac App
+## 🖥️ 打开桌面 App
+
+### Windows
+
+从 [GitHub Releases](https://github.com/JinPLu/ServerPilot/releases/latest) 下载 `ServerPilot-*-windows-x64.zip`，解压后运行其中的 `ServerPilot.exe`。App 会在 `%LOCALAPPDATA%\ServerPilot` 保存本机 inventory 与控制面状态，启动后直接打开与 macOS 版相同的信息架构：服务器总览、服务器详情、逐 GPU 显存环图和 2×2 资源历史。
+
+Windows 10/11 需要 Microsoft Edge WebView2 Runtime（多数系统已自带）；缺失时 App 会给出明确提示，不会降级为外部浏览器页面。关闭窗口只停止本次由 App 启动的本机服务；已经在运行的控制面保持不受影响。
+
+如需从 Windows 源码构建，可在 PowerShell 中运行：
+
+```powershell
+.\desktop\build-windows-app.ps1
+```
+
+### macOS
 
 ```bash
 zsh desktop/build-macos-app.sh

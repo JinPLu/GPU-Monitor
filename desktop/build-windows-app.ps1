@@ -16,14 +16,14 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 
 Set-Location $projectRoot
 
-uv sync --extra dev --reinstall-package serverpilot
+uv sync --extra dev --extra windows --reinstall-package serverpilot
 
 if (Test-Path $outputRoot) {
     Remove-Item -Recurse -Force $outputRoot
 }
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 
-uv run --with pyinstaller pyinstaller `
+uv run --extra windows pyinstaller `
     --clean `
     --noconfirm `
     --distpath $outputRoot `
@@ -33,6 +33,11 @@ uv run --with pyinstaller pyinstaller `
 $appPath = Join-Path $outputRoot "ServerPilot\ServerPilot.exe"
 if (-not (Test-Path $appPath)) {
     throw "Build finished but $appPath was not created."
+}
+
+$uiPath = Join-Path $outputRoot "ServerPilot\_internal\desktop\windows\ui\index.html"
+if (-not (Test-Path $uiPath)) {
+    throw "Build finished but the bundled Windows desktop UI was not created at $uiPath."
 }
 
 Write-Host "Built $appPath"

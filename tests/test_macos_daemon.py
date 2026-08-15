@@ -709,7 +709,7 @@ def test_product_copy_is_anchored_on_one_user_with_projects_and_agents() -> None
         / "dashboard.html"
     ).read_text(encoding="utf-8")
 
-    assert "一个 macOS 用户，管理多台服务器与协作 Agent" in readme
+    assert "一个本机用户，管理多台服务器与协作 Agent" in readme
     assert "| 核心价值 | ServerPilot 提供什么 |\n| --- | --- |" in readme
     for product_value in (
         "统一资源事实",

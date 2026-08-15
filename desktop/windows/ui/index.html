@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>ServerPilot</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主要导航">
+      <div class="brand"><span class="brand-mark">▤</span><span>ServerPilot</span></div>
+      <nav>
+        <button class="nav-item active" type="button" data-page="servers" aria-current="page"><span>▤</span>服务器</button>
+        <button class="nav-item" type="button" data-page="usage"><span>▥</span>使用情况</button>
+        <button class="nav-item" type="button" data-page="settings"><span>⚙</span>设置</button>
+      </nav>
+      <div class="sidebar-footer"><span class="live-dot" id="connection-dot"></span><span id="connection-label">正在连接本机服务</span></div>
+    </aside>
+
+    <main class="workspace">
+      <div id="servers-page">
+      <header class="page-header">
+        <div><h1>服务器</h1><p id="updated-at">正在读取资源状态</p></div>
+        <div class="header-actions">
+          <button class="button secondary" id="open-add-server" type="button">＋ 添加服务器</button>
+          <button class="button primary" id="open-claim" type="button">⚿ 申请 GPU</button>
+          <button class="icon-button" id="refresh" type="button" aria-label="刷新资源" title="刷新资源">↻</button>
+        </div>
+      </header>
+
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <section class="summary-strip" aria-label="资源摘要">
+        <div class="summary-item"><span class="summary-number" id="summary-servers">—</span><span>台服务器</span></div>
+        <div class="summary-item"><span class="summary-number" id="summary-gpus">—</span><span>张 GPU</span></div>
+        <div class="summary-item success"><span class="summary-number" id="summary-free">—</span><span>张空闲</span></div>
+        <div class="gpu-models"><span>GPU 型号</span><strong id="summary-models">正在读取</strong></div>
+      </section>
+
+      <section class="resource-panel" aria-label="服务器资源">
+        <div class="toolbar">
+          <label class="search"><span>⌕</span><input id="search" type="search" placeholder="搜索 SSH、GPU、项目或任务"></label>
+          <div class="filters" role="group" aria-label="服务器筛选">
+            <button type="button" class="filter selected" data-filter="all">全部</button>
+            <button type="button" class="filter" data-filter="available">有空闲 GPU</button>
+            <button type="button" class="filter" data-filter="busy">任务占用</button>
+            <button type="button" class="filter" data-filter="keepalive">占卡</button>
+            <button type="button" class="filter" data-filter="error">连接失败</button>
+          </div>
+          <span class="ten-minute-note">◎ 资源指标：近 10 分钟均值</span>
+        </div>
+        <div class="table-scroller">
+          <div class="resource-table">
+            <div class="table-head" role="row">
+              <button type="button" data-sort="server">服务器 <span>↕</span></button>
+              <button type="button" data-sort="task">项目 / 当前任务 <span>↕</span></button>
+              <button type="button" data-sort="gpu">▱ GPU 配置 <span>↕</span></button>
+              <button type="button" data-sort="free">◉ 空闲 <span>↕</span></button>
+              <button type="button" data-sort="gpuUtil">GPU 利用率 <span>↕</span></button>
+              <button type="button" data-sort="memory">显存占用率 <span>↕</span></button>
+              <button type="button" data-sort="cpu">CPU 负载 <span>↕</span></button>
+              <button type="button" data-sort="systemMemory">内存占用率 <span>↕</span></button>
+              <span aria-hidden="true"></span>
+            </div>
+            <div id="server-rows" class="table-body" role="rowgroup"></div>
+          </div>
+        </div>
+      </section>
+      </div>
+
+      <section id="usage-page" class="usage-page" hidden aria-labelledby="usage-title">
+        <header class="page-header">
+          <div><h1 id="usage-title">使用情况</h1><p>按项目和当前任务查看已分配资源</p></div>
+          <div class="header-actions"><button class="button primary" id="usage-claim" type="button">⚿ 申请 GPU</button></div>
+        </header>
+        <section class="usage-summary-strip" aria-label="当前资源分配摘要">
+          <div><span id="usage-projects">0</span><small>个项目</small></div>
+          <div><span id="usage-tasks">0</span><small>个当前任务</small></div>
+          <div><span id="usage-gpus">0</span><small>张已分配 GPU</small></div>
+        </section>
+        <section class="resource-panel usage-panel" aria-label="项目资源分配">
+          <div class="usage-panel-heading"><h2>项目与任务</h2><p>只显示当前归属；ServerPilot 不会启动、停止或迁移任务。</p></div>
+          <div id="usage-rows" class="usage-rows"></div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="detail-dialog" class="detail-dialog">
+    <div id="detail-content"></div>
+  </dialog>
+
+  <dialog id="claim-dialog" class="form-dialog">
+    <form id="claim-form" method="dialog">
+      <div class="dialog-header"><div><h2>申请 GPU</h2><p>申请成功后只获得资源租约；不会启动远端任务。</p></div><button class="icon-button close" type="button" value="cancel" aria-label="关闭">×</button></div>
+      <div class="form-grid">
+        <label>项目<input name="project" required maxlength="64" placeholder="例如：research"></label>
+        <label>任务<input name="task" required maxlength="255" placeholder="例如：模型训练"></label>
+        <label>用途<input name="purpose" required maxlength="1000" placeholder="例如：训练实验"></label>
+        <label>GPU 数量<input name="gpuCount" type="number" value="1" min="1" required></label>
+        <label>服务器（可选）<select name="endpoint" id="claim-endpoint"><option value="">自动选择</option></select></label>
+        <label>最小可用显存 GiB（可选）<input name="minimumFreeVRAM" type="number" min="0" step="1" placeholder="例如：60"></label>
+      </div>
+      <p class="dialog-help">容量不足时会返回 no_capacity，不会进入排队。获得租约前请勿启动任务。</p>
+      <div class="dialog-actions"><button class="button secondary" type="button" value="cancel">取消</button><button class="button primary" id="submit-claim" value="default">申请 GPU</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="add-dialog" class="form-dialog">
+    <form id="add-form" method="dialog">
+      <div class="dialog-header"><div><h2>添加服务器</h2><p>只登记固定、只读的监控配置；不会执行 SSH 命令或读取私钥。</p></div><button class="icon-button close" type="button" value="cancel" aria-label="关闭">×</button></div>
+      <div class="form-grid">
+        <label>服务器标识<input name="id" required pattern="[a-z][a-z0-9-]{0,127}" placeholder="例如：training-a"></label>
+        <label>主机或 IP<input name="host" required placeholder="例如：10.40.1.203"></label>
+        <label>SSH 端口<input name="port" type="number" min="1" max="65535" value="22" required></label>
+        <label>SSH 用户<input name="sshUser" required value="root"></label>
+        <label class="span-2">远端工作区路径<input name="workspace" required value="/srv/serverpilot-workspace"></label>
+        <label class="span-2">归属项目（可选）<input name="ownerProject" maxlength="64" placeholder="例如：research"></label>
+      </div>
+      <p class="dialog-help">首次完整的只读采集会识别 GPU、纯 CPU 或尚未确认的服务器；未确认的服务器不能参与 GPU 分配。</p>
+      <div class="dialog-actions"><button class="button secondary" type="button" value="cancel">取消</button><button class="button primary" id="submit-add" value="default">添加服务器</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" class="form-dialog narrow-dialog">
+    <form id="settings-form" method="dialog">
+      <div class="dialog-header"><div><h2>设置</h2><p>本机服务与资源采集</p></div><button class="icon-button close" type="button" value="cancel" aria-label="关闭">×</button></div>
+      <dl class="settings-list"><div><dt>本机服务地址</dt><dd id="service-url">—</dd></div><div><dt>数据目录</dt><dd id="data-directory">—</dd></div><div><dt>版本</dt><dd id="app-version">—</dd></div></dl>
+      <label>数据采集间隔<select id="collector-interval"><option value="5">5 秒</option><option value="10">10 秒</option><option value="30">30 秒</option></select></label>
+      <div class="dialog-actions"><button class="button secondary" type="button" value="cancel">关闭</button><button class="button primary" id="save-settings" value="default">保存设置</button></div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

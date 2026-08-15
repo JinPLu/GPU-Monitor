@@ -4,6 +4,15 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## 1.5.9 - 2026-08-15
+
+**ServerPilot 1.5.9 provides Windows users with a complete desktop App that follows the same resource workflow as macOS.**
+
+- The Windows app uses a system WebView2 desktop window rather than opening an external browser. Overview, search, filters, header sorting, GPU claims, server registration, occupancy control, and collector settings use a narrow local bridge to the same loopback control plane.
+- The server table fills the available window width, keeps GPU Configuration toward the left, and displays and sorts GPU utilization, memory utilization, CPU load, and system-memory utilization with the same rolling ten-minute basis.
+- Windows server details reuse the macOS per-GPU memory rings and free / occupancy / busy / error labels, plus a 2×2 CPU, memory, GPU utilization, and memory-history layout.
+- Each GitHub Release is built on a Windows runner and receives a `ServerPilot-*-windows-x64.zip` asset, so Windows users do not need to install Python or uv.
+
 ## 1.5.8 - 2026-08-15
 
 **ServerPilot 1.5.8 makes server resource summaries and desktop GPU details more consistent and readable.**

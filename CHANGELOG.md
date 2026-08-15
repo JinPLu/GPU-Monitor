@@ -4,6 +4,15 @@
 
 这里只记录用户能感受到的变化；实现细节见 Git 提交。
 
+## 1.5.9 - 2026-08-15
+
+**ServerPilot 1.5.9 为 Windows 用户提供与 macOS 版保持同一资源工作流的完整桌面 App。**
+
+- Windows 版使用系统 WebView2 打开独立桌面窗口，不再跳转外部浏览器；总览、搜索、筛选、表头排序、资源申请、添加服务器、占卡设置和采集间隔都通过受限的本机桥接调用同一份 loopback 控制面。
+- 服务器表铺满窗口的可用宽度，GPU 配置靠左，GPU 利用率、显存占用率、CPU 负载和内存占用率按最近 10 分钟均值展示和排序。
+- Windows 服务器详情沿用 macOS 的逐 GPU 显存环和空闲 / 占卡 / 繁忙 / 错误标签，并以 2×2 历史图展示 CPU、内存、GPU 利用率和显存占用率。
+- GitHub Release 会由 Windows Runner 生成并附上 `ServerPilot-*-windows-x64.zip`，无需 Windows 用户自行安装 Python 或 uv。
+
 ## 1.5.8 - 2026-08-15
 
 **ServerPilot 1.5.8 让服务器资源总览与桌面详情页以更稳定、可读的方式呈现 CPU、内存与逐 GPU 状态。**

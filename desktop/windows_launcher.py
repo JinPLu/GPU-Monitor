@@ -12,15 +12,17 @@ import socket
 import sys
 import threading
 import time
-import webbrowser
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping
-from urllib.error import URLError
-from urllib.request import urlopen
+from typing import Any, Callable, Mapping
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import uvicorn
 
+from serverpilot import __version__
 from serverpilot.api import create_app
 from serverpilot.config import Settings
 
@@ -180,6 +182,146 @@ class BrokerServer:
             self._thread.join(timeout=3.0)
 
 
+class DesktopBridge:
+    """Narrow pywebview bridge for the Windows-only desktop presentation.
+
+    The frontend can only call named REST projections and mutations against the
+    loopback broker started by this launcher. It never receives a database path,
+    SSH command, arbitrary URL, or a generic request primitive.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        paths: RuntimePaths,
+        *,
+        actor_id: str = "human",
+        opener: Callable[..., Any] = urlopen,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.paths = paths
+        self.actor_id = actor_id
+        self._opener = opener
+
+    def app_info(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "data": {
+                "name": APP_NAME,
+                "version": __version__,
+                "base_url": self.base_url,
+                "data_dir": str(self.paths.data_dir),
+            },
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/state")
+
+    def endpoint_history(self, endpoint_id: str, window_seconds: int) -> dict[str, Any]:
+        if window_seconds not in {3_600, 21_600, 86_400}:
+            return self._invalid("资源历史范围无效。")
+        return self._request(
+            "GET",
+            f"/api/v1/endpoints/{quote(endpoint_id, safe='')}/history"
+            f"?window_seconds={window_seconds}&points=120",
+        )
+
+    def create_endpoint(self, endpoint: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "id",
+            "host",
+            "port",
+            "ssh_user",
+            "workspace_path",
+            "observation_profile",
+            "keepalive_adapter_id",
+            "labels",
+            "owner_project_id",
+        }
+        return self._request("POST", "/api/v1/endpoints", self._only(endpoint, allowed))
+
+    def claim(self, request: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"project_id", "task_ref", "purpose", "constraints"}
+        return self._request("POST", "/api/v1/claims", self._only(request, allowed))
+
+    def set_keepalive(self, endpoint_id: str, enabled: bool) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/endpoints/{quote(endpoint_id, safe='')}/keepalive",
+            {"enabled": bool(enabled)},
+        )
+
+    def collector_settings(self) -> dict[str, Any]:
+        return self._request("GET", "/api/v1/settings/collector")
+
+    def update_collector_interval(self, interval_seconds: int) -> dict[str, Any]:
+        if interval_seconds not in {5, 10, 30}:
+            return self._invalid("数据采集间隔必须是 5、10 或 30 秒。")
+        return self._request(
+            "PATCH",
+            "/api/v1/settings/collector",
+            {"interval_seconds": interval_seconds},
+        )
+
+    @staticmethod
+    def _only(payload: object, allowed: set[str]) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        return {key: value for key, value in payload.items() if key in allowed}
+
+    @staticmethod
+    def _invalid(message: str) -> dict[str, Any]:
+        return {"ok": False, "error": {"code": "invalid_input", "message": message}}
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        request = Request(f"{self.base_url}{path}", data=body, method=method)
+        request.add_header("Accept", "application/json")
+        request.add_header("X-ServerPilot-Actor", self.actor_id)
+        if body is not None:
+            request.add_header("Content-Type", "application/json")
+            request.add_header("Idempotency-Key", f"windows-{uuid.uuid4()}")
+        try:
+            with self._opener(request, timeout=8) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            return self._http_error(exc)
+        except (OSError, URLError, TimeoutError):
+            return {
+                "ok": False,
+                "error": {"code": "local_service_unavailable", "message": "无法连接本机 ServerPilot 服务。"},
+            }
+        try:
+            return {"ok": True, "data": json.loads(raw)}
+        except json.JSONDecodeError:
+            return {
+                "ok": False,
+                "error": {"code": "invalid_response", "message": "本机服务返回了无法读取的数据。"},
+            }
+
+    @staticmethod
+    def _http_error(exc: HTTPError) -> dict[str, Any]:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
+        error = payload.get("error") if isinstance(payload, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        return {
+            "ok": False,
+            "error": {
+                "code": code if isinstance(code, str) else "service_rejected",
+                "message": message if isinstance(message, str) else f"本机服务拒绝了操作（HTTP {exc.code}）。",
+            },
+        }
+
+
 def settings_for(paths: RuntimePaths) -> Settings:
     return Settings(
         database_url=paths.database_url,
@@ -203,74 +345,45 @@ def show_error(title: str, message: str) -> None:
     root.destroy()
 
 
-def run_status_window(base_url: str, paths: RuntimePaths, server: BrokerServer | None) -> None:
-    import tkinter as tk
-    from tkinter import messagebox
+def run_desktop_window(base_url: str, paths: RuntimePaths, server: BrokerServer | None) -> None:
+    """Show the dedicated Windows desktop view in the system WebView2 host."""
 
-    root = tk.Tk()
-    root.title(APP_NAME)
-    root.geometry("430x220")
-    root.minsize(390, 210)
+    try:
+        import webview
+    except ImportError as exc:
+        raise LauncherError("Windows 桌面运行资源不完整；请重新安装 ServerPilot。") from exc
 
-    icon = resource_path("desktop", "assets", "ServerPilot Icon.png")
-    if icon.is_file():
-        try:
-            image = tk.PhotoImage(file=str(icon))
-            root.iconphoto(True, image)
-        except tk.TclError:
-            pass
+    index = resource_path("desktop", "windows", "ui", "index.html")
+    if not index.is_file():
+        raise LauncherError("Windows 桌面界面资源不完整；请重新安装 ServerPilot。")
 
-    root.columnconfigure(0, weight=1)
-    frame = tk.Frame(root, padx=22, pady=20)
-    frame.grid(row=0, column=0, sticky="nsew")
-    frame.columnconfigure(0, weight=1)
-
-    title = tk.Label(frame, text=APP_NAME, font=("Segoe UI", 16, "bold"), anchor="w")
-    title.grid(row=0, column=0, sticky="ew")
-
-    status = tk.Label(
-        frame,
-        text=f"本机服务已运行：{base_url}",
-        font=("Segoe UI", 10),
-        anchor="w",
-        wraplength=370,
-        justify="left",
+    bridge = DesktopBridge(base_url, paths)
+    webview.create_window(
+        APP_NAME,
+        url=str(index),
+        js_api=bridge,
+        width=1440,
+        height=900,
+        min_size=(1024, 640),
+        text_select=True,
+        confirm_close=False,
     )
-    status.grid(row=1, column=0, sticky="ew", pady=(10, 2))
-
-    data_path = tk.Label(
-        frame,
-        text=f"数据目录：{paths.data_dir}",
-        font=("Segoe UI", 9),
-        fg="#54656f",
-        anchor="w",
-        wraplength=370,
-        justify="left",
-    )
-    data_path.grid(row=2, column=0, sticky="ew")
-
-    button_bar = tk.Frame(frame)
-    button_bar.grid(row=3, column=0, sticky="ew", pady=(22, 0))
-
-    def open_dashboard() -> None:
-        webbrowser.open(base_url)
-
-    def copy_url() -> None:
-        root.clipboard_clear()
-        root.clipboard_append(base_url)
-        messagebox.showinfo(APP_NAME, "Dashboard 地址已复制。")
-
-    def quit_app() -> None:
+    try:
+        webview.start(
+            gui="edgechromium",
+            private_mode=True,
+            http_server=True,
+        )
+    except Exception as exc:
+        raise LauncherError(
+            "无法启动 Windows WebView2。请安装 Microsoft Edge WebView2 Runtime 后重试。"
+        ) from exc
+    finally:
+        # The bundled backend belongs to this app instance. An already running
+        # broker remains untouched so MCP and a separately launched app keep
+        # sharing the same local control plane.
         if server is not None:
             server.stop()
-        root.destroy()
-
-    tk.Button(button_bar, text="打开 Dashboard", command=open_dashboard, width=16).pack(side="left")
-    tk.Button(button_bar, text="复制地址", command=copy_url, width=10).pack(side="left", padx=(10, 0))
-    tk.Button(button_bar, text="退出", command=quit_app, width=8).pack(side="right")
-
-    root.protocol("WM_DELETE_WINDOW", quit_app)
-    root.mainloop()
 
 
 def launch() -> int:
@@ -288,8 +401,7 @@ def launch() -> int:
             raise LauncherError("本机 ServerPilot 服务未能在规定时间内启动。请检查数据目录和 inventory。")
 
     base_url = f"http://127.0.0.1:{paths.port}/"
-    webbrowser.open(base_url)
-    run_status_window(base_url, paths, server)
+    run_desktop_window(base_url, paths, server)
     return 0
 
 
