@@ -151,8 +151,10 @@ def test_public_gpu_status_reports_connection_failure_from_canonical_monitor_sta
     }
 
 
-def test_workload_conflict_on_one_gpu_does_not_block_sibling_keepalive_candidate(service, admin) -> None:
-    """A stale workload ownership record must be isolated to its own GPU."""
+def test_workload_turnover_on_one_gpu_does_not_block_sibling_keepalive_candidate(
+    service, admin
+) -> None:
+    """A normal workload worker replacement leaves sibling capacity unchanged."""
 
     _configure_idle_policy(service, admin)
     claimed = service.create_request(
@@ -185,7 +187,7 @@ def test_workload_conflict_on_one_gpu_does_not_block_sibling_keepalive_candidate
     service.ingest_observation(observation(count=2, processes=[replacement]))
 
     gpus = _gpus(service.snapshot(admin))
-    assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "CONFLICT"
+    assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "RUNNING_MANAGED"
     assert gpus["endpoint-a:GPU-endpoint-a-1"]["state"] == "AVAILABLE"
     assert [item["gpu_id"] for item in service.desired_keepalive_candidates("endpoint-a")["candidates"]] == [
         "endpoint-a:GPU-endpoint-a-1"

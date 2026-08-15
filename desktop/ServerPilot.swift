@@ -456,9 +456,9 @@ private func confirmKeepaliveEnd() -> Bool {
 private func confirmEmptyLeaseCleanup(_ lease: LeaseRecord, conflict: Bool) -> Bool {
     let alert = NSAlert()
     alert.alertStyle = .warning
-    alert.messageText = conflict ? "清理这笔遗留归属？" : "释放这笔空闲占用？"
-    alert.informativeText = "ServerPilot 会先重新采集这台服务器；只有确认这笔租约覆盖的 GPU 都没有运行中的进程时才会释放。"
-    alert.addButton(withTitle: conflict ? "清理遗留归属" : "释放空闲占用")
+    alert.messageText = conflict ? "确认任务已结束后清理记录？" : "释放这笔空闲占用？"
+    alert.informativeText = "ServerPilot 会先重新采集这台服务器；只有确认这笔租约覆盖的 GPU 都没有运行中的进程时才会释放。此操作不会停止远端任务。"
+    alert.addButton(withTitle: conflict ? "确认任务已结束后清理" : "释放空闲占用")
     alert.addButton(withTitle: "取消")
     return alert.runModal() == .alertFirstButtonReturn
 }
@@ -1974,6 +1974,14 @@ private struct EndpointTableRow: View {
         gpus.filter { $0.state == "CONFLICT" }.count
     }
 
+    private var legacyWorkloadReviewGPUCount: Int {
+        gpus.filter(gpuHasLegacyWorkloadProcessReview).count
+    }
+
+    private var nonWorkloadConflictGPUCount: Int {
+        conflictedGPUCount - legacyWorkloadReviewGPUCount
+    }
+
     private var availabilitySummary: some View {
         VStack(alignment: .trailing, spacing: 2) {
             Text(availabilityLabel)
@@ -1989,9 +1997,12 @@ private struct EndpointTableRow: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("空闲 GPU")
         .accessibilityValue(
-            conflictedGPUCount > 0
-                ? "\(availabilityLabel)，\(conflictedGPUCount) 张归属待确认"
+            legacyWorkloadReviewGPUCount > 0
+                ? "\(availabilityLabel)，\(legacyWorkloadReviewGPUCount) 张任务归属待核对"
+                : (conflictedGPUCount > 0
+                    ? "\(availabilityLabel)，\(conflictedGPUCount) 张 GPU 状态需要处理"
                 : availabilityLabel
+                )
         )
     }
 
@@ -2029,12 +2040,12 @@ private struct EndpointTableRow: View {
     private var attentionLabel: String {
         if !isSnapshotFresh { return "不可分配" }
         if endpointNeedsAttention(endpoint) { return endpoint.monitorLabel }
-        let conflictedGPUCount = gpus.filter { $0.state == "CONFLICT" }.count
-        if availableGPUCount > 0, conflictedGPUCount > 0 {
-            return "\(availableGPUCount) 张可申请 · \(conflictedGPUCount) 张待确认"
+        if nonWorkloadConflictGPUCount > 0 { return "不可分配" }
+        if availableGPUCount > 0, legacyWorkloadReviewGPUCount > 0 {
+            return "\(availableGPUCount) 张可申请 · \(legacyWorkloadReviewGPUCount) 张任务待核对"
         }
         if gpus.contains(where: { ["BUSY_UNMANAGED", "ORPHANED_BUSY"].contains($0.state) }) { return "任务占用" }
-        if conflictedGPUCount > 0 { return "归属待确认" }
+        if legacyWorkloadReviewGPUCount > 0 { return "任务归属待核对" }
         if gpus.contains(where: gpuNeedsAttention) { return "不可分配" }
         if endpointHighPressure(endpoint: endpoint, gpus: gpus) { return "压力较高" }
         return endpoint.monitorLabel
@@ -2044,7 +2055,9 @@ private struct EndpointTableRow: View {
         if !isSnapshotFresh { return DesignTokens.danger }
         switch endpoint.monitorStatus {
         case "ONLINE":
-            return endpointRequiresAttention(endpoint: endpoint, gpus: gpus) ? DesignTokens.warning : DesignTokens.success
+            return endpointRequiresAttention(endpoint: endpoint, gpus: gpus) || conflictedGPUCount > 0
+                ? DesignTokens.warning
+                : DesignTokens.success
         case "PENDING", "DRAINING":
             return DesignTokens.warning
         default:
@@ -3323,6 +3336,34 @@ private func gpuNeedsAttention(_ gpu: GPURecord) -> Bool {
     ].contains(gpu.state)
 }
 
+/// Older brokers can report a workload's ordinary worker replacement as a
+/// process-attribution conflict.  That is distinct from a keeper or foreign
+/// process conflict, both of which remain error/attention states.
+private func gpuHasLegacyWorkloadProcessReview(_ gpu: GPURecord) -> Bool {
+    let task = gpu.taskReference?.trimmingCharacters(in: .whitespacesAndNewlines)
+    return gpu.state == "CONFLICT"
+        && gpu.stateReason == "lease/process attribution conflict"
+        && gpu.keepalive.leaseID == nil
+        && task?.isEmpty == false
+}
+
+private func gpuTaskObservationLabel(_ gpu: GPURecord) -> String? {
+    let task = gpu.taskReference?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if gpuHasLegacyWorkloadProcessReview(gpu) {
+        if let task, !task.isEmpty {
+            return "任务：\(task) · 观测到进程已更新"
+        }
+        return "任务已指派 · 观测到进程已更新"
+    }
+    if let task, !task.isEmpty, !gpu.isPubliclyAvailable {
+        return "任务：\(task)"
+    }
+    if ["BUSY_UNMANAGED", "ORPHANED_BUSY"].contains(gpu.state) {
+        return "观测到计算任务"
+    }
+    return nil
+}
+
 private func gpuStateColor(_ state: String) -> Color {
     switch state {
     case "AVAILABLE": return DesignTokens.success
@@ -3353,6 +3394,10 @@ func gpuPresentationLabel(_ gpu: GPURecord) -> String {
     if let publicStatus = gpu.publicStatus {
         return publicStatus
     }
+    if gpuHasLegacyWorkloadProcessReview(gpu) {
+        let task = gpu.taskReference?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return task.map { "任务使用中 · \($0)" } ?? "任务使用中 · 进程已更新"
+    }
     if gpu.keepalive.state == "ERROR" {
         let reason = gpu.keepalive.reason.map(localizedStateReason) ?? "未知原因"
         return gpu.isPubliclyAvailable
@@ -3374,6 +3419,10 @@ func gpuPresentationLabel(_ gpu: GPURecord) -> String {
         return "任务占用"
     }
     return gpuStateLabel(gpu.state)
+}
+
+private func gpuVisualStateColor(_ gpu: GPURecord) -> Color {
+    gpuHasLegacyWorkloadProcessReview(gpu) ? DesignTokens.warning : gpuStateColor(gpu.state)
 }
 
 private func endpointStateIcon(_ state: String) -> String {
@@ -3404,8 +3453,8 @@ private func localizedStateReason(_ reason: String) -> String {
     if reason == "lease expired while a compute process remains" {
         return "资源使用记录已到期，但服务器上仍有任务运行"
     }
-    if reason == "bound workload process observed" {
-        return "已检测到登记过的任务进程"
+    if reason == "bound workload process observed" || reason == "compute process observed on assigned GPU" {
+        return "已指派任务，当前检测到计算进程"
     }
     if reason == "compute process observed; admission blocked" {
         return "检测到未登记的计算进程，暂不能分配"
@@ -4263,10 +4312,10 @@ private struct GPUUsageGlyph: View {
                 .stroke(DesignTokens.ink.opacity(0.10), lineWidth: 4)
             Circle()
                 .trim(from: 0, to: usageFraction)
-                .stroke(gpuStateColor(gpu.state), style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .stroke(gpuVisualStateColor(gpu), style: StrokeStyle(lineWidth: 4, lineCap: .round))
                 .rotationEffect(.degrees(-90))
             Circle()
-                .fill(gpuStateColor(gpu.state).opacity(0.18))
+                .fill(gpuVisualStateColor(gpu).opacity(0.18))
                 .frame(width: diameter * 0.58, height: diameter * 0.58)
             Text("\(gpu.index)")
                 .font(.system(size: diameter > 32 ? 10 : 9, weight: .semibold, design: .rounded))
@@ -4361,6 +4410,7 @@ private struct GPUAccessoryChip: View {
     }
 
     private var stateIcon: String {
+        if gpuHasLegacyWorkloadProcessReview(gpu) { return "bolt.fill" }
         switch gpu.state {
         case "AVAILABLE": return "checkmark.circle.fill"
         case "HELD", "LEASED_IDLE": return "key.fill"
@@ -4371,6 +4421,7 @@ private struct GPUAccessoryChip: View {
     }
 
     private var stateColor: Color {
+        if gpuHasLegacyWorkloadProcessReview(gpu) { return DesignTokens.warning }
         switch gpu.state {
         case "AVAILABLE": return DesignTokens.success
         case "HELD", "LEASED_IDLE", "KEEPALIVE": return DesignTokens.interaction
@@ -4535,22 +4586,33 @@ private struct ServerDetailSheet: View {
                         }
 
                         let conflictedGPUCount = gpus.filter { $0.state == "CONFLICT" }.count
+                        let legacyWorkloadReviewGPUCount = gpus.filter(gpuHasLegacyWorkloadProcessReview).count
                         if !reclaimableLeases.isEmpty {
                             ForEach(reclaimableLeases) { lease in
                                 let conflict = conflictedLeases.contains(where: { $0.id == lease.id })
+                                let legacyWorkloadReview = lease.gpuIDs.contains { gpuID in
+                                    gpus.first(where: { $0.id == gpuID }).map(gpuHasLegacyWorkloadProcessReview) ?? false
+                                }
                                 let gpuCount = lease.gpuIDs.filter { gpuID in
                                     guard let state = gpus.first(where: { $0.id == gpuID })?.state else { return false }
                                     return conflict ? state == "CONFLICT" : ["HELD", "LEASED_IDLE"].contains(state)
                                 }.count
+                                let task = lease.taskReference ?? lease.purpose ?? "未命名任务"
                                 DetailCallout(
-                                    icon: conflict ? "exclamationmark.shield.fill" : "clock.badge.exclamationmark",
-                                    color: conflict ? DesignTokens.warning : DesignTokens.interaction,
+                                    icon: conflict
+                                        ? (legacyWorkloadReview ? "exclamationmark.shield.fill" : "exclamationmark.triangle.fill")
+                                        : "clock.badge.exclamationmark",
+                                    color: conflict
+                                        ? (legacyWorkloadReview ? DesignTokens.warning : DesignTokens.danger)
+                                        : DesignTokens.interaction,
                                     message: conflict
-                                        ? "有 \(gpuCount) 张 GPU 的归属待确认；它们暂时不能申请，其余 \(availableGPUCount) 张仍可申请。"
+                                        ? (legacyWorkloadReview
+                                            ? "有 \(gpuCount) 张 GPU 仍指派给 \(lease.projectID) · \(task)。当前观测到计算进程变更；worker 重启或替换不会被当作硬件故障，也不会自动释放或停止任务。它们暂不能申请，其余 \(availableGPUCount) 张仍可申请。如需更正实际任务-GPU 指派，请在“使用情况”中选择任务后调整 GPU 分配。"
+                                            : "有 \(gpuCount) 张 GPU 的归属状态需要处理；它们暂不能申请，其余 \(availableGPUCount) 张仍可申请。请在“使用情况”中核对任务-GPU 指派，并根据实际任务决定改派或在任务结束后释放。")
                                         : "有 \(gpuCount) 张 GPU 仍被租约占用，但当前采集没有观察到进程；可确认后释放。",
                                     actionTitle: isMutating
                                         ? "处理中"
-                                        : (conflict ? "清理遗留归属" : "释放空闲占用"),
+                                        : (conflict ? "任务结束后清理记录" : "释放空闲占用"),
                                     action: {
                                         guard confirmEmptyLeaseCleanup(lease, conflict: conflict) else { return }
                                         store.clearEmptyConflictedLease(
@@ -4562,9 +4624,15 @@ private struct ServerDetailSheet: View {
                             }
                         } else if conflictedGPUCount > 0 {
                             DetailCallout(
-                                icon: "exclamationmark.shield.fill",
-                                color: DesignTokens.warning,
-                                message: "有 \(conflictedGPUCount) 张 GPU 的归属待确认；它们暂时不能申请，其余 \(availableGPUCount) 张仍可申请。请刷新后重试清理。"
+                                icon: legacyWorkloadReviewGPUCount == conflictedGPUCount
+                                    ? "exclamationmark.shield.fill"
+                                    : "exclamationmark.triangle.fill",
+                                color: legacyWorkloadReviewGPUCount == conflictedGPUCount
+                                    ? DesignTokens.warning
+                                    : DesignTokens.danger,
+                                message: legacyWorkloadReviewGPUCount == conflictedGPUCount
+                                    ? "有 \(conflictedGPUCount) 张 GPU 仍有任务归属待核对。任务运行中的 worker 可正常更换；请根据当前任务与显存、利用率观测判断。它们暂不能申请，其余 \(availableGPUCount) 张仍可申请；如需更正任务-GPU 指派，请在“使用情况”中调整分配。"
+                                    : "有 \(conflictedGPUCount) 张 GPU 的状态需要人工处理；它们暂不能申请，其余 \(availableGPUCount) 张仍可申请。请在“使用情况”中核对任务-GPU 指派。"
                             )
                         }
 
@@ -4762,6 +4830,7 @@ private struct ServerGPUMemoryStatusGrid: View {
     let gpus: [GPURecord]
 
     private func section(for gpu: GPURecord) -> GPUStatusSection {
+        if gpuHasLegacyWorkloadProcessReview(gpu) { return .busy }
         if gpuNeedsAttention(gpu) { return .error }
         if gpu.keepalive.isActive { return .keepalive }
         if gpu.isPubliclyAvailable { return .available }
@@ -4785,7 +4854,8 @@ private struct ServerGPUMemoryStatusGrid: View {
         let gpuStates = gpus
             .sorted { $0.index < $1.index }
             .map { gpu in
-                "GPU \(gpu.index) \(section(for: gpu).label) 显存 \(gpuMemoryPercent(gpu))"
+                let observation = gpuTaskObservationLabel(gpu).map { " · \($0)" } ?? ""
+                return "GPU \(gpu.index) \(section(for: gpu).label)\(observation) 显存 \(gpuMemoryPercent(gpu))"
             }
             .joined(separator: "，")
         let counts = GPUStatusSection.allCases
@@ -4885,6 +4955,13 @@ private struct GPUMemoryStatusRow: View {
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(DesignTokens.mutedInk)
                     .lineLimit(1)
+                if let observation = gpuTaskObservationLabel(gpu) {
+                    Text(observation)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(status == .error ? DesignTokens.danger : DesignTokens.mutedInk)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
             }
 
             Spacer(minLength: 8)
@@ -4899,7 +4976,7 @@ private struct GPUMemoryStatusRow: View {
             }
         }
         .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity, minHeight: 66, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 74, alignment: .leading)
         .background(DesignTokens.surface.opacity(0.92), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 11, style: .continuous)
@@ -4907,8 +4984,8 @@ private struct GPUMemoryStatusRow: View {
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("GPU \(gpu.index)")
-        .accessibilityValue("\(status.label)，当前显存 \(gpu.memoryLabel)，占用 \(gpuMemoryPercent(gpu))")
-        .help("GPU \(gpu.index) · \(status.label) · 当前显存 \(gpu.memoryLabel)")
+        .accessibilityValue("\(status.label)，\(gpuTaskObservationLabel(gpu) ?? "无任务指派")，当前显存 \(gpu.memoryLabel)，占用 \(gpuMemoryPercent(gpu))")
+        .help("GPU \(gpu.index) · \(status.label) · \(gpuTaskObservationLabel(gpu) ?? "无任务指派") · 当前显存 \(gpu.memoryLabel)")
     }
 
     private func memoryPressureColor(_ gpu: GPURecord) -> Color {
@@ -5148,6 +5225,7 @@ private struct GPUAccessoryTile: View {
     }
 
     private var stateIcon: String {
+        if gpuHasLegacyWorkloadProcessReview(gpu) { return "bolt.fill" }
         switch gpu.state {
         case "AVAILABLE": return "checkmark.circle.fill"
         case "HELD", "LEASED_IDLE": return "key.fill"
@@ -5158,6 +5236,7 @@ private struct GPUAccessoryTile: View {
     }
 
     private var stateColor: Color {
+        if gpuHasLegacyWorkloadProcessReview(gpu) { return DesignTokens.warning }
         switch gpu.state {
         case "AVAILABLE": return DesignTokens.success
         case "HELD", "LEASED_IDLE", "KEEPALIVE": return DesignTokens.interaction
@@ -5190,7 +5269,13 @@ private struct GPUDetailSheet: View {
                 GPUDetailMetric(label: "计算利用率", value: utilizationLabel, accent: DesignTokens.warning)
                 GPUDetailMetric(label: "温度", value: temperatureLabel, accent: DesignTokens.danger)
             }
-            if let reason = gpu.stateReason {
+            if gpuHasLegacyWorkloadProcessReview(gpu) {
+                DetailCallout(
+                    icon: "info.circle.fill",
+                    color: DesignTokens.warning,
+                    message: "任务仍保持 GPU 指派，采集到的计算进程与此前观测不同。worker 重启或替换会出现这一提示，并不表示 GPU 硬件故障；仅在实际任务-GPU 指派需要更正时，才到“使用情况”调整分配。"
+                )
+            } else if let reason = gpu.stateReason {
                 DetailCallout(icon: "info.circle.fill", color: stateColor, message: localizedStateReason(reason))
             }
             if let task = gpu.taskReference?.trimmingCharacters(in: .whitespacesAndNewlines), !task.isEmpty {
@@ -5231,6 +5316,7 @@ private struct GPUDetailSheet: View {
     private var stateLabel: String { gpuPresentationLabel(gpu) }
 
     private var stateIcon: String {
+        if gpuHasLegacyWorkloadProcessReview(gpu) { return "bolt.fill" }
         switch gpu.state {
         case "AVAILABLE": return "checkmark.circle.fill"
         case "HELD", "LEASED_IDLE": return "key.fill"
@@ -5241,6 +5327,7 @@ private struct GPUDetailSheet: View {
     }
 
     private var stateColor: Color {
+        if gpuHasLegacyWorkloadProcessReview(gpu) { return DesignTokens.warning }
         switch gpu.state {
         case "AVAILABLE": return DesignTokens.success
         case "HELD", "LEASED_IDLE", "KEEPALIVE": return DesignTokens.interaction

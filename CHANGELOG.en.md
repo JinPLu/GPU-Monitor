@@ -4,6 +4,12 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## Unreleased
+
+- Multi-GPU tasks now remain shown as “task in use” while workers restart, child processes change, or stages hand off; PID turnover no longer turns an entire task into a false ownership warning.
+- An upgraded service clears legacy workload-attribution errors, while genuine keepalive-helper identity errors remain explicit and are never presented as ordinary tasks.
+- The desktop app shows the task assignment alongside process-observation changes and makes clear that cleanup is only for a finished task; it never stops the remote workload.
+
 ## 1.5.10 - 2026-08-15
 
 **ServerPilot 1.5.10 fixes cross-platform release validation so the Windows x64 desktop App is built automatically on GitHub and published as a downloadable asset.**

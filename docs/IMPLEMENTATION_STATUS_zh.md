@@ -73,7 +73,7 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 
 service 快照直接提供统一的 `publicly_available` 和简短中文 `public_status`；routine MCP 与 Web 只投影这份结果，不再各自判断占卡容量。API 与 Swift 模型分别校验 `desired=ON/OFF` 与 `actual=ON/OFF/ERROR`，遇到未知值会明确拒绝。
 
-原生 APP 同样直接读取 `desired / actual / publicly_available / public_status`；`CONFLICT` 或其他不可申请状态不会再显示“可用”，`desired=ON, actual=OFF` 显示“占卡未运行”。普通 routine Agent 在同一 lease 内完整换代进程时会自动更新 collector binding；只有旧进程已经全部退出、完整 endpoint 采集确认每张租用 GPU 都出现新进程、且 binding 是 collector 自动建立时才恢复。新进程必须自身连续观测两次才触发冲突；完整采集确认重试窗口暂时为空时保留 lease 并清掉瞬态冲突。旧新进程稳定并存、不完整采集、非 routine 项目和显式高级 binding 仍保持 fail closed。租约终止或不再拥有活动资源时，lease-scoped 冲突/孤儿告警会立即关闭；初始化与 reconcile 会自愈历史陈旧告警。APP 通过独立 operator 路由释放用户已确认结束的 Agent 租约，routine Agent 仍只能释放自己的 lease。
+原生 APP 同样直接读取 `desired / actual / publicly_available / public_status`；`desired=ON, actual=OFF` 显示“占卡未运行”。工作租约是稳定的任务—GPU 指派：租用 GPU 上的 PID、启动时间和进程集合仅是采集事实。worker 重启、子进程替换或 bridge→后续队列的混合换代不会改变任务归属、触发 `CONFLICT` 或阻塞该租约；有有效工作租约且观察到计算进程时统一显示为“任务使用中”。服务启动和常规 reconcile 会将旧版本留下的 workload `CONFLICT` 归正为 `ACTIVE` 并关闭相应历史告警，不影响远端任务。占卡 helper 的 `ERROR/CONFLICT` 仍保持显式错误和不可申请，绝不作为工作任务收养。APP 通过独立 operator 路由让人调整任务—GPU 分配或释放已确认结束的任务；routine Agent 仍只能释放自己的 lease。
 
 APP 人工 GPU 改派现在也走独立的 loopback desktop operator 路由；普通 lease API 只能由 lease owner 调用，不能借 keeper reclaim 的规划阶段跨过授权。Host CPU/RAM admission 同时计算 direct GPU lease commitments 与 active generic host claims，不再因创建顺序不同而过量分配。
 

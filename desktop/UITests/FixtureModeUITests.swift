@@ -151,21 +151,39 @@ final class FixtureModeUITests: XCTestCase {
         relaunch(fixture: "conflict-with-available", section: "server-pool")
 
         let serverRow = app.descendants(matching: .any).matching(
-            NSPredicate(format: "value CONTAINS %@", "归属待确认")
+            NSPredicate(format: "value CONTAINS %@", "任务归属待核对")
         ).firstMatch
-        XCTAssertTrue(serverRow.waitForExistence(timeout: 5), "Conflict state must be explicit in the resource table")
+        XCTAssertTrue(serverRow.waitForExistence(timeout: 5), "Task-attribution review must be explicit in the resource table")
         XCTAssertTrue(
             String(describing: serverRow.value).contains("可申请"),
-            "A conflicted GPU must not make unrelated available GPUs appear unavailable"
+            "A task-attribution review must not make unrelated available GPUs appear unavailable"
         )
         serverRow.click()
         let recovery = app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS %@", "仍可申请")
         ).firstMatch
-        XCTAssertTrue(recovery.waitForExistence(timeout: 2), "Server detail must explain that conflict is per-GPU")
+        XCTAssertTrue(recovery.waitForExistence(timeout: 2), "Server detail must explain that the review is per-GPU")
         XCTAssertTrue(
-            app.buttons["清理遗留归属"].exists,
-            "Server detail must expose the guarded stale-conflict recovery action"
+            app.buttons["任务结束后清理记录"].exists,
+            "Cleanup must be explicitly limited to tasks that have ended"
+        )
+
+        let gpuMemoryGrid = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "GPU 显存状态")
+        ).firstMatch
+        XCTAssertTrue(gpuMemoryGrid.waitForExistence(timeout: 2))
+        let gridValue = String(describing: gpuMemoryGrid.value)
+        XCTAssertTrue(
+            gridValue.contains("GPU 0 繁忙"),
+            "An observed worker change must be presented as a busy task, not a hardware error"
+        )
+        XCTAssertTrue(
+            gridValue.contains("观测到进程已更新"),
+            "The grid must retain the process observation alongside the task assignment"
+        )
+        XCTAssertFalse(
+            gridValue.contains("GPU 0 错误"),
+            "Ordinary worker turnover must not be presented as a GPU error"
         )
     }
 
@@ -185,7 +203,7 @@ final class FixtureModeUITests: XCTestCase {
         let gridValue = String(describing: gpuMemoryGrid.value)
         XCTAssertTrue(
             gridValue.contains("GPU 0 错误"),
-            "A fail-closed keeper must be placed in the explicit error state group"
+            "A keepalive identity error must remain in the explicit error state group"
         )
         XCTAssertFalse(
             gridValue.contains("GPU 0 空闲"),

@@ -219,6 +219,11 @@ class BrokerService:
                 self._upsert_inventory(session, now)
             self._ensure_system_identity(session, now)
             self._defer_interrupted_scheduler_transfers(session, now)
+            self._normalize_legacy_workload_conflicts(
+                session,
+                now,
+                actor_id=SYSTEM_ACTOR_ID,
+            )
             self._resolve_stale_lease_alerts(session, now)
             self._bump_revision(session, now)
 
@@ -1794,7 +1799,7 @@ class BrokerService:
             else:
                 self._set_keepalive_current(session, resource.gpu_id, "OFF", now=now)
 
-    def _clear_keepalive_errors_for_bound_workloads(
+    def _clear_keepalive_errors_for_assigned_workloads(
         self,
         session: Session,
         *,
@@ -1802,15 +1807,17 @@ class BrokerService:
         observation_complete: bool,
         now: datetime,
     ) -> None:
-        """Forget only stale keepalive errors superseded by a bound workload.
+        """Forget only stale keepalive errors superseded by an assigned workload.
 
         A failed keepalive transition can leave a ``KeepaliveCurrent`` ERROR
         row after its internal lease is gone.  Once a complete, current
         endpoint observation proves that every active GPU in this endpoint's
-        portion of a workload lease has only its *known* process cohort, that
-        historical display state no longer describes those GPUs.  Clear the
-        current rows only; workload ownership and observed processes are
-        deliberately untouched.
+        portion of a workload lease has an observed compute process, that
+        historical display state no longer describes those GPUs. Process
+        identities are telemetry facts, not workload-ownership proof, so a
+        normal worker restart must not retain the obsolete keepalive error.
+        Clear the current rows only; workload ownership and observed processes
+        are deliberately untouched.
         """
 
         if not observation_complete:
@@ -1870,11 +1877,6 @@ class BrokerService:
                 for resource in endpoint_resources
             }
             if any(not processes for processes in processes_by_gpu.values()):
-                continue
-            if any(
-                not self._processes_match_binding(session, lease.id, processes)
-                for processes in processes_by_gpu.values()
-            ):
                 continue
             for resource in endpoint_resources:
                 current = session.get(KeepaliveCurrent, resource.gpu_id)
@@ -3041,7 +3043,7 @@ class BrokerService:
         }:
             return "UNHEALTHY", telemetry.health
         lease = self._active_lease_for_gpu(session, gpu.id)
-        if lease is not None and lease.state == "CONFLICT":
+        if lease is not None and lease.kind != "workload" and lease.state == "CONFLICT":
             return "CONFLICT", "lease/process attribution conflict"
         if lease is not None and lease.state == "ORPHANED_BUSY":
             return "ORPHANED_BUSY", "lease expired while a compute process remains"
@@ -3054,8 +3056,8 @@ class BrokerService:
             return "CONFLICT", keepalive_reason
         processes = self._current_processes(session, gpu.id, now)
         if processes:
-            if lease is not None and self._processes_match_binding(session, lease.id, processes):
-                return "RUNNING_MANAGED", "bound workload process observed"
+            if lease is not None and lease.kind == "workload":
+                return "RUNNING_MANAGED", "compute process observed on assigned GPU"
             return "BUSY_UNMANAGED", "compute process observed; admission blocked"
         if lease is not None:
             return ("HELD" if lease.state == "HELD" else "LEASED_IDLE"), "exclusive lease active"
@@ -3083,22 +3085,6 @@ class BrokerService:
             "observations": process.observations,
             "first_seen_at": _iso(process.first_seen_at),
             "last_seen_at": _iso(process.last_seen_at),
-        }
-
-    def _processes_match_binding(
-        self, session: Session, lease_id: str, processes: Iterable[ProcessObservation]
-    ) -> bool:
-        known = self._binding_process_keys(session, lease_id)
-        return bool(known) and all(self._process_key(process) in known for process in processes)
-
-    @staticmethod
-    def _binding_process_keys(session: Session, lease_id: str) -> set[str]:
-        return {
-            process_key
-            for binding in session.scalars(
-                select(WorkloadBinding).where(WorkloadBinding.lease_id == lease_id)
-            ).all()
-            for process_key in json_load(binding.process_keys_json)
         }
 
     def _gpu_dict(self, session: Session, gpu: GPUDevice, now: datetime) -> dict[str, Any]:
@@ -3358,15 +3344,6 @@ class BrokerService:
                 )
                 for lease in all_leases
             }
-            binding_keys = {
-                lease_id: {
-                    process_key
-                    for binding in bindings
-                    for process_key in json_load(binding.process_keys_json)
-                }
-                for lease_id, bindings in bindings_by_lease.items()
-            }
-
             maintenance_by_gpu: dict[str, MaintenanceWindow] = {}
             maintenance_by_endpoint: dict[str, MaintenanceWindow] = {}
             current_reservation_by_gpu: dict[str, Reservation] = {}
@@ -3489,7 +3466,7 @@ class BrokerService:
                 }:
                     return "UNHEALTHY", telemetry.health
                 lease = lease_by_gpu.get(gpu.id)
-                if lease is not None and lease.state == "CONFLICT":
+                if lease is not None and lease.kind != "workload" and lease.state == "CONFLICT":
                     return "CONFLICT", "lease/process attribution conflict"
                 if lease is not None and lease.state == "ORPHANED_BUSY":
                     return "ORPHANED_BUSY", "lease expired while a compute process remains"
@@ -3502,13 +3479,8 @@ class BrokerService:
                     return "CONFLICT", keepalive_reason
                 processes = processes_by_gpu[gpu.id]
                 if processes:
-                    known = binding_keys.get(lease.id, set()) if lease else set()
-                    if (
-                        lease is not None
-                        and known
-                        and all(self._process_key(process) in known for process in processes)
-                    ):
-                        return "RUNNING_MANAGED", "bound workload process observed"
+                    if lease is not None and lease.kind == "workload":
+                        return "RUNNING_MANAGED", "compute process observed on assigned GPU"
                     return "BUSY_UNMANAGED", "compute process observed; admission blocked"
                 if lease is not None:
                     return (
@@ -6042,7 +6014,7 @@ class BrokerService:
                 observation_complete=observation.observation_complete,
                 now=now,
             )
-            self._clear_keepalive_errors_for_bound_workloads(
+            self._clear_keepalive_errors_for_assigned_workloads(
                 session,
                 endpoint_id=endpoint.id,
                 observation_complete=observation.observation_complete,
@@ -6090,14 +6062,13 @@ class BrokerService:
         observation_complete: bool,
         now: datetime,
     ) -> None:
-        """Attach a complete observed workload cohort to its routine lease.
+        """Record initial observed workload activity for a routine lease.
 
-        A routine Agent may restart a failed worker without releasing the GPU
-        lease.  When a complete endpoint observation shows that every old
-        bound process has gone and every leased GPU has a wholly new process
-        cohort, keep the durable task ownership and replace its observed
-        process keys.  Mixed old/new cohorts remain fail closed because they
-        can represent an unrelated process entering an assigned GPU.
+        The lease's durable task-to-GPU assignment is independent of the
+        collected PID cohort.  Observed process identities are retained for
+        display and auditing, but later worker turnover (including a mixed
+        bridge-to-replacement transition) must not reassign or conflict the
+        existing task lease.
         """
 
         lease_ids = session.scalars(
@@ -6131,76 +6102,14 @@ class BrokerService:
                 resource.gpu_id: self._current_processes(session, resource.gpu_id, now)
                 for resource in resources
             }
-            resource_endpoint_ids = {
-                gpu.endpoint_id
-                for resource in resources
-                if (gpu := session.get(GPUDevice, resource.gpu_id)) is not None
-            }
-            legacy_binding_was_collector_owned = False
-            if len(bindings) == 1 and bindings[0].run_id == f"lease:{lease.id}":
-                legacy_binding_events = session.scalars(
-                    select(AuditEvent)
-                    .where(
-                        AuditEvent.action == "lease.workload_bound",
-                        AuditEvent.resource_type == "lease",
-                        AuditEvent.resource_id == lease.id,
-                    )
-                    .order_by(AuditEvent.id.desc())
-                ).all()
-                latest_legacy_binding_event = next(
-                    (
-                        event
-                        for event in legacy_binding_events
-                        if json_load(event.summary_json).get("run_id") in {None, bindings[0].run_id}
-                    ),
-                    None,
-                )
-                legacy_binding_was_collector_owned = bool(
-                    latest_legacy_binding_event is not None
-                    and json_load(latest_legacy_binding_event.summary_json).get("source")
-                    == "collector_observed"
-                    and latest_legacy_binding_event.actor_id == f"collector:{endpoint_id}"
-                )
-            collector_owned_routine_binding = bool(
-                len(bindings) == 1
-                and (
-                    bindings[0].run_id == f"collector:lease:{lease.id}"
-                    or legacy_binding_was_collector_owned
-                )
-                and lease.project_id == "agent"
-                and resource_endpoint_ids == {endpoint_id}
-            )
-            if (
-                resources
-                and observation_complete
-                and collector_owned_routine_binding
-                and lease.state == "CONFLICT"
-                and all(not processes_by_gpu[resource.gpu_id] for resource in resources)
-            ):
-                before = self._lease_dict(session, lease)
-                lease.state = "ACTIVE"
-                lease.last_heartbeat_at = now
-                request = session.get(AllocationRequest, lease.request_id)
-                if request is not None:
-                    request.state = "ACTIVE"
-                    request.updated_at = now
-                self._resolve_lease_alerts(session, lease.id, now)
-                self._audit(
-                    session,
-                    actor_id=f"collector:{endpoint_id}",
-                    action="lease.conflict_resolved",
-                    resource_type="lease",
-                    resource_id=lease.id,
-                    result="success",
-                    before=before,
-                    after=self._lease_dict(session, lease),
-                    summary={"source": "complete_empty_routine_retry_window"},
-                    now=now,
-                )
-                continue
             if not resources or any(
                 not processes_by_gpu[resource.gpu_id] for resource in resources
             ):
+                continue
+            # A binding records the original observed start only. It never
+            # claims ownership of a later PID cohort; the GPU assignment is
+            # the durable ownership record.
+            if bindings:
                 continue
             process_keys = sorted(
                 {
@@ -6209,33 +6118,16 @@ class BrokerService:
                     for process in processes
                 }
             )
-            known_process_keys = {
-                process_key
-                for binding in bindings
-                for process_key in json_load(binding.process_keys_json)
-            }
-            replacing_complete_routine_cohort = bool(
-                collector_owned_routine_binding
-                and observation_complete
-                and known_process_keys.isdisjoint(process_keys)
-            )
-            if bindings and not replacing_complete_routine_cohort:
-                continue
             run_id = f"collector:lease:{lease.id}"
             before = self._lease_dict(session, lease)
-            if replacing_complete_routine_cohort:
-                bindings[0].process_keys_json = json_dump(process_keys)
-                bindings[0].created_at = now
-                self._resolve_lease_alerts(session, lease.id, now)
-            else:
-                session.add(
-                    WorkloadBinding(
-                        lease_id=lease.id,
-                        run_id=run_id,
-                        process_keys_json=json_dump(process_keys),
-                        created_at=now,
-                    )
+            session.add(
+                WorkloadBinding(
+                    lease_id=lease.id,
+                    run_id=run_id,
+                    process_keys_json=json_dump(process_keys),
+                    created_at=now,
                 )
+            )
             lease.state = "ACTIVE"
             lease.activated_at = now
             lease.last_heartbeat_at = now
@@ -6265,14 +6157,8 @@ class BrokerService:
                 result="success",
                 after={"run_id": run_id, "process_key_count": len(process_keys)},
                 summary={
-                    "source": (
-                        "collector_observed_process_turnover"
-                        if replacing_complete_routine_cohort
-                        else "collector_observed"
-                    ),
+                    "source": "collector_observed",
                     "gpu_count": len(resources),
-                    "resolved_conflict": replacing_complete_routine_cohort
-                    and before.get("state") == "CONFLICT",
                 },
                 now=now,
             )
@@ -8272,9 +8158,56 @@ class BrokerService:
 
         return self._write(operation)
 
-    def _reconcile_leases(self, session: Session, now: datetime, *, actor_id: str) -> None:
-        """Fail closed on expiry and unexpected compute processes; never kill/restart anything."""
+    def _normalize_legacy_workload_conflicts(
+        self,
+        session: Session,
+        now: datetime,
+        *,
+        actor_id: str,
+    ) -> int:
+        """Retire persisted workload PID-attribution conflicts safely.
 
+        ``CONFLICT`` was previously created only when a workload's sampled
+        process identity diverged. Workload assignments are now durable
+        task-to-GPU records, so normalize those legacy rows at startup as well
+        as during reconciliation. Keepalive conflicts deliberately stay out
+        of this repair path because their sealed-worker identity remains an
+        active controller safety check.
+        """
+
+        leases = session.scalars(
+            select(Lease).where(
+                Lease.kind == "workload",
+                Lease.state == "CONFLICT",
+            )
+        ).all()
+        for lease in leases:
+            before = self._lease_dict(session, lease)
+            lease.state = "ACTIVE"
+            lease.last_heartbeat_at = now
+            request = session.get(AllocationRequest, lease.request_id)
+            if request is not None:
+                request.state = "ACTIVE"
+                request.updated_at = now
+            self._resolve_lease_alerts(session, lease.id, now)
+            self._audit(
+                session,
+                actor_id=actor_id,
+                action="lease.conflict_resolved",
+                resource_type="lease",
+                resource_id=lease.id,
+                result="success",
+                before=before,
+                after=self._lease_dict(session, lease),
+                summary={"source": "retired_process_attribution_policy"},
+                now=now,
+            )
+        return len(leases)
+
+    def _reconcile_leases(self, session: Session, now: datetime, *, actor_id: str) -> None:
+        """Reconcile expiry and legacy attribution state; never kill/restart anything."""
+
+        self._normalize_legacy_workload_conflicts(session, now, actor_id=actor_id)
         self._resolve_stale_lease_alerts(session, now)
         leases = session.scalars(select(Lease).where(Lease.state.in_(ACTIVE_LEASE_STATES))).all()
         expired_released = False
@@ -8333,40 +8266,6 @@ class BrokerService:
                     summary={"reason": lease.release_reason},
                     now=now,
                 )
-            elif lease.state in {"HELD", "ACTIVE"} and processes:
-                known_process_keys = self._binding_process_keys(session, lease.id)
-                unexpected_processes = [
-                    process
-                    for process in processes
-                    if self._process_key(process) not in known_process_keys
-                ]
-                if (
-                    known_process_keys
-                    and unexpected_processes
-                    and any(process.observations >= 2 for process in unexpected_processes)
-                ):
-                    before = self._lease_dict(session, lease)
-                    lease.state = "CONFLICT"
-                    self._upsert_alert(
-                        session,
-                        alert_type="lease_process_conflict",
-                        severity="critical",
-                        resource_type="lease",
-                        resource_id=lease.id,
-                        message="observed compute process does not match workload binding; new allocation is blocked",
-                        now=now,
-                    )
-                    self._audit(
-                        session,
-                        actor_id=actor_id,
-                        action="lease.conflict_detected",
-                        resource_type="lease",
-                        resource_id=lease.id,
-                        result="success",
-                        before=before,
-                        after=self._lease_dict(session, lease),
-                        now=now,
-                    )
         self._resolve_stale_lease_alerts(session, now)
         if expired_released:
             self._allocate_queued(session, now, self._revision(session))
