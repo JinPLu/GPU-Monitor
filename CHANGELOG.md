@@ -4,6 +4,12 @@
 
 这里只记录用户能感受到的变化；实现细节见 Git 提交。
 
+## 1.5.10 - 2026-08-15
+
+**ServerPilot 1.5.10 修复 Windows Release 的跨平台校验，使 Windows x64 桌面 App 能由 GitHub 自动构建并作为可下载资产发布。**
+
+- Windows 构建校验现在同时兼容 Windows 与 POSIX 路径分隔符；Release 只在 Windows Runner 成功完成桌面 UI、WebView2 主机和打包检查后上传压缩包。
+
 ## 1.5.9 - 2026-08-15
 
 **ServerPilot 1.5.9 为 Windows 用户提供与 macOS 版保持同一资源工作流的完整桌面 App。**

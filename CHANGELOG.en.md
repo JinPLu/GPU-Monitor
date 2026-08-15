@@ -4,6 +4,12 @@
 
 This changelog records user-visible changes; implementation details belong in Git history.
 
+## 1.5.10 - 2026-08-15
+
+**ServerPilot 1.5.10 fixes cross-platform release validation so the Windows x64 desktop App is built automatically on GitHub and published as a downloadable asset.**
+
+- The Windows build check now accepts Windows and POSIX path separators. A release asset is uploaded only after the Windows runner completes its desktop UI, WebView2 host, and packaging checks.
+
 ## 1.5.9 - 2026-08-15
 
 **ServerPilot 1.5.9 provides Windows users with a complete desktop App that follows the same resource workflow as macOS.**

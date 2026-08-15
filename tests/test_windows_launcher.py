@@ -191,6 +191,7 @@ def test_windows_desktop_window_uses_local_ui_and_webview2_http_host(monkeypatch
     launcher.run_desktop_window("http://127.0.0.1:8787/", paths, server)
 
     assert calls["title"] == "ServerPilot"
-    assert str(calls["window"]["url"]).endswith("desktop/windows/ui/index.html")  # type: ignore[index]
+    window_url = str(calls["window"]["url"]).replace("\\", "/")  # type: ignore[index]
+    assert window_url.endswith("desktop/windows/ui/index.html")
     assert calls["start"] == {"gui": "edgechromium", "private_mode": True, "http_server": True}
     assert stopped == [True]
