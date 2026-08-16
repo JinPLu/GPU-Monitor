@@ -48,11 +48,12 @@ from serverpilot.keepalive_protocol import (
 # These values are fixed server policy, never request inputs.  The worker has
 # no steady-state filesystem or network activity: state is read/written only
 # during a reconciliation call and runtime CUDA work is fully resident.
-TARGET_MEMORY_FRACTION = 0.31
-ACTIVE_DUTY_FRACTION = 0.30
+TARGET_MEMORY_FRACTION = 0.80
+ACTIVE_DUTY_FRACTION = 0.80
 DUTY_PERIOD_SECONDS = 0.1
 ALLOCATION_CHUNK_BYTES = 256 * 1024 * 1024
 COMPUTE_MATRIX_SIZE = 2048
+WORKER_MEMORY_SLACK_BYTES = 128 * 1024 * 1024
 WORKER_READY_TIMEOUT_SECONDS = 35
 WORKER_STOP_TIMEOUT_SECONDS = 10
 NVIDIA_SMI_TIMEOUT_SECONDS = 10
@@ -70,6 +71,14 @@ class KeepaliveProcessIdentity:
     boot_id: str
     start_time_ticks: int
     worker_marker: str
+
+
+def keepalive_target_bytes(total_bytes: int) -> int:
+    """Return the fixed VRAM hold for one GPU from its CUDA-visible total."""
+
+    if total_bytes <= 0:
+        raise RuntimeError("keepalive CUDA visible total memory is invalid")
+    return math.ceil(total_bytes * TARGET_MEMORY_FRACTION)
 
 
 def default_state_directory() -> Path:
@@ -833,12 +842,11 @@ def _run_cuda_worker(ready_fd: int) -> None:
             raise RuntimeError("PyTorch CUDA runtime could not initialize the selected GPU")
 
         device = torch.device("cuda:0")
-        properties = torch.cuda.get_device_properties(device)
-        target_bytes = math.ceil(properties.total_memory * TARGET_MEMORY_FRACTION)
-        free_bytes, _ = torch.cuda.mem_get_info(device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        target_bytes = keepalive_target_bytes(total_bytes)
         # Reserve fixed VRAM separately from the resident compute buffers so
         # the duty loop itself does not allocate or write/cache on each tick.
-        if free_bytes < target_bytes + 128 * 1024 * 1024:
+        if free_bytes < target_bytes + WORKER_MEMORY_SLACK_BYTES:
             raise RuntimeError("target GPU lacks memory for fixed keepalive target")
         held_allocations: list[Any] = []
         remaining = target_bytes
@@ -875,8 +883,8 @@ def _run_cuda_worker(ready_fd: int) -> None:
         while time.monotonic() < active_until and not stop_event.is_set():
             torch.mm(left, right, out=output)
             torch.cuda.synchronize(device)
-        # A 100ms duty cycle avoids busy spin during the remaining 70ms and
-        # caps host scheduling pressure without disk/network polling.
+        # A 100ms duty cycle avoids busy spin during the remaining idle slice
+        # and caps host scheduling pressure without disk/network polling.
         stop_event.wait(max(0.0, period_started + DUTY_PERIOD_SECONDS - time.monotonic()))
     del held_allocations, resident_compute_buffers
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import stat
 import signal
@@ -38,6 +39,7 @@ from serverpilot.server_keepalive import (
     DUTY_PERIOD_SECONDS,
     TARGET_MEMORY_FRACTION,
     WORKER_PROCESS_MARKER,
+    keepalive_target_bytes,
     KeepaliveProcessIdentity,
     LocalKeepaliveController,
     TorchSubprocessProvider,
@@ -190,7 +192,7 @@ def test_protocol_info_publishes_v3_helper_capabilities() -> None:
     assert keepalive_protocol_info() == {
         "kind": "serverpilot-keepalive",
         "schema_version": 3,
-        "implementation_version": "1.5.10",
+        "implementation_version": "1.5.11",
         "capabilities": [
             "per_gpu_keepalive",
             "pidfd_identity",
@@ -1092,10 +1094,14 @@ def test_handle_request_returns_each_requested_gpu(tmp_path: Path) -> None:
         handle_request(b'{"schema_version":2,"enabled":true}', controller=controller)
 
 
-def test_server_policy_meets_low_impact_targets() -> None:
-    assert TARGET_MEMORY_FRACTION >= 0.30
-    assert 0.20 <= ACTIVE_DUTY_FRACTION <= 0.35
+def test_server_policy_holds_eighty_percent_of_cuda_visible_memory() -> None:
+    assert TARGET_MEMORY_FRACTION == 0.80
+    assert ACTIVE_DUTY_FRACTION == 0.80
     assert DUTY_PERIOD_SECONDS == 0.1
+    eighty_gib = 80 * 1024 * 1024 * 1024
+    ninety_six_gib = 96 * 1024 * 1024 * 1024
+    assert keepalive_target_bytes(eighty_gib) == 64 * 1024 * 1024 * 1024
+    assert keepalive_target_bytes(ninety_six_gib) == math.ceil(ninety_six_gib * 0.80)
 
 
 def test_default_state_directory_is_persistent(

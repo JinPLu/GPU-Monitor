@@ -6,6 +6,11 @@ This changelog records user-visible changes; implementation details belong in Gi
 
 ## Unreleased
 
+## 1.5.11 - 2026-08-17
+
+**ServerPilot 1.5.11 raises idle occupancy to about 80% memory and GPU utilization per card, and keeps long-running tasks correctly attributed across worker turnover.**
+
+- Idle occupancy now holds about 80% of each GPU’s CUDA-visible memory and raises GPU utilization to about 80%.
 - Multi-GPU tasks now remain shown as “task in use” while workers restart, child processes change, or stages hand off; PID turnover no longer turns an entire task into a false ownership warning.
 - An upgraded service clears legacy workload-attribution errors, while genuine keepalive-helper identity errors remain explicit and are never presented as ordinary tasks.
 - The desktop app shows the task assignment alongside process-observation changes and makes clear that cleanup is only for a finished task; it never stops the remote workload.

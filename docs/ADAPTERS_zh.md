@@ -34,9 +34,9 @@ NVIDIA compute 查询必须恰好得到一个 driver-visible PID，Broker 再以
 若历史工作负载租约遗留为“归属待确认”，人类监控端可执行“清理遗留归属”；ServerPilot
 会先重新采集，确认相关 GPU 都没有进程后才释放，单看 0% 利用率不会直接释放。
 
-每张目标 GPU 有独立内部 lease、worker 和健康状态。worker 的目标是约 31% 显存、30% GPU duty
-cycle、单 PyTorch CPU 线程和无稳态磁盘/网络 I/O；实际 CPU、RSS、GPU 干扰和停止响应仍须在获授权
-的目标主机验证。
+每张目标 GPU 有独立内部 lease、worker 和健康状态。worker 按该卡 CUDA 可见总显存占约 80%、约
+80% GPU duty cycle、单 PyTorch CPU 线程和无稳态磁盘/网络 I/O；实际 CPU、RSS、GPU 干扰和停止
+响应仍须在获授权的目标主机验证。
 
 即时受管 claim 只有在普通分配失败且服务规划出完整、已验证的逐卡回收方案时，才停止这些 keeper、
 取得新鲜空观测并重试原 claim。它不会影响同机其他卡、未托管进程或直接 SSH 任务；直接 SSH
