@@ -102,6 +102,17 @@ class Endpoint(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class EndpointDeletion(Base):
+    """Tombstone that keeps inventory YAML from resurrecting a deleted endpoint."""
+
+    __tablename__ = "endpoint_deletions"
+
+    endpoint_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    host: Mapped[str] = mapped_column(String(253), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class EndpointProject(Base):
     __tablename__ = "endpoint_projects"
 

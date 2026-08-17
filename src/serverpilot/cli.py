@@ -59,6 +59,7 @@ app.add_typer(endpoint_app, name="endpoint")
 app.add_typer(gpu_app, name="gpu")
 app.add_typer(request_app, name="request")
 app.add_typer(lease_app, name="lease")
+app.add_typer(reservation_app, name="reservation")
 app.add_typer(resource_app, name="resource")
 app.add_typer(collect_app, name="collect")
 app.add_typer(daemon_app, name="daemon")
@@ -328,44 +329,6 @@ def endpoint_list(
     _print(_call(lambda: _client(url, actor).endpoints()), as_json)
 
 
-@endpoint_app.command("pause")
-def endpoint_pause(
-    endpoint_id: str,
-    as_json: Annotated[bool, typer.Option("--json")] = False,
-    url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")] = None,
-    actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")] = None,
-) -> None:
-    """Block new placement while retaining collection and current leases."""
-
-    _print(
-        _call(
-            lambda: _client(url, actor).post(
-                f"/api/v1/endpoints/{endpoint_id}/pause", {}, idempotency_key=secrets.token_hex(16)
-            )
-        ),
-        as_json,
-    )
-
-
-@endpoint_app.command("resume")
-def endpoint_resume(
-    endpoint_id: str,
-    as_json: Annotated[bool, typer.Option("--json")] = False,
-    url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")] = None,
-    actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")] = None,
-) -> None:
-    """Resume a draining endpoint."""
-
-    _print(
-        _call(
-            lambda: _client(url, actor).post(
-                f"/api/v1/endpoints/{endpoint_id}/resume", {}, idempotency_key=secrets.token_hex(16)
-            )
-        ),
-        as_json,
-    )
-
-
 @gpu_app.command("list")
 def gpu_list(
     state: Annotated[str | None, typer.Option()] = None,
@@ -469,19 +432,6 @@ def lease_bind_observed(lease_id: str, run_id: Annotated[str | None, typer.Optio
 @reservation_app.command("list")
 def reservation_list(as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
     _print(_call(lambda: _client(url, actor).reservations()), as_json)
-
-
-@reservation_app.command("create")
-def reservation_create(file: Annotated[Path, typer.Option("--file", exists=True)], as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
-    raw = yaml.safe_load(file.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise typer.BadParameter("reservation YAML must be a mapping")
-    _print(_call(lambda: _client(url, actor).post("/api/v1/reservations", raw, idempotency_key=secrets.token_hex(16))), as_json)
-
-
-@reservation_app.command("cancel")
-def reservation_cancel(reservation_id: str, as_json: Annotated[bool, typer.Option("--json")]=False, url: Annotated[str | None, typer.Option(envvar="SERVERPILOT_URL")]=None, actor: Annotated[str | None, typer.Option(envvar="SERVERPILOT_ACTOR")]=None) -> None:
-    _print(_call(lambda: _client(url, actor).post(f"/api/v1/reservations/{reservation_id}/cancel", {}, idempotency_key=secrets.token_hex(16))), as_json)
 
 
 @resource_app.command("providers")

@@ -558,7 +558,7 @@ final class BrokerStoreTests: XCTestCase {
         let mutationSession = URLSession(configuration: configuration)
         let snapshot = try Self.snapshot(named: "1")
         let endpoint = try XCTUnwrap(snapshot.endpoints.first)
-        let capabilities: Set<String> = ["endpoint_update", "endpoint_pause_resume", "endpoint_keepalive", "endpoint_conflict_cleanup"]
+        let capabilities: Set<String> = ["endpoint_update", "endpoint_delete", "endpoint_keepalive", "endpoint_conflict_cleanup"]
         let serviceInfo = ServiceInfo(schemaVersion: "v1", capabilities: capabilities)
         let store = BrokerStore(
             actorID: "tester",
@@ -569,7 +569,7 @@ final class BrokerStoreTests: XCTestCase {
         StateRouteURLProtocol.responseData = try JSONSerialization.data(withJSONObject: ["snapshot_revision": 102])
         defer { StateRouteURLProtocol.reset() }
         store.connectForTesting(
-            snapshotClient: ScriptedClient(results: [.success(snapshot), .success(snapshot), .success(snapshot), .success(snapshot), .success(snapshot)]),
+            snapshotClient: ScriptedClient(results: [.success(snapshot), .success(snapshot), .success(snapshot), .success(snapshot)]),
             serviceInfo: serviceInfo,
             baseURL: URL(string: "http://broker.test/")!
         )
@@ -595,24 +595,6 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(updatePayload["ssh_user"] as? String, "collector")
         XCTAssertEqual(updatePayload["workspace_path"] as? String, "/srv/storyboard")
         XCTAssertEqual(updatePayload["observation_profile"] as? String, "server-script-v1")
-
-        let pauseRecorder = CompletionRecorder()
-        store.pauseEndpoint(endpoint) { success, message in
-            pauseRecorder.success = success
-            pauseRecorder.message = message
-        }
-        try await waitUntil { pauseRecorder.success != nil }
-        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "POST")
-        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/fixture-1/pause")
-
-        let resumeRecorder = CompletionRecorder()
-        store.resumeEndpoint(endpoint) { success, message in
-            resumeRecorder.success = success
-            resumeRecorder.message = message
-        }
-        try await waitUntil { resumeRecorder.success != nil }
-        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "POST")
-        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/fixture-1/resume")
 
         let keepaliveRecorder = CompletionRecorder()
         store.setEndpointKeepalive(endpoint, enabled: true) { success, message in
@@ -641,6 +623,15 @@ final class BrokerStoreTests: XCTestCase {
             StateRouteURLProtocol.lastRequest?.url?.path,
             "/api/v1/endpoints/fixture-1/leases/lease-conflict/release-empty"
         )
+
+        let deleteRecorder = CompletionRecorder()
+        store.deleteEndpoint(endpoint) { success, message in
+            deleteRecorder.success = success
+            deleteRecorder.message = message
+        }
+        try await waitUntil { deleteRecorder.success != nil }
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.httpMethod, "DELETE")
+        XCTAssertEqual(StateRouteURLProtocol.lastRequest?.url?.path, "/api/v1/endpoints/fixture-1")
 
     }
 
@@ -837,6 +828,73 @@ final class BrokerStoreTests: XCTestCase {
             "error": ["code": "endpoint_not_found"]
         ])
         XCTAssertEqual(BrokerStore.apiErrorCode(from: errorPayload), "endpoint_not_found")
+
+        let advertised = ServiceInfo(schemaVersion: "v1", capabilities: ["endpoint_update"])
+        XCTAssertTrue(advertised.supportsEndpointUpdate)
+        XCTAssertFalse(advertised.supportsEndpointDelete)
+
+        let fixture = ServiceInfo.fixture
+        XCTAssertTrue(fixture.supportsEndpointDelete)
+    }
+
+    func testDeleteEndpointKeepsActionableConflictError() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StateRouteURLProtocol.self]
+        let mutationSession = URLSession(configuration: configuration)
+        let snapshot = try Self.snapshot(named: "1")
+        let endpoint = try XCTUnwrap(snapshot.endpoints.first)
+        let store = BrokerStore(
+            actorID: "tester",
+            refreshTimeoutSeconds: 1,
+            refreshIntervalSeconds: 0,
+            mutationSession: mutationSession
+        )
+        StateRouteURLProtocol.statusCode = 409
+        StateRouteURLProtocol.responseData = try JSONSerialization.data(withJSONObject: [
+            "error": [
+                "code": "endpoint_has_active_allocations",
+                "message": "这台服务器上还有进行中的资源分配，请先结束后再删除。",
+            ]
+        ])
+        defer { StateRouteURLProtocol.reset() }
+        store.connectForTesting(
+            snapshotClient: ScriptedClient(results: [.success(snapshot)]),
+            serviceInfo: ServiceInfo(schemaVersion: "v1", capabilities: ["endpoint_delete"]),
+            baseURL: URL(string: "http://broker.test/")!
+        )
+        try await waitUntil { store.freshness == .fresh && !store.isRefreshing }
+
+        let recorder = CompletionRecorder()
+        store.deleteEndpoint(endpoint) { success, message in
+            recorder.success = success
+            recorder.message = message
+        }
+        try await waitUntil { recorder.success != nil }
+        XCTAssertEqual(recorder.success, false)
+        XCTAssertTrue(recorder.message?.contains("先结束") == true)
+        XCTAssertTrue(store.snapshot.endpoints.contains(where: { $0.id == endpoint.id }))
+    }
+
+    func testDeleteEndpointFailsClosedWithoutCapability() async throws {
+        let snapshot = try Self.snapshot(named: "1")
+        let endpoint = try XCTUnwrap(snapshot.endpoints.first)
+        let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
+        store.connectForTesting(
+            snapshotClient: ScriptedClient(results: [.success(snapshot)]),
+            serviceInfo: ServiceInfo(schemaVersion: "v1", capabilities: ["endpoint_update"]),
+            baseURL: URL(string: "http://broker.test/")!
+        )
+        try await waitUntil { store.freshness == .fresh && !store.isRefreshing }
+
+        let recorder = CompletionRecorder()
+        store.deleteEndpoint(endpoint) { success, message in
+            recorder.success = success
+            recorder.message = message
+        }
+        try await waitUntil { recorder.success != nil }
+        XCTAssertEqual(recorder.success, false)
+        XCTAssertTrue(recorder.message?.contains("删除服务器") == true)
+        XCTAssertFalse(store.supportsEndpointDelete)
     }
 
     func testKeepaliveSnapshotUsesPerGPUCoverageAndRedactsInternalLease() throws {
@@ -1385,6 +1443,7 @@ private actor CooperativeDelayedEndpointHistoryClient: BrokerEndpointTelemetryHi
 private final class StateRouteURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var responseData: Data?
     nonisolated(unsafe) static var lastRequest: URLRequest?
+    nonisolated(unsafe) static var statusCode = 200
 
     override class func canInit(with request: URLRequest) -> Bool {
         true
@@ -1399,7 +1458,7 @@ private final class StateRouteURLProtocol: URLProtocol, @unchecked Sendable {
         let data = Self.responseData ?? Data("{}".utf8)
         let response = HTTPURLResponse(
             url: request.url!,
-            statusCode: 200,
+            statusCode: Self.statusCode,
             httpVersion: nil,
             headerFields: ["Content-Type": "application/json"]
         )!
@@ -1413,5 +1472,6 @@ private final class StateRouteURLProtocol: URLProtocol, @unchecked Sendable {
     static func reset() {
         responseData = nil
         lastRequest = nil
+        statusCode = 200
     }
 }

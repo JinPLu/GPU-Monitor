@@ -644,10 +644,6 @@ class EndpointUpsert(EndpointCreate):
     enabled: bool | None = None
 
 
-class EndpointEnabled(StrictModel):
-    enabled: bool
-
-
 class EndpointKeepaliveRequest(StrictModel):
     """The endpoint control accepts one explicit boolean, never a GPU target."""
 

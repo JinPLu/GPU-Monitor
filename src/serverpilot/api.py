@@ -12,11 +12,9 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Callable
-from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import quote
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Depends, FastAPI, Form, Header, Request
 from fastapi.encoders import jsonable_encoder
@@ -202,6 +200,9 @@ def _public_error_message(exc: BrokerError) -> str:
         "lease_already_released": "这个 GPU 租约已经结束。",
         "workload_process_not_observed": "每张已分配 GPU 都检测到新的任务进程后才能完成绑定。",
         "idempotency_key_required": "本次写操作缺少 idempotency_key。",
+        "endpoint_not_found": "这台服务器已经不在本机资源池中。",
+        "endpoint_has_active_leases": "这台服务器上还有进行中的租约，请先释放后再删除。",
+        "endpoint_has_active_allocations": "这台服务器上还有进行中的资源分配，请先结束后再删除。",
     }
     if exc.code in messages:
         return messages[exc.code]
@@ -1884,6 +1885,18 @@ def create_app(
             idempotency_key=_idempotency_key(idempotency_key),
         )
 
+    @app.delete("/api/v1/endpoints/{endpoint_id}")
+    def delete_endpoint(
+        endpoint_id: str,
+        actor: ApiActor,
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        return service.delete_endpoint(
+            actor,
+            endpoint_id,
+            idempotency_key=_idempotency_key(idempotency_key),
+        )
+
     @app.post("/api/v1/endpoints/{endpoint_id}/keepalive")
     async def set_endpoint_keepalive(
         endpoint_id: str,
@@ -2466,22 +2479,6 @@ def create_app(
             return False
         raise BrokerError("invalid_form_boolean", f"{name} 必须是 true 或 false", status_code=422)
 
-    def _form_timestamp(form: Any, name: str) -> str:
-        value = _form_value(form, name, required=True)
-        assert value is not None
-        try:
-            parsed = datetime.fromisoformat(value)
-        except ValueError as exc:
-            raise BrokerError("invalid_form_time", f"{name} 不是有效时间", status_code=422) from exc
-        if parsed.tzinfo is not None:
-            return parsed.isoformat()
-        timezone_name = _form_value(form, "timezone") or "Asia/Shanghai"
-        try:
-            zone = ZoneInfo(timezone_name)
-        except ZoneInfoNotFoundError as exc:
-            raise BrokerError("invalid_form_timezone", "请选择有效时区", status_code=422) from exc
-        return parsed.replace(tzinfo=zone).isoformat()
-
     def _csv_values(value: str | None) -> list[str]:
         return [item.strip() for item in (value or "").split(",") if item.strip()]
 
@@ -2521,8 +2518,6 @@ def create_app(
                 "endpoint_ids": [endpoint_id] if endpoint_id else [],
                 "gpu_ids": gpu_ids,
             }
-        if action == "cancel-request":
-            return {"request_id": _form_value(form, "request_id", required=True)}
         if action in {"activate-lease", "renew-lease"}:
             return {"lease_id": _form_value(form, "lease_id", required=True)}
         if action == "release-lease":
@@ -2540,35 +2535,6 @@ def create_app(
                     for item in (process_keys or "").replace("\n", ",").split(",")
                     if item.strip()
                 ],
-            }
-        if action == "reservation":
-            return {
-                "project_id": _form_value(form, "project_id", required=True),
-                "gpu_ids": _form_list(form, "gpu_ids"),
-                "start_at": _form_timestamp(form, "start_at"),
-                "end_at": _form_timestamp(form, "end_at"),
-                "reason": _form_value(form, "reason", required=True),
-            }
-        if action == "cancel-reservation":
-            return {"reservation_id": _form_value(form, "reservation_id", required=True)}
-        if action == "maintenance":
-            target = _form_value(form, "target", required=True)
-            assert target is not None
-            target_type, separator, target_id = target.partition("|")
-            if not separator or not target_id:
-                raise BrokerError(
-                    "invalid_maintenance_target", "请选择有效的维护对象", status_code=422
-                )
-            if target_type not in {"endpoint", "gpu"}:
-                raise BrokerError(
-                    "invalid_maintenance_target", "维护对象必须是 endpoint 或 GPU", status_code=422
-                )
-            return {
-                "endpoint_id": target_id if target_type == "endpoint" else None,
-                "gpu_id": target_id if target_type == "gpu" else None,
-                "start_at": _form_timestamp(form, "start_at"),
-                "end_at": _form_timestamp(form, "end_at"),
-                "reason": _form_value(form, "reason", required=True),
             }
         if action == "ack-alert":
             return {
@@ -2643,11 +2609,6 @@ def create_app(
                 "project_ids": [owner_project_id],
                 "enabled": _form_boolean(form, "enabled"),
             }
-        if action == "endpoint-enabled":
-            return {
-                "endpoint_id": _form_value(form, "endpoint_id", required=True),
-                "enabled": _form_boolean(form, "enabled"),
-            }
         if action == "reconcile":
             return {}
         if action == "prune-telemetry":
@@ -2665,18 +2626,13 @@ def create_app(
     ) -> Any:
         routes = {
             "endpoint": "/",
-            "endpoint-enabled": "/",
             "request": "/ui/requests",
             "quick-claim": "/ui/requests",
             "profile-claim": "/ui/requests",
-            "cancel-request": "/ui/requests",
             "activate-lease": "/ui/leases",
             "renew-lease": "/ui/leases",
             "release-lease": "/ui/leases",
             "bind-workload": "/ui/leases",
-            "reservation": "/ui/reservations",
-            "cancel-reservation": "/ui/reservations",
-            "maintenance": "/ui/maintenance",
             "ack-alert": "/ui/alerts",
             "workload-profile": "/ui/identities",
             "actor": "/ui/identities",

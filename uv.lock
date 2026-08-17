@@ -1384,7 +1384,7 @@ wheels = [
 
 [[package]]
 name = "serverpilot"
-version = "1.5.11"
+version = "1.5.12"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },

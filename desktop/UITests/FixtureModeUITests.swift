@@ -133,8 +133,22 @@ final class FixtureModeUITests: XCTestCase {
         let operations = app.buttons["服务器操作"]
         XCTAssertTrue(operations.exists, "Server settings must remain reachable from the detail sheet")
         operations.click()
-        XCTAssertTrue(app.menuItems["编辑服务器"].waitForExistence(timeout: 2))
+        let editServer = app.menuItems["编辑或移除服务器"]
+        XCTAssertTrue(editServer.waitForExistence(timeout: 2))
+        editServer.click()
+        let remove = app.buttons["endpoint-delete-action"]
+        XCTAssertTrue(remove.waitForExistence(timeout: 2))
+        XCTAssertEqual(remove.label, "从 ServerPilot 移除…")
+        XCTAssertTrue(app.staticTexts["危险操作"].exists)
         XCTAssertFalse(app.menuItems["删除服务器"].exists)
+        XCTAssertFalse(app.menuItems["暂停接收新任务"].exists)
+
+        remove.click()
+        let confirmation = app.dialogs.firstMatch
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 2), "Removal must ask for confirmation")
+        XCTAssertTrue(confirmation.staticTexts["从 ServerPilot 移除这台服务器？"].exists)
+        confirmation.buttons["取消"].click()
+        XCTAssertTrue(remove.waitForExistence(timeout: 2), "Cancel must keep the edit sheet open")
 
         relaunch(fixture: "keepalive-off", section: "server-pool")
         let inactiveServer = app.descendants(matching: .any).matching(

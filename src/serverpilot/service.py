@@ -25,6 +25,7 @@ from serverpilot.models import (
     AllocationRequest,
     AuditEvent,
     Endpoint,
+    EndpointDeletion,
     EndpointTelemetryCurrent,
     EndpointTelemetrySnapshot,
     GPUDevice,
@@ -61,7 +62,6 @@ from serverpilot.schemas import (
     AlertAcknowledge,
     EndpointCreate,
     EndpointObservation,
-    EndpointEnabled,
     EndpointUpdate,
     EndpointUpsert,
     LeaseBind,
@@ -357,7 +357,10 @@ class BrokerService:
                 project.updated_at = now
 
         session.flush()
+        tombstoned_ids = set(session.scalars(select(EndpointDeletion.endpoint_id)))
         for configured_endpoint in self.inventory.endpoints:
+            if configured_endpoint.id in tombstoned_ids:
+                continue
             endpoint = session.get(Endpoint, configured_endpoint.id)
             if endpoint is None:
                 endpoint = Endpoint(
@@ -759,6 +762,68 @@ class BrokerService:
             )
             .limit(1)
         )
+
+    @staticmethod
+    def _endpoint_has_active_leases(session: Session, endpoint_id: str) -> bool:
+        gpu_lease_id = session.scalar(
+            select(Lease.id)
+            .join(LeaseResource, LeaseResource.lease_id == Lease.id)
+            .join(GPUDevice, GPUDevice.id == LeaseResource.gpu_id)
+            .where(
+                GPUDevice.endpoint_id == endpoint_id,
+                Lease.state.in_(ACTIVE_LEASE_STATES),
+                LeaseResource.active.is_(True),
+            )
+            .limit(1)
+        )
+        if gpu_lease_id is not None:
+            return True
+        commitment_lease_id = session.scalar(
+            select(Lease.id)
+            .join(LeaseEndpointCommitment, LeaseEndpointCommitment.lease_id == Lease.id)
+            .where(
+                LeaseEndpointCommitment.endpoint_id == endpoint_id,
+                Lease.state.in_(ACTIVE_LEASE_STATES),
+            )
+            .limit(1)
+        )
+        return commitment_lease_id is not None
+
+    @staticmethod
+    def _endpoint_has_active_allocations(session: Session, endpoint_id: str) -> bool:
+        return (
+            session.scalar(
+                select(ResourceAllocation.id)
+                .join(AllocatableUnit, AllocatableUnit.id == ResourceAllocation.unit_id)
+                .where(
+                    AllocatableUnit.endpoint_id == endpoint_id,
+                    ResourceAllocation.state == "active",
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
+    @staticmethod
+    def _purge_endpoint_restrict_history(session: Session, endpoint_id: str) -> None:
+        gpu_ids = list(
+            session.scalars(select(GPUDevice.id).where(GPUDevice.endpoint_id == endpoint_id))
+        )
+        unit_ids = list(
+            session.scalars(
+                select(AllocatableUnit.id).where(AllocatableUnit.endpoint_id == endpoint_id)
+            )
+        )
+        session.execute(
+            delete(LeaseEndpointCommitment).where(LeaseEndpointCommitment.endpoint_id == endpoint_id)
+        )
+        if gpu_ids:
+            session.execute(delete(LeaseResource).where(LeaseResource.gpu_id.in_(gpu_ids)))
+        if unit_ids:
+            session.execute(
+                delete(ResourceAllocation).where(ResourceAllocation.unit_id.in_(unit_ids))
+            )
+        session.flush()
 
     @staticmethod
     def _can_manage_endpoint(actor: ActorContext, _endpoint: Endpoint) -> bool:
@@ -10236,6 +10301,9 @@ class BrokerService:
             )
             session.add(endpoint)
             session.flush()
+            session.execute(
+                delete(EndpointDeletion).where(EndpointDeletion.endpoint_id == endpoint.id)
+            )
             payload = self._endpoint_dict(endpoint)
             event = self._audit(
                 session,
@@ -10386,7 +10454,6 @@ class BrokerService:
         *,
         idempotency_key: str,
         _idempotency_action: str = "endpoint.pause",
-        _compatibility_alias: bool = False,
     ) -> dict[str, Any]:
         """Move active -> draining without changing collection or existing leases."""
 
@@ -10437,8 +10504,6 @@ class BrokerService:
                 "changed": changed,
                 "history_retained": True,
             }
-            if _compatibility_alias:
-                result["deprecated_compatibility_alias"] = "DELETE /api/v1/endpoints/{endpoint_id}"
             self._remember_idempotency(
                 session,
                 actor=actor,
@@ -10505,6 +10570,89 @@ class BrokerService:
                 session,
                 actor=actor,
                 action="endpoint.resume",
+                key=idempotency_key,
+                response=result,
+                now=now,
+            )
+            return result
+
+        return self._write(operation)
+
+    def delete_endpoint(
+        self, actor: ActorContext, endpoint_id: str, *, idempotency_key: str
+    ) -> dict[str, Any]:
+        """Hard-delete one endpoint from the local control plane.
+
+        Active leases and active generic allocations fail closed. Released
+        history that would block SQLite RESTRICT is removed first; telemetry,
+        GPUs and providers then follow the endpoint CASCADE.
+        """
+
+        self._require_role(actor, MUTATING_ROLES)
+
+        def operation(session: Session) -> dict[str, Any]:
+            existing = self._idempotent(
+                session, actor=actor, action="endpoint.delete", key=idempotency_key
+            )
+            if existing is not None:
+                return existing
+            endpoint = session.get(Endpoint, endpoint_id)
+            if endpoint is None:
+                raise BrokerError("endpoint_not_found", "endpoint does not exist", status_code=404)
+            self._require_endpoint_manager(actor, endpoint)
+            if self._endpoint_has_active_leases(session, endpoint.id):
+                raise BrokerError(
+                    "endpoint_has_active_leases",
+                    "这台服务器上还有进行中的租约，请先释放后再删除。",
+                    status_code=409,
+                )
+            if self._endpoint_has_active_allocations(session, endpoint.id):
+                raise BrokerError(
+                    "endpoint_has_active_allocations",
+                    "这台服务器上还有进行中的资源分配，请先结束后再删除。",
+                    status_code=409,
+                )
+            now = utcnow()
+            before = self._endpoint_dict(endpoint)
+            tombstone = session.get(EndpointDeletion, endpoint.id)
+            if tombstone is None:
+                session.add(
+                    EndpointDeletion(
+                        endpoint_id=endpoint.id,
+                        host=endpoint.host,
+                        port=endpoint.port,
+                        deleted_at=now,
+                    )
+                )
+            else:
+                tombstone.host = endpoint.host
+                tombstone.port = endpoint.port
+                tombstone.deleted_at = now
+            self._purge_endpoint_restrict_history(session, endpoint.id)
+            session.delete(endpoint)
+            session.flush()
+            revision = self._bump_revision(session, now)
+            event = self._audit(
+                session,
+                actor_id=actor.id,
+                action="endpoint.deleted",
+                resource_type="endpoint",
+                resource_id=endpoint_id,
+                result="success",
+                before=before,
+                now=now,
+            )
+            result = {
+                "event_id": event.id,
+                "snapshot_revision": revision,
+                "endpoint_id": endpoint_id,
+                "endpoint": before,
+                "changed": True,
+            }
+            self._remember_idempotency(
+                session,
+                actor=actor,
+                action="endpoint.delete",
                 key=idempotency_key,
                 response=result,
                 now=now,
@@ -10661,20 +10809,6 @@ class BrokerService:
             return result
 
         return self._write(operation)
-
-    def set_endpoint_enabled(
-        self,
-        actor: ActorContext,
-        endpoint_id: str,
-        state: EndpointEnabled,
-        *,
-        idempotency_key: str,
-    ) -> dict[str, Any]:
-        """Deprecated boolean compatibility facade for explicit pause/resume."""
-
-        if state.enabled:
-            return self.resume_endpoint(actor, endpoint_id, idempotency_key=idempotency_key)
-        return self.pause_endpoint(actor, endpoint_id, idempotency_key=idempotency_key)
 
     def create_actor(
         self, actor: ActorContext, actor_data: ActorCreate, *, idempotency_key: str

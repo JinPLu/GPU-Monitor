@@ -177,6 +177,58 @@ def test_live_probe_requires_recent_telemetry_average_capability(
         probe_live(config)
 
 
+def test_live_probe_requires_endpoint_delete_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    capabilities = sorted(daemon.EXPECTED_CAPABILITIES - {"endpoint_delete"})
+    monkeypatch.setattr(
+        daemon,
+        "_probe_json",
+        lambda *_args, **_kwargs: {
+            "status": "live",
+            "schema_version": "v1",
+            "capabilities": capabilities,
+        },
+    )
+
+    with pytest.raises(DaemonError, match="incompatible ServerPilot service"):
+        probe_live(config)
+
+
+def test_ensure_restarts_when_daemon_only_missing_endpoint_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daemon.sys, "platform", "darwin")
+    config = _config(tmp_path)
+    config.plist_path.parent.mkdir(parents=True)
+    config.plist_path.write_bytes(b"plist")
+    manager = MacOSDaemonManager(config)
+    capabilities = sorted(daemon.EXPECTED_CAPABILITIES - {"endpoint_delete"})
+    monkeypatch.setattr(
+        daemon,
+        "_probe_json",
+        lambda *_args, **_kwargs: {
+            "status": "live",
+            "schema_version": "v1",
+            "capabilities": capabilities,
+        },
+    )
+    started: list[bool] = []
+    monkeypatch.setattr(manager, "_loaded", lambda: True)
+    monkeypatch.setattr(manager, "_bootout_legacy_if_loaded", lambda: None)
+    monkeypatch.setattr(manager, "_install_locked", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(manager, "start", lambda **_kwargs: started.append(True))
+    monkeypatch.setattr(manager, "status", lambda: {"restarted": True})
+
+    result = manager.ensure()
+
+    assert started == [True]
+    assert result["restarted"] is True
+
+
 def test_install_migrates_inventory_and_database_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -556,6 +608,13 @@ def test_macos_gui_no_longer_owns_or_terminates_server_process() -> None:
     ).read_text(encoding="utf-8")
 
     assert '"daemon", "ensure", "--source-root"' in source
+    health_check = source.split("private func healthCheck", maxsplit=1)[1].split(
+        "private func ensureDaemon", maxsplit=1
+    )[0]
+    assert 'info.capabilities.contains("endpoint_delete")' in health_check
+    assert "危险操作" in source
+    assert "从 ServerPilot 移除…" in source
+    assert "onRemoved()" in source
     launch_body = source.split(
         "func applicationDidFinishLaunching", maxsplit=1
     )[1].split("func applicationShouldTerminate", maxsplit=1)[0]
@@ -578,9 +637,6 @@ def test_macos_gui_defaults_to_low_composition_surfaces() -> None:
     support_source = (project_root / "desktop" / "AppSupport.swift").read_text(
         encoding="utf-8"
     )
-    overview_source = (
-        project_root / "desktop" / "OverviewDashboard.swift"
-    ).read_text(encoding="utf-8")
 
     launch_body = window_source.split(
         "func applicationDidFinishLaunching", maxsplit=1
@@ -610,7 +666,6 @@ def test_macos_gui_defaults_to_low_composition_surfaces() -> None:
     assert "SERVERPILOT_DESKTOP_SCREENSHOT" in window_source
     assert "SERVERPILOT_DESKTOP_EXIT_AFTER_SCREENSHOT" in window_source
     assert "SERVERPILOT_DESKTOP_SECTION" in window_source
-    assert "CPU 计算节点 · 当前未检测到 GPU" in overview_source
     assert "static let interaction = Color(nsColor: .controlAccentColor)" in support_source
     assert "static let cpu = mutedInk" in support_source
     assert "static let memory = mutedInk" in support_source
@@ -619,12 +674,11 @@ def test_macos_gui_defaults_to_low_composition_surfaces() -> None:
     for forbidden_accent in (".systemTeal", ".systemIndigo", ".systemBlue"):
         assert forbidden_accent not in support_source
 
-    surface_body = overview_source.split(
-        "func overviewSurface(radius:", maxsplit=1
-    )[1].split("private func percent", maxsplit=1)[0]
-    assert ".regularMaterial" not in surface_body
-    assert ".shadow(" not in surface_body
-    assert "background(DesignTokens.surface, in: shape)" in surface_body
+    resources_body = window_source.split(
+        "private struct ResourcesDashboard", maxsplit=1
+    )[1].split("private struct ResourceInlineStat", maxsplit=1)[0]
+    assert ".regularMaterial" not in resources_body
+    assert "background(DesignTokens.surface)" in resources_body
 
 
 def test_macos_resource_split_preserves_readable_endpoint_rows_when_narrow() -> None:
@@ -648,7 +702,7 @@ def test_macos_resource_split_preserves_readable_endpoint_rows_when_narrow() -> 
     assert "ViewThatFits(in: .horizontal)" in endpoint_table_body
     assert "compactRow" in endpoint_table_body
     assert "LazyVGrid(" in endpoint_table_body
-    assert 'Text("项目与任务")' in dashboard_source
+    assert 'header("项目 · 任务", icon: "folder", column: .assignment, alignment: .leading)' in dashboard_source
 
 
 def test_macos_resource_usage_groups_projects_agents_and_tasks_without_telemetry_claims() -> None:

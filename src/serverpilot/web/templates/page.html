@@ -170,12 +170,6 @@
       <p>资源：{{ format_constraints(item.constraints) }}</p>
       {% if item.profile_id %}<p class="muted">预设任务：<code>{{ item.profile_id }}</code></p>{% endif %}
       {% if item.blocked_reason %}<p class="warning-text">队列说明：{{ item.blocked_reason }}</p>{% endif %}
-      {% if item.state == 'QUEUED' and actor.role in ['allocator', 'operator', 'admin'] %}
-      <form method="post" action="/ui/action/cancel-request" class="inline-form">
-        <input type="hidden" name="request_id" value="{{ item.id }}"><input type="hidden" name="csrf" value="{{ csrf }}">
-        <input type="hidden" name="confirmed" value="yes"><button type="submit" class="danger">取消排队</button>
-      </form>
-      {% endif %}
     </article>
   {% else %}
     <p class="empty">尚无请求。可通过上方表单提交第一条申请。</p>
@@ -250,29 +244,13 @@
 </section>
 
 {% elif page == 'reservations' %}
-{% if actor.role in ['operator', 'admin'] %}
-<section class="actions" aria-labelledby="reservation-title">
-  <h2 id="reservation-title">安排未来使用时间</h2>
-  <p>安排者：<strong>{{ actor.id }}</strong></p>
-  <p class="muted">选择具体 GPU 和时间；与已有分配或安排冲突时会直接提示。</p>
-  <form method="post" action="/ui/action/reservation" class="stack form-grid">
-    <label>项目标识<input name="project_id" required placeholder="例如：storyboard"></label>
-    <label>时区<select name="timezone"><option value="Asia/Shanghai" selected>Asia/Shanghai</option><option value="UTC">UTC</option></select></label>
-    <label>开始时间<input name="start_at" type="datetime-local" required></label>
-    <label>结束时间<input name="end_at" type="datetime-local" required></label>
-    <label class="span-all">GPU（可多选）<select name="gpu_ids" multiple required size="8">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label>
-    <label class="span-all">任务说明<input name="reason" required placeholder="例如：周一模型评测"></label>
-    <input type="hidden" name="csrf" value="{{ csrf }}">
-    <input type="hidden" name="confirmed" value="yes"><button type="submit">保存安排</button>
-  </form>
-</section>
-{% endif %}
-<section class="list-section"><h2>现有预约</h2><div class="stacked-cards">
+<section class="list-section"><h2>现有预约</h2>
+<p class="muted">此页只读查看已有安排，不会创建、取消或改动远端任务。</p>
+<div class="stacked-cards">
 {% for reservation in payload.reservations %}
   <article class="card"><div class="card-title"><strong>{{ reservation.actor_id }}</strong><span class="badge">{{ reservation.state }}</span></div>
     <p>{{ reservation.start_at }} → {{ reservation.end_at }}</p><p>{{ reservation.reason }}</p>
     <p>{% for gpu_id in reservation.gpu_ids %}<code>{{ gpu_id }}</code>{% if not loop.last %}、{% endif %}{% endfor %}</p>
-    {% if actor.role in ['operator', 'admin'] and reservation.state == 'ACTIVE' %}<form method="post" action="/ui/action/cancel-reservation" class="inline-form"><input type="hidden" name="reservation_id" value="{{ reservation.id }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes"><button class="danger" type="submit">取消安排</button></form>{% endif %}
   </article>
 {% else %}<p class="empty">尚无未来预约。</p>{% endfor %}
 </div></section>
@@ -317,16 +295,9 @@
 {% endif %}
 
 {% elif page == 'maintenance' %}
-{% if actor.role in ['operator', 'admin'] %}
-<section class="actions"><h2>创建维护窗口</h2><p class="muted">维护窗口将 fail closed，阻止受影响资源的新分配。</p>
-  <form method="post" action="/ui/action/maintenance" class="stack form-grid">
-    <label>维护对象<select name="target" required><optgroup label="整个 endpoint">{% for endpoint in payload.endpoints %}<option value="endpoint|{{ endpoint.id }}">{{ endpoint.id }}</option>{% endfor %}</optgroup><optgroup label="单张 GPU">{% for gpu in payload.gpus %}<option value="gpu|{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }}</option>{% endfor %}</optgroup></select></label>
-    <label>时区<select name="timezone"><option value="Asia/Shanghai" selected>Asia/Shanghai</option><option value="UTC">UTC</option></select></label><label>开始时间<input name="start_at" type="datetime-local" required></label><label>结束时间<input name="end_at" type="datetime-local" required></label>
-    <label class="span-all">原因<textarea name="reason" rows="3" required></textarea></label><input type="hidden" name="csrf" value="{{ csrf }}"><label class="confirm span-all"><input type="checkbox" name="confirmed" value="yes" required> 我确认这是调度保护，不会停止任何远端进程。</label><button type="submit">创建维护窗口</button>
-  </form>
-</section>
-{% endif %}
-<section class="list-section"><h2>维护窗口</h2><div class="stacked-cards">{% for item in payload.maintenance %}<article class="card"><div class="card-title"><strong>{{ item.endpoint_id or item.gpu_id }}</strong><span class="badge">{{ item.state }}</span></div><p>{{ item.start_at }} → {{ item.end_at }}</p><p>{{ item.reason }}</p></article>{% else %}<p class="empty">尚无维护窗口。</p>{% endfor %}</div></section>
+<section class="list-section"><h2>维护窗口</h2>
+<p class="muted">此页只读查看已有维护窗口，不会创建或改动远端任务。</p>
+<div class="stacked-cards">{% for item in payload.maintenance %}<article class="card"><div class="card-title"><strong>{{ item.endpoint_id or item.gpu_id }}</strong><span class="badge">{{ item.state }}</span></div><p>{{ item.start_at }} → {{ item.end_at }}</p><p>{{ item.reason }}</p></article>{% else %}<p class="empty">尚无维护窗口。</p>{% endfor %}</div></section>
 
 {% elif page == 'alerts' %}
 <section class="list-section"><h2>告警</h2><div class="stacked-cards">

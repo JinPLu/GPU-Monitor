@@ -930,7 +930,9 @@ def test_collector_observation_ingestion_is_not_a_public_actor_route(
     assert response.status_code == 404
 
 
-def test_endpoint_delete_rest_route_is_not_public(tmp_path: Path, inventory) -> None:
+def test_endpoint_delete_rest_route_removes_idle_endpoint_and_rejects_active_leases(
+    tmp_path: Path, inventory
+) -> None:
     inventory_path = tmp_path / "inventory.yaml"
     inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
     app = create_app(
@@ -941,14 +943,53 @@ def test_endpoint_delete_rest_route_is_not_public(tmp_path: Path, inventory) -> 
         )
     )
     client = TestClient(app)
-    deleted = client.delete(
-        "/api/v1/endpoints/endpoint-b",
-        headers={"X-ServerPilot-Actor": "endpoint-admin", "Idempotency-Key": "unused"},
+    actor = {"X-ServerPilot-Actor": "endpoint-admin"}
+    created = client.post(
+        "/api/v1/endpoints",
+        json={
+            "id": "endpoint-delete-me",
+            "host": "127.0.0.1",
+            "port": 2297,
+            "ssh_user": "gpu",
+            "workspace_path": "/srv/endpoint-delete-me",
+        },
+        headers={**actor, "Idempotency-Key": "endpoint-delete-create"},
     )
-    assert deleted.status_code == 405
-    listed = client.get("/api/v1/endpoints", headers={"X-ServerPilot-Actor": "endpoint-admin"})
+    assert created.status_code == 200
+    deleted = client.delete(
+        "/api/v1/endpoints/endpoint-delete-me",
+        headers={**actor, "Idempotency-Key": "endpoint-delete"},
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["changed"] is True
+    assert deleted.json()["endpoint_id"] == "endpoint-delete-me"
+    listed = client.get("/api/v1/endpoints", headers=actor)
     endpoints = {endpoint["id"]: endpoint for endpoint in listed.json()["data"]}
+    assert "endpoint-delete-me" not in endpoints
     assert "endpoint-b" in endpoints
+
+    service = app.state.service
+    service.ingest_observation(observation(endpoint_id="endpoint-a", count=1))
+    claimed = client.post(
+        "/api/v1/claims",
+        json={
+            "project_id": "project-a",
+            "task_ref": "keep-endpoint-a",
+            "purpose": "block delete while leased",
+            "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-a"]},
+        },
+        headers={**actor, "Idempotency-Key": "endpoint-a-claim"},
+    )
+    assert claimed.status_code == 200
+    assert claimed.json()["lease"] is not None
+    blocked = client.delete(
+        "/api/v1/endpoints/endpoint-a",
+        headers={**actor, "Idempotency-Key": "endpoint-a-delete-blocked"},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["error"]["code"] == "endpoint_has_active_leases"
+    still_listed = client.get("/api/v1/endpoints", headers=actor)
+    assert "endpoint-a" in {endpoint["id"] for endpoint in still_listed.json()["data"]}
 
 
 def test_endpoint_rest_uses_explicit_create_and_update_without_delete(
@@ -1007,11 +1048,6 @@ def test_endpoint_rest_uses_explicit_create_and_update_without_delete(
     assert (
         workspace_updated.json()["endpoint"]["workspace_path"] == "/srv/endpoint-lifecycle-updated"
     )
-    deleted = client.delete(
-        "/api/v1/endpoints/endpoint-lifecycle",
-        headers={**actor, "Idempotency-Key": "endpoint-delete"},
-    )
-    assert deleted.status_code == 405
     later_update = client.patch(
         "/api/v1/endpoints/endpoint-lifecycle",
         json={"ssh_user": "other"},
@@ -1043,12 +1079,6 @@ def test_removed_maintenance_and_delete_routes(tmp_path: Path, inventory) -> Non
         headers=headers,
     )
     assert created.status_code == 405
-
-    deleted = client.delete(
-        "/api/v1/endpoints/endpoint-b",
-        headers={"X-ServerPilot-Actor": "human", "Idempotency-Key": "delete-maintained"},
-    )
-    assert deleted.status_code == 405
 
 
 def test_project_creation_route_and_gui_are_not_exposed(tmp_path: Path, inventory) -> None:
@@ -1136,21 +1166,6 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
     )
     assert added_server.status_code == 200
     assert "click-server" in added_server.text
-    removed_server = client.post(
-        "/ui/action/delete-endpoint",
-        data={
-            "endpoint_id": "click-server",
-            "csrf": _csrf(added_server.text),
-            "confirmed": "yes",
-        },
-        follow_redirects=True,
-    )
-    assert removed_server.status_code == 200
-    endpoints = {
-        endpoint["id"]: endpoint
-        for endpoint in service.list_endpoints(service.local_actor("human"))["data"]
-    }
-    assert "click-server" in endpoints
 
     actor_page = client.get("/")
     rejected_switch = client.post(
@@ -1181,8 +1196,67 @@ def test_click_first_gui_forms_and_all_human_pages(tmp_path: Path, inventory) ->
     ]:
         response = client.get(page)
         assert response.status_code == 200, page
+        assert "/ui/action/reservation" not in response.text
+        assert "/ui/action/cancel-reservation" not in response.text
+        assert "/ui/action/maintenance" not in response.text
+        assert "/ui/action/cancel-request" not in response.text
+        assert "/ui/action/endpoint-enabled" not in response.text
+    reservations = client.get("/ui/reservations")
+    assert "现有预约" in reservations.text
+    assert "此页只读查看已有安排" in reservations.text
+    maintenance = client.get("/ui/maintenance")
+    assert "维护窗口" in maintenance.text
+    assert "此页只读查看已有维护窗口" in maintenance.text
     gpu_id = service.list_gpus(service.local_actor("click-agent"))["data"][0]["id"]
     assert client.get(f"/ui/gpus/{gpu_id}").status_code == 200
+
+
+def test_web_delete_endpoint_action_does_not_remove_server(tmp_path: Path, inventory) -> None:
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'web-delete.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    client = TestClient(app)
+    home = client.get("/")
+    created = client.post(
+        "/ui/action/endpoint",
+        data={
+            "id": "web-delete-server",
+            "host": "127.0.0.3",
+            "port": "2204",
+            "ssh_user": "gpu",
+            "workspace_path": "/srv/web-delete-server",
+            "owner_project_id": "project-a",
+            "expected_gpu_count": "1",
+            "enabled": "true",
+            "csrf": _csrf(home.text),
+            "confirmed": "yes",
+        },
+        follow_redirects=True,
+    )
+    assert created.status_code == 200
+    removed = client.post(
+        "/ui/action/delete-endpoint",
+        data={
+            "endpoint_id": "web-delete-server",
+            "csrf": _csrf(created.text),
+            "confirmed": "yes",
+        },
+        follow_redirects=True,
+    )
+    assert removed.status_code == 200
+    endpoints = {
+        endpoint["id"]
+        for endpoint in app.state.service.list_endpoints(
+            app.state.service.local_actor("human")
+        )["data"]
+    }
+    assert "web-delete-server" in endpoints
 
 
 def test_mcp_exposes_required_tools() -> None:
@@ -1291,10 +1365,6 @@ def test_mcp_endpoint_administration_requires_contract_and_uses_rest(monkeypatch
             return {"endpoint_id": "server-a"}
 
     monkeypatch.setattr(mcp_server, "_client", lambda actor_name=None: FakeClient())
-    with pytest.raises(ValueError, match="approval_ref"):
-        mcp_server.gpu_pause_server("agent", "server-a", "", "stable-key")
-    with pytest.raises(ValueError, match="idempotency_key"):
-        mcp_server.gpu_pause_server("agent", "server-a", "approved-task", "")
 
     created = mcp_server.gpu_add_server(
         "agent",

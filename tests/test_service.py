@@ -9,8 +9,10 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from serverpilot.config import EndpointConfig, InventoryConfig, ProjectConfig
 from serverpilot.database import Database
 from serverpilot.models import (
+    Actor,
     AllocationRequest,
     Alert,
     AuditEvent,
@@ -30,6 +32,7 @@ from serverpilot.schemas import (
     LeaseObservedBind,
     ReservationCreate,
     RequestCreate,
+    ResourceClaim,
     RetentionPrune,
     WorkloadProfileClaim,
     WorkloadProfileUpsert,
@@ -388,56 +391,6 @@ def test_routine_claim_fails_immediately_and_can_be_retried_when_capacity_arrive
     assert claimed["lease"]["state"] == "HELD"
 
 
-def test_unstarted_held_claim_is_retained_after_deprecated_startup_grace(
-    tmp_path: Path, inventory
-) -> None:
-    broker = BrokerService(
-        Database(
-            f"sqlite:///{tmp_path / 'startup-grace.sqlite3'}", Path(__file__).resolve().parents[1]
-        ),
-        inventory.model_copy(update={"held_lease_startup_grace_seconds": 1}),
-    )
-    broker.initialize()
-    admin = broker.local_actor("grace-agent")
-    broker.ingest_observation(observation(count=1))
-
-    first = broker.create_request(
-        admin,
-        request_data("grace-first"),
-        idempotency_key="grace-first",
-        activate_if_allocated=True,
-    )
-    assert first["lease"] is not None
-    assert first["lease"]["state"] == "HELD"
-    with pytest.raises(BrokerError) as error:
-        broker.create_request(
-            admin,
-            request_data("grace-second"),
-            idempotency_key="grace-second",
-            activate_if_allocated=True,
-        )
-    assert error.value.code == "no_capacity"
-
-    first_lease_id = first["lease"]["id"]
-
-    def age_held_lease(session) -> None:  # type: ignore[no-untyped-def]
-        lease = session.get(Lease, first_lease_id)
-        assert lease is not None
-        issued_at = utcnow() - timedelta(seconds=2)
-        lease.issued_at = issued_at
-        lease.last_heartbeat_at = issued_at
-
-    broker._write(age_held_lease)
-    broker.reconcile(admin)
-
-    leases = {lease["id"]: lease for lease in broker.list_leases(admin)["data"]}
-    assert leases[first_lease_id]["state"] == "HELD"
-    assert len(leases) == 1
-    requests = {request["task_ref"]: request for request in broker.list_requests(admin)["data"]}
-    assert requests["grace-first"]["state"] == "LEASED"
-    assert "grace-second" not in requests
-
-
 def test_renewal_cannot_cross_a_future_reservation(service, admin) -> None:
     service.ingest_observation(observation(count=1))
     gpu_id = service.list_gpus(admin)["data"][0]["id"]
@@ -650,6 +603,144 @@ def test_endpoint_inventory_mutations_do_not_require_project_membership(service,
         idempotency_key="desktop-update-without-project",
     )
     assert updated["endpoint"]["labels"] == ["desktop-updated"]
+
+
+def test_delete_endpoint_removes_idle_server_from_list(service, admin) -> None:
+    created = service.create_endpoint(
+        admin,
+        EndpointCreate(
+            id="endpoint-idle-delete",
+            host="127.0.0.1",
+            port=2296,
+            ssh_user="gpu",
+            workspace_path="/srv/endpoint-idle-delete",
+        ),
+        idempotency_key="endpoint-idle-delete-create",
+    )
+    assert created["endpoint"]["id"] == "endpoint-idle-delete"
+    deleted = service.delete_endpoint(
+        admin, "endpoint-idle-delete", idempotency_key="endpoint-idle-delete"
+    )
+    assert deleted["changed"] is True
+    assert deleted["endpoint_id"] == "endpoint-idle-delete"
+    listed = {endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]}
+    assert "endpoint-idle-delete" not in listed
+    replayed = service.delete_endpoint(
+        admin, "endpoint-idle-delete", idempotency_key="endpoint-idle-delete"
+    )
+    assert replayed == deleted
+
+
+def test_delete_endpoint_rejects_active_leases_then_deletes_after_release(service, admin) -> None:
+    service.ingest_observation(observation(endpoint_id="endpoint-b", count=1))
+    claimed = service.create_request(
+        admin,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "keep-endpoint-b",
+                "purpose": "block delete while leased",
+                "constraints": {"gpu_count": 1, "endpoint_ids": ["endpoint-b"]},
+            }
+        ),
+        idempotency_key="endpoint-b-claim",
+    )
+    assert claimed["lease"] is not None
+    with pytest.raises(BrokerError) as error:
+        service.delete_endpoint(admin, "endpoint-b", idempotency_key="endpoint-b-delete-blocked")
+    assert error.value.code == "endpoint_has_active_leases"
+    assert error.value.status_code == 409
+    service.release_lease(
+        admin,
+        claimed["lease"]["id"],
+        reason="finished before delete",
+        idempotency_key="endpoint-b-release",
+    )
+    deleted = service.delete_endpoint(admin, "endpoint-b", idempotency_key="endpoint-b-delete")
+    assert deleted["changed"] is True
+    listed = {endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]}
+    assert "endpoint-b" not in listed
+    assert "endpoint-a" in listed
+
+
+def test_delete_endpoint_rejects_active_generic_allocations(service, admin) -> None:
+    service.ingest_observation(observation(count=0))
+    claimed = service.create_resource_claim(
+        admin,
+        ResourceClaim.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "block-delete",
+                "purpose": "generic allocation blocks delete",
+                "provider_type": "host-capacity",
+                "quantities": {"cpu_cores": 2, "memory_mib": 2048},
+            }
+        ),
+        idempotency_key="generic-block-delete",
+    )
+    assert claimed["claim"]["state"] == "active"
+    with pytest.raises(BrokerError) as error:
+        service.delete_endpoint(admin, "endpoint-a", idempotency_key="delete-blocked-generic")
+    assert error.value.code == "endpoint_has_active_allocations"
+    assert error.value.status_code == 409
+    listed = {endpoint["id"] for endpoint in service.list_endpoints(admin)["data"]}
+    assert "endpoint-a" in listed
+
+
+def test_deleted_inventory_endpoint_is_not_resurrected_on_restart(tmp_path: Path) -> None:
+    inventory = InventoryConfig(
+        schema_version=1,
+        projects=[ProjectConfig(id="project-a", display_name="Project A", weight=1)],
+        endpoints=[
+            EndpointConfig(
+                id="only-server",
+                host="127.0.0.1",
+                port=2298,
+                ssh_user="gpu",
+                workspace_path="/srv/only-server",
+            )
+        ],
+    )
+    root = Path(__file__).resolve().parents[1]
+    database = Database(f"sqlite:///{tmp_path / 'tombstone-restart.sqlite3'}", root)
+    first = BrokerService(database, inventory)
+    first.initialize()
+    first.local_actor("tombstone-admin")
+    with first.database.session() as session:
+        actor = session.get(Actor, "tombstone-admin")
+        assert actor is not None
+        actor.role = "admin"
+        session.commit()
+    admin = ActorContext(
+        id="tombstone-admin",
+        role="admin",
+        project_ids=frozenset({"project-a"}),
+    )
+    assert {endpoint["id"] for endpoint in first.list_endpoints(admin)["data"]} == {"only-server"}
+
+    deleted = first.delete_endpoint(admin, "only-server", idempotency_key="delete-only-server")
+    assert deleted["changed"] is True
+    assert first.list_endpoints(admin)["data"] == []
+
+    restarted = BrokerService(database, inventory)
+    restarted.initialize(sync_inventory=True)
+    assert restarted.list_endpoints(admin)["data"] == []
+
+    created = restarted.create_endpoint(
+        admin,
+        EndpointCreate(
+            id="only-server",
+            host="127.0.0.1",
+            port=2298,
+            ssh_user="gpu",
+            workspace_path="/srv/only-server",
+        ),
+        idempotency_key="readd-only-server",
+    )
+    assert created["endpoint"]["id"] == "only-server"
+    assert {endpoint["id"] for endpoint in restarted.list_endpoints(admin)["data"]} == {
+        "only-server"
+    }
 
 
 def test_claim_auto_creates_project_without_extra_endpoint_scope(service, admin) -> None:

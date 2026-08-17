@@ -521,16 +521,14 @@
       return (data.requests || []).map((request) => `
         <article class="coordination-item"><header><strong>${escapeHTML(request.actor_id)}</strong><span class="badge">排队</span></header><p>${escapeHTML(request.task_ref)}</p><p>${escapeHTML(constraintsSummary(request.constraints))}</p><p>${escapeHTML(request.blocked_reason || "等待可用资源")}</p></article>`).join("");
     }
-    return (data.reservations || []).map((reservation) => `
-      <article class="coordination-item"><header><strong>${escapeHTML(reservation.actor_id)}</strong><span class="badge">已安排</span></header><p>${escapeHTML(reservation.reason)}</p><p>${formatDate(reservation.start_at, true)} → ${formatDate(reservation.end_at, true)} · ${reservation.gpu_ids.length} 块 GPU</p></article>`).join("");
+    return "";
   };
 
   const renderCoordination = () => {
     document.getElementById("claims-count").textContent = (data.leases || []).length;
     document.getElementById("queue-count").textContent = (data.requests || []).length;
-    document.getElementById("schedule-count").textContent = (data.reservations || []).length;
     document.getElementById("coordination-content").innerHTML = sideItems()
-      || `<p class="empty-inline">${activeSideTab === "claims" ? "当前没有资源分配" : activeSideTab === "queue" ? "当前没有排队" : "当前没有未来安排"}</p>`;
+      || `<p class="empty-inline">${activeSideTab === "claims" ? "当前没有资源分配" : "当前没有排队"}</p>`;
   };
 
   const render = () => {

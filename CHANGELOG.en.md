@@ -6,6 +6,13 @@ This changelog records user-visible changes; implementation details belong in Gi
 
 ## Unreleased
 
+## 1.5.12 - 2026-08-17
+
+**ServerPilot 1.5.12 lets you remove a server from the local control plane, and drops unused pause/resume and web reservation submit entry points.**
+
+- The macOS Edit or Remove Server sheet can remove a server from the local control plane. A stale local service missing this capability is replaced by the app-bundled backend, and a deleted YAML-seeded server is not resurrected on restart. Active leases or resource allocations are rejected, and remote processes are not stopped.
+- Unused desktop views and non-working pause/resume or web reservation/maintenance submit forms are gone. Reservation and maintenance pages remain available as read-only lists.
+
 ## 1.5.11 - 2026-08-17
 
 **ServerPilot 1.5.11 raises idle occupancy to about 80% memory and GPU utilization per card, and keeps long-running tasks correctly attributed across worker turnover.**

@@ -9,7 +9,6 @@
   {% if payload.endpoints %}<div class="dashboard-actions" aria-label="常用操作">
     <button class="quiet-action" type="button" data-open-dialog="server-dialog"><i class="ph ph-plus" aria-hidden="true"></i>添加服务器</button>
     <button type="button" data-open-dialog="claim-dialog"><i class="ph ph-user-plus" aria-hidden="true"></i>申请 GPU</button>
-    <button class="quiet-action" type="button" data-open-dialog="schedule-dialog"><i class="ph ph-calendar-plus" aria-hidden="true"></i>安排时间</button>
   </div>{% endif %}
 </section>
 
@@ -61,13 +60,12 @@
 
   <aside id="coordination-panel" class="coordination-panel" aria-labelledby="coordination-title">
     <div class="panel-heading compact-heading">
-      <div><h2 id="coordination-title">项目与 Agent</h2><p class="muted">当前分配、排队和预约</p></div>
+      <div><h2 id="coordination-title">项目与 Agent</h2><p class="muted">当前分配和排队</p></div>
       <button id="toggle-coordination" class="icon-button" type="button" title="收起项目与 Agent" aria-label="收起项目与 Agent" aria-controls="coordination-panel" aria-expanded="true"><i class="ph ph-caret-right" aria-hidden="true"></i></button>
     </div>
     <div class="side-tabs" role="tablist" aria-label="项目与 Agent 资源状态">
       <button id="claims-tab" type="button" role="tab" aria-selected="true" aria-controls="coordination-content" data-side-tab="claims">已分配 <span id="claims-count">0</span></button>
       <button id="queue-tab" type="button" role="tab" aria-selected="false" aria-controls="coordination-content" data-side-tab="queue" tabindex="-1">排队 <span id="queue-count">0</span></button>
-      <button id="schedule-tab" type="button" role="tab" aria-selected="false" aria-controls="coordination-content" data-side-tab="schedule" tabindex="-1">安排 <span id="schedule-count">0</span></button>
     </div>
     <div id="coordination-content" class="coordination-content" role="tabpanel" aria-labelledby="claims-tab" tabindex="0"></div>
     <p class="advanced-link"><a href="/ui/requests">管理申请与分配</a> · <a href="/ui/doctor">高级设置</a></p>
@@ -150,21 +148,6 @@
       <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">一次性申请</button></div>
     </form>
   </details>
-</dialog>
-
-<dialog id="schedule-dialog" class="modal-dialog">
-  <div class="dialog-heading"><div><p class="eyebrow">未来预约</p><h2>安排使用时间</h2></div><button type="button" class="icon-button" data-close-dialog aria-label="关闭"><i class="ph ph-x" aria-hidden="true"></i></button></div>
-  <p class="muted consequence-copy">安排只记录未来使用时间，不会启动、停止或抢占远端任务。</p>
-  <form method="post" action="/ui/action/reservation" class="stack form-grid">
-    <label>项目标识<input name="project_id" required placeholder="例如：storyboard"></label>
-    <label>时区<select name="timezone"><option value="Asia/Shanghai" selected>Asia/Shanghai</option><option value="UTC">UTC</option></select></label>
-    <label>开始时间<input name="start_at" type="datetime-local" required></label>
-    <label>结束时间<input name="end_at" type="datetime-local" required></label>
-    <label class="span-all">GPU（可多选）<select name="gpu_ids" multiple required size="8">{% for gpu in payload.gpus %}<option value="{{ gpu.id }}">{{ gpu.endpoint_id }} / GPU {{ gpu.gpu_index }} · {{ gpu.state }}</option>{% endfor %}</select></label>
-    <label class="span-all">任务说明<input name="reason" required placeholder="例如 周一模型评测"></label>
-    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirmed" value="yes">
-    <div class="dialog-actions span-all"><button class="quiet-action" type="button" data-close-dialog>取消</button><button type="submit">保存安排</button></div>
-  </form>
 </dialog>
 
 <dialog id="gpu-detail" class="drawer-dialog">

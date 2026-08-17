@@ -23,15 +23,15 @@ public struct ServiceInfo: Equatable, Sendable {
     public static let fixture = ServiceInfo(
         schemaVersion: "v1",
         version: "fixture",
-        capabilities: ["instant_claims", "endpoint_update", "endpoint_keepalive", "endpoint_conflict_cleanup", "operator_lease_release", "operator_lease_reassignment", "collector_settings", "telemetry_recent_averages"]
+        capabilities: ["instant_claims", "endpoint_update", "endpoint_delete", "endpoint_keepalive", "endpoint_conflict_cleanup", "operator_lease_release", "operator_lease_reassignment", "collector_settings", "telemetry_recent_averages"]
     )
 
     public var supportsEndpointUpdate: Bool {
         supports("endpoint_update")
     }
 
-    public var supportsEndpointPauseResume: Bool {
-        supports("endpoint_pause_resume")
+    public var supportsEndpointDelete: Bool {
+        supports("endpoint_delete")
     }
 
     public var supportsEndpointTelemetryHistory: Bool {

@@ -1582,34 +1582,6 @@ def gpu_update_server(
     )
 
 
-def gpu_pause_server(
-    agent_name: str,
-    server_id: str,
-    approval_ref: str,
-    idempotency_key: str,
-) -> dict[str, Any]:
-    """Pause new placement (active -> draining) without stopping collection or workloads."""
-
-    _require_endpoint_admin_contract(approval_ref, idempotency_key)
-    return _client(agent_name).post(
-        f"/api/v1/endpoints/{server_id}/pause", {}, idempotency_key=idempotency_key
-    )
-
-
-def gpu_resume_server(
-    agent_name: str,
-    server_id: str,
-    approval_ref: str,
-    idempotency_key: str,
-) -> dict[str, Any]:
-    """Resume a draining endpoint (draining -> active)."""
-
-    _require_endpoint_admin_contract(approval_ref, idempotency_key)
-    return _client(agent_name).post(
-        f"/api/v1/endpoints/{server_id}/resume", {}, idempotency_key=idempotency_key
-    )
-
-
 @mcp.tool()
 def gpu_set_keepalive(
     agent_name: str,

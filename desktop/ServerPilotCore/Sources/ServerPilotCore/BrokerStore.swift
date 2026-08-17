@@ -194,8 +194,8 @@ public final class BrokerStore: ObservableObject {
         serviceInfo?.supportsEndpointUpdate == true
     }
 
-    public var supportsEndpointPauseResume: Bool {
-        serviceInfo?.supportsEndpointPauseResume == true
+    public var supportsEndpointDelete: Bool {
+        serviceInfo?.supportsEndpointDelete == true
     }
 
     public var supportsEndpointTelemetryHistory: Bool {
@@ -595,6 +595,26 @@ public final class BrokerStore: ObservableObject {
         }
     }
 
+    public func deleteEndpoint(
+        _ endpoint: EndpointRecord,
+        completion: @escaping @MainActor @Sendable (Bool, String?) -> Void
+    ) {
+        guard supportsEndpointDelete else {
+            let message = endpointCompatibilityMessage("删除服务器", capability: "endpoint_delete")
+            errorMessage = message
+            completion(false, message)
+            return
+        }
+        performEndpointMutation(
+            endpoint,
+            path: "api/v1/endpoints/\(endpoint.id)",
+            method: "DELETE",
+            payload: [:],
+            successMessage: "已从本机控制面移除 \(endpoint.displayName)。",
+            completion: completion
+        )
+    }
+
     public func updateEndpoint(
         _ endpoint: EndpointRecord,
         draft: EndpointUpdateDraft,
@@ -616,40 +636,6 @@ public final class BrokerStore: ObservableObject {
                 "observation_profile": draft.observationProfile.rawValue,
             ],
             successMessage: "已更新服务器设置，正在确认状态。",
-            completion: completion
-        )
-    }
-
-    public func pauseEndpoint(_ endpoint: EndpointRecord, completion: @escaping @MainActor @Sendable (Bool, String?) -> Void) {
-        guard supportsEndpointPauseResume else {
-            let message = endpointCompatibilityMessage("暂停接收新任务", capability: "endpoint_pause_resume")
-            errorMessage = message
-            completion(false, message)
-            return
-        }
-        performEndpointMutation(
-            endpoint,
-            path: "api/v1/endpoints/\(endpoint.id)/pause",
-            method: "POST",
-            payload: [:],
-            successMessage: "\(endpoint.displayName) 已暂停接收新任务；正在排空的任务不会被停止。",
-            completion: completion
-        )
-    }
-
-    public func resumeEndpoint(_ endpoint: EndpointRecord, completion: @escaping @MainActor @Sendable (Bool, String?) -> Void) {
-        guard supportsEndpointPauseResume else {
-            let message = endpointCompatibilityMessage("恢复接收新任务", capability: "endpoint_pause_resume")
-            errorMessage = message
-            completion(false, message)
-            return
-        }
-        performEndpointMutation(
-            endpoint,
-            path: "api/v1/endpoints/\(endpoint.id)/resume",
-            method: "POST",
-            payload: [:],
-            successMessage: "\(endpoint.displayName) 已恢复接收新任务。",
             completion: completion
         )
     }
@@ -1300,6 +1286,10 @@ public final class BrokerStore: ObservableObject {
         switch code {
         case "endpoint_not_found":
             return "这台服务器已经不在本机资源池中。"
+        case "endpoint_has_active_leases":
+            return "这台服务器上还有进行中的租约，请先释放后再删除。"
+        case "endpoint_has_active_allocations":
+            return "这台服务器上还有进行中的资源分配，请先结束后再删除。"
         case "idempotency_key_required":
             return "本次操作缺少防重复标识，请重试。"
         case "validation_error":

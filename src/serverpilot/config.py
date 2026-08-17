@@ -103,9 +103,8 @@ class InventoryConfig(BaseModel):
 
     schema_version: Literal[1]
     collector: CollectorConfig = Field(default_factory=CollectorConfig)
-    # Deprecated compatibility input. HELD leases are retained until their
-    # explicit expires_at, release, or safety reconciliation outcome; this
-    # value no longer triggers an automatic startup-grace release.
+    # Accepted for existing inventory files only. The service no longer reads
+    # this value; HELD leases stay until explicit expiry, release, or reconcile.
     held_lease_startup_grace_seconds: int = Field(default=120, ge=1, le=3600)
     # Project policies are optional.  The broker creates a neutral record when
     # a claim first uses an otherwise unknown project_id.

@@ -2,7 +2,7 @@
 
 更新时间：2026-08-17（Asia/Shanghai）
 
-本文只记录当前事实、直接证据和仍未验证的边界。当前源码候选为 `1.5.11`；本轮自动化、固定夹具桌面验收和 Windows 打包规格检查均以该版本完成，并与 `1.5.10` 及更早版本的历史现场验收明确分开。历史过程见 `docs/archive/`。
+本文只记录当前事实、直接证据和仍未验证的边界。当前源码候选为 `1.5.12`；本轮自动化、固定夹具桌面验收和 Windows 打包规格检查均以该版本完成，并与 `1.5.11` 及更早版本的历史现场验收明确分开。历史过程见 `docs/archive/`。
 
 ## 当前四项功能
 
@@ -16,7 +16,7 @@
 
 占卡 GPU 对 APP、REST 和 MCP 仍计为可用；`desired=ON, actual=OFF` 时 GPU 空闲则仍可申请，同时下一轮按策略重新启动 helper。真正分配前，Agent 申请、浏览器快速申请、预设申请和 APP 人工改派都复用同一个“选中 GPU → 逐卡停止 helper → 定向采集 → 结束占卡记录 → 普通申请或改派”实现。
 
-loopback 控制面不使用登录 token：没有 token model、登录页面、签发接口或撤销接口。服务器永久删除也不在 REST、Web、MCP 或 APP 公共面中；暂停和恢复是非破坏操作。升级迁移只移除旧摘要字段，不删除已有 token 表、退役服务器、占卡请求、占卡租约或 lease resource。
+loopback 控制面不使用登录 token：没有 token model、登录页面、签发接口或撤销接口。服务器永久删除已在 REST `DELETE /api/v1/endpoints/{id}` 与 macOS「编辑或移除服务器」公共面中；旧 daemon 缺少 `endpoint_delete` 时会被替换为内置后端。删除会写入墓碑，YAML 清单在重启或 `sync_inventory` 时不会把已删服务器复活；用户显式 `create_endpoint` 重新添加同一 endpoint 时清除墓碑。有进行中租约或资源分配时 fail closed，且不停止远端进程。Web、Windows 与默认 MCP 仍不提供删除。`pause_endpoint` / `resume_endpoint` 与预约/维护创建仍是领域方法，不再作为 CLI、网页表单或桌面公共入口。GET reservations/maintenance、Web 只读列表页和 CLI `reservation list` 仍可用。升级迁移只移除旧摘要字段，不删除已有 token 表、退役服务器、占卡请求、占卡租约或 lease resource。
 
 占卡链路没有校验摘要、自动重试、退避器、第二套定时器、自动抢占或整机占卡状态机；唯一的身份证明是固定 helper 对自身 v3 state 的只读检查，并且必须与已有 collector 观测一致，不能用于收养任意进程。
 
@@ -26,19 +26,19 @@ Agent 合同现已明确限定作用域：ServerPilot 只协调 GPU，禁止绕�
 
 ## 已完成验证
 
-以下自动化结果来自 `1.5.11` 当前工作树；测试使用临时数据库和 fake provider。
+以下自动化结果来自 `1.5.12` 当前工作树；测试使用临时数据库和 fake provider。
 
 | 检查 | 结果 |
 | --- | --- |
-| Python 全量测试 | `454` 项 collected，`uv run --reinstall-package serverpilot pytest -q` 通过；覆盖实际 ASGI body 限流与断连转发、并发限流、CSV 字段投影、Web actor CSRF、SQLite 原子备份、owner/operator 改派授权、direct 与 generic CPU/RAM 双向 admission、GPU 与主机近 10 分钟遥测均值、CUDA ordinal、MCP request-id 命名空间/传输重试/同参数多 lease，以及 Windows 桌面桥接白名单、错误映射、WebView2 本地 UI 主机与打包资源、keepalive v3 预检、固定 inspect、worker 身份校验、旧 wire/state 拒绝、PID 重用、marker、目标 GPU 映射和原子状态写入 |
+| Python 全量测试 | `460` 项 collected，`uv run --reinstall-package serverpilot pytest -q` 通过；覆盖实际 ASGI body 限流与断连转发、并发限流、CSV 字段投影、Web actor CSRF、SQLite 原子备份、owner/operator 改派授权、direct 与 generic CPU/RAM 双向 admission、GPU 与主机近 10 分钟遥测均值、CUDA ordinal、MCP request-id 命名空间/传输重试/同参数多 lease，以及 Windows 桌面桥接白名单、错误映射、WebView2 本地 UI 主机与打包资源、keepalive v3 预检、固定 inspect、worker 身份校验、旧 wire/state 拒绝、PID 重用、marker、目标 GPU 映射和原子状态写入 |
 | Ruff | `uv run ruff check .` 通过 |
-| 数据迁移 | 当前源码迁移头 `20260815_0026`；endpoint 的 `resource_kind` 默认 `unknown`，只由 collector 将端点更新为 `gpu` 或 `cpu_only`；`gpu_devices.cuda_ordinal` 初始为 NULL，只有当前 collector 观测才写入并恢复分配；`keepalive_current` 保存 `actual/error_reason` 与逐卡唯一进程身份，只把仍有 active resource 的活动 keepalive lease 转为无 TTL，保留 terminal keeper 与 workload 历史 expiry |
+| 数据迁移 | 当前源码迁移头 `20260817_0027`；`endpoint_deletions` 保存已删除 endpoint 的墓碑，避免 YAML seed 复活；endpoint 的 `resource_kind` 默认 `unknown`，只由 collector 将端点更新为 `gpu` 或 `cpu_only`；`gpu_devices.cuda_ordinal` 初始为 NULL，只有当前 collector 观测才写入并恢复分配；`keepalive_current` 保存 `actual/error_reason` 与逐卡唯一进程身份，只把仍有 active resource 的活动 keepalive lease 转为无 TTL，保留 terminal keeper 与 workload 历史 expiry |
 | MCP 上下文 | 默认发现结果严格为 3 个工具；`gpu_apply` schema 仍只有 `server_id / gpu_count / task`。adapter 使用进程随机命名空间与 MCP request ID 生成不公开的重放键；同一次本地 HTTP 传输失败只重试一次，不同调用不按任务名折叠 |
 | Agent 任务说明 | 默认 MCP 不依赖客户端身份、UI 标题或专用环境变量。`gpu_apply(task?)` 接收用户任务名或当前目标的简短人类可读概括；未提供时使用“未命名任务”。`gpu_status` 逐卡返回最近显存/利用率 `telemetry` 与 `telemetry.recent_average`（近 10 分钟平均资源使用及样本时间范围），端点 `host_telemetry.recent_average` 同样提供 CPU 负载和内存占用均值，并给出本次可见卡的 `telemetry_summary`；这些仅为观测，调度仍以 `status` 与 `gpu_apply` 为准。首次只读采集会将端点记录为 GPU、纯 CPU 或尚未确认；已识别纯 CPU 端点保留主机容量，并以说明性的 `cpu_only_servers` 返回，但不会参与 GPU 分配。`gpu_status(include_busy=true)` 为忙卡返回人类可读 `task` |
-| macOS App 构建 | `zsh desktop/build-macos-app.sh` 通过，包含 Swift 桌面端编译；根目录 App 为 `1.5.11 / build 16` |
+| macOS App 构建 | `zsh desktop/build-macos-app.sh` 通过，包含 Swift 桌面端编译；根目录 App 为 `1.5.12 / build 17` |
 | standalone 验证 | `zsh desktop/verify-macos-app.sh` 通过 |
 | Windows Desktop 打包规格 | `desktop/windows_launcher.py` 的桥接、输入白名单、错误映射和 UI 资源由单测覆盖；`uv run --extra windows pyinstaller ... ServerPilotWindows.spec` 的本机构建规格冒烟通过，实际 `.exe` 由 GitHub Windows Runner 交叉环境构建并上传 Release |
-| 冗余机制扫描 | 运行源码和桌面端没有摘要计算、登录 token、永久删除入口、占卡 `STARTING/HELD`、额外定时器或自动抢占 |
+| 冗余机制扫描 | 运行源码和桌面端没有摘要计算、登录 token、占卡 `STARTING/HELD`、额外定时器或自动抢占；永久删除只走 REST/macOS 编辑页，有活跃租约或资源分配时拒绝；暂停/恢复与预约/维护 mutation 不再作为公共入口 |
 | 文本与补丁完整性 | `git diff --check` 通过 |
 | App 落盘 | 根目录唯一 `ServerPilot.app` |
 

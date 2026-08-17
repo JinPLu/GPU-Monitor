@@ -39,6 +39,7 @@ EXPECTED_CAPABILITIES = frozenset(
     {
         "coordination_board",
         "endpoint_conflict_cleanup",
+        "endpoint_delete",
         "operator_lease_release",
         "cuda_ordinal_selectors",
         "keepalive_protocol_v3",
