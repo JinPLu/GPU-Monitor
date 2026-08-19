@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -138,6 +139,9 @@ class EndpointTelemetryCurrent(Base):
     load_1m: Mapped[float] = mapped_column(nullable=False)
     cpu_total_ticks: Mapped[int | None] = mapped_column(Integer)
     cpu_idle_ticks: Mapped[int | None] = mapped_column(Integer)
+    cpu_usage_usec: Mapped[int | None] = mapped_column(BigInteger)
+    cpu_quota_usec: Mapped[int | None] = mapped_column(BigInteger)
+    cpu_period_usec: Mapped[int | None] = mapped_column(Integer)
     cpu_utilization_pct: Mapped[float | None] = mapped_column()
     memory_total_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     memory_available_mib: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -162,6 +166,9 @@ class EndpointTelemetrySnapshot(Base):
     load_1m: Mapped[float] = mapped_column(nullable=False)
     cpu_total_ticks: Mapped[int | None] = mapped_column(Integer)
     cpu_idle_ticks: Mapped[int | None] = mapped_column(Integer)
+    cpu_usage_usec: Mapped[int | None] = mapped_column(BigInteger)
+    cpu_quota_usec: Mapped[int | None] = mapped_column(BigInteger)
+    cpu_period_usec: Mapped[int | None] = mapped_column(Integer)
     cpu_utilization_pct: Mapped[float | None] = mapped_column()
     memory_total_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     memory_available_mib: Mapped[int] = mapped_column(Integer, nullable=False)

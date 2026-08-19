@@ -546,6 +546,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
     public let monitorLastAttemptAt: String?
     public let cpuCount: Int?
     public let load1m: Double?
+    public let cpuUtilizationFraction: Double?
     public let memoryTotalMiB: Int?
     public let memoryAvailableMiB: Int?
     public let recentTelemetryAverage: HostTelemetryRecentAverage?
@@ -577,6 +578,7 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         let hostTelemetry = raw["host_telemetry"] as? [String: Any] ?? [:]
         self.cpuCount = hostTelemetry.optionalInt("cpu_count")
         self.load1m = hostTelemetry.optionalDouble("load_1m")
+        self.cpuUtilizationFraction = hostTelemetry.optionalPercent("cpu_utilization_pct")
         self.memoryTotalMiB = hostTelemetry.optionalInt("memory_total_mib")
         self.memoryAvailableMiB = hostTelemetry.optionalInt("memory_available_mib")
         self.recentTelemetryAverage = HostTelemetryRecentAverage(
@@ -644,8 +646,8 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
     }
 
     public var cpuLoadFraction: Double? {
-        guard monitorStatus == "ONLINE", let cpuCount, cpuCount > 0, let load1m else { return nil }
-        return min(max(load1m / Double(cpuCount), 0), 1)
+        guard monitorStatus == "ONLINE" else { return nil }
+        return cpuUtilizationFraction
     }
 
     public var availableCPUCores: Double? {
@@ -842,16 +844,10 @@ public struct EndpointTelemetrySample: Identifiable, Equatable, Sendable {
             return nil
         }
         self.timestamp = timestamp
-        let cpuCount = raw.optionalDouble("cpu_count")
-        let load1m = raw.optionalDouble("load_1m")
         cpuLoadFraction = raw.optionalFraction("cpu_load_fraction")
             ?? raw.optionalFraction("cpu_fraction")
             ?? raw.optionalFraction("load_fraction")
             ?? raw.optionalPercent("cpu_utilization_pct")
-            ?? (cpuCount.flatMap { count in
-                guard count > 0, let load1m else { return nil }
-                return min(max(load1m / count, 0), 1)
-            })
         memoryFraction = raw.optionalFraction("memory_fraction")
             ?? raw.optionalFraction("memory_used_fraction")
             ?? raw.optionalPercent("memory_used_pct")

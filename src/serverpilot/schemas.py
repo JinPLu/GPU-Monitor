@@ -763,6 +763,9 @@ class HostTelemetryInput(StrictModel):
     load_1m: float = Field(ge=0)
     cpu_total_ticks: int | None = Field(default=None, ge=0)
     cpu_idle_ticks: int | None = Field(default=None, ge=0)
+    cpu_usage_usec: int | None = Field(default=None, ge=0)
+    cpu_quota_usec: int | None = Field(default=None, ge=0)
+    cpu_period_usec: int | None = Field(default=None, ge=1)
     memory_total_mib: int = Field(ge=1)
     memory_available_mib: int = Field(ge=0)
 

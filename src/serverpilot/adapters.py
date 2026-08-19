@@ -64,7 +64,12 @@ HOST_RESOURCES_QUERY = (
     "END {printf \"%d %d\\n\", total/1024, available/1024}' /proc/meminfo; "
     "cut -d ' ' -f1 /proc/loadavg; "
     "awk 'NR == 1 && $1 == \"cpu\" {idle=$5+$6; total=0; "
-    "for (i=2; i<=NF; i++) total+=$i; printf \"%d %d\\n\", total, idle}' /proc/stat"
+    "for (i=2; i<=NF; i++) total+=$i; printf \"%.0f %.0f\\n\", total, idle}' /proc/stat; "
+    "if [ -r /sys/fs/cgroup/cpu.max ] && [ -r /sys/fs/cgroup/cpu.stat ]; then "
+    "awk 'FNR==NR {quota=$1; period=$2; next} "
+    "$1==\"usage_usec\" && quota != \"\" && period != \"\" "
+    "{printf \"%s %s %s\\n\", quota, period, $2}' "
+    "/sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu.stat; fi"
 )
 GPU_SECTION = "__SERVERPILOT_GPU__"
 PROCESS_SECTION = "__SERVERPILOT_PROCESSES__"

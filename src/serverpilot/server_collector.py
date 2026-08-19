@@ -97,7 +97,49 @@ def _read_required(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
 
 
-def _host_snapshot() -> dict[str, int | float]:
+CGROUP_CPU_MAX_PATH = "/sys/fs/cgroup/cpu.max"
+CGROUP_CPU_STAT_PATH = "/sys/fs/cgroup/cpu.stat"
+
+
+def _cgroup_cpu_snapshot() -> dict[str, int | None]:
+    """Read cgroup v2 usage and quota. Omit the fields when the files are absent."""
+
+    max_path = Path(CGROUP_CPU_MAX_PATH)
+    stat_path = Path(CGROUP_CPU_STAT_PATH)
+    if not max_path.is_file() or not stat_path.is_file():
+        return {}
+    try:
+        max_parts = max_path.read_text(encoding="utf-8").split()
+        if len(max_parts) != 2:
+            return {}
+        period = _integer(max_parts[1])
+        if period is None or period < 1:
+            return {}
+        if max_parts[0] == "max":
+            quota: int | None = None
+        else:
+            quota = _integer(max_parts[0])
+            if quota is None or quota < 0:
+                return {}
+        usage: int | None = None
+        for line in stat_path.read_text(encoding="utf-8").splitlines():
+            key, _, rest = line.partition(" ")
+            if key == "usage_usec":
+                token = rest.split(maxsplit=1)[0] if rest.split() else None
+                usage = _integer(token)
+                break
+        if usage is None or usage < 0:
+            return {}
+    except OSError:
+        return {}
+    return {
+        "cpu_usage_usec": usage,
+        "cpu_quota_usec": quota,
+        "cpu_period_usec": period,
+    }
+
+
+def _host_snapshot() -> dict[str, int | float | None]:
     memory: dict[str, int] = {}
     for line in _read_required("/proc/meminfo").splitlines():
         key, separator, rest = line.partition(":")
@@ -117,7 +159,7 @@ def _host_snapshot() -> dict[str, int | float]:
     if any(value is None for value in cpu_ticks):
         raise RuntimeError("invalid Linux CPU ticks")
     tick_values = [value for value in cpu_ticks if value is not None]
-    return {
+    snapshot: dict[str, int | float | None] = {
         "cpu_count": os.cpu_count() or 1,
         "load_1m": load_1m,
         "cpu_total_ticks": sum(tick_values),
@@ -125,6 +167,8 @@ def _host_snapshot() -> dict[str, int | float]:
         "memory_total_mib": memory["MemTotal"],
         "memory_available_mib": memory["MemAvailable"],
     }
+    snapshot.update(_cgroup_cpu_snapshot())
+    return snapshot
 
 
 def _gpu_snapshot() -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:

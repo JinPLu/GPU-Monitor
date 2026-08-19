@@ -231,6 +231,7 @@ def parse_server_script_snapshot(
             "memory_total_mib",
             "memory_available_mib",
         },
+        optional_keys={"cpu_usage_usec", "cpu_quota_usec", "cpu_period_usec"},
     )
     cpu_count = _integer(host["cpu_count"], label="host.cpu_count", minimum=1, maximum=1_048_576)
     load_1m = _number(host["load_1m"], label="host.load_1m", minimum=0)
@@ -238,6 +239,15 @@ def parse_server_script_snapshot(
         host["cpu_total_ticks"], label="host.cpu_total_ticks", minimum=0
     )
     cpu_idle_ticks = _integer(host["cpu_idle_ticks"], label="host.cpu_idle_ticks", minimum=0)
+    cpu_usage_usec = _integer(
+        host.get("cpu_usage_usec"), label="host.cpu_usage_usec", minimum=0, nullable=True
+    )
+    cpu_quota_usec = _integer(
+        host.get("cpu_quota_usec"), label="host.cpu_quota_usec", minimum=0, nullable=True
+    )
+    cpu_period_usec = _integer(
+        host.get("cpu_period_usec"), label="host.cpu_period_usec", minimum=1, nullable=True
+    )
     memory_total_mib = _integer(
         host["memory_total_mib"], label="host.memory_total_mib", minimum=1
     )
@@ -427,6 +437,9 @@ def parse_server_script_snapshot(
             "load_1m": load_1m,
             "cpu_total_ticks": cpu_total_ticks,
             "cpu_idle_ticks": cpu_idle_ticks,
+            "cpu_usage_usec": cpu_usage_usec,
+            "cpu_quota_usec": cpu_quota_usec,
+            "cpu_period_usec": cpu_period_usec,
             "memory_total_mib": memory_total_mib,
             "memory_available_mib": memory_available_mib,
         },
@@ -554,23 +567,58 @@ def parse_identity(raw: str) -> tuple[str, str]:
     return lines[0], lines[1]
 
 
-def parse_host_resource_snapshot(raw: str) -> tuple[int, float, int | None, int | None, int, int]:
-    """Parse CPU capacity/load and Linux MemAvailable from the immutable probe."""
+def _parse_cgroup_cpu_line(raw: str) -> tuple[int, int | None, int]:
+    parts = raw.split()
+    if len(parts) != 3:
+        raise CollectionError("host resource probe returned invalid cgroup CPU line")
+    quota_token, period_token, usage_token = parts
+    if quota_token == "max":
+        cpu_quota_usec = None
+    else:
+        cpu_quota_usec = _int(quota_token)
+        if cpu_quota_usec is None or cpu_quota_usec < 0:
+            raise CollectionError("host resource probe returned invalid cgroup CPU quota")
+    cpu_period_usec = _int(period_token)
+    cpu_usage_usec = _int(usage_token)
+    if cpu_period_usec is None or cpu_period_usec < 1 or cpu_usage_usec is None or cpu_usage_usec < 0:
+        raise CollectionError("host resource probe returned invalid cgroup CPU usage")
+    return cpu_usage_usec, cpu_quota_usec, cpu_period_usec
+
+
+def parse_host_resource_snapshot(
+    raw: str,
+) -> tuple[
+    int,
+    float,
+    int | None,
+    int | None,
+    int,
+    int,
+    int | None,
+    int | None,
+    int | None,
+]:
+    """Parse CPU capacity/load, ticks, optional cgroup, and Linux MemAvailable."""
 
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    if len(lines) not in {3, 4}:
+    if len(lines) not in {3, 4, 5}:
         raise CollectionError("host resource probe must return CPU count, memory, and load")
     cpu_count = _int(lines[0])
     memory = lines[1].split()
     load_1m = _float(lines[2])
     cpu_total_ticks: int | None = None
     cpu_idle_ticks: int | None = None
-    if len(lines) == 4:
+    cpu_usage_usec: int | None = None
+    cpu_quota_usec: int | None = None
+    cpu_period_usec: int | None = None
+    if len(lines) >= 4:
         cpu_ticks = lines[3].split()
         if len(cpu_ticks) != 2:
             raise CollectionError("host resource probe returned invalid CPU ticks")
         cpu_total_ticks = _int(cpu_ticks[0])
         cpu_idle_ticks = _int(cpu_ticks[1])
+    if len(lines) == 5:
+        cpu_usage_usec, cpu_quota_usec, cpu_period_usec = _parse_cgroup_cpu_line(lines[4])
     if cpu_count is None or len(memory) != 2 or load_1m is None:
         raise CollectionError("host resource probe returned invalid values")
     memory_total = _int(memory[0])
@@ -591,13 +639,31 @@ def parse_host_resource_snapshot(raw: str) -> tuple[int, float, int | None, int 
         )
     ):
         raise CollectionError("host resource probe returned out-of-range values")
-    return cpu_count, load_1m, cpu_total_ticks, cpu_idle_ticks, memory_total, memory_available
+    return (
+        cpu_count,
+        load_1m,
+        cpu_total_ticks,
+        cpu_idle_ticks,
+        memory_total,
+        memory_available,
+        cpu_usage_usec,
+        cpu_quota_usec,
+        cpu_period_usec,
+    )
 
 
 def parse_host_resources(raw: str) -> tuple[int, float, int, int]:
-    cpu_count, load_1m, _cpu_total_ticks, _cpu_idle_ticks, memory_total, memory_available = (
-        parse_host_resource_snapshot(raw)
-    )
+    (
+        cpu_count,
+        load_1m,
+        _cpu_total_ticks,
+        _cpu_idle_ticks,
+        memory_total,
+        memory_available,
+        _cpu_usage_usec,
+        _cpu_quota_usec,
+        _cpu_period_usec,
+    ) = parse_host_resource_snapshot(raw)
     return cpu_count, load_1m, memory_total, memory_available
 
 
@@ -727,6 +793,9 @@ class SSHCollector:
             cpu_idle_ticks,
             memory_total_mib,
             memory_available_mib,
+            cpu_usage_usec,
+            cpu_quota_usec,
+            cpu_period_usec,
         ) = parse_host_resource_snapshot(host_raw)
         details = parse_ps_output(process_details_raw, observed_at)
         processes = []
@@ -753,6 +822,9 @@ class SSHCollector:
                 "load_1m": load_1m,
                 "cpu_total_ticks": cpu_total_ticks,
                 "cpu_idle_ticks": cpu_idle_ticks,
+                "cpu_usage_usec": cpu_usage_usec,
+                "cpu_quota_usec": cpu_quota_usec,
+                "cpu_period_usec": cpu_period_usec,
                 "memory_total_mib": memory_total_mib,
                 "memory_available_mib": memory_available_mib,
             },

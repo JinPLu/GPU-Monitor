@@ -1725,7 +1725,8 @@ def test_snapshot_includes_per_gpu_recent_telemetry_average(service, admin) -> N
         "sample_count": 3,
         "first_observed_at": start.isoformat(),
         "last_observed_at": (start + timedelta(seconds=90)).isoformat(),
-        "cpu_load_fraction": 0.27,
+        "cpu_utilization_pct": None,
+        "cpu_load_fraction": None,
         "memory_used_pct": 23.33,
     }
 
@@ -1760,6 +1761,9 @@ def test_endpoint_cpu_and_memory_telemetry_is_exposed_in_snapshot(service, admin
         "cpu_utilization_pct": None,
         "cpu_total_ticks": None,
         "cpu_idle_ticks": None,
+        "cpu_usage_usec": None,
+        "cpu_quota_usec": None,
+        "cpu_period_usec": None,
         "memory_total_mib": 262_144,
         "memory_available_mib": 196_608,
         "provider": "raw-ssh",
@@ -1768,33 +1772,48 @@ def test_endpoint_cpu_and_memory_telemetry_is_exposed_in_snapshot(service, admin
             "sample_count": 1,
             "first_observed_at": endpoint["host_telemetry"]["observed_at"],
             "last_observed_at": endpoint["host_telemetry"]["observed_at"],
-            "cpu_load_fraction": 0.06,
+            "cpu_utilization_pct": None,
+            "cpu_load_fraction": None,
             "memory_used_pct": 25.0,
         },
     }
 
 
-def test_endpoint_history_is_throttled_and_calculates_cpu_utilization(service, admin) -> None:
+def test_endpoint_history_is_throttled_and_calculates_cgroup_cpu_utilization(
+    service, admin
+) -> None:
     start = utcnow() - timedelta(minutes=10)
     first = service.ingest_observation(
         observation(
             count=1,
             observed_at=start,
-            host={"cpu_total_ticks": 1_000, "cpu_idle_ticks": 700},
+            host={
+                "cpu_usage_usec": 1_000_000_000,
+                "cpu_quota_usec": 3_000_000,
+                "cpu_period_usec": 100_000,
+            },
         )
     )
     second = service.ingest_observation(
         observation(
             count=1,
             observed_at=start + timedelta(seconds=30),
-            host={"cpu_total_ticks": 1_100, "cpu_idle_ticks": 750},
+            host={
+                "cpu_usage_usec": 1_000_000_000 + 1_500_000 * 30,
+                "cpu_quota_usec": 3_000_000,
+                "cpu_period_usec": 100_000,
+            },
         )
     )
     third = service.ingest_observation(
         observation(
             count=1,
             observed_at=start + timedelta(seconds=61),
-            host={"cpu_total_ticks": 1_200, "cpu_idle_ticks": 810},
+            host={
+                "cpu_usage_usec": 1_000_000_000 + 1_500_000 * 61,
+                "cpu_quota_usec": 3_000_000,
+                "cpu_period_usec": 100_000,
+            },
         )
     )
 
@@ -1807,11 +1826,16 @@ def test_endpoint_history_is_throttled_and_calculates_cpu_utilization(service, a
     assert service._read(endpoint_history_count) == 2
 
     current_host = service.snapshot(admin)["data"]["endpoints"][0]["host_telemetry"]
-    assert current_host["cpu_utilization_pct"] == 40.0
+    assert current_host["cpu_utilization_pct"] == 5.0
+    assert current_host["cpu_usage_usec"] == 1_000_000_000 + 1_500_000 * 61
+    assert current_host["cpu_quota_usec"] == 3_000_000
+    assert current_host["cpu_period_usec"] == 100_000
+    assert current_host["recent_average"]["cpu_utilization_pct"] == 5.0
+    assert current_host["recent_average"]["cpu_load_fraction"] == 0.05
     history = service.endpoint_history(admin, "endpoint-a", window_seconds=3600, max_points=120)
     assert history["data"]["point_count"] == 2
     assert history["data"]["points"][0]["cpu_utilization_pct"] is None
-    assert history["data"]["points"][1]["cpu_utilization_pct"] == 40.0
+    assert history["data"]["points"][1]["cpu_utilization_pct"] == 5.0
     assert history["data"]["points"][1]["memory_used_pct"] == 25.0
     gpu_series = history["data"]["gpu_series"]
     assert len(gpu_series) == 1
@@ -1821,6 +1845,43 @@ def test_endpoint_history_is_throttled_and_calculates_cpu_utilization(service, a
     assert len(gpu_series[0]["points"]) == 2
     assert gpu_series[0]["points"][1]["gpu_utilization_pct"] == 0.0
     assert gpu_series[0]["points"][1]["memory_used_pct"] == 0.0
+
+
+def test_endpoint_cpu_utilization_stays_null_without_cgroup(service, admin) -> None:
+    start = utcnow() - timedelta(minutes=10)
+    service.ingest_observation(
+        observation(
+            count=1,
+            observed_at=start,
+            host={
+                "cpu_count": 128,
+                "load_1m": 380.0,
+                "cpu_total_ticks": 1_000,
+                "cpu_idle_ticks": 700,
+            },
+        )
+    )
+    service.ingest_observation(
+        observation(
+            count=1,
+            observed_at=start + timedelta(seconds=61),
+            host={
+                "cpu_count": 128,
+                "load_1m": 380.0,
+                "cpu_total_ticks": 1_200,
+                "cpu_idle_ticks": 810,
+            },
+        )
+    )
+
+    current_host = service.snapshot(admin)["data"]["endpoints"][0]["host_telemetry"]
+    assert current_host["cpu_utilization_pct"] is None
+    assert current_host["cpu_usage_usec"] is None
+    assert current_host["recent_average"]["cpu_utilization_pct"] is None
+    assert current_host["recent_average"]["cpu_load_fraction"] is None
+    history = service.endpoint_history(admin, "endpoint-a", window_seconds=3600, max_points=120)
+    assert history["data"]["point_count"] == 2
+    assert [point["cpu_utilization_pct"] for point in history["data"]["points"]] == [None, None]
 
 
 def test_endpoint_history_validates_window_points_and_identity(service, admin) -> None:

@@ -282,11 +282,9 @@
 
   function valuesForChart(history, kind) {
     const data = history?.data || history || {};
-    if (kind === "cpu") return (data.points || []).map((point) => {
-      if (typeof point.cpu_utilization_pct === "number") return point.cpu_utilization_pct;
-      if (typeof point.load_1m === "number" && typeof point.cpu_count === "number" && point.cpu_count > 0) return point.load_1m * 100 / point.cpu_count;
-      return null;
-    });
+    if (kind === "cpu") return (data.points || []).map((point) => (
+      typeof point.cpu_utilization_pct === "number" ? point.cpu_utilization_pct : null
+    ));
     if (kind === "systemMemory") return (data.points || []).map((point) => point.memory_used_pct ?? null);
     const field = kind === "gpuUtil" ? "gpu_utilization_pct" : "memory_used_pct";
     const series = data.gpu_series || [];

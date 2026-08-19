@@ -1441,11 +1441,11 @@ class BrokerService:
             present = [value for value in values if value is not None]
             return round(sum(present) / len(present), 2) if present else None
 
-        cpu_load_fraction = average(
-            [
-                sample.load_1m / sample.cpu_count if sample.cpu_count > 0 else None
-                for sample in samples
-            ]
+        cpu_utilization_pct = average(
+            [sample.cpu_utilization_pct for sample in samples]
+        )
+        cpu_load_fraction = (
+            round(cpu_utilization_pct / 100, 2) if cpu_utilization_pct is not None else None
         )
         memory_used_pct = average(
             [
@@ -1460,6 +1460,7 @@ class BrokerService:
             "sample_count": len(samples),
             "first_observed_at": _iso(samples[0].observed_at),
             "last_observed_at": _iso(samples[-1].observed_at),
+            "cpu_utilization_pct": cpu_utilization_pct,
             "cpu_load_fraction": cpu_load_fraction,
             "memory_used_pct": memory_used_pct,
         }
@@ -1478,6 +1479,9 @@ class BrokerService:
             "cpu_utilization_pct": telemetry.cpu_utilization_pct,
             "cpu_total_ticks": telemetry.cpu_total_ticks,
             "cpu_idle_ticks": telemetry.cpu_idle_ticks,
+            "cpu_usage_usec": telemetry.cpu_usage_usec,
+            "cpu_quota_usec": telemetry.cpu_quota_usec,
+            "cpu_period_usec": telemetry.cpu_period_usec,
             "memory_total_mib": telemetry.memory_total_mib,
             "memory_available_mib": telemetry.memory_available_mib,
             "provider": telemetry.provider,
@@ -1487,22 +1491,34 @@ class BrokerService:
     def _host_cpu_utilization_pct(
         previous: EndpointTelemetryCurrent | None,
         *,
-        cpu_total_ticks: int | None,
-        cpu_idle_ticks: int | None,
+        observed_at: datetime,
+        cpu_count: int,
+        cpu_usage_usec: int | None,
+        cpu_quota_usec: int | None,
+        cpu_period_usec: int | None,
     ) -> float | None:
+        previous_observed_at = _as_utc(previous.observed_at) if previous is not None else None
         if (
             previous is None
-            or previous.cpu_total_ticks is None
-            or previous.cpu_idle_ticks is None
-            or cpu_total_ticks is None
-            or cpu_idle_ticks is None
+            or previous_observed_at is None
+            or previous.cpu_usage_usec is None
+            or cpu_usage_usec is None
         ):
             return None
-        total_delta = cpu_total_ticks - previous.cpu_total_ticks
-        idle_delta = cpu_idle_ticks - previous.cpu_idle_ticks
-        if total_delta <= 0 or idle_delta < 0 or idle_delta > total_delta:
+        elapsed_seconds = (ensure_utc(observed_at) - previous_observed_at).total_seconds()
+        usage_delta = cpu_usage_usec - previous.cpu_usage_usec
+        if elapsed_seconds <= 0 or usage_delta < 0:
             return None
-        return round((total_delta - idle_delta) * 100 / total_delta, 2)
+        if cpu_quota_usec is None:
+            quota_cores = float(cpu_count)
+        else:
+            if cpu_period_usec is None or cpu_period_usec <= 0:
+                return None
+            quota_cores = cpu_quota_usec / cpu_period_usec
+        if quota_cores <= 0:
+            return None
+        used_cores = usage_delta / 1_000_000 / elapsed_seconds
+        return round(used_cores / quota_cores * 100, 2)
 
     @staticmethod
     def _resource_quantities_dict(quantities: ResourceQuantities) -> dict[str, Any]:
@@ -5742,10 +5758,16 @@ class BrokerService:
                 endpoint.updated_at = now
             host_cpu_total_ticks = observation.host.cpu_total_ticks
             host_cpu_idle_ticks = observation.host.cpu_idle_ticks
+            host_cpu_usage_usec = observation.host.cpu_usage_usec
+            host_cpu_quota_usec = observation.host.cpu_quota_usec
+            host_cpu_period_usec = observation.host.cpu_period_usec
             host_cpu_utilization_pct = self._host_cpu_utilization_pct(
                 host_telemetry,
-                cpu_total_ticks=host_cpu_total_ticks,
-                cpu_idle_ticks=host_cpu_idle_ticks,
+                observed_at=observed_at,
+                cpu_count=observation.host.cpu_count,
+                cpu_usage_usec=host_cpu_usage_usec,
+                cpu_quota_usec=host_cpu_quota_usec,
+                cpu_period_usec=host_cpu_period_usec,
             )
             latest_endpoint_history_at = _as_utc(
                 session.scalar(
@@ -5769,6 +5791,9 @@ class BrokerService:
                         load_1m=observation.host.load_1m,
                         cpu_total_ticks=host_cpu_total_ticks,
                         cpu_idle_ticks=host_cpu_idle_ticks,
+                        cpu_usage_usec=host_cpu_usage_usec,
+                        cpu_quota_usec=host_cpu_quota_usec,
+                        cpu_period_usec=host_cpu_period_usec,
                         cpu_utilization_pct=host_cpu_utilization_pct,
                         memory_total_mib=observation.host.memory_total_mib,
                         memory_available_mib=observation.host.memory_available_mib,
@@ -5785,6 +5810,9 @@ class BrokerService:
                     load_1m=observation.host.load_1m,
                     cpu_total_ticks=host_cpu_total_ticks,
                     cpu_idle_ticks=host_cpu_idle_ticks,
+                    cpu_usage_usec=host_cpu_usage_usec,
+                    cpu_quota_usec=host_cpu_quota_usec,
+                    cpu_period_usec=host_cpu_period_usec,
                     cpu_utilization_pct=host_cpu_utilization_pct,
                     memory_total_mib=observation.host.memory_total_mib,
                     memory_available_mib=observation.host.memory_available_mib,
@@ -5798,6 +5826,9 @@ class BrokerService:
                 host_telemetry.load_1m = observation.host.load_1m
                 host_telemetry.cpu_total_ticks = host_cpu_total_ticks
                 host_telemetry.cpu_idle_ticks = host_cpu_idle_ticks
+                host_telemetry.cpu_usage_usec = host_cpu_usage_usec
+                host_telemetry.cpu_quota_usec = host_cpu_quota_usec
+                host_telemetry.cpu_period_usec = host_cpu_period_usec
                 host_telemetry.cpu_utilization_pct = host_cpu_utilization_pct
                 host_telemetry.memory_total_mib = observation.host.memory_total_mib
                 host_telemetry.memory_available_mib = observation.host.memory_available_mib

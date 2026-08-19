@@ -206,7 +206,7 @@ final class BrokerStoreTests: XCTestCase {
         let endpoint = try XCTUnwrap(snapshot.endpoint(id: "gpu-node-01"))
         let gpu = try XCTUnwrap(snapshot.gpu(id: "gpu-node-01:GPU-FIXTURE-0"))
 
-        XCTAssertEqual(endpoint.cpuLoadFraction, 18.0 / 64.0)
+        XCTAssertNil(endpoint.cpuLoadFraction)
         XCTAssertEqual(endpoint.recentTelemetryAverage?.windowSeconds, 600)
         XCTAssertEqual(endpoint.recentTelemetryAverage?.sampleCount, 10)
         XCTAssertEqual(endpoint.recentTelemetryAverage?.cpuLoadFraction, 0.21)
@@ -328,6 +328,50 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertEqual(history.gpuSeries.first?.id, "gpu-node-01:GPU-uuid-0")
         XCTAssertEqual(history.gpuSeries.first?.samples.first?.gpuUtilizationFraction, 0.8)
         XCTAssertEqual(history.gpuSeries.first?.samples.first?.memoryFraction, 0.25)
+    }
+
+    func testEndpointCpuLoadUsesUtilizationAndDoesNotFallBackToHostLoad() throws {
+        let utilized = try XCTUnwrap(EndpointRecord(raw: [
+            "id": "gpu-node-01",
+            "host": "10.0.0.1",
+            "ssh_user": "gpu",
+            "monitor": ["status": "ONLINE"],
+            "host_telemetry": [
+                "cpu_count": 128,
+                "load_1m": 380,
+                "cpu_utilization_pct": 25
+            ]
+        ]))
+        XCTAssertEqual(utilized.cpuLoadFraction, 0.25)
+
+        let loadOnly = try XCTUnwrap(EndpointRecord(raw: [
+            "id": "gpu-node-01",
+            "host": "10.0.0.1",
+            "ssh_user": "gpu",
+            "monitor": ["status": "ONLINE"],
+            "host_telemetry": [
+                "cpu_count": 128,
+                "load_1m": 380
+            ]
+        ]))
+        XCTAssertNotEqual(loadOnly.cpuLoadFraction, 1.0)
+        XCTAssertNil(loadOnly.cpuLoadFraction)
+
+        let utilizedSample = try XCTUnwrap(EndpointTelemetrySample(raw: [
+            "observed_at": "2026-08-19T06:00:00Z",
+            "cpu_count": 128,
+            "load_1m": 380,
+            "cpu_utilization_pct": 25
+        ]))
+        XCTAssertEqual(utilizedSample.cpuLoadFraction, 0.25)
+
+        let loadOnlySample = try XCTUnwrap(EndpointTelemetrySample(raw: [
+            "observed_at": "2026-08-19T06:00:00Z",
+            "cpu_count": 128,
+            "load_1m": 380
+        ]))
+        XCTAssertNotEqual(loadOnlySample.cpuLoadFraction, 1.0)
+        XCTAssertNil(loadOnlySample.cpuLoadFraction)
     }
 
     func testEndpointTelemetryHistoryCapabilityGateDegradesWithoutChangingSnapshot() throws {

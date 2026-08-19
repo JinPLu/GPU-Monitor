@@ -439,12 +439,22 @@
     const utilValues = telemetry.map((item) => item.gpu_utilization_pct).filter((value) => value !== null && value !== undefined);
     const util = utilValues.length ? utilValues.reduce((sum, value) => sum + Number(value), 0) / utilValues.length : 0;
     const host = endpoint.host_telemetry;
-    const cpuLoadPct = host?.cpu_count ? clamp((Number(host.load_1m) * 100) / Number(host.cpu_count)) : 0;
-    const availableCpu = host ? Math.max(0, Number(host.cpu_count) - Number(host.load_1m)) : null;
+    const cpuUtilizationPct = typeof host?.cpu_utilization_pct === "number" ? host.cpu_utilization_pct : null;
+    const cpuLoadPct = cpuUtilizationPct === null ? 0 : clamp(cpuUtilizationPct);
+    const quotaUsec = typeof host?.cpu_quota_usec === "number" ? host.cpu_quota_usec : null;
+    const periodUsec = typeof host?.cpu_period_usec === "number" ? host.cpu_period_usec : null;
+    const quotaCores = quotaUsec !== null && periodUsec !== null && periodUsec > 0
+      ? quotaUsec / periodUsec
+      : (Number(host?.cpu_count) > 0 ? Number(host.cpu_count) : null);
+    const usedCores = cpuUtilizationPct !== null && quotaCores !== null
+      ? (cpuUtilizationPct / 100) * quotaCores
+      : null;
     const memoryUsedPct = host?.memory_total_mib
       ? clamp((1 - Number(host.memory_available_mib) / Number(host.memory_total_mib)) * 100)
       : 0;
-    const cpuDetail = host ? `${availableCpu.toLocaleString("zh-CN", { maximumFractionDigits: 1 })}/${Number(host.cpu_count).toLocaleString("zh-CN")} 核可用` : "暂无数据";
+    const cpuDetail = usedCores !== null && quotaCores !== null
+      ? `已用 ${usedCores.toLocaleString("zh-CN", { maximumFractionDigits: 1 })} / 配额 ${quotaCores.toLocaleString("zh-CN", { maximumFractionDigits: 1 })} 核`
+      : "暂无数据";
     const memoryDetail = host ? `${formatMemory(host.memory_available_mib)}/${formatMemory(host.memory_total_mib)} 可用` : "暂无数据";
     const vramDetail = total ? `${formatMemory(used)}/${formatMemory(total)} 已用` : "暂无数据";
     const sshCommand = `ssh -p ${endpoint.port} ${endpoint.ssh_user}@${endpoint.host}`;

@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from serverpilot import server_collector
-from serverpilot.adapters import RAW_SSH_OBSERVATION_ADAPTER, RawSSHResult
+from serverpilot.adapters import HOST_RESOURCES_QUERY, RAW_SSH_OBSERVATION_ADAPTER, RawSSHResult
 from serverpilot.collector import (
     COMBINED_QUERY,
     CollectionError,
@@ -54,10 +54,65 @@ def test_gpu_and_process_csv_parser() -> None:
         750,
         262144,
         196608,
+        None,
+        None,
+        None,
     )
     processes = parse_process_csv("GPU-0, 123, 1024, python\n")
     assert processes[0].pid == 123
     assert parse_process_csv("No running processes found\n") == []
+
+
+def test_host_resource_probe_keeps_64bit_ticks_and_optional_cgroup() -> None:
+    assert 'printf "%.0f %.0f\\n"' in HOST_RESOURCES_QUERY
+    assert "/sys/fs/cgroup/cpu.max" in HOST_RESOURCES_QUERY
+    assert "usage_usec" in HOST_RESOURCES_QUERY
+    assert parse_host_resource_snapshot(
+        "64\n262144 196608\n4.25\n20695902555 10347951278\n"
+    ) == (
+        64,
+        4.25,
+        20_695_902_555,
+        10_347_951_278,
+        262144,
+        196608,
+        None,
+        None,
+        None,
+    )
+    assert parse_host_resource_snapshot(
+        "64\n262144 196608\n4.25\n20695902555 10347951278\n3000000 100000 1600000\n"
+    ) == (
+        64,
+        4.25,
+        20_695_902_555,
+        10_347_951_278,
+        262144,
+        196608,
+        1_600_000,
+        3_000_000,
+        100_000,
+    )
+    assert parse_host_resource_snapshot(
+        "64\n262144 196608\n4.25\n20695902555 10347951278\nmax 100000 1600000\n"
+    ) == (
+        64,
+        4.25,
+        20_695_902_555,
+        10_347_951_278,
+        262144,
+        196608,
+        1_600_000,
+        None,
+        100_000,
+    )
+
+
+def test_host_resource_probe_rejects_invalid_cgroup_line() -> None:
+    with pytest.raises(CollectionError, match="cgroup CPU"):
+        parse_host_resource_snapshot(
+            "64\n262144 196608\n4.25\n20695902555 10347951278\n3000000 100000\n"
+        )
 
 
 def test_server_collector_assigns_cuda_ordinals_by_pci_bus(
@@ -87,6 +142,33 @@ def test_server_collector_assigns_cuda_ordinals_by_pci_bus(
         ("GPU-late", 0, 1),
     ]
     assert processes == []
+
+
+def test_server_collector_reads_cgroup_usage_and_omits_missing_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cpu_max = tmp_path / "cpu.max"
+    cpu_stat = tmp_path / "cpu.stat"
+    cpu_max.write_text("3000000 100000\n", encoding="utf-8")
+    cpu_stat.write_text("usage_usec 1600000\nuser_usec 10\n", encoding="utf-8")
+    monkeypatch.setattr(server_collector, "CGROUP_CPU_MAX_PATH", str(cpu_max))
+    monkeypatch.setattr(server_collector, "CGROUP_CPU_STAT_PATH", str(cpu_stat))
+    assert server_collector._cgroup_cpu_snapshot() == {
+        "cpu_usage_usec": 1_600_000,
+        "cpu_quota_usec": 3_000_000,
+        "cpu_period_usec": 100_000,
+    }
+
+    cpu_max.write_text("max 100000\n", encoding="utf-8")
+    assert server_collector._cgroup_cpu_snapshot() == {
+        "cpu_usage_usec": 1_600_000,
+        "cpu_quota_usec": None,
+        "cpu_period_usec": 100_000,
+    }
+
+    monkeypatch.setattr(server_collector, "CGROUP_CPU_MAX_PATH", str(tmp_path / "missing.max"))
+    monkeypatch.setattr(server_collector, "CGROUP_CPU_STAT_PATH", str(tmp_path / "missing.stat"))
+    assert server_collector._cgroup_cpu_snapshot() == {}
 
 
 def test_fake_collector_never_needs_a_shell(service, inventory) -> None:
@@ -362,6 +444,56 @@ def test_server_script_collector_keeps_cpu_only_host_online(
     assert observation.gpus == []
     assert observation.processes == []
     assert observation.host.cpu_count == 64
+
+
+def test_raw_ssh_host_snapshot_forwards_cgroup_line(inventory: InventoryConfig) -> None:
+    async def fake_runner(endpoint, command):  # type: ignore[no-untyped-def]
+        assert endpoint.id == "endpoint-a"
+        assert command == COMBINED_QUERY
+        return (
+            "__SERVERPILOT_GPU__\n"
+            f"{GPU_CPU_ONLY}\n"
+            "__SERVERPILOT_PROCESSES__\n"
+            "__SERVERPILOT_PROCESS_DETAILS__\n"
+            "__SERVERPILOT_IDENTITY__\n"
+            "host-a\nboot-a\n"
+            "__SERVERPILOT_HOST_RESOURCES__\n"
+            "64\n262144 196608\n4.25\n20695902555 10347951278\n3000000 100000 1600000\n"
+        )
+
+    observation = asyncio.run(
+        SSHCollector(inventory, runner=fake_runner).observe_endpoint(inventory.endpoints[0])
+    )
+
+    assert observation.host.cpu_total_ticks == 20_695_902_555
+    assert observation.host.cpu_idle_ticks == 10_347_951_278
+    assert observation.host.cpu_usage_usec == 1_600_000
+    assert observation.host.cpu_quota_usec == 3_000_000
+    assert observation.host.cpu_period_usec == 100_000
+
+
+def test_server_script_parser_accepts_optional_cgroup_fields() -> None:
+    snapshot = _server_script_snapshot()
+    snapshot["host"]["cpu_usage_usec"] = 1_600_000
+    snapshot["host"]["cpu_quota_usec"] = 3_000_000
+    snapshot["host"]["cpu_period_usec"] = 100_000
+    observed_at = datetime(2026, 8, 10, tzinfo=timezone.utc)
+    observation = parse_server_script_snapshot(
+        json.dumps(snapshot),
+        endpoint_id="endpoint-a",
+        observed_at=observed_at,
+    )
+    assert observation.host.cpu_usage_usec == 1_600_000
+    assert observation.host.cpu_quota_usec == 3_000_000
+    assert observation.host.cpu_period_usec == 100_000
+
+    snapshot["host"]["cpu_quota_usec"] = None
+    observation = parse_server_script_snapshot(
+        json.dumps(snapshot),
+        endpoint_id="endpoint-a",
+        observed_at=observed_at,
+    )
+    assert observation.host.cpu_quota_usec is None
 
 
 @pytest.mark.parametrize(
