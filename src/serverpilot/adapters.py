@@ -69,7 +69,11 @@ HOST_RESOURCES_QUERY = (
     "awk 'FNR==NR {quota=$1; period=$2; next} "
     "$1==\"usage_usec\" && quota != \"\" && period != \"\" "
     "{printf \"%s %s %s\\n\", quota, period, $2}' "
-    "/sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu.stat; fi"
+    "/sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu.stat; fi; "
+    "if [ -r /sys/fs/cgroup/memory.max ] && [ -r /sys/fs/cgroup/memory.current ]; then "
+    "printf \"mem %s %s\\n\" "
+    "\"$(cat /sys/fs/cgroup/memory.max)\" "
+    "\"$(cat /sys/fs/cgroup/memory.current)\"; fi"
 )
 GPU_SECTION = "__SERVERPILOT_GPU__"
 PROCESS_SECTION = "__SERVERPILOT_PROCESSES__"

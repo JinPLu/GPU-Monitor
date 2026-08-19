@@ -145,6 +145,8 @@ class EndpointTelemetryCurrent(Base):
     cpu_utilization_pct: Mapped[float | None] = mapped_column()
     memory_total_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     memory_available_mib: Mapped[int] = mapped_column(Integer, nullable=False)
+    memory_limit_mib: Mapped[int | None] = mapped_column(Integer)
+    memory_current_mib: Mapped[int | None] = mapped_column(Integer)
     provider: Mapped[str] = mapped_column(String(40), nullable=False, default="raw-ssh")
 
 
@@ -172,6 +174,8 @@ class EndpointTelemetrySnapshot(Base):
     cpu_utilization_pct: Mapped[float | None] = mapped_column()
     memory_total_mib: Mapped[int] = mapped_column(Integer, nullable=False)
     memory_available_mib: Mapped[int] = mapped_column(Integer, nullable=False)
+    memory_limit_mib: Mapped[int | None] = mapped_column(Integer)
+    memory_current_mib: Mapped[int | None] = mapped_column(Integer)
     provider: Mapped[str] = mapped_column(String(40), nullable=False, default="raw-ssh")
 
 

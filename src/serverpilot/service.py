@@ -1448,12 +1448,7 @@ class BrokerService:
             round(cpu_utilization_pct / 100, 2) if cpu_utilization_pct is not None else None
         )
         memory_used_pct = average(
-            [
-                (1 - sample.memory_available_mib / sample.memory_total_mib) * 100
-                if sample.memory_total_mib > 0
-                else None
-                for sample in samples
-            ]
+            [BrokerService._host_memory_used_pct(sample) for sample in samples]
         )
         return {
             "window_seconds": TELEMETRY_RECENT_AVERAGE_WINDOW_SECONDS,
@@ -1464,6 +1459,20 @@ class BrokerService:
             "cpu_load_fraction": cpu_load_fraction,
             "memory_used_pct": memory_used_pct,
         }
+
+    @staticmethod
+    def _host_memory_used_pct(
+        sample: EndpointTelemetryCurrent | EndpointTelemetrySnapshot,
+    ) -> float | None:
+        """Prefer cgroup current/limit; fall back to host MemAvailable only when unlimited."""
+
+        limit = sample.memory_limit_mib
+        current = sample.memory_current_mib
+        if limit is not None and limit > 0 and current is not None:
+            return current * 100 / limit
+        if sample.memory_total_mib > 0:
+            return (1 - sample.memory_available_mib / sample.memory_total_mib) * 100
+        return None
 
     @staticmethod
     def _host_telemetry_dict(
@@ -1484,6 +1493,8 @@ class BrokerService:
             "cpu_period_usec": telemetry.cpu_period_usec,
             "memory_total_mib": telemetry.memory_total_mib,
             "memory_available_mib": telemetry.memory_available_mib,
+            "memory_limit_mib": telemetry.memory_limit_mib,
+            "memory_current_mib": telemetry.memory_current_mib,
             "provider": telemetry.provider,
         }
 
@@ -1743,11 +1754,20 @@ class BrokerService:
             telemetry_collected_at = (
                 _as_utc(telemetry.collected_at) if telemetry is not None else None
             )
+            if gpu is None or gpu.endpoint_id != endpoint_id:
+                raise BrokerError(
+                    "keepalive_observation_incomplete",
+                    "the post-operation observation did not cover every endpoint GPU",
+                    status_code=409,
+                    details={"gpu_id": gpu_id},
+                )
+            if not gpu.present:
+                # A vanished GPU cannot still be running this endpoint's
+                # processes. The host snapshot above already proved the
+                # observation is complete and fresh.
+                continue
             if (
-                gpu is None
-                or gpu.endpoint_id != endpoint_id
-                or not gpu.present
-                or telemetry_at is None
+                telemetry_at is None
                 or telemetry_at != host_observed_at
                 or telemetry_collected_at is None
                 or telemetry_collected_at < threshold
@@ -5587,6 +5607,10 @@ class BrokerService:
             for bucket in buckets:
                 memory_total = average(bucket, "memory_total_mib")
                 memory_available = average(bucket, "memory_available_mib")
+                memory_used_values = [
+                    BrokerService._host_memory_used_pct(sample) for sample in bucket
+                ]
+                present_used = [value for value in memory_used_values if value is not None]
                 points.append(
                     {
                         "observed_at": _iso(bucket[-1].observed_at),
@@ -5595,12 +5619,11 @@ class BrokerService:
                         "cpu_utilization_pct": average(bucket, "cpu_utilization_pct"),
                         "memory_total_mib": memory_total,
                         "memory_available_mib": memory_available,
+                        "memory_limit_mib": average(bucket, "memory_limit_mib"),
+                        "memory_current_mib": average(bucket, "memory_current_mib"),
                         "memory_used_pct": (
-                            round(
-                                (memory_total - (memory_available or 0)) * 100 / memory_total,
-                                2,
-                            )
-                            if memory_total
+                            round(sum(present_used) / len(present_used), 2)
+                            if present_used
                             else None
                         ),
                     }
@@ -5714,6 +5737,96 @@ class BrokerService:
 
     # ---- collector input and telemetry / process reconciliation ----------------
 
+    def _release_absent_keepalive_leases(
+        self,
+        session: Session,
+        *,
+        endpoint_id: str,
+        now: datetime,
+        revision: int,
+    ) -> int:
+        """Release keepalive leases whose every active GPU is absent from inventory.
+
+        Workload leases are left in place; a complete observation can prove a
+        vanished GPU is gone, but it cannot prove a user job was empty.
+        """
+
+        gpus = {
+            gpu.id: gpu
+            for gpu in session.scalars(
+                select(GPUDevice).where(GPUDevice.endpoint_id == endpoint_id)
+            ).all()
+        }
+        absent_gpu_ids = {gpu_id for gpu_id, gpu in gpus.items() if not gpu.present}
+        if not absent_gpu_ids:
+            return revision
+
+        for current in session.scalars(
+            select(KeepaliveCurrent).where(KeepaliveCurrent.gpu_id.in_(absent_gpu_ids))
+        ).all():
+            session.delete(current)
+
+        resources = session.scalars(
+            select(LeaseResource).where(
+                LeaseResource.gpu_id.in_(list(gpus)),
+                LeaseResource.active.is_(True),
+            )
+        ).all()
+        resources_by_lease: dict[str, list[LeaseResource]] = defaultdict(list)
+        for resource in resources:
+            resources_by_lease[resource.lease_id].append(resource)
+
+        released_any = False
+        for lease_id, lease_resources in resources_by_lease.items():
+            lease = session.get(Lease, lease_id)
+            if (
+                lease is None
+                or lease.kind != "keepalive"
+                or lease.state in TERMINAL_LEASE_STATES
+            ):
+                continue
+            all_active = session.scalars(
+                select(LeaseResource).where(
+                    LeaseResource.lease_id == lease.id,
+                    LeaseResource.active.is_(True),
+                )
+            ).all()
+            if not all_active:
+                continue
+            if any(
+                (gpu := session.get(GPUDevice, resource.gpu_id)) is None or gpu.present
+                for resource in all_active
+            ):
+                continue
+            before = self._lease_dict(session, lease)
+            lease.state = "RELEASED"
+            lease.released_at = now
+            lease.release_reason = "gpu absent from endpoint inventory"
+            for resource in all_active:
+                resource.active = False
+                resource.released_at = now
+            request = session.get(AllocationRequest, lease.request_id)
+            if request is not None:
+                request.state = "RELEASED"
+                request.updated_at = now
+            self._resolve_lease_alerts(session, lease.id, now)
+            self._audit(
+                session,
+                actor_id=f"collector:{endpoint_id}",
+                action="lease.released",
+                resource_type="lease",
+                resource_id=lease.id,
+                result="success",
+                before=before,
+                after=self._lease_dict(session, lease),
+                summary={"reason": lease.release_reason},
+                now=now,
+            )
+            released_any = True
+        if released_any:
+            revision = self._bump_revision(session, now)
+        return revision
+
     def ingest_observation(
         self, observation: EndpointObservation, *, provider: str = "raw-ssh"
     ) -> dict[str, Any]:
@@ -5797,6 +5910,8 @@ class BrokerService:
                         cpu_utilization_pct=host_cpu_utilization_pct,
                         memory_total_mib=observation.host.memory_total_mib,
                         memory_available_mib=observation.host.memory_available_mib,
+                        memory_limit_mib=observation.host.memory_limit_mib,
+                        memory_current_mib=observation.host.memory_current_mib,
                         provider=provider,
                     )
                 )
@@ -5816,6 +5931,8 @@ class BrokerService:
                     cpu_utilization_pct=host_cpu_utilization_pct,
                     memory_total_mib=observation.host.memory_total_mib,
                     memory_available_mib=observation.host.memory_available_mib,
+                    memory_limit_mib=observation.host.memory_limit_mib,
+                    memory_current_mib=observation.host.memory_current_mib,
                     provider=provider,
                 )
                 session.add(host_telemetry)
@@ -5832,6 +5949,8 @@ class BrokerService:
                 host_telemetry.cpu_utilization_pct = host_cpu_utilization_pct
                 host_telemetry.memory_total_mib = observation.host.memory_total_mib
                 host_telemetry.memory_available_mib = observation.host.memory_available_mib
+                host_telemetry.memory_limit_mib = observation.host.memory_limit_mib
+                host_telemetry.memory_current_mib = observation.host.memory_current_mib
                 host_telemetry.provider = provider
             self._ensure_host_capacity_unit(session, endpoint, host_telemetry, now=now)
             gpu_ids = list(observed_gpu_ids)
@@ -5948,6 +6067,13 @@ class BrokerService:
                         gpu.present = False
                         gpu.absent_at = observed_at
                         absent_gpu_count += 1
+                session.flush()
+                revision = self._release_absent_keepalive_leases(
+                    session,
+                    endpoint_id=endpoint.id,
+                    now=now,
+                    revision=revision,
+                )
             session.flush()
             observed_process_keys: set[tuple[str, int, str, datetime]] = set()
             for process in observation.processes:
@@ -7928,9 +8054,13 @@ class BrokerService:
                     _as_utc(telemetry.collected_at) if telemetry is not None else None
                 )
                 observed_at = _as_utc(telemetry.observed_at) if telemetry is not None else None
+                if not gpu.present:
+                    # A vanished GPU cannot still be running this endpoint's
+                    # processes. Host freshness above already required a
+                    # complete observation.
+                    continue
                 if (
-                    not gpu.present
-                    or telemetry_collected_at is None
+                    telemetry_collected_at is None
                     or telemetry_collected_at < barrier
                     or observed_at is None
                     or observed_at < cutoff

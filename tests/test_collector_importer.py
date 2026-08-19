@@ -20,6 +20,7 @@ from serverpilot.collector import (
     SSHCollector,
     parse_gpu_csv,
     parse_host_resource_snapshot,
+    HostResourceSnapshot,
     parse_host_resources,
     parse_process_csv,
     parse_server_script_snapshot,
@@ -47,13 +48,15 @@ def test_gpu_and_process_csv_parser() -> None:
     ]
     assert samples[0].memory_free_mib == 100000
     assert parse_host_resources("64\n262144 196608\n4.25\n") == (64, 4.25, 262144, 196608)
-    assert parse_host_resource_snapshot("64\n262144 196608\n4.25\n1000 750\n") == (
+    assert parse_host_resource_snapshot("64\n262144 196608\n4.25\n1000 750\n") == HostResourceSnapshot(
         64,
         4.25,
         1000,
         750,
         262144,
         196608,
+        None,
+        None,
         None,
         None,
         None,
@@ -69,7 +72,7 @@ def test_host_resource_probe_keeps_64bit_ticks_and_optional_cgroup() -> None:
     assert "usage_usec" in HOST_RESOURCES_QUERY
     assert parse_host_resource_snapshot(
         "64\n262144 196608\n4.25\n20695902555 10347951278\n"
-    ) == (
+    ) == HostResourceSnapshot(
         64,
         4.25,
         20_695_902_555,
@@ -79,10 +82,12 @@ def test_host_resource_probe_keeps_64bit_ticks_and_optional_cgroup() -> None:
         None,
         None,
         None,
+        None,
+        None,
     )
     assert parse_host_resource_snapshot(
         "64\n262144 196608\n4.25\n20695902555 10347951278\n3000000 100000 1600000\n"
-    ) == (
+    ) == HostResourceSnapshot(
         64,
         4.25,
         20_695_902_555,
@@ -92,10 +97,12 @@ def test_host_resource_probe_keeps_64bit_ticks_and_optional_cgroup() -> None:
         1_600_000,
         3_000_000,
         100_000,
+        None,
+        None,
     )
     assert parse_host_resource_snapshot(
         "64\n262144 196608\n4.25\n20695902555 10347951278\nmax 100000 1600000\n"
-    ) == (
+    ) == HostResourceSnapshot(
         64,
         4.25,
         20_695_902_555,
@@ -105,14 +112,42 @@ def test_host_resource_probe_keeps_64bit_ticks_and_optional_cgroup() -> None:
         1_600_000,
         None,
         100_000,
+        None,
+        None,
     )
 
 
 def test_host_resource_probe_rejects_invalid_cgroup_line() -> None:
-    with pytest.raises(CollectionError, match="cgroup CPU"):
+    with pytest.raises(CollectionError, match="unrecognized optional line"):
         parse_host_resource_snapshot(
             "64\n262144 196608\n4.25\n20695902555 10347951278\n3000000 100000\n"
         )
+
+
+def test_host_resource_probe_parses_cgroup_memory_by_marker() -> None:
+    assert "mem %s %s" in HOST_RESOURCES_QUERY
+    assert "/sys/fs/cgroup/memory.max" in HOST_RESOURCES_QUERY
+    limited = parse_host_resource_snapshot(
+        "64\n1029120 921600\n4.25\n20695902555 10347951278\n"
+        "3000000 100000 1600000\nmem 261993005056 53687091200\n"
+    )
+    assert limited.memory_total_mib == 1_029_120
+    assert limited.memory_limit_mib == 249_856
+    assert limited.memory_current_mib == 51_200
+    assert limited.cpu_usage_usec == 1_600_000
+
+    unlimited = parse_host_resource_snapshot(
+        "64\n1029120 921600\n4.25\n20695902555 10347951278\n"
+        "mem max 53687091200\n3000000 100000 1600000\n"
+    )
+    assert unlimited.memory_limit_mib is None
+    assert unlimited.memory_current_mib == 51_200
+
+    unread = parse_host_resource_snapshot(
+        "64\n1029120 921600\n4.25\n20695902555 10347951278\n"
+    )
+    assert unread.memory_limit_mib is None
+    assert unread.memory_current_mib is None
 
 
 def test_server_collector_assigns_cuda_ordinals_by_pci_bus(
@@ -169,6 +204,33 @@ def test_server_collector_reads_cgroup_usage_and_omits_missing_files(
     monkeypatch.setattr(server_collector, "CGROUP_CPU_MAX_PATH", str(tmp_path / "missing.max"))
     monkeypatch.setattr(server_collector, "CGROUP_CPU_STAT_PATH", str(tmp_path / "missing.stat"))
     assert server_collector._cgroup_cpu_snapshot() == {}
+
+
+def test_server_collector_reads_cgroup_memory_and_omits_missing_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    memory_max = tmp_path / "memory.max"
+    memory_current = tmp_path / "memory.current"
+    memory_max.write_text("261993005056\n", encoding="utf-8")
+    memory_current.write_text("53687091200\n", encoding="utf-8")
+    monkeypatch.setattr(server_collector, "CGROUP_MEMORY_MAX_PATH", str(memory_max))
+    monkeypatch.setattr(server_collector, "CGROUP_MEMORY_CURRENT_PATH", str(memory_current))
+    assert server_collector._cgroup_memory_snapshot() == {
+        "memory_limit_mib": 249_856,
+        "memory_current_mib": 51_200,
+    }
+
+    memory_max.write_text("max\n", encoding="utf-8")
+    assert server_collector._cgroup_memory_snapshot() == {
+        "memory_limit_mib": None,
+        "memory_current_mib": 51_200,
+    }
+
+    monkeypatch.setattr(server_collector, "CGROUP_MEMORY_MAX_PATH", str(tmp_path / "missing.max"))
+    monkeypatch.setattr(
+        server_collector, "CGROUP_MEMORY_CURRENT_PATH", str(tmp_path / "missing.current")
+    )
+    assert server_collector._cgroup_memory_snapshot() == {}
 
 
 def test_fake_collector_never_needs_a_shell(service, inventory) -> None:
@@ -458,7 +520,8 @@ def test_raw_ssh_host_snapshot_forwards_cgroup_line(inventory: InventoryConfig) 
             "__SERVERPILOT_IDENTITY__\n"
             "host-a\nboot-a\n"
             "__SERVERPILOT_HOST_RESOURCES__\n"
-            "64\n262144 196608\n4.25\n20695902555 10347951278\n3000000 100000 1600000\n"
+            "64\n262144 196608\n4.25\n20695902555 10347951278\n"
+            "3000000 100000 1600000\nmem 261993005056 53687091200\n"
         )
 
     observation = asyncio.run(
@@ -470,6 +533,8 @@ def test_raw_ssh_host_snapshot_forwards_cgroup_line(inventory: InventoryConfig) 
     assert observation.host.cpu_usage_usec == 1_600_000
     assert observation.host.cpu_quota_usec == 3_000_000
     assert observation.host.cpu_period_usec == 100_000
+    assert observation.host.memory_limit_mib == 249_856
+    assert observation.host.memory_current_mib == 51_200
 
 
 def test_server_script_parser_accepts_optional_cgroup_fields() -> None:
@@ -488,12 +553,16 @@ def test_server_script_parser_accepts_optional_cgroup_fields() -> None:
     assert observation.host.cpu_period_usec == 100_000
 
     snapshot["host"]["cpu_quota_usec"] = None
+    snapshot["host"]["memory_limit_mib"] = 249_856
+    snapshot["host"]["memory_current_mib"] = 51_200
     observation = parse_server_script_snapshot(
         json.dumps(snapshot),
         endpoint_id="endpoint-a",
         observed_at=observed_at,
     )
     assert observation.host.cpu_quota_usec is None
+    assert observation.host.memory_limit_mib == 249_856
+    assert observation.host.memory_current_mib == 51_200
 
 
 @pytest.mark.parametrize(

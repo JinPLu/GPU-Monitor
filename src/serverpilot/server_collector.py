@@ -99,6 +99,9 @@ def _read_required(path: str) -> str:
 
 CGROUP_CPU_MAX_PATH = "/sys/fs/cgroup/cpu.max"
 CGROUP_CPU_STAT_PATH = "/sys/fs/cgroup/cpu.stat"
+CGROUP_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
+CGROUP_MEMORY_CURRENT_PATH = "/sys/fs/cgroup/memory.current"
+_BYTES_PER_MIB = 1024 * 1024
 
 
 def _cgroup_cpu_snapshot() -> dict[str, int | None]:
@@ -139,6 +142,34 @@ def _cgroup_cpu_snapshot() -> dict[str, int | None]:
     }
 
 
+def _cgroup_memory_snapshot() -> dict[str, int | None]:
+    """Read cgroup v2 memory usage and limit. Omit the fields when unreadable."""
+
+    max_path = Path(CGROUP_MEMORY_MAX_PATH)
+    current_path = Path(CGROUP_MEMORY_CURRENT_PATH)
+    if not max_path.is_file() or not current_path.is_file():
+        return {}
+    try:
+        limit_token = max_path.read_text(encoding="utf-8").split()[0]
+        current_token = current_path.read_text(encoding="utf-8").split()[0]
+        current_bytes = _integer(current_token)
+        if current_bytes is None or current_bytes < 0:
+            return {}
+        if limit_token == "max":
+            limit_mib: int | None = None
+        else:
+            limit_bytes = _integer(limit_token)
+            if limit_bytes is None or limit_bytes < 1:
+                return {}
+            limit_mib = limit_bytes // _BYTES_PER_MIB
+    except (OSError, IndexError):
+        return {}
+    return {
+        "memory_limit_mib": limit_mib,
+        "memory_current_mib": current_bytes // _BYTES_PER_MIB,
+    }
+
+
 def _host_snapshot() -> dict[str, int | float | None]:
     memory: dict[str, int] = {}
     for line in _read_required("/proc/meminfo").splitlines():
@@ -168,6 +199,7 @@ def _host_snapshot() -> dict[str, int | float | None]:
         "memory_available_mib": memory["MemAvailable"],
     }
     snapshot.update(_cgroup_cpu_snapshot())
+    snapshot.update(_cgroup_memory_snapshot())
     return snapshot
 
 

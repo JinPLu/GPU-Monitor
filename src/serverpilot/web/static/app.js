@@ -449,13 +449,22 @@
     const usedCores = cpuUtilizationPct !== null && quotaCores !== null
       ? (cpuUtilizationPct / 100) * quotaCores
       : null;
-    const memoryUsedPct = host?.memory_total_mib
-      ? clamp((1 - Number(host.memory_available_mib) / Number(host.memory_total_mib)) * 100)
-      : 0;
+    const memoryLimitMib = typeof host?.memory_limit_mib === "number" ? host.memory_limit_mib : null;
+    const memoryCurrentMib = typeof host?.memory_current_mib === "number" ? host.memory_current_mib : null;
+    const useCgroupMemory = memoryLimitMib !== null && memoryLimitMib > 0 && memoryCurrentMib !== null;
+    const memoryUsedPct = useCgroupMemory
+      ? clamp(memoryCurrentMib * 100 / memoryLimitMib)
+      : (host?.memory_total_mib
+        ? clamp((1 - Number(host.memory_available_mib) / Number(host.memory_total_mib)) * 100)
+        : 0);
     const cpuDetail = usedCores !== null && quotaCores !== null
       ? `已用 ${usedCores.toLocaleString("zh-CN", { maximumFractionDigits: 1 })} / 配额 ${quotaCores.toLocaleString("zh-CN", { maximumFractionDigits: 1 })} 核`
       : "暂无数据";
-    const memoryDetail = host ? `${formatMemory(host.memory_available_mib)}/${formatMemory(host.memory_total_mib)} 可用` : "暂无数据";
+    const memoryAvailableMib = useCgroupMemory
+      ? Math.max(0, memoryLimitMib - memoryCurrentMib)
+      : host?.memory_available_mib;
+    const memoryTotalMib = useCgroupMemory ? memoryLimitMib : host?.memory_total_mib;
+    const memoryDetail = host ? `${formatMemory(memoryAvailableMib)}/${formatMemory(memoryTotalMib)} 可用` : "暂无数据";
     const vramDetail = total ? `${formatMemory(used)}/${formatMemory(total)} 已用` : "暂无数据";
     const sshCommand = `ssh -p ${endpoint.port} ${endpoint.ssh_user}@${endpoint.host}`;
     const expanded = allExpanded || expandedServers.has(endpoint.id);

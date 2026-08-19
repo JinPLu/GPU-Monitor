@@ -60,6 +60,8 @@ def test_migration_upgrade_and_downgrade(tmp_path: Path) -> None:
         "cpu_usage_usec",
         "cpu_quota_usec",
         "cpu_period_usec",
+        "memory_limit_mib",
+        "memory_current_mib",
     }.issubset(endpoint_telemetry_columns)
     config = Config(str(root / "alembic.ini"))
     config.set_main_option("script_location", str(root / "src" / "serverpilot" / "migrations"))

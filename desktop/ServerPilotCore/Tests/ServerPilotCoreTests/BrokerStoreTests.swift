@@ -374,6 +374,35 @@ final class BrokerStoreTests: XCTestCase {
         XCTAssertNil(loadOnlySample.cpuLoadFraction)
     }
 
+    func testEndpointMemoryUsesCgroupLimitInsteadOfHostMemTotal() throws {
+        let cgroup = try XCTUnwrap(EndpointRecord(raw: [
+            "id": "gpu-node-01",
+            "host": "10.0.0.1",
+            "ssh_user": "gpu",
+            "monitor": ["status": "ONLINE"],
+            "host_telemetry": [
+                "memory_total_mib": 1_029_120,
+                "memory_available_mib": 921_600,
+                "memory_limit_mib": 249_856,
+                "memory_current_mib": 51_200
+            ]
+        ]))
+        XCTAssertEqual(cgroup.memoryFraction!, 51_200.0 / 249_856.0, accuracy: 0.0001)
+
+        let unlimited = try XCTUnwrap(EndpointRecord(raw: [
+            "id": "gpu-node-01",
+            "host": "10.0.0.1",
+            "ssh_user": "gpu",
+            "monitor": ["status": "ONLINE"],
+            "host_telemetry": [
+                "memory_total_mib": 1_029_120,
+                "memory_available_mib": 921_600,
+                "memory_current_mib": 51_200
+            ]
+        ]))
+        XCTAssertEqual(unlimited.memoryFraction!, 1 - 921_600.0 / 1_029_120.0, accuracy: 0.0001)
+    }
+
     func testEndpointTelemetryHistoryCapabilityGateDegradesWithoutChangingSnapshot() throws {
         let store = BrokerStore(actorID: "tester", refreshTimeoutSeconds: 1, refreshIntervalSeconds: 0)
         let snapshot = try Self.snapshot(named: "1")

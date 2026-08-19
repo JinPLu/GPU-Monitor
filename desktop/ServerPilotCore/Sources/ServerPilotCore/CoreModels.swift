@@ -549,6 +549,8 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
     public let cpuUtilizationFraction: Double?
     public let memoryTotalMiB: Int?
     public let memoryAvailableMiB: Int?
+    public let memoryLimitMiB: Int?
+    public let memoryCurrentMiB: Int?
     public let recentTelemetryAverage: HostTelemetryRecentAverage?
 
     public init?(raw: [String: Any]) {
@@ -581,6 +583,8 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
         self.cpuUtilizationFraction = hostTelemetry.optionalPercent("cpu_utilization_pct")
         self.memoryTotalMiB = hostTelemetry.optionalInt("memory_total_mib")
         self.memoryAvailableMiB = hostTelemetry.optionalInt("memory_available_mib")
+        self.memoryLimitMiB = hostTelemetry.optionalInt("memory_limit_mib")
+        self.memoryCurrentMiB = hostTelemetry.optionalInt("memory_current_mib")
         self.recentTelemetryAverage = HostTelemetryRecentAverage(
             raw: hostTelemetry["recent_average"] as? [String: Any] ?? [:]
         )
@@ -656,8 +660,11 @@ public struct EndpointRecord: Identifiable, Equatable, Sendable {
     }
 
     public var memoryFraction: Double? {
+        guard monitorStatus == "ONLINE" else { return nil }
+        if let memoryLimitMiB, memoryLimitMiB > 0, let memoryCurrentMiB {
+            return min(max(Double(memoryCurrentMiB) / Double(memoryLimitMiB), 0), 1)
+        }
         guard
-            monitorStatus == "ONLINE",
             let memoryTotalMiB,
             memoryTotalMiB > 0,
             let memoryAvailableMiB

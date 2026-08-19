@@ -476,6 +476,111 @@ def test_validated_keepalive_stop_clears_old_expected_process_identity(service, 
         assert current.expected_process_started_at is None
 
 
+def test_complete_observation_releases_keepalive_lease_on_absent_gpu(service, admin) -> None:
+    _configure_idle_policy(service, admin)
+    begun = _begin(service, admin)
+    keepalive = begun["keepalive"]
+    assert isinstance(keepalive, dict)
+    lease_id = str(keepalive["lease_id"])
+
+    service.ingest_observation(observation(gpu_uuids=["GPU-new-0", "GPU-new-1"]))
+
+    with service.database.session() as session:
+        lease = session.get(Lease, lease_id)
+        assert lease is not None
+        assert lease.state == "RELEASED"
+        assert lease.release_reason == "gpu absent from endpoint inventory"
+        resources = session.scalars(
+            select(LeaseResource).where(LeaseResource.lease_id == lease_id)
+        ).all()
+        assert resources
+        assert all(not resource.active for resource in resources)
+        assert session.get(KeepaliveCurrent, "endpoint-a:GPU-endpoint-a-0") is None
+
+    claimed = service.create_request(
+        admin,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "after-absent-keepalive",
+                "purpose": "new GPU should be allocatable",
+                "duration_seconds": 3600,
+                "constraints": {"gpu_count": 1},
+            }
+        ),
+        idempotency_key="after-absent-keepalive",
+    )
+    assert claimed["lease"] is not None
+    assert claimed["lease"]["gpu_ids"] == ["endpoint-a:GPU-new-0"]
+
+
+def test_absent_workload_lease_is_not_auto_released_but_can_be_cleared(
+    service, admin
+) -> None:
+    service.ingest_observation(observation(gpu_uuids=["GPU-old", "GPU-new"]))
+    claimed = service.create_request(
+        admin,
+        RequestCreate.model_validate(
+            {
+                "project_id": "project-a",
+                "task_ref": "absent-workload",
+                "purpose": "hold old GPU",
+                "duration_seconds": 3600,
+                "constraints": {
+                    "gpu_count": 1,
+                    "placement": "exact",
+                    "gpu_ids": ["endpoint-a:GPU-old"],
+                },
+            }
+        ),
+        idempotency_key="absent-workload",
+        activate_if_allocated=True,
+    )
+    lease_id = claimed["lease"]["id"]
+
+    service.ingest_observation(observation(gpu_uuids=["GPU-new"]))
+    with service.database.session() as session:
+        lease = session.get(Lease, lease_id)
+        assert lease is not None
+        assert lease.state in {"HELD", "ACTIVE"}
+        assert lease.kind == "workload"
+
+    barrier = utcnow()
+    service.ingest_observation(observation(gpu_uuids=["GPU-new"]))
+    released = service.release_empty_conflicted_lease(
+        admin,
+        "endpoint-a",
+        lease_id,
+        observation_not_before=barrier,
+        idempotency_key="absent-workload-release-empty",
+    )
+    assert released["released"] is True
+    assert released["lease"]["state"] == "RELEASED"
+
+
+def test_incomplete_observation_does_not_release_absent_keepalive_lease(service, admin) -> None:
+    _configure_idle_policy(service, admin)
+    begun = _begin(service, admin)
+    keepalive = begun["keepalive"]
+    assert isinstance(keepalive, dict)
+    lease_id = str(keepalive["lease_id"])
+
+    service.ingest_observation(
+        observation(gpu_uuids=["GPU-new-0"], observation_complete=False)
+    )
+
+    with service.database.session() as session:
+        lease = session.get(Lease, lease_id)
+        assert lease is not None
+        assert lease.state == "ACTIVE"
+        resources = session.scalars(
+            select(LeaseResource).where(
+                LeaseResource.lease_id == lease_id, LeaseResource.active.is_(True)
+            )
+        ).all()
+        assert [resource.gpu_id for resource in resources] == ["endpoint-a:GPU-endpoint-a-0"]
+
+
 def test_endpoint_operator_can_clear_stale_per_gpu_keepalive_lease(service, admin) -> None:
     """A failed stop leaves a recoverable internal lease, not a permanent wedge."""
 

@@ -1766,6 +1766,8 @@ def test_endpoint_cpu_and_memory_telemetry_is_exposed_in_snapshot(service, admin
         "cpu_period_usec": None,
         "memory_total_mib": 262_144,
         "memory_available_mib": 196_608,
+        "memory_limit_mib": None,
+        "memory_current_mib": None,
         "provider": "raw-ssh",
         "recent_average": {
             "window_seconds": 600,
@@ -1845,6 +1847,45 @@ def test_endpoint_history_is_throttled_and_calculates_cgroup_cpu_utilization(
     assert len(gpu_series[0]["points"]) == 2
     assert gpu_series[0]["points"][1]["gpu_utilization_pct"] == 0.0
     assert gpu_series[0]["points"][1]["memory_used_pct"] == 0.0
+
+
+def test_host_memory_used_pct_prefers_cgroup_limit_over_host_memtotal(service, admin) -> None:
+    service.ingest_observation(
+        observation(
+            count=1,
+            host={
+                "memory_total_mib": 1_029_120,
+                "memory_available_mib": 921_600,
+                "memory_limit_mib": 249_856,
+                "memory_current_mib": 51_200,
+            },
+        )
+    )
+
+    host = service.snapshot(admin)["data"]["endpoints"][0]["host_telemetry"]
+    assert host["memory_total_mib"] == 1_029_120
+    assert host["memory_limit_mib"] == 249_856
+    assert host["memory_current_mib"] == 51_200
+    assert host["recent_average"]["memory_used_pct"] == 20.49
+
+
+def test_host_memory_used_pct_falls_back_to_host_when_cgroup_unlimited(service, admin) -> None:
+    service.ingest_observation(
+        observation(
+            count=1,
+            host={
+                "memory_total_mib": 1_029_120,
+                "memory_available_mib": 921_600,
+                "memory_limit_mib": None,
+                "memory_current_mib": 51_200,
+            },
+        )
+    )
+
+    host = service.snapshot(admin)["data"]["endpoints"][0]["host_telemetry"]
+    assert host["memory_limit_mib"] is None
+    assert host["memory_current_mib"] == 51_200
+    assert host["recent_average"]["memory_used_pct"] == 10.45
 
 
 def test_endpoint_cpu_utilization_stays_null_without_cgroup(service, admin) -> None:

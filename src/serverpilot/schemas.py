@@ -768,6 +768,8 @@ class HostTelemetryInput(StrictModel):
     cpu_period_usec: int | None = Field(default=None, ge=1)
     memory_total_mib: int = Field(ge=1)
     memory_available_mib: int = Field(ge=0)
+    memory_limit_mib: int | None = Field(default=None, ge=1)
+    memory_current_mib: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def available_memory_is_bounded(self) -> "HostTelemetryInput":

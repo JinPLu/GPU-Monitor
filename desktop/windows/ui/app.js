@@ -75,6 +75,16 @@
     return key === "cpu_load_fraction" ? value * 100 : value;
   }
 
+  function hostMemoryUsedPct(endpoint) {
+    const host = endpoint.host_telemetry || {};
+    const limit = host.memory_limit_mib;
+    const current = host.memory_current_mib;
+    if (typeof limit === "number" && limit > 0 && typeof current === "number") {
+      return current * 100 / limit;
+    }
+    return hostMetric(endpoint, "memory_used_pct");
+  }
+
   function gpuMemoryPercent(gpu) {
     const used = gpu.telemetry?.memory_used_mib;
     const total = gpu.total_vram_mib;
@@ -129,7 +139,7 @@
       gpuUtil: average(gpus.map((gpu) => recentGPUValue(gpu, "gpu_utilization_pct"))),
       memory: average(gpus.map((gpu) => recentGPUValue(gpu, "memory_used_pct"))),
       cpu: hostMetric(endpoint, "cpu_load_fraction"),
-      systemMemory: hostMetric(endpoint, "memory_used_pct"),
+      systemMemory: hostMemoryUsedPct(endpoint),
       project: leaseGPU?.lease?.project_id || "—",
       task: leaseGPU?.lease?.task_ref || (gpus.length ? "无 GPU 任务" : "CPU 节点"),
       status: endpointStatus(endpoint),
