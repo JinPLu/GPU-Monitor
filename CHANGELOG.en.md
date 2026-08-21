@@ -6,6 +6,20 @@ This changelog records user-visible changes; implementation details belong in Gi
 
 ## Unreleased
 
+## 1.6.0 - 2026-08-21
+
+**ServerPilot 1.6.0 cuts about seventy percent of the context an agent spends reading GPU status, and returns idle-but-claimed GPUs to the pool on their own.**
+
+- Agents spend far less context reading GPU status: connection details and the remote working directory are now returned once per server instead of repeated on every GPU, and `gpu_status` also lists busy cards with the task holding each one — so deciding where to place work takes a single call instead of two. On one 8-GPU server that decision path dropped from roughly 21,800 to 6,700 characters.
+- `gpu_status` accepts a `server_id` argument to narrow the response to one server.
+- `gpu_release` now echoes the released lease id and its settled state, so an agent holding several leases can confirm them one by one instead of assuming one release finished everything.
+- The desktop App refreshes more cheaply: it no longer fetches the generic-resource and external-scheduler projections it never displays, cutting the measured state payload from roughly 77,000 to 59,700 characters (-22.4%) per refresh. Everything the interface actually renders — servers, GPUs, leases, resource usage — is byte-for-byte unchanged.
+- Three desktop details now match the design contract: the server column header uses the `server.rack` icon, the setting reads "data collection interval" (distinct from "refresh", which only re-reads local state), and the usage page's empty state reads "no current resource allocation".
+- Status colors now meet the accessibility floor: the normal green and caution amber darken to `#339653` and `#AA7C00` (lightness only, hues unchanged), lifting status dots and pressure bars from as low as 1.53 to at least 3.01 against both the content surface and the page background — the WCAG threshold for non-text graphics. The error red already passed and is unchanged.
+- Idle GPUs come back on their own: when a lease's GPUs show no compute process across observations the collector can actually see, ServerPilot raises a warning first and then releases the lease back into the allocatable pool. An agent that forgets to release, or a job that finished without cleanup, no longer locks the cards indefinitely. The idle clock resets whenever telemetry goes stale, so a collector outage never reclaims a job that is merely unobserved.
+- GPU status no longer collapses into "task in use": it now distinguishes a running task, a claim with no observed task, an unmanaged process, and an attribution conflict — so a card that is claimed but idle is visible at a glance.
+- Upgrade note: an external agent's global rules are a static copy on disk. After upgrading, re-run `python3 scripts/install_agent_policy.py all --install` (Cursor: `--print` then paste), otherwise the rules describe the old response shape.
+
 ## 1.5.12 - 2026-08-17
 
 **ServerPilot 1.5.12 lets you remove a server from the local control plane, and drops unused pause/resume and web reservation submit entry points.**

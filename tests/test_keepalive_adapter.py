@@ -192,7 +192,9 @@ def test_protocol_info_publishes_v3_helper_capabilities() -> None:
     assert keepalive_protocol_info() == {
         "kind": "serverpilot-keepalive",
         "schema_version": 3,
-        "implementation_version": "1.5.12",
+        # Pinned by tests/test_release_metadata.py; this test owns the
+        # schema version and capability list, not the release string.
+        "implementation_version": KEEPALIVE_IMPLEMENTATION_VERSION,
         "capabilities": [
             "per_gpu_keepalive",
             "pidfd_identity",
