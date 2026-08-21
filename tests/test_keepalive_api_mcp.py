@@ -1544,7 +1544,10 @@ def test_routine_agent_path_handles_keepalive_on_and_off(
 
     class RoutineClient:
         def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
-            response = rest.get("/api/v1/snapshot", params=kwargs, headers=headers)
+            # Mirror BrokerClient.snapshot: an unset endpoint_id is dropped
+            # rather than sent as an empty value the broker would filter on.
+            params = {key: value for key, value in kwargs.items() if value is not None}
+            response = rest.get("/api/v1/snapshot", params=params, headers=headers)
             assert response.status_code == 200, response.text
             return response.json()
 

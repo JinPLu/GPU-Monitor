@@ -16,8 +16,8 @@ serverpilot daemon status
 
 | 客户端 | MCP 注册 | 全局规则 |
 | --- | --- | --- |
-| Codex | `codex mcp add serverpilot --env SERVERPILOT_URL=http://127.0.0.1:8787 -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py codex --install` |
-| Claude Code | `claude mcp add --scope user serverpilot --env SERVERPILOT_URL=http://127.0.0.1:8787 -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py claude --install` |
+| Codex | `codex mcp add serverpilot -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py codex --install` |
+| Claude Code | `claude mcp add --scope user serverpilot -- serverpilot-mcp` | `python3 scripts/install_agent_policy.py claude --install` |
 | Cursor | 在 `~/.cursor/mcp.json` 配置 `serverpilot` | `python3 scripts/install_agent_policy.py cursor --print` 后粘贴到 User Rules |
 
 服务未运行时，macOS 的 MCP 会尝试启动同一用户的 LaunchAgent；如果服务不兼容或未就绪，调用会明确失败，不会创建备用数据库或改走 SSH。
@@ -30,15 +30,15 @@ serverpilot daemon status
 申请 → 使用返回的分配 → 释放
 ```
 
-1. `gpu_status()` 返回当前可见 GPU：`server_id`、结构化 `ssh {host, port, user}`、结构化 `workspace`、兼容字段 `workspace_path`、GPU 信息、简短中文 `status`，以及占卡的 `keepalive.desired / actual`。每张卡还返回最近一次采集的 `telemetry`：`observed_at`、显存已用/可用 MiB、由总显存推导的 `memory_used_pct`、GPU 利用率、显存控制器利用率和温度。`telemetry.recent_average` 进一步给出最近 10 分钟逐卡均值：时间窗、样本数、首末样本时间、平均显存已用/可用、平均显存占用、GPU/显存控制器利用率与温度；这能区分持续繁忙和瞬时波动。它与 GUI 同读 daemon 的同一份 REST 快照，不会另行 SSH 采集。首次只读采集还会将端点记录为 GPU、纯 CPU 或尚未确认；已识别纯 CPU 端点会在 `cpu_only_servers` 中返回服务器标识、在线状态、CPU 数和可用内存，但仅供说明，永不参与 GPU 分配。`telemetry_summary` 汇总本次可见卡的总/平均显存、显存占用和当前瞬时利用率的平均（字段以 `current_average_` 起始），并用各指标的 `*_gpu_count` 标明参与汇总的样本数。遥测只描述最近观测，调度是否可申请仍以 `status` 和 `gpu_apply` 为准。`workspace` 固定表达远端工作目录语义：`{path, kind=working_directory, use_as_cwd=true, code_location=not_provided}`。没有 GPU 时返回“无 GPU”；需要查看占用者或连接失败卡时调用 `gpu_status(include_busy=true)`，忙卡带人类可读的 `task`。
-2. `gpu_apply(server_id?, gpu_count=1, task?)` 直接申请。`task` 使用用户给定的任务名或当前目标的简短人类可读概括，不读取客户端 UI 标题；未提供时记录为“未命名任务”。ServerPilot 自动选 GPU，Agent 不提供 GPU ID。申请结果中的四类信息必须分开理解：`ssh` 是连接参数；`workspace.path` 是 SSH 后先进入的远端 cwd；`code_location=not_provided` 表示 ServerPilot 不提供也不暗示代码仓库位置；GPU UUID 只作物理身份。执行时设置返回的 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，再用顶层 `cuda_visible_devices` ordinal 集合选择整个租约，或用每行 `gpu_cuda_visible_devices` ordinal 选择对应一张卡；不得把 UUID 直接填入 `CUDA_VISIBLE_DEVICES`。跨 endpoint 结果不生成有歧义的顶层 server/SSH/workspace/CUDA 字段。随后做最小 CUDA gate，再启动 workload。
-3. 最小 CUDA gate 失败或 workload 未能启动时立即调用 `gpu_release(lease_id)`；在当前任务内记下失败的 `server_id` 与原因，后续申请避开同一环境。workload 停止时同样释放。
+1. `gpu_status(include_busy=false, server_id?)` 返回当前可见 GPU。**连接与工作目录逐服务器返回一次**：`servers[]` 给出 `server_id`、结构化 `ssh {host, port, user}`、结构化 `workspace` 与兼容字段 `workspace_path`；`gpus[]` 每行只带 `server_id` 外键与该卡自身的信息（`gpu_id`、`index`、`name`、`vram_mib`、简短中文 `status`、占卡的 `keepalive.desired / actual`）。每张卡的 `telemetry` 是最近一次采集：`observed_at`、显存已用/可用 MiB、由总显存推导的 `memory_used_pct`、GPU 利用率、显存控制器利用率和温度；`telemetry.recent_average` 给出最近 10 分钟逐卡均值（平均显存已用/可用、平均显存占用、GPU/显存控制器利用率与温度），用于区分持续繁忙和瞬时波动。该均值的时间窗描述（时间窗长度、样本数、首末样本时间）对同一次采集的所有卡相同，因此放在 `servers[].telemetry_window`；只有某张卡的窗口与本服务器不一致时，才在该卡的 `telemetry.window_override` 单独给出，绝不把部分失败的采集伪装成一个共享窗口。默认响应还返回紧凑的 `busy_gpus`：占用卡的 `server_id`、`gpu_id`、`index`、`status` 和人类可读 `task`，不含遥测——因此判断“有没有空卡、被谁占着”只需要这一次调用。需要忙卡的完整遥测时才用 `include_busy=true`（此时忙卡并入 `gpus[]` 且不再重复 `busy_gpus`）；只关心一台服务器时用 `server_id` 收窄响应。它与 GUI 同读 daemon 的同一份 REST 快照，不会另行 SSH 采集。首次只读采集还会将端点记录为 GPU、纯 CPU 或尚未确认；已识别纯 CPU 端点会在 `cpu_only_servers` 中返回服务器标识、在线状态、CPU 数和可用内存，但仅供说明，永不参与 GPU 分配。`telemetry_summary` 汇总本次可见卡的总/平均显存、显存占用和当前瞬时利用率的平均（字段以 `current_average_` 起始），并用各指标的 `*_gpu_count` 标明参与汇总的样本数。遥测只描述最近观测，调度是否可申请仍以 `status` 和 `gpu_apply` 为准。`workspace` 固定表达远端工作目录语义：`{path, kind=working_directory, use_as_cwd=true, code_location=not_provided}`。没有 GPU 时返回“无 GPU”。
+2. `gpu_apply(server_id?, gpu_count=1, task?)` 直接申请。`task` 使用用户给定的任务名或当前目标的简短人类可读概括，不读取客户端 UI 标题；未提供时记录为“未命名任务”。ServerPilot 自动选 GPU，Agent 不提供 GPU ID。**连接、工作目录和整份租约的 CUDA selector 同样逐服务器返回一次**，在 `servers[]` 中；单服务器租约额外在顶层重复一份，那是最常读的路径。`gpus[]` 每行只有 `server_id`、`gpu_id`、`gpu_index`、`cuda_ordinal` 和 `gpu_cuda_visible_devices`。四类信息必须分开理解：`ssh` 是连接参数；`workspace.path` 是 SSH 后先进入的远端 cwd；`code_location=not_provided` 表示 ServerPilot 不提供也不暗示代码仓库位置；GPU UUID 只作物理身份。执行时设置返回的 `CUDA_DEVICE_ORDER=PCI_BUS_ID`，再用该服务器的 `cuda_visible_devices` ordinal 集合选择整份租约，或用每行 `gpu_cuda_visible_devices` ordinal 选择对应一张卡；不得把 UUID 直接填入 `CUDA_VISIBLE_DEVICES`。跨 endpoint 结果不生成有歧义的顶层 server/SSH/workspace/CUDA 字段，逐服务器信息一律从 `servers[]` 读取。随后做最小 CUDA gate，再启动 workload。
+3. 最小 CUDA gate 失败或 workload 未能启动时立即调用 `gpu_release(lease_id)`，它回显被结算的 `lease_id` 与终态 `state` 供逐个确认；在当前任务内记下失败的 `server_id` 与原因，后续申请避开同一环境。workload 停止时同样释放。
 
 已确认的空闲占卡 GPU 仍出现在可用容量中。`gpu_apply` 真正分配这张卡前会自动停止该卡 helper、定向刷新并确认空闲，再返回普通工作租约；Agent 不需要也不能手工执行占卡停止流程。
 
 新增服务器必须同时登记一个绝对 `workspace_path`（例如 `/srv/serverpilot-workspace`）。历史 endpoint 没有该元数据时状态明确返回空值，需通过现有 endpoint 更新面补齐，不会猜测子项目路径。该字段是远端操作的工作目录元数据，不是代码仓库路径：ServerPilot 不会自动创建/删除远端目录，也不会因此获得启动项目 workload 的权限。密封占卡 helper 只采用固定布局 `${workspace_path}/serverpilot-keepalive`；adapter 先以该 workspace 执行只读 `./serverpilot-keepalive --protocol-info`，确认 v3 与所需能力后才执行固定逐卡启停命令；身份恢复只读执行 `./serverpilot-keepalive --inspect --schema-version 3`，并与新鲜 collector 观测交叉确认。不从远端 `PATH` 查找，也不接受 caller 提供的 PID、helper 路径、命令或参数。旧 v2 wire/state 版本直接 fail closed，不会收养、删除或停止旧状态。
 
-`no_capacity` 不创建队列，也不代表传输失败。同一 turn 最多再刷新一次状态，然后把再次尝试留给下一 turn 或后续工作周期，不在当前 turn 反复申请。`Transport closed` 与 `no_capacity` 分开处理：前者最多重试一次，仍失败就报告传输错误。
+`no_capacity` 不创建队列，也不代表传输失败；此时 `busy_gpus` 已经列出占用者，不需要为了看占用再查一次。同一 turn 最多再刷新一次状态，然后把再次尝试留给下一 turn 或后续工作周期，不在当前 turn 反复申请。`Transport closed` 与 `no_capacity` 分开处理：前者最多重试一次，仍失败就报告传输错误。
 
 例行租约持续到显式 `gpu_release` 或 App 人工处理，不需要 bind、renew、heartbeat、coordination 或调用方提供 `idempotency_key`。MCP adapter 为每次工具调用生成内部重放键，只在本地 HTTP 传输失败时以同一键自动重试一次；参数相同的新工具调用仍会创建新的 lease。一个任务持有多个 lease 时必须维护显式的 `lease_id` 清单，申请者负责逐个释放并确认结果为 `released`，不能因其中一个已释放就把整个任务视为完成。MCP 进程退出后，由调用方另发的新调用不能与旧调用判定为同一次传输重放。
 

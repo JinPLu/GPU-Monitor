@@ -94,3 +94,59 @@ def test_idempotent_mutation_replay_retains_committed_revision(service, admin) -
 
     assert first == second
     assert first["committed"] == {"snapshot_revision": first["snapshot_revision"]}
+
+
+def test_control_plane_state_can_omit_advanced_projections(tmp_path: Path, inventory) -> None:
+    """The App renders no generic-resource or scheduler projection.
+
+    Asking for the state without them keeps the observe/allocate sections
+    byte-identical, so narrowing the request cannot change what the desktop
+    table shows.
+    """
+
+    inventory_path = tmp_path / "inventory.yaml"
+    inventory_path.write_text(yaml.safe_dump(inventory.model_dump(mode="json")), encoding="utf-8")
+    app = create_app(
+        Settings(
+            database_url=f"sqlite:///{tmp_path / 'state-narrow.sqlite3'}",
+            inventory_path=inventory_path,
+            session_secret="s" * 32,
+        )
+    )
+    service = app.state.service
+    actor = service.local_actor("state-agent")
+    service.ingest_observation(observation(count=1))
+    service.create_request(actor, _request("state-lease"), idempotency_key="state-lease")
+    client = TestClient(app)
+    headers = {"X-ServerPilot-Actor": "state-agent"}
+
+    full = client.get("/api/v1/state", headers=headers).json()["data"]
+    narrowed = client.get(
+        "/api/v1/state",
+        params={"include_advanced": "false"},
+        headers=headers,
+    ).json()["data"]
+
+    advanced = {
+        "resource_providers",
+        "allocatable_units",
+        "scheduler_targets",
+        "scheduler_jobs",
+        "scheduler_transfers",
+        "workload_profiles",
+    }
+    assert advanced <= full["current"].keys()
+    assert not advanced & narrowed["current"].keys()
+    assert "resource_plan_evaluations" in full["history"]
+    assert "resource_plan_evaluations" not in narrowed["history"]
+
+    # Everything the App actually renders is untouched, including the resource
+    # claim and run-actual history the usage page reads.
+    assert narrowed["current"].keys() == full["current"].keys() - advanced
+    for shared in narrowed["current"]:
+        assert narrowed["current"][shared] == full["current"][shared], shared
+    assert narrowed["history"] == {"resource_run_actuals": full["history"]["resource_run_actuals"]}
+
+    # Omitting the projections is opt-in: the default response is unchanged.
+    default = client.get("/api/v1/state", headers=headers).json()["data"]
+    assert default["current"].keys() == full["current"].keys()

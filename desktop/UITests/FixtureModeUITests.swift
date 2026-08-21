@@ -260,7 +260,7 @@ final class FixtureModeUITests: XCTestCase {
         let settings = app.descendants(matching: .any)["设置"]
         XCTAssertTrue(settings.waitForExistence(timeout: 5), "Settings must expose its accepted accessible section name")
         XCTAssertTrue(app.staticTexts["本机服务地址"].exists)
-        XCTAssertTrue(app.staticTexts["数据更新间隔"].exists)
+        XCTAssertTrue(app.staticTexts["数据采集间隔"].exists)
         XCTAssertTrue(app.staticTexts["版本"].exists)
         assertAgentIdentityIsNotExposed()
     }

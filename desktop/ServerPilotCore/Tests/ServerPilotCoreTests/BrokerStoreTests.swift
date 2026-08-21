@@ -1020,7 +1020,7 @@ final class BrokerStoreTests: XCTestCase {
             "total_vram_mib": 81920,
             "state": "CONFLICT",
             "publicly_available": false,
-            "public_status": "任务使用中",
+            "public_status": "任务占用",
             "keepalive": [
                 "configured": true,
                 "policy": "idle_keepalive",
@@ -1030,7 +1030,7 @@ final class BrokerStoreTests: XCTestCase {
                 "lease_id": "keepalive-conflicted-lease"
             ],
         ]))
-        XCTAssertEqual(conflictedKeeper.publicStatus, "任务使用中")
+        XCTAssertEqual(conflictedKeeper.publicStatus, "任务占用")
         XCTAssertEqual(conflictedKeeper.projectedPubliclyAvailable, false)
         XCTAssertFalse(conflictedKeeper.isPubliclyAvailable)
         XCTAssertEqual(conflictedKeeper.keepalive.desired, "ON")

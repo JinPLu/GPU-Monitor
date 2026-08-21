@@ -987,7 +987,7 @@ private struct DashboardView: View {
         }) else { return notice }
 
         let task = runningLease.taskReference ?? runningLease.purpose ?? "未命名任务"
-        return "任务使用中：\(runningLease.projectID) · \(task) · \(runningLease.gpuIDs.count) GPU。"
+        return "任务占用：\(runningLease.projectID) · \(task) · \(runningLease.gpuIDs.count) GPU。"
     }
 }
 
@@ -1032,12 +1032,12 @@ private struct SettingsDashboard: View {
                                 .foregroundStyle(DesignTokens.interaction)
                                 .frame(width: 28, height: 28)
                                 .background(DesignTokens.interaction.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            Text("数据更新间隔")
+                            Text("数据采集间隔")
                                 .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(DesignTokens.mutedInk)
                             Spacer()
                             Picker(
-                                "数据更新间隔",
+                                "数据采集间隔",
                                 selection: Binding(
                                     get: { store.collectorSettings?.intervalSeconds ?? 10 },
                                     set: { store.updateCollectorInterval($0) { _, _ in } }
@@ -1050,7 +1050,7 @@ private struct SettingsDashboard: View {
                             .pickerStyle(.segmented)
                             .labelsHidden()
                             .frame(width: 210)
-                            .accessibilityLabel("数据更新间隔")
+                            .accessibilityLabel("数据采集间隔")
                             .accessibilityValue("\(store.collectorSettings?.intervalSeconds ?? 10) 秒")
                             .disabled(
                                 store.collectorSettingsLoading
@@ -1622,7 +1622,7 @@ private struct EndpointTableHeader: View {
 
     private var standardHeader: some View {
         HStack(spacing: EndpointTableLayout.columnSpacing) {
-                header("服务器", icon: "terminal", column: .id, alignment: .leading)
+                header("服务器", icon: "server.rack", column: .id, alignment: .leading)
                     .frame(width: EndpointTableLayout.serverWidth, alignment: .leading)
                 header("项目 · 任务", icon: "folder", column: .assignment, alignment: .leading)
                     .frame(minWidth: EndpointTableLayout.assignmentMinimumWidth, maxWidth: .infinity, alignment: .leading)
@@ -1645,7 +1645,7 @@ private struct EndpointTableHeader: View {
 
     private var compactHeader: some View {
         VStack(alignment: .leading, spacing: 7) {
-            header("服务器", icon: "terminal", column: .id, alignment: .leading)
+            header("服务器", icon: "server.rack", column: .id, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 8) {
                 header("项目 · 任务", icon: "folder", column: .assignment, alignment: .leading)
@@ -2997,7 +2997,7 @@ func gpuPresentationLabel(_ gpu: GPURecord) -> String {
     }
     if gpuHasLegacyWorkloadProcessReview(gpu) {
         let task = gpu.taskReference?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return task.map { "任务使用中 · \($0)" } ?? "任务使用中 · 进程已更新"
+        return task.map { "任务占用 · \($0)" } ?? "任务占用 · 进程已更新"
     }
     if gpu.keepalive.state == "ERROR" {
         let reason = gpu.keepalive.reason.map(localizedStateReason) ?? "未知原因"

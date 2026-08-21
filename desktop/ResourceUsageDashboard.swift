@@ -357,7 +357,7 @@ struct ResourceUsageDashboard: View {
             .id(selectedGroup.id)
         } else {
             VStack(spacing: 12) {
-                ContentUnavailableView("当前没有 GPU 使用记录", systemImage: "square.stack.3d.up.slash")
+                ContentUnavailableView("当前没有资源分配。", systemImage: "square.stack.3d.up.slash")
                 Button("申请 GPU", action: claimGPU)
                     .buttonStyle(PrimaryActionButtonStyle())
                     .disabled(!store.allowsMutations)

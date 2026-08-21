@@ -24,11 +24,11 @@ RESOURCE_MARGINAL_MIN_SAVED_SECONDS = 120
 _ROUTINE_MCP_INSTANCE_ID = secrets.token_hex(16)
 
 MCP_INSTRUCTIONS = """常规 GPU 任务三个工具：gpu_status；gpu_apply 自动选卡(task=任务名)，不读取客户端 UI 标题；gpu_release。
-ssh=连接；workspace.path（workspace_path）=cwd，以它为工作目录；kind=working_directory、use_as_cwd=true、code_location=not_provided；不得把 workspace_path 当代码仓库路径。
-cuda_device_order=PCI_BUS_ID；cuda_visible_devices=租约ordinal；gpus[].gpu_cuda_visible_devices=单卡ordinal。
-telemetry 含最近观测/近10分钟均值，status/gpu_apply 决定申请。include_busy=true 看 task/空闲占卡；无容量直接失败，不排队。
-失败即 gpu_release。只协调 GPU；勿用 SSH、SQLite、inventory、nvidia-smi 绕过协调。
-非 GPU 远端操作（Git 同步）无需 GPU 租约。"""
+连接与工作目录在 servers[]，不逐卡重复：ssh=连接；workspace.path（workspace_path）=cwd，以它为工作目录；code_location=not_provided，不得把 workspace_path 当代码仓库路径；gpus[] 以 server_id 指回。
+cuda_device_order=PCI_BUS_ID；cuda_visible_devices=租约 ordinal，gpu_cuda_visible_devices=单卡 ordinal；勿用 UUID 选卡。
+gpu_status 默认给可申请卡（含空闲占卡）与紧凑 busy_gpus(task)；忙卡遥测用 include_busy=true，server_id 收窄一台。
+无容量直接失败，不排队。失败即 gpu_release 并确认 released。
+只协调 GPU；勿用 SSH、SQLite、inventory、nvidia-smi 绕过协调。非 GPU 远端操作（Git 同步）无需 GPU 租约。"""
 
 
 mcp = FastMCP(
@@ -116,8 +116,12 @@ def _routine_number(value: Any) -> int | float | None:
     return value if value >= 0 else None
 
 
-def _routine_recent_telemetry_average(value: Any) -> dict[str, Any] | None:
-    """Project a per-GPU rolling average without exposing other snapshot state."""
+def _routine_telemetry_window(value: Any) -> dict[str, Any] | None:
+    """Project the rolling-average window descriptor of one GPU observation.
+
+    Every GPU observed in the same collector cycle shares this descriptor, so
+    the status projection publishes it once per server instead of once per GPU.
+    """
 
     if not isinstance(value, dict):
         return None
@@ -125,7 +129,7 @@ def _routine_recent_telemetry_average(value: Any) -> dict[str, Any] | None:
     sample_count = _routine_integer(value.get("sample_count"))
     first_observed_at = value.get("first_observed_at")
     last_observed_at = value.get("last_observed_at")
-    return {
+    window = {
         "window_seconds": window_seconds if window_seconds and window_seconds > 0 else None,
         "sample_count": sample_count if sample_count and sample_count > 0 else None,
         "first_observed_at": (
@@ -136,6 +140,37 @@ def _routine_recent_telemetry_average(value: Any) -> dict[str, Any] | None:
         "last_observed_at": (
             last_observed_at if isinstance(last_observed_at, str) and last_observed_at else None
         ),
+    }
+    return window if any(item is not None for item in window.values()) else None
+
+
+def _routine_shared_telemetry_window(
+    windows: list[dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    """Return the window shared by one server's GPUs, or None when they disagree.
+
+    Disagreement is not smoothed over.  A partially failing collector cycle must
+    not be published as one shared window, so the caller keeps each GPU's own
+    descriptor instead.
+    """
+
+    observed = [window for window in windows if window is not None]
+    if not observed:
+        return None
+    first = observed[0]
+    return first if all(window == first for window in observed[1:]) else None
+
+
+def _routine_recent_telemetry_average(value: Any) -> dict[str, Any] | None:
+    """Project one GPU's rolling-average measurements.
+
+    The window descriptor lives in ``servers[].telemetry_window``; a GPU whose
+    window disagrees with its server keeps its own ``telemetry.window_override``.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    return {
         "memory_used_mib": _routine_number(value.get("memory_used_mib")),
         "memory_free_mib": _routine_number(value.get("memory_free_mib")),
         "memory_used_pct": _routine_number(value.get("memory_used_pct")),
@@ -504,6 +539,15 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
         if isinstance(endpoint, dict) and endpoint.get("id")
     }
     gpus: list[dict[str, Any]] = []
+    busy_gpus: list[dict[str, Any]] = []
+    referenced_server_ids: list[Any] = []
+    windows_by_server: dict[Any, list[dict[str, Any] | None]] = {}
+    rows_by_server: dict[Any, list[dict[str, Any]]] = {}
+
+    def reference(server_id: Any) -> None:
+        if server_id not in referenced_server_ids:
+            referenced_server_ids.append(server_id)
+
     for gpu in values:
         if not isinstance(gpu, dict):
             continue
@@ -512,14 +556,25 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
         if not isinstance(available, bool) or not isinstance(status, str) or not status:
             raise ValueError("ServerPilot 返回的 GPU 公开状态无效")
         lease = gpu.get("lease")
+        server_id = gpu.get("endpoint_id")
+        task = lease.get("task_ref") or "未命名任务" if isinstance(lease, dict) else None
         if not available and not include_busy:
+            # Answer "who holds the busy cards" inside the default response so a
+            # placement decision does not need a second, telemetry-heavy call.
+            reference(server_id)
+            busy_gpus.append(
+                {
+                    "server_id": server_id,
+                    "gpu_id": gpu.get("gpu_uuid"),
+                    "index": gpu.get("gpu_index"),
+                    "status": status,
+                    "task": task,
+                }
+            )
             continue
-        endpoint = endpoint_by_id.get(gpu.get("endpoint_id"))
+        reference(server_id)
         row: dict[str, Any] = {
-            "server_id": gpu.get("endpoint_id"),
-            "workspace_path": (
-                endpoint.get("workspace_path") if isinstance(endpoint, dict) else None
-            ),
+            "server_id": server_id,
             "gpu_id": gpu.get("gpu_uuid"),
             "index": gpu.get("gpu_index"),
             "name": gpu.get("name"),
@@ -527,10 +582,13 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
             "status": status,
         }
         row["telemetry"] = _routine_gpu_telemetry(gpu, vram_mib=row["vram_mib"])
-        row["workspace"] = _routine_workspace(row["workspace_path"])
-        ssh = _routine_ssh(endpoint)
-        if ssh is not None:
-            row["ssh"] = ssh
+        source = gpu.get("telemetry")
+        windows_by_server.setdefault(server_id, []).append(
+            _routine_telemetry_window(source.get("recent_average"))
+            if isinstance(source, dict)
+            else None
+        )
+        rows_by_server.setdefault(server_id, []).append(row)
         keepalive = gpu.get("keepalive")
         if isinstance(keepalive, dict):
             row["keepalive"] = {
@@ -539,10 +597,36 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
             }
         if include_busy:
             row["available"] = available
-            if isinstance(lease, dict):
-                row["task"] = lease.get("task_ref") or "未命名任务"
+            if task is not None:
+                row["task"] = task
         gpus.append(row)
-    result: dict[str, Any] = {"gpus": gpus}
+
+    servers: list[dict[str, Any]] = []
+    for server_id in referenced_server_ids:
+        endpoint = endpoint_by_id.get(server_id)
+        workspace_path = endpoint.get("workspace_path") if isinstance(endpoint, dict) else None
+        server: dict[str, Any] = {
+            "server_id": server_id,
+            "workspace_path": workspace_path,
+            "workspace": _routine_workspace(workspace_path),
+        }
+        ssh = _routine_ssh(endpoint)
+        if ssh is not None:
+            server["ssh"] = ssh
+        server_windows = windows_by_server.get(server_id, [])
+        shared_window = _routine_shared_telemetry_window(server_windows)
+        if shared_window is not None:
+            server["telemetry_window"] = shared_window
+        else:
+            for row, window in zip(rows_by_server.get(server_id, []), server_windows, strict=True):
+                telemetry = row.get("telemetry")
+                if window is not None and isinstance(telemetry, dict):
+                    telemetry["window_override"] = window
+        servers.append(server)
+
+    result: dict[str, Any] = {"servers": servers, "gpus": gpus}
+    if busy_gpus:
+        result["busy_gpus"] = busy_gpus
     cpu_only_servers: list[dict[str, Any]] = []
     for endpoint in endpoints:
         if not isinstance(endpoint, dict) or endpoint.get("resource_kind") != "cpu_only":
@@ -573,7 +657,7 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
         total_gpus = summary.get("total_gpus") if isinstance(summary, dict) else None
         result["no_capacity"] = {
             "reason": "all_gpus_busy_or_unavailable",
-            "message": "当前没有可申请 GPU；可调用 gpu_status(include_busy=true) 查看占用任务或异常状态。",
+            "message": "当前没有可申请 GPU；busy_gpus 已列出占用任务，需要忙卡遥测时再调用 gpu_status(include_busy=true)。",
             "total_gpus": total_gpus if isinstance(total_gpus, int) else None,
         }
     return result
@@ -582,9 +666,11 @@ def _routine_gpu_status(payload: dict[str, Any], *, include_busy: bool) -> dict[
 def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
     """Project a lease for routine use without conflating lease and GPU scope.
 
-    A single-endpoint lease keeps its complete CUDA device set at the top level.
-    Each ``gpus`` row carries both the resource-wide selector and its own
-    one-GPU selector while retaining the UUID as the physical identity.
+    Connection, workspace and the lease-wide CUDA selector belong to the server,
+    so they are published once per server in ``servers`` rather than copied onto
+    every GPU row.  A single-server lease also keeps them at the top level,
+    which is the path routine callers read first.  Each ``gpus`` row carries its
+    own one-GPU selector and retains the UUID as the physical identity.
     """
 
     lease = payload.get("lease")
@@ -617,23 +703,22 @@ def _routine_gpu_allocation(payload: dict[str, Any]) -> dict[str, Any]:
             if isinstance(gpu, dict):
                 gpu_index = gpu.get("gpu_index")
                 cuda_ordinal = gpu.get("cuda_ordinal")
-                if isinstance(cuda_ordinal, bool) or not isinstance(cuda_ordinal, int) or cuda_ordinal < 0:
+                if (
+                    isinstance(cuda_ordinal, bool)
+                    or not isinstance(cuda_ordinal, int)
+                    or cuda_ordinal < 0
+                ):
                     raise ValueError("ServerPilot 返回了无效的 GPU CUDA ordinal")
-                row = {
-                    "server_id": server_id,
-                    "workspace_path": workspace_path,
-                    "workspace": _routine_workspace(workspace_path),
-                    "gpu_id": gpu.get("gpu_uuid"),
-                    "gpu_index": gpu_index,
-                    "cuda_ordinal": cuda_ordinal,
-                    "cuda_visible_devices": cuda_visible_devices,
-                    "gpu_cuda_visible_devices": str(cuda_ordinal),
-                    "cuda_device_order": cuda_device_order,
-                }
-                if ssh is not None:
-                    row["ssh"] = ssh
-                rows.append(row)
-    result: dict[str, Any] = {"lease_id": lease.get("id"), "gpus": rows}
+                rows.append(
+                    {
+                        "server_id": server_id,
+                        "gpu_id": gpu.get("gpu_uuid"),
+                        "gpu_index": gpu_index,
+                        "cuda_ordinal": cuda_ordinal,
+                        "gpu_cuda_visible_devices": str(cuda_ordinal),
+                    }
+                )
+    result: dict[str, Any] = {"lease_id": lease.get("id"), "servers": resources, "gpus": rows}
     if len(resources) == 1:
         result.update(resources[0])
     return result
@@ -799,12 +884,19 @@ def control_plane_state(
 
 
 @mcp.tool()
-def gpu_status(include_busy: bool = False) -> dict[str, Any]:
-    """列出 GPU、已识别纯 CPU 服务器和近 10 分钟显存/利用率遥测；include_busy=true 时列出占用任务。"""
+def gpu_status(include_busy: bool = False, server_id: str | None = None) -> dict[str, Any]:
+    """列出可申请 GPU、紧凑 busy_gpus、纯 CPU 服务器和近 10 分钟遥测；include_busy=true 时忙卡带完整遥测。"""
 
+    if server_id is not None:
+        server_id = server_id.strip()
+        if not server_id:
+            raise ValueError("提供 server_id 时不能为空")
+    # Busy cards are filtered in the projection, not by the broker, so the
+    # default response can name their tasks without a second tool call.
     payload = _routine_client().snapshot(
         compact=False,
-        only_available=not include_busy,
+        endpoint_id=server_id,
+        only_available=False,
     )
     return _routine_gpu_status(payload, include_busy=include_busy)
 
@@ -1459,13 +1551,21 @@ def gpu_apply(
 def gpu_release(
     lease_id: str,
 ) -> dict[str, Any]:
-    """释放此前申请的 GPU。"""
+    """释放此前申请的 GPU；返回被释放的 lease_id 与其终态，供逐个确认。"""
 
     if not isinstance(lease_id, str) or not lease_id.strip():
         raise ValueError("lease_id 不能为空")
     lease_id = lease_id.strip()
-    _routine_client().post(f"/api/v1/routine/leases/{lease_id}/release")
-    return {"released": True}
+    payload = _routine_client().post(f"/api/v1/routine/leases/{lease_id}/release")
+    # Echo the lease the broker actually settled so a caller holding several
+    # leases can confirm them one by one instead of assuming one release
+    # finished the whole task.
+    lease = payload.get("lease") if isinstance(payload, dict) else None
+    state = lease.get("state") if isinstance(lease, dict) else None
+    result: dict[str, Any] = {"released": True, "lease_id": lease_id}
+    if isinstance(state, str) and state:
+        result["state"] = state
+    return result
 
 
 def gpu_schedule(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -1318,10 +1319,12 @@ def test_mcp_exposes_required_tools() -> None:
     assert by_name["gpu_release"].inputSchema["required"] == ["lease_id"]
     assert set(by_name["gpu_release"].inputSchema["properties"]) == {"lease_id"}
     status_schema = by_name["gpu_status"].inputSchema
-    assert set(status_schema["properties"]) == {"include_busy"}
+    assert set(status_schema["properties"]) == {"include_busy", "server_id"}
     assert status_schema["properties"]["include_busy"]["default"] is False
+    assert "required" not in status_schema
     assert by_name["gpu_status"].description == (
-        "列出 GPU、已识别纯 CPU 服务器和近 10 分钟显存/利用率遥测；include_busy=true 时列出占用任务。"
+        "列出可申请 GPU、紧凑 busy_gpus、纯 CPU 服务器和近 10 分钟遥测；"
+        "include_busy=true 时忙卡带完整遥测。"
     )
     for name in (
         "gpu_add_server",
@@ -1344,7 +1347,8 @@ def test_default_stdio_mcp_uses_intent_first_routine_surface() -> None:
     assert not any(name.startswith("gpu_scheduler_") for name in names)
     assert names == {"gpu_status", "gpu_apply", "gpu_release"}
     assert by_name["gpu_status"].description == (
-        "列出 GPU、已识别纯 CPU 服务器和近 10 分钟显存/利用率遥测；include_busy=true 时列出占用任务。"
+        "列出可申请 GPU、紧凑 busy_gpus、纯 CPU 服务器和近 10 分钟遥测；"
+        "include_busy=true 时忙卡带完整遥测。"
     )
 
 
@@ -1468,8 +1472,16 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
         "use_as_cwd": True,
         "code_location": "not_provided",
     }
+    server_projection = {
+        "server_id": "server-a",
+        "workspace_path": "/srv/server-a",
+        "workspace": workspace,
+        "cuda_visible_devices": "0,1",
+        "cuda_device_order": "PCI_BUS_ID",
+    }
     assert result == {
         "lease_id": "lease-a",
+        "servers": [server_projection],
         "server_id": "server-a",
         "workspace_path": "/srv/server-a",
         "workspace": workspace,
@@ -1478,25 +1490,17 @@ def test_mcp_common_tools_do_not_preflight_health(monkeypatch) -> None:  # type:
         "gpus": [
             {
                 "server_id": "server-a",
-                "workspace_path": "/srv/server-a",
-                "workspace": workspace,
                 "gpu_id": "GPU-a",
                 "gpu_index": 7,
                 "cuda_ordinal": 0,
-                "cuda_visible_devices": "0,1",
                 "gpu_cuda_visible_devices": "0",
-                "cuda_device_order": "PCI_BUS_ID",
             },
             {
                 "server_id": "server-a",
-                "workspace_path": "/srv/server-a",
-                "workspace": workspace,
                 "gpu_id": "GPU-b",
                 "gpu_index": 3,
                 "cuda_ordinal": 1,
-                "cuda_visible_devices": "0,1",
                 "gpu_cuda_visible_devices": "1",
-                "cuda_device_order": "PCI_BUS_ID",
             },
         ],
     }
@@ -1539,8 +1543,16 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
             }
         }
     )
+    server_a = {
+        "server_id": "server-a",
+        "workspace_path": "/srv/server-a",
+        "workspace": workspace_a,
+        "cuda_visible_devices": "0",
+        "cuda_device_order": "PCI_BUS_ID",
+    }
     assert single == {
         "lease_id": "lease-single",
+        "servers": [server_a],
         "server_id": "server-a",
         "workspace_path": "/srv/server-a",
         "workspace": workspace_a,
@@ -1549,14 +1561,10 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
         "gpus": [
             {
                 "server_id": "server-a",
-                "workspace_path": "/srv/server-a",
-                "workspace": workspace_a,
                 "gpu_id": "GPU-a",
                 "gpu_index": 7,
                 "cuda_ordinal": 0,
-                "cuda_visible_devices": "0",
                 "gpu_cuda_visible_devices": "0",
-                "cuda_device_order": "PCI_BUS_ID",
             }
         ],
     }
@@ -1592,20 +1600,12 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
             }
         }
     )
+    # A spread lease keeps every server reachable through servers[]; it must not
+    # publish an ambiguous top-level server, SSH, workspace or CUDA selector.
     assert multiple_endpoints == {
         "lease_id": "lease-spread",
-        "gpus": [
-            {
-                "server_id": "server-a",
-                "workspace_path": "/srv/server-a",
-                "workspace": workspace_a,
-                "gpu_id": "GPU-a",
-                "gpu_index": 7,
-                "cuda_ordinal": 0,
-                "cuda_visible_devices": "0",
-                "gpu_cuda_visible_devices": "0",
-                "cuda_device_order": "PCI_BUS_ID",
-            },
+        "servers": [
+            server_a,
             {
                 "server_id": "server-b",
                 "workspace_path": "/srv/server-b",
@@ -1615,15 +1615,29 @@ def test_routine_gpu_allocation_projects_single_gpu_and_multiple_endpoints() -> 
                     "use_as_cwd": True,
                     "code_location": "not_provided",
                 },
-                "gpu_id": "GPU-b",
-                "gpu_index": 3,
-                "cuda_ordinal": 0,
                 "cuda_visible_devices": "0",
-                "gpu_cuda_visible_devices": "0",
                 "cuda_device_order": "PCI_BUS_ID",
             },
         ],
+        "gpus": [
+            {
+                "server_id": "server-a",
+                "gpu_id": "GPU-a",
+                "gpu_index": 7,
+                "cuda_ordinal": 0,
+                "gpu_cuda_visible_devices": "0",
+            },
+            {
+                "server_id": "server-b",
+                "gpu_id": "GPU-b",
+                "gpu_index": 3,
+                "cuda_ordinal": 0,
+                "gpu_cuda_visible_devices": "0",
+            },
+        ],
     }
+    assert "ssh" not in multiple_endpoints
+    assert "cuda_visible_devices" not in multiple_endpoints
 
 
 def test_routine_projects_registered_ssh_connection_without_a_shell_command() -> None:
@@ -1653,18 +1667,24 @@ def test_routine_projects_registered_ssh_connection_without_a_shell_command() ->
         },
         include_busy=False,
     )
-    assert status["gpus"][0]["ssh"] == {
-        "host": "gpu.example.test",
-        "port": 2201,
-        "user": "gpu",
-    }
-    assert status["gpus"][0]["workspace"] == {
-        "path": "/srv/server-a",
-        "kind": "working_directory",
-        "use_as_cwd": True,
-        "code_location": "not_provided",
-    }
-    assert "ssh_command" not in status["gpus"][0]
+    # Connection and workspace belong to the server, not to each GPU.
+    assert status["servers"] == [
+        {
+            "server_id": "server-a",
+            "workspace_path": "/srv/server-a",
+            "workspace": {
+                "path": "/srv/server-a",
+                "kind": "working_directory",
+                "use_as_cwd": True,
+                "code_location": "not_provided",
+            },
+            "ssh": {"host": "gpu.example.test", "port": 2201, "user": "gpu"},
+        }
+    ]
+    assert status["gpus"][0]["server_id"] == "server-a"
+    for duplicated in ("ssh", "workspace", "workspace_path"):
+        assert duplicated not in status["gpus"][0]
+    assert "ssh_command" not in status["servers"][0]
 
     allocation = mcp_server._routine_gpu_allocation(
         {
@@ -1685,7 +1705,8 @@ def test_routine_projects_registered_ssh_connection_without_a_shell_command() ->
     )
     expected_ssh = {"host": "gpu.example.test", "port": 2201, "user": "gpu"}
     assert allocation["ssh"] == expected_ssh
-    assert allocation["gpus"][0]["ssh"] == expected_ssh
+    assert allocation["servers"][0]["ssh"] == expected_ssh
+    assert "ssh" not in allocation["gpus"][0]
     assert "ssh_command" not in allocation
 
 
@@ -1698,10 +1719,13 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
 ) -> None:  # type: ignore[no-untyped-def]
     class FakeClient:
         def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
-            assert kwargs in (
-                {"compact": False, "only_available": True},
-                {"compact": False, "only_available": False},
-            )
+            # Busy cards are filtered in the projection so the default response
+            # can name their tasks; the broker is never asked to pre-filter.
+            assert kwargs == {
+                "compact": False,
+                "endpoint_id": None,
+                "only_available": False,
+            }
             return {
                 "schema_version": "v1",
                 "snapshot_revision": 9,
@@ -1779,7 +1803,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                             "state_reason": "workload lease is held",
                             "lease": {"task_ref": "训练"},
                             "publicly_available": False,
-                            "public_status": "任务使用中",
+                            "public_status": "任务占用",
                             "keepalive": {"state": "OFF", "reason": None, "lease_id": None},
                             "telemetry": {
                                 "observed_at": "2026-08-12T00:00:00Z",
@@ -1810,8 +1834,15 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
         "code_location": "not_provided",
     }
 
+    server_projection = {
+        "server_id": "server-a",
+        "workspace_path": "/srv/serverpilot-workspace",
+        "workspace": workspace,
+    }
+
     status = mcp_server.gpu_status()
     assert status == {
+        "servers": [server_projection],
         "gpus": [
             {
                 "server_id": "server-a",
@@ -1830,9 +1861,18 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                     "temperature_c": 42,
                     "recent_average": None,
                 },
-                "workspace_path": "/srv/serverpilot-workspace",
-                "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
+            }
+        ],
+        # The default response names the busy card's task, so deciding where to
+        # place work never needs a second include_busy call.
+        "busy_gpus": [
+            {
+                "server_id": "server-a",
+                "gpu_id": "GPU-b",
+                "index": 1,
+                "status": "任务占用",
+                "task": "训练",
             }
         ],
         "telemetry_summary": {
@@ -1852,7 +1892,12 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
         },
     }
 
-    assert mcp_server.gpu_status(include_busy=True) == {
+    # include_busy keeps its old meaning: busy cards join gpus[] with full
+    # telemetry, and the compact busy_gpus summary is then redundant.
+    busy = mcp_server.gpu_status(include_busy=True)
+    assert "busy_gpus" not in busy
+    assert busy == {
+        "servers": [server_projection],
         "gpus": [
             {
                 "server_id": "server-a",
@@ -1871,8 +1916,6 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                     "temperature_c": 42,
                     "recent_average": None,
                 },
-                "workspace_path": "/srv/serverpilot-workspace",
-                "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
                 "available": True,
             },
@@ -1882,7 +1925,7 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                 "index": 1,
                 "name": "A",
                 "vram_mib": 80000,
-                "status": "任务使用中",
+                "status": "任务占用",
                 "telemetry": {
                     "observed_at": "2026-08-12T00:00:00Z",
                     "memory_used_mib": 25000,
@@ -1893,8 +1936,6 @@ def test_mcp_status_defaults_to_available_and_adds_busy_task_only_on_request(
                     "temperature_c": 75,
                     "recent_average": None,
                 },
-                "workspace_path": "/srv/serverpilot-workspace",
-                "workspace": workspace,
                 "keepalive": {"desired": "OFF", "actual": "OFF"},
                 "available": False,
                 "task": "训练",
@@ -1955,11 +1996,9 @@ def test_routine_status_projects_per_gpu_recent_telemetry_average() -> None:
         include_busy=False,
     )
 
+    # Measurements stay per GPU; the window descriptor they all share is
+    # published once on the server.
     assert status["gpus"][0]["telemetry"]["recent_average"] == {
-        "window_seconds": 3_600,
-        "sample_count": 3,
-        "first_observed_at": "2026-08-15T00:00:00Z",
-        "last_observed_at": "2026-08-15T00:02:00Z",
         "memory_used_mib": 12_000.5,
         "memory_free_mib": 67_999.5,
         "memory_used_pct": 15.0,
@@ -1967,6 +2006,52 @@ def test_routine_status_projects_per_gpu_recent_telemetry_average() -> None:
         "memory_utilization_pct": 21.0,
         "temperature_c": 54.67,
     }
+    assert status["servers"][0]["telemetry_window"] == {
+        "window_seconds": 3_600,
+        "sample_count": 3,
+        "first_observed_at": "2026-08-15T00:00:00Z",
+        "last_observed_at": "2026-08-15T00:02:00Z",
+    }
+    assert "window_override" not in status["gpus"][0]["telemetry"]
+
+
+def test_routine_status_keeps_a_disagreeing_telemetry_window_on_its_own_gpu() -> None:
+    """A partially failing collector cycle must not read as one shared window."""
+
+    def gpu(uuid: str, index: int, sample_count: int) -> dict[str, object]:
+        return {
+            "endpoint_id": "server-a",
+            "gpu_uuid": uuid,
+            "gpu_index": index,
+            "name": "A800",
+            "total_vram_mib": 80_000,
+            "publicly_available": True,
+            "public_status": "可用 · 未开启占卡",
+            "telemetry": {
+                "observed_at": "2026-08-15T00:02:00Z",
+                "recent_average": {
+                    "window_seconds": 600,
+                    "sample_count": sample_count,
+                    "first_observed_at": "2026-08-15T00:00:00Z",
+                    "last_observed_at": "2026-08-15T00:02:00Z",
+                    "memory_used_mib": 1_000,
+                },
+            },
+        }
+
+    status = mcp_server._routine_gpu_status(
+        {
+            "data": {
+                "endpoints": [{"id": "server-a", "workspace_path": "/srv/server-a"}],
+                "gpus": [gpu("GPU-a", 0, 10), gpu("GPU-b", 1, 4)],
+            }
+        },
+        include_busy=False,
+    )
+
+    assert "telemetry_window" not in status["servers"][0]
+    assert status["gpus"][0]["telemetry"]["window_override"]["sample_count"] == 10
+    assert status["gpus"][1]["telemetry"]["window_override"]["sample_count"] == 4
 
 
 def test_mcp_reads_distinguish_internal_keepalive_from_available_capacity(
@@ -2014,8 +2099,15 @@ def test_mcp_reads_distinguish_internal_keepalive_from_available_capacity(
 
     class RestBackedClient:
         def snapshot(self, **kwargs):  # type: ignore[no-untyped-def]
-            assert kwargs == {"compact": False, "only_available": True}
-            response = rest.get("/api/v1/snapshot", params=kwargs, headers=headers)
+            assert kwargs == {
+                "compact": False,
+                "endpoint_id": None,
+                "only_available": False,
+            }
+            # Mirror BrokerClient.snapshot: an unset endpoint_id is dropped
+            # rather than sent as an empty value the broker would filter on.
+            params = {key: value for key, value in kwargs.items() if value is not None}
+            response = rest.get("/api/v1/snapshot", params=params, headers=headers)
             assert response.status_code == 200
             return response.json()
 
@@ -2465,3 +2557,120 @@ def test_cli_resource_evaluate_uses_client_contract(
     assert result.exit_code == 0
     assert '"eval-1"' in result.stdout
     assert calls == [("cpu-8", True)]
+
+
+def _routine_status_fixture(gpu_count: int) -> dict[str, object]:
+    """One server holding ``gpu_count`` fully observed GPUs."""
+
+    return {
+        "data": {
+            "summary": {"total_gpus": gpu_count},
+            "endpoints": [
+                {
+                    "id": "server-10-40-1-222-p4482",
+                    "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                    "host": "10.40.1.222",
+                    "port": 4482,
+                    "ssh_user": "root",
+                }
+            ],
+            "gpus": [
+                {
+                    "endpoint_id": "server-10-40-1-222-p4482",
+                    "gpu_uuid": f"GPU-a6c03f47-e30a-61f9-e1b9-ff1e3156e1{index:02d}",
+                    "gpu_index": index,
+                    "name": "NVIDIA H100 80GB HBM3",
+                    "total_vram_mib": 97_887,
+                    "publicly_available": True,
+                    "public_status": "可用 · 空闲占卡",
+                    "keepalive": {"desired": "ON", "actual": "ON"},
+                    "telemetry": {
+                        "observed_at": "2026-08-21T11:50:42.163448+00:00",
+                        "memory_used_mib": 78_411,
+                        "memory_free_mib": 18_840,
+                        "gpu_utilization_pct": 68,
+                        "memory_utilization_pct": 0,
+                        "temperature_c": 60,
+                        "recent_average": {
+                            "window_seconds": 600,
+                            "sample_count": 10,
+                            "first_observed_at": "2026-08-21T11:41:43.064003+00:00",
+                            "last_observed_at": "2026-08-21T11:50:42.163448+00:00",
+                            "memory_used_mib": 78_411,
+                            "memory_free_mib": 18_840,
+                            "memory_used_pct": 80.1,
+                            "gpu_utilization_pct": 68,
+                            "memory_utilization_pct": 0,
+                            "temperature_c": 62.7,
+                        },
+                    },
+                }
+                for index in range(gpu_count)
+            ],
+        }
+    }
+
+
+def test_routine_projections_do_not_repeat_server_facts_per_gpu() -> None:
+    """Guard the response budget these projections were reshaped to protect.
+
+    A measured 8-GPU status response spent about a quarter of its bytes on
+    endpoint fields copied onto every GPU row, and a 4-GPU lease spent about
+    half.  Both are now published once per server, so this gate fails if per-GPU
+    duplication is reintroduced or the payload creeps back up.
+    """
+
+    status = mcp_server._routine_gpu_status(_routine_status_fixture(8), include_busy=False)
+
+    assert len(status["servers"]) == 1
+    assert len(status["gpus"]) == 8
+    for row in status["gpus"]:
+        for server_fact in ("ssh", "workspace", "workspace_path"):
+            assert server_fact not in row
+        # The shared window is published once on the server.
+        assert set(row["telemetry"]["recent_average"]) == {
+            "memory_used_mib",
+            "memory_free_mib",
+            "memory_used_pct",
+            "gpu_utilization_pct",
+            "memory_utilization_pct",
+            "temperature_c",
+        }
+    assert status["servers"][0]["telemetry_window"]["sample_count"] == 10
+    status_size = len(json.dumps(status, ensure_ascii=False))
+    assert status_size < 6_000, status_size
+
+    allocation = mcp_server._routine_gpu_allocation(
+        {
+            "lease": {
+                "id": "lease-a",
+                "resources": [
+                    {
+                        "endpoint": {
+                            "id": "server-10-40-1-222-p4482",
+                            "workspace_path": "/media/datasets/OminiEWM_Data/tmp/ljp",
+                            "host": "10.40.1.222",
+                            "port": 4482,
+                            "ssh_user": "root",
+                        },
+                        "gpus": [
+                            {
+                                "gpu_uuid": f"GPU-a6c03f47-e30a-61f9-e1b9-ff1e3156e1{index:02d}",
+                                "gpu_index": index,
+                                "cuda_ordinal": index,
+                            }
+                            for index in range(4)
+                        ],
+                        "cuda_visible_devices": "0,1,2,3",
+                        "cuda_device_order": "PCI_BUS_ID",
+                    }
+                ],
+            }
+        }
+    )
+
+    for row in allocation["gpus"]:
+        for server_fact in ("ssh", "workspace", "workspace_path", "cuda_visible_devices"):
+            assert server_fact not in row
+    allocation_size = len(json.dumps(allocation, ensure_ascii=False))
+    assert allocation_size < 1_600, allocation_size

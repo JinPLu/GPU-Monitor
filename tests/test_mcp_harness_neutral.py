@@ -318,23 +318,28 @@ def test_routine_agent_can_retry_no_capacity_then_claim_two_gpus_on_one_server(
         "user": inventory.endpoints[0].ssh_user,
     }
     assert {gpu["server_id"] for gpu in claimed["gpus"]} == {"endpoint-a"}
-    assert {gpu["workspace_path"] for gpu in claimed["gpus"]} == {
-        inventory.endpoints[0].workspace_path
-    }
-    assert {tuple(gpu["ssh"].items()) for gpu in claimed["gpus"]} == {tuple(claimed["ssh"].items())}
+    # Connection and workspace are published once per server, not per GPU.
+    assert [server["server_id"] for server in claimed["servers"]] == ["endpoint-a"]
+    assert claimed["servers"][0]["workspace_path"] == inventory.endpoints[0].workspace_path
+    assert claimed["servers"][0]["ssh"] == claimed["ssh"]
+    for duplicated in ("ssh", "workspace", "workspace_path", "cuda_visible_devices"):
+        assert all(duplicated not in gpu for gpu in claimed["gpus"])
     assert len({gpu["gpu_id"] for gpu in claimed["gpus"]}) == 2
     expected_visible_devices = ",".join(
         str(gpu["cuda_ordinal"]) for gpu in claimed["gpus"]
     )
     assert claimed["cuda_visible_devices"] == expected_visible_devices
     assert claimed["cuda_device_order"] == "PCI_BUS_ID"
-    assert {gpu["cuda_visible_devices"] for gpu in claimed["gpus"]} == {expected_visible_devices}
+    assert claimed["servers"][0]["cuda_visible_devices"] == expected_visible_devices
     assert {gpu["gpu_cuda_visible_devices"] for gpu in claimed["gpus"]} == {
         str(gpu["cuda_ordinal"]) for gpu in claimed["gpus"]
     }
-    assert {gpu["cuda_device_order"] for gpu in claimed["gpus"]} == {"PCI_BUS_ID"}
 
-    assert mcp_server.gpu_release(claimed["lease_id"]) == {"released": True}
+    assert mcp_server.gpu_release(claimed["lease_id"]) == {
+        "released": True,
+        "lease_id": claimed["lease_id"],
+        "state": "RELEASED",
+    }
     leases = app.state.service.list_leases(app.state.service.local_actor("agent"))["data"]
     assert len(leases) == 1
     assert leases[0]["state"] == "RELEASED"
@@ -391,7 +396,7 @@ def test_busy_status_returns_task_without_a_contact_field() -> None:
                         "total_vram_mib": 80_000,
                         "state": "HELD",
                         "publicly_available": False,
-                        "public_status": "任务使用中",
+                        "public_status": "任务占用",
                         "keepalive": {"state": "OFF", "reason": None},
                         "lease": {"task_ref": "训练任务"},
                     }
@@ -402,7 +407,7 @@ def test_busy_status_returns_task_without_a_contact_field() -> None:
     )
 
     assert status["gpus"][0]["task"] == "训练任务"
-    assert status["gpus"][0]["workspace"] == {
+    assert status["servers"][0]["workspace"] == {
         "path": "/srv/server-a",
         "kind": "working_directory",
         "use_as_cwd": True,
@@ -416,12 +421,11 @@ def test_busy_status_returns_task_without_a_contact_field() -> None:
         "vram_mib",
         "status",
         "telemetry",
-        "workspace_path",
-        "workspace",
         "available",
         "task",
         "keepalive",
     }
+    assert set(status["servers"][0]) == {"server_id", "workspace_path", "workspace"}
 
 
 def test_routine_status_reports_no_gpu_from_the_canonical_summary() -> None:
@@ -430,7 +434,7 @@ def test_routine_status_reports_no_gpu_from_the_canonical_summary() -> None:
         include_busy=False,
     )
 
-    assert status == {"gpus": [], "message": "无 GPU"}
+    assert status == {"servers": [], "gpus": [], "message": "无 GPU"}
 
 
 def test_routine_status_reports_recognized_cpu_only_servers() -> None:
@@ -461,6 +465,7 @@ def test_routine_status_reports_recognized_cpu_only_servers() -> None:
     )
 
     assert status == {
+        "servers": [],
         "gpus": [],
         "cpu_only_servers": [
             {
@@ -482,11 +487,13 @@ def test_routine_status_explains_when_all_gpus_are_unavailable() -> None:
     )
 
     assert status == {
+        "servers": [],
         "gpus": [],
         "no_capacity": {
             "reason": "all_gpus_busy_or_unavailable",
             "message": (
-                "当前没有可申请 GPU；可调用 gpu_status(include_busy=true) 查看占用任务或异常状态。"
+                "当前没有可申请 GPU；busy_gpus 已列出占用任务，"
+                "需要忙卡遥测时再调用 gpu_status(include_busy=true)。"
             ),
             "total_gpus": 4,
         },

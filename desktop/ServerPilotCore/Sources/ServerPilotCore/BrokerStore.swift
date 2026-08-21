@@ -50,7 +50,17 @@ public final class URLSessionBrokerSnapshotClient: BrokerSnapshotClient {
     }
 
     public func snapshot(actorID: String) async throws -> BrokerSnapshot {
-        var request = URLRequest(url: baseURL.appendingPathComponent("api/v1/state"))
+        // The App renders none of the generic-resource or external-scheduler
+        // projections, so it does not pay to transfer and decode them every
+        // refresh.  Older services ignore the unknown query item and keep
+        // returning the full payload, which decodes exactly as before.
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent("api/v1/state"),
+            resolvingAgainstBaseURL: false
+        )
+        components?.queryItems = [URLQueryItem(name: "include_advanced", value: "false")]
+        let stateURL = components?.url ?? baseURL.appendingPathComponent("api/v1/state")
+        var request = URLRequest(url: stateURL)
         request.timeoutInterval = 6
         request.setValue(actorID, forHTTPHeaderField: "X-ServerPilot-Actor")
         let (data, response) = try await session.data(for: request)
@@ -411,7 +421,7 @@ public final class BrokerStore: ObservableObject {
         completion: @escaping @MainActor @Sendable (Bool, String?) -> Void
     ) {
         guard canUpdateCollectorSettings else {
-            let message = "当前版本不支持修改数据更新间隔。"
+            let message = "当前版本不支持修改数据采集间隔。"
             errorMessage = message
             completion(false, message)
             return
@@ -437,7 +447,7 @@ public final class BrokerStore: ObservableObject {
                 return
             }
             self.collectorSettings = settings
-            self.notice = "数据更新间隔已设为 \(settings.intervalSeconds) 秒。"
+            self.notice = "数据采集间隔已设为 \(settings.intervalSeconds) 秒。"
             self.errorMessage = nil
             self.reload()
             completion(true, nil)

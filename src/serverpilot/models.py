@@ -777,6 +777,10 @@ class Lease(Base):
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     release_reason: Mapped[str | None] = mapped_column(String(500))
     issued_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: When a fresh observation first showed no compute process on any of this
+    #: lease's GPUs.  Cleared whenever a process appears or telemetry goes
+    #: stale, so the elapsed time is always a fully observed idle window.
+    idle_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class LeaseResource(Base):

@@ -2426,3 +2426,170 @@ def test_reassigned_active_task_auto_binds_process_on_its_new_gpu(service, admin
     gpus = {gpu["id"]: gpu for gpu in service.list_gpus(admin)["data"]}
     assert gpus["endpoint-a:GPU-endpoint-a-0"]["state"] == "AVAILABLE"
     assert gpus["endpoint-a:GPU-endpoint-a-1"]["state"] == "RUNNING_MANAGED"
+
+
+def _lease_idle_since(service, lease_id: str):  # type: ignore[no-untyped-def]
+    def read(session):  # type: ignore[no-untyped-def]
+        lease = session.get(Lease, lease_id)
+        assert lease is not None
+        return lease.idle_since
+
+    return service._read(read)
+
+
+def _make_persistent(service, lease_id: str) -> None:  # type: ignore[no-untyped-def]
+    """Match a routine claim, which is created with no expiry at all."""
+
+    def write(session):  # type: ignore[no-untyped-def]
+        lease = session.get(Lease, lease_id)
+        assert lease is not None
+        lease.expires_at = None
+
+    service._write(write)
+
+
+def _backdate_idle_since(service, lease_id: str, seconds: int) -> None:  # type: ignore[no-untyped-def]
+    def write(session):  # type: ignore[no-untyped-def]
+        lease = session.get(Lease, lease_id)
+        assert lease is not None
+        lease.idle_since = utcnow() - timedelta(seconds=seconds)
+
+    service._write(write)
+
+
+def test_idle_workload_lease_is_warned_then_reclaimed_without_a_process(service, admin) -> None:
+    """A persistent claim that never runs must not hold GPUs forever.
+
+    Routine claims carry no expiry, so before this path nothing ever returned
+    their GPUs when an agent forgot to release.
+    """
+
+    service.ingest_observation(observation(count=1))
+    allocated = service.create_request(admin, request_data("idle-claim"), idempotency_key="idle")
+    assert allocated["lease"] is not None
+    lease_id = allocated["lease"]["id"]
+    _make_persistent(service, lease_id)
+
+    # First idle observation only starts the clock.
+    service.ingest_observation(observation(count=1))
+    assert _lease_idle_since(service, lease_id) is not None
+    lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
+    assert lease["state"] in {"HELD", "ACTIVE"}
+
+    # Past the alert window the lease is flagged but still owns its GPU.
+    _backdate_idle_since(service, lease_id, service.inventory.idle_lease_alert_seconds + 5)
+    service.ingest_observation(observation(count=1))
+    lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
+    assert lease["state"] in {"HELD", "ACTIVE"}
+    alerts = service.snapshot(admin)["data"]["alerts"]
+    idle_alerts = [item for item in alerts if item["type"] == "idle_lease"]
+    assert len(idle_alerts) == 1
+    assert idle_alerts[0]["resource_id"] == lease_id
+
+    # Past the reclaim window the GPU comes back to the allocatable pool.
+    _backdate_idle_since(service, lease_id, service.inventory.idle_lease_reclaim_seconds + 5)
+    service.ingest_observation(observation(count=1))
+    lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
+    assert lease["state"] == "EXPIRED_EMPTY"
+    assert lease["release_reason"] == "idle without observed process"
+    assert not [
+        item
+        for item in service.snapshot(admin)["data"]["alerts"]
+        if item["type"] == "idle_lease" and item["active"]
+    ]
+    reclaimed = service.create_request(admin, request_data("after-reclaim"), idempotency_key="after")
+    assert reclaimed["lease"] is not None
+
+
+def test_idle_clock_resets_when_a_process_appears(service, admin) -> None:
+    service.ingest_observation(observation(count=1))
+    allocated = service.create_request(admin, request_data("busy-claim"), idempotency_key="busy")
+    lease_id = allocated["lease"]["id"]
+    _make_persistent(service, lease_id)
+
+    service.ingest_observation(observation(count=1))
+    assert _lease_idle_since(service, lease_id) is not None
+
+    # A real workload starting must clear the streak so it is never reclaimed.
+    _backdate_idle_since(service, lease_id, service.inventory.idle_lease_reclaim_seconds + 5)
+    service.ingest_observation(
+        observation(count=1, processes=[process_for_gpu("GPU-endpoint-a-0")])
+    )
+    assert _lease_idle_since(service, lease_id) is None
+    lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
+    assert lease["state"] in {"HELD", "ACTIVE", "RUNNING_MANAGED"}
+    assert lease["state"] != "EXPIRED_EMPTY"
+
+
+def test_gpu_public_status_separates_an_idle_claim_from_a_running_task() -> None:
+    """DESIGN_SYSTEM 5 requires these states to read differently.
+
+    Collapsing them hides exactly the case a human needs to spot: a GPU that is
+    claimed but running nothing.
+    """
+
+    def project(state: str, lease: object | None = None) -> str:
+        return BrokerService._gpu_public_projection(
+            {"state": state, "lease": lease, "keepalive": {}},
+            monitor_status="ONLINE",
+        )["public_status"]
+
+    assert project("LEASED_IDLE", lease={"id": "lease-a"}) == "占卡"
+    assert project("HELD", lease={"id": "lease-a"}) == "占卡"
+    assert project("RUNNING_MANAGED", lease={"id": "lease-a"}) == "任务占用"
+    assert project("BUSY_UNMANAGED") == "未归属占用"
+    assert project("ORPHANED_BUSY", lease={"id": "lease-a"}) == "未归属占用"
+    assert project("CONFLICT", lease={"id": "lease-a"}) == "归属冲突"
+
+
+def test_stale_telemetry_resets_the_idle_clock_instead_of_reclaiming(service, admin) -> None:
+    """A collector outage is not evidence of an idle workload.
+
+    Without this reset a long outage would accumulate into a reclaim and take
+    GPUs away from a job the broker simply could not see.
+    """
+
+    service.ingest_observation(observation(count=1))
+    allocated = service.create_request(admin, request_data("unseen"), idempotency_key="unseen")
+    lease_id = allocated["lease"]["id"]
+    _make_persistent(service, lease_id)
+    service.ingest_observation(observation(count=1))
+    assert _lease_idle_since(service, lease_id) is not None
+    _backdate_idle_since(service, lease_id, service.inventory.idle_lease_reclaim_seconds + 5)
+
+    # Age every telemetry row past the stale threshold, then reconcile without
+    # a fresh observation.
+    stale_cutoff = utcnow() - timedelta(
+        seconds=service.inventory.collector.stale_after_seconds * 10
+    )
+
+    def age_telemetry(session):  # type: ignore[no-untyped-def]
+        for row in session.scalars(select(TelemetryCurrent)).all():
+            row.observed_at = stale_cutoff
+
+    service._write(age_telemetry)
+    service.reconcile(admin)
+
+    lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
+    assert lease["state"] != "EXPIRED_EMPTY"
+    assert _lease_idle_since(service, lease_id) is None
+
+
+def test_idle_reclaim_leaves_a_lease_that_declared_its_own_duration(service, admin) -> None:
+    """A declared duration is the user's stated intent and stays authoritative.
+
+    A job may legitimately hold GPUs at zero utilisation through a long CPU
+    phase; only claims with no expiry at all are reclaimed on observed idleness.
+    """
+
+    service.ingest_observation(observation(count=1))
+    allocated = service.create_request(admin, request_data("timed"), idempotency_key="timed")
+    lease_id = allocated["lease"]["id"]
+    assert allocated["lease"]["expires_at"] is not None
+
+    service.ingest_observation(observation(count=1))
+    _backdate_idle_since(service, lease_id, service.inventory.idle_lease_reclaim_seconds + 5)
+    service.ingest_observation(observation(count=1))
+
+    lease = next(item for item in service.list_leases(admin)["data"] if item["id"] == lease_id)
+    assert lease["state"] != "EXPIRED_EMPTY"

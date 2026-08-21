@@ -181,7 +181,12 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
         "无需 gpu 租约",
     ):
         assert runtime_contract in mcp_instructions
-    assert len(mcp.instructions) < 512
+    # The routine instructions load once per session, so they stay bounded.  The
+    # ceiling moved from 512 to 560 when connection and workspace became a
+    # per-server projection: the added structure sentence costs about ten tokens
+    # once, and saves far more on every gpu_status response.  Prohibition
+    # wording is never shortened to fit this bound.
+    assert len(mcp.instructions) < 560
     for removed_routine_step in (
         "gpu_bind_observed_workload",
         "gpu_renew_lease",
@@ -197,7 +202,7 @@ def test_global_policy_describes_the_no_setup_routine_gpu_path() -> None:
 
 def test_tracked_client_rules_use_only_the_exact_harness_neutral_routine_contract() -> None:
     required = (
-        "gpu_status(include_busy=false)",
+        "gpu_status(include_busy=false, server_id?)",
         "gpu_apply(server_id?, gpu_count=1, task?)",
         "gpu_release(lease_id)",
     )

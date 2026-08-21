@@ -322,7 +322,7 @@ semantic_checks = {
     ),
     "settings_contract_ax": all(
         token in ax_text["settings"]
-        for token in ("设置", "本机服务地址", "数据更新间隔", "版本")
+        for token in ("设置", "本机服务地址", "数据采集间隔", "版本")
     ),
     "empty_state_ax": "暂无资源" in ax_text["empty"],
     "connection_error_ax": any(

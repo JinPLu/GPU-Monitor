@@ -1178,8 +1178,11 @@ def create_app(
         )
 
     @app.get("/api/v1/state", response_model=ControlPlaneSnapshot)
-    def control_plane_state(actor: ApiActor) -> dict[str, Any]:
-        return service.control_plane_state(actor)
+    def control_plane_state(
+        actor: ApiActor,
+        include_advanced: bool = True,
+    ) -> dict[str, Any]:
+        return service.control_plane_state(actor, include_advanced=include_advanced)
 
     @app.get("/api/v1/endpoints")
     def endpoints(actor: ApiActor) -> dict[str, Any]:

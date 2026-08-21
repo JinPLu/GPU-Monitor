@@ -64,7 +64,7 @@
           "state": "CONFLICT",
           "state_reason": "lease/process attribution conflict",
           "publicly_available": false,
-          "public_status": "任务使用中",
+          "public_status": "任务占用",
           "keepalive": {
             "configured": true,
             "policy": "idle_keepalive",

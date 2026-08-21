@@ -106,10 +106,24 @@ class InventoryConfig(BaseModel):
     # Accepted for existing inventory files only. The service no longer reads
     # this value; HELD leases stay until explicit expiry, release, or reconcile.
     held_lease_startup_grace_seconds: int = Field(default=120, ge=1, le=3600)
+    # Two-phase reclaim of workload leases that hold GPUs without running
+    # anything.  Both windows count only continuously observed idle time: a
+    # stale observation resets the clock, so a collector outage can never be
+    # mistaken for an idle workload.
+    idle_lease_alert_seconds: int = Field(default=600, ge=60, le=86400)
+    idle_lease_reclaim_seconds: int = Field(default=3600, ge=120, le=604800)
     # Project policies are optional.  The broker creates a neutral record when
     # a claim first uses an otherwise unknown project_id.
     projects: list[ProjectConfig] = Field(default_factory=list)
     endpoints: list[EndpointConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def reclaim_follows_alert(self) -> "InventoryConfig":
+        if self.idle_lease_reclaim_seconds < self.idle_lease_alert_seconds:
+            raise ValueError(
+                "idle_lease_reclaim_seconds must be >= idle_lease_alert_seconds"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_identity_and_project_references(self) -> "InventoryConfig":

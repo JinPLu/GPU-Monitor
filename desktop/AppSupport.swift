@@ -14,8 +14,13 @@ enum DesignTokens {
     static let gpu = mutedInk
     static let network = mutedInk
     // Beszel-derived semantic palette: success, warning, danger.
-    static let success = Color(red: 62.0 / 255.0, green: 184.0 / 255.0, blue: 102.0 / 255.0)
-    static let warning = Color(red: 242.0 / 255.0, green: 177.0 / 255.0, blue: 0.0)
+    // Status colors are graphical objects (dots, pressure bars), so they must
+    // clear the 3:1 WCAG 1.4.11 floor against both the content surface and the
+    // page background.  Measured against #F6F7F9 / #E4E7EC the three land at
+    // 3.48 / 3.50 / 3.55 and 3.01 / 3.03 / 3.07, which also keeps their visual
+    // weight matched.  Keep the hues; only lightness carries the contrast.
+    static let success = Color(red: 51.0 / 255.0, green: 150.0 / 255.0, blue: 83.0 / 255.0)
+    static let warning = Color(red: 170.0 / 255.0, green: 124.0 / 255.0, blue: 0.0)
     static let danger = Color(red: 251.0 / 255.0, green: 44.0 / 255.0, blue: 55.0 / 255.0)
     static let selection = Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
     static let surface = Color(nsColor: NSColor(name: nil) { appearance in
